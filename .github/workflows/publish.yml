@@ -1,0 +1,97 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish package
+    if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && startsWith(github.ref_name, 'v'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Validate tag and package version
+        id: package
+        shell: bash
+        run: |
+          PACKAGE_NAME="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).name")"
+          PACKAGE_VERSION="$(node -p "JSON.parse(require('fs').readFileSync('package.json', 'utf8')).version")"
+
+          if [[ -z "$PACKAGE_NAME" || -z "$PACKAGE_VERSION" ]]; then
+            echo "package.json must define a name and version" >&2
+            exit 1
+          fi
+          if [[ ! "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "package.json version must be a stable semver (x.y.z): $PACKAGE_VERSION" >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            EXPECTED_TAG="v$PACKAGE_VERSION"
+            if [[ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]]; then
+              echo "Tag $GITHUB_REF_NAME does not match package version $PACKAGE_VERSION" >&2
+              exit 1
+            fi
+          fi
+
+          {
+            echo "name=$PACKAGE_NAME"
+            echo "version=$PACKAGE_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify package
+        run: npm run verify
+
+      - name: Check whether npm version already exists
+        id: npm-version
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          if NPM_VIEW_OUTPUT="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" version --registry=https://registry.npmjs.org 2>&1)"; then
+            echo "npm version $PACKAGE_NAME@$PACKAGE_VERSION already exists; skipping publish"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$NPM_VIEW_OUTPUT" == *"E404"* || "$NPM_VIEW_OUTPUT" == *"404 Not Found"* ]]; then
+            echo "npm version $PACKAGE_NAME@$PACKAGE_VERSION is not published yet"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$NPM_VIEW_OUTPUT" >&2
+            echo "Could not safely determine whether the npm version exists" >&2
+            exit 1
+          fi
+
+      - name: Publish to npm
+        if: steps.npm-version.outputs.exists != 'true'
+        run: npm publish --access public --provenance
+
+      - name: Create GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "GitHub Release $GITHUB_REF_NAME already exists; skipping creation"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          fi

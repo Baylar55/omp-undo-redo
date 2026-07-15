@@ -1,0 +1,46 @@
+{
+  "name": "@baylarsadigov/omp-undo-redo",
+  "version": "1.0.0",
+  "description": "Undo and redo session navigation for Oh My Pi",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "pack:check": "npm pack --dry-run",
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run build && npm run pack:check"
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": ">=16.5.2"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "16.5.2",
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "@vitest/coverage-v8": "^3.2.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.2.0"
+  }
+}
