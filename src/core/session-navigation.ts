@@ -1,57 +1,65 @@
-import {
-  invalidateRedo,
-  validateRedoState,
-  type RedoState,
-  createRedoState,
-} from "./redo-state.js";
-import { isValidTarget, previousCheckpoint } from "./checkpoints.js";
-import type { NavigationPort } from "./types.js";
+import type { Checkpoint, GitRunner, NavigationPort } from "./types.js";
+import { previousCheckpoint } from "./checkpoints.js";
+import { capturePostTurnCheckpoint, restoreToCheckpoint } from "./checkpoints.js";
 
-export type NavigationOutcome = "moved" | "empty" | "invalid" | "cancelled";
+export type NavigationOutcome = "moved" | "empty" | "invalid" | "cancelled" | "git_failed";
 
 export class SessionNavigation {
-  readonly redoState: RedoState;
+  private checkpoints: Checkpoint[] = [];
+  private currentIndex: number = -1;
 
   constructor(
     private readonly port: NavigationPort,
-    state: unknown = createRedoState(),
-  ) {
-    this.redoState = validateRedoState(state, port) ? state : createRedoState();
+    private readonly git: GitRunner,
+  ) {}
+
+  setInitialCheckpoint(commitHash: string): void {
+    this.checkpoints = [{ commitHash, leafId: null }];
+    this.currentIndex = 0;
   }
 
-  invalidateIfDiverged(): void {
-    if (
-      this.redoState.targets.length > 0 &&
-      this.port.getLeafId() !== this.redoState.currentLeafId
-    ) {
-      invalidateRedo(this.redoState);
+  async recordTurnEnd(turnIndex: number): Promise<void> {
+    const leafId = this.port.getLeafId();
+    const hash = await capturePostTurnCheckpoint(this.git, turnIndex);
+    if (!hash) return;
+
+    if (this.currentIndex < this.checkpoints.length - 1) {
+      this.checkpoints.splice(this.currentIndex + 1);
     }
+    this.checkpoints.push({ commitHash: hash, leafId });
+    this.currentIndex = this.checkpoints.length - 1;
   }
 
   async undo(): Promise<NavigationOutcome> {
-    const currentLeafId = this.port.getLeafId();
-    const targetId = previousCheckpoint(this.port);
-    if (!currentLeafId || !targetId) return "empty";
-    if (!isValidTarget(this.port, targetId)) return "invalid";
-    const result = await this.port.navigateTree(targetId);
-    if (result.cancelled) return "cancelled";
-    this.redoState.targets.push(currentLeafId);
-    this.redoState.currentLeafId = this.port.getLeafId();
+    if (this.currentIndex < 1) return "empty";
+
+    const target = this.checkpoints[this.currentIndex - 1];
+    const ok = await restoreToCheckpoint(this.git, target.commitHash);
+    if (!ok) return "git_failed";
+
+    const userMessageId = previousCheckpoint(this.port);
+    if (userMessageId) {
+      const result = await this.port.navigateTree(userMessageId);
+      if (result.cancelled) return "cancelled";
+    }
+
+    this.currentIndex--;
     return "moved";
   }
 
   async redo(): Promise<NavigationOutcome> {
-    this.invalidateIfDiverged();
-    const targetId = this.redoState.targets.at(-1);
-    if (!targetId || this.port.getLeafId() !== this.redoState.currentLeafId) return "empty";
-    if (!isValidTarget(this.port, targetId)) {
-      invalidateRedo(this.redoState);
-      return "invalid";
+    if (this.currentIndex >= this.checkpoints.length - 1) return "empty";
+
+    const target = this.checkpoints[this.currentIndex + 1];
+    const ok = await restoreToCheckpoint(this.git, target.commitHash);
+    if (!ok) return "git_failed";
+
+    if (target.leafId) {
+      const result = await this.port.navigateTree(target.leafId);
+      if (result.cancelled) return "cancelled";
     }
-    const result = await this.port.navigateTree(targetId);
-    if (result.cancelled) return "cancelled";
-    this.redoState.targets.pop();
-    this.redoState.currentLeafId = this.port.getLeafId();
+
+    this.currentIndex++;
     return "moved";
   }
 }

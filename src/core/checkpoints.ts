@@ -1,27 +1,68 @@
-import type { SessionEntryLike, SessionReader } from "./types.js";
+import type { GitRunner, SessionReader } from "./types.js";
 
-export function isUserMessage(entry: SessionEntryLike): boolean {
-  return entry.type === "message" && entry.message?.role === "user";
-}
+const COMMIT_PREFIX = "omp-undo:";
 
-/** Return the user-prompt boundary before the latest assistant/tool activity. */
-export function previousCheckpoint(reader: SessionReader): string | null {
-  const leafId = reader.getLeafId();
+export function previousCheckpoint(ctx: SessionReader): string | null {
+  const leafId = ctx.getLeafId();
   if (!leafId) return null;
-  const branch = reader.getBranch(leafId);
-  let latestUserIndex = -1;
-  for (let index = branch.length - 1; index >= 0; index -= 1) {
-    if (isUserMessage(branch[index])) {
-      latestUserIndex = index;
-      break;
+  const entries = ctx.getBranch(leafId);
+  const currentIndex = entries.findIndex((e) => e.id === leafId);
+  for (let i = currentIndex - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "message" && entry.message?.role === "user") {
+      return entry.id;
     }
   }
-  if (latestUserIndex < 0 || branch[latestUserIndex].id === leafId) return null;
-  return branch[latestUserIndex].id;
+  return null;
 }
 
-export function isValidTarget(reader: SessionReader, targetId: string): boolean {
-  if (!targetId || !reader.getEntry(targetId)) return false;
-  const branch = reader.getBranch(targetId);
-  return branch.length > 0 && branch.at(-1)?.id === targetId;
+export async function captureInitialState(
+  git: GitRunner,
+): Promise<string | null> {
+  try {
+    const add = await git(["add", "-A"]);
+    if (add.code !== 0) return null;
+    const commit = await git([
+      "commit", "--allow-empty",
+      "-m", `${COMMIT_PREFIX} initial`,
+    ]);
+    if (commit.code !== 0) return null;
+    const hash = await git(["rev-parse", "HEAD"]);
+    if (hash.code !== 0) return null;
+    return hash.stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+export async function capturePostTurnCheckpoint(
+  git: GitRunner,
+  turnIndex: number,
+): Promise<string | null> {
+  try {
+    const add = await git(["add", "-A"]);
+    if (add.code !== 0) return null;
+    const commit = await git([
+      "commit", "--allow-empty",
+      "-m", `${COMMIT_PREFIX} turn ${turnIndex}`,
+    ]);
+    if (commit.code !== 0) return null;
+    const hash = await git(["rev-parse", "HEAD"]);
+    if (hash.code !== 0) return null;
+    return hash.stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+export async function restoreToCheckpoint(
+  git: GitRunner,
+  commitHash: string,
+): Promise<boolean> {
+  try {
+    const reset = await git(["reset", "--hard", commitHash]);
+    return reset.code === 0;
+  } catch {
+    return false;
+  }
 }

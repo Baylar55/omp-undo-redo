@@ -10,17 +10,22 @@ export async function runUndo(
     ctx.ui.notify("Cannot undo while the agent is busy.", "warning");
     return;
   }
+
   const outcome = await navigation.undo();
-  if (outcome === "moved") {
-    ctx.ui.notify(
-      "Session context moved back one checkpoint. Files and external changes were not reverted.",
-      "info",
-    );
-  } else if (outcome === "empty") {
-    ctx.ui.notify("Nothing to undo in this session.", "info");
-  } else if (outcome === "cancelled") {
-    ctx.ui.notify("Undo was cancelled.", "warning");
-  } else {
-    ctx.ui.notify("Nothing to undo in this session.", "warning");
+  switch (outcome) {
+    case "moved":
+      ctx.ui.notify("Undid last turn: session moved back and file changes reverted.", "info");
+      break;
+    case "empty":
+      ctx.ui.notify("Nothing to undo in this session.", "info");
+      break;
+    case "cancelled":
+      ctx.ui.notify("Undo was cancelled.", "warning");
+      break;
+    case "git_failed":
+      ctx.ui.notify("Could not revert file changes (git checkpoint missing).", "warning");
+      break;
+    default:
+      ctx.ui.notify("Nothing to undo in this session.", "warning");
   }
 }

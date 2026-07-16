@@ -2,9 +2,21 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
-## [Unreleased]
+## [1.0.7] - 2026-07-16
 
-_No unreleased changes._
+### Changed
+
+- **Breaking refactor**: undo/redo now creates Git checkpoints at each `turn_end` and uses `git reset --hard` to revert both file changes and session context.
+- Added `pi.exec("git", ...)` integration for checkpoint creation (`git add -A`, `git commit`) and restoration (`git reset --hard`).
+- Removed the old tree-only navigation approach (`redo-state.ts`, `invalidateIfDiverged`).
+- Graceful fallback when Git is unavailable (extension does nothing rather than crashing).
+
+## [1.0.6] - 2026-07-16
+
+### Fixed
+
+- Use per-session navigation state via `Map<string, SessionNavigation>` so undo/redo state is no longer shared and lost across sessions.
+- `session_start` and `turn_end` handlers now correctly use the session context to operate on the right session's navigation state.
 
 ## [1.0.5] - 2026-07-16
 
@@ -45,7 +57,9 @@ _No unreleased changes._
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
-[Unreleased]: https://github.com/baylarsadigov/omp-undo-redo/compare/v1.0.5...HEAD
+[Unreleased]: https://github.com/baylarsadigov/omp-undo-redo/compare/v1.0.7...HEAD
+[1.0.7]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.7
+[1.0.6]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.6
 [1.0.5]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.5
 [1.0.4]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.4
 [1.0.3]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.3

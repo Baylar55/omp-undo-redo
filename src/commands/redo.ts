@@ -10,15 +10,22 @@ export async function runRedo(
     ctx.ui.notify("Cannot redo while the agent is busy.", "warning");
     return;
   }
+
   const outcome = await navigation.redo();
-  if (outcome === "moved") {
-    ctx.ui.notify(
-      "Session context moved forward one checkpoint. Files and external changes were not reverted.",
-      "info",
-    );
-  } else if (outcome === "cancelled") {
-    ctx.ui.notify("Redo was cancelled.", "warning");
-  } else {
-    ctx.ui.notify("Nothing to redo.", outcome === "invalid" ? "warning" : "info");
+  switch (outcome) {
+    case "moved":
+      ctx.ui.notify("Redid last turn: session moved forward and file changes reapplied.", "info");
+      break;
+    case "empty":
+      ctx.ui.notify("Nothing to redo in this session.", "info");
+      break;
+    case "cancelled":
+      ctx.ui.notify("Redo was cancelled.", "warning");
+      break;
+    case "git_failed":
+      ctx.ui.notify("Could not reapply file changes (git checkpoint missing).", "warning");
+      break;
+    default:
+      ctx.ui.notify("Nothing to redo in this session.", "warning");
   }
 }
