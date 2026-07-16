@@ -41,7 +41,7 @@ describe("session navigation", () => {
     const session = port();
     const navigation = new SessionNavigation(session);
     expect(await navigation.undo()).toBe("moved");
-    expect(session.leaf).toBe("a1");
+    expect(session.leaf).toBe("u2");
     expect(await navigation.undo()).toBe("empty");
     expect(await navigation.redo()).toBe("moved");
     expect(session.leaf).toBe("a2");
@@ -54,7 +54,7 @@ describe("session navigation", () => {
     await navigation.undo();
     session.leaf = "new-branch";
     expect(await navigation.redo()).toBe("empty");
-    expect(session.navigateCalls).toEqual(["a1"]);
+    expect(session.navigateCalls).toEqual(["u2"]);
   });
 
   it("rejects cancelled navigation and stale targets", async () => {

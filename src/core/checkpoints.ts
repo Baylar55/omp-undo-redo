@@ -4,7 +4,7 @@ export function isUserMessage(entry: SessionEntryLike): boolean {
   return entry.type === "message" && entry.message?.role === "user";
 }
 
-/** Return the target before the latest completed user interaction. */
+/** Return the user-prompt boundary before the latest assistant/tool activity. */
 export function previousCheckpoint(reader: SessionReader): string | null {
   const leafId = reader.getLeafId();
   if (!leafId) return null;
@@ -16,10 +16,8 @@ export function previousCheckpoint(reader: SessionReader): string | null {
       break;
     }
   }
-  if (latestUserIndex <= 0) return null;
-  const latestUser = branch[latestUserIndex];
-  const target = latestUser.parentId ? reader.getEntry(latestUser.parentId) : undefined;
-  return target ? target.id : null;
+  if (latestUserIndex < 0 || branch[latestUserIndex].id === leafId) return null;
+  return branch[latestUserIndex].id;
 }
 
 export function isValidTarget(reader: SessionReader, targetId: string): boolean {

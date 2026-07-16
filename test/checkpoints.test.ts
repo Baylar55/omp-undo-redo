@@ -27,12 +27,13 @@ const entries: SessionEntryLike[] = [
 ];
 
 describe("checkpoint selection", () => {
-  it("returns no target at the first interaction", () => {
-    expect(previousCheckpoint(reader(entries.slice(0, 2), "a1"))).toBeNull();
+  it("selects the first prompt boundary so the first interaction is undoable", () => {
+    expect(previousCheckpoint(reader(entries.slice(0, 2), "a1"))).toBe("u1");
+    expect(previousCheckpoint(reader(entries.slice(0, 1), "u1"))).toBeNull();
   });
 
-  it("selects the previous completed interaction", () => {
-    expect(previousCheckpoint(reader(entries, "a2"))).toBe("a1");
+  it("selects the latest prompt boundary", () => {
+    expect(previousCheckpoint(reader(entries, "a2"))).toBe("u2");
     expect(isValidTarget(reader(entries, "a1"), "a1")).toBe(true);
     expect(isValidTarget(reader(entries, "a1"), "missing")).toBe(false);
   });

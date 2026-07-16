@@ -6,6 +6,12 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 _No unreleased changes._
 
+## [1.0.4] - 2026-07-16
+
+### Fixed
+
+- Make the first completed interaction undoable by navigating to its user-prompt boundary.
+
 ## [1.0.3] - 2026-07-16
 
 ### Changed
@@ -33,7 +39,8 @@ _No unreleased changes._
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
-[Unreleased]: https://github.com/baylarsadigov/omp-undo-redo/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/baylarsadigov/omp-undo-redo/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.4
 [1.0.3]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.3
 [1.0.2]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.2
 [1.0.1]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.1

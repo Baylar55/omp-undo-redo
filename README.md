@@ -29,8 +29,8 @@ Do not add a second entry for the extension when the package manifest is already
 
 The extension exposes exactly these commands:
 
-- `/undo` — move to the checkpoint immediately before the latest completed user interaction on the current branch. If there is no earlier checkpoint, it reports that undo is unavailable.
-- `/redo` — move forward to the next checkpoint recorded by this extension. Redo is single-use in order: after a new branch or any navigation that is not the matching redo, the in-memory redo history is cleared.
+- `/undo` — move to the latest user-prompt boundary, removing that prompt's assistant/tool activity from the active context. The prompt itself remains as the supported OMP session-tree boundary. If the current context is already at that boundary, it reports that undo is unavailable.
+- `/redo` — restore the most recently undone context checkpoint. Redo is single-use in order: after a new branch or any navigation that is not the matching redo, the in-memory redo history is cleared.
 
 Commands take no arguments. They navigate OMP's session tree through the official extension API and do not create a new model turn.
 Both commands wait for the current agent turn to become idle; if OMP remains busy, the command leaves the session unchanged and shows a warning.
