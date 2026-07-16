@@ -36,7 +36,7 @@ export class SessionNavigation {
     const result = await this.port.navigateTree(targetId);
     if (result.cancelled) return "cancelled";
     this.redoState.targets.push(currentLeafId);
-    this.redoState.currentLeafId = targetId;
+    this.redoState.currentLeafId = this.port.getLeafId();
     return "moved";
   }
 
@@ -51,7 +51,7 @@ export class SessionNavigation {
     const result = await this.port.navigateTree(targetId);
     if (result.cancelled) return "cancelled";
     this.redoState.targets.pop();
-    this.redoState.currentLeafId = targetId;
+    this.redoState.currentLeafId = this.port.getLeafId();
     return "moved";
   }
 }

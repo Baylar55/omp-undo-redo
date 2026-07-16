@@ -6,6 +6,12 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 _No unreleased changes._
 
+## [1.0.5] - 2026-07-16
+
+### Fixed
+
+- Track OMP's effective leaf after navigating to a user entry so redo remains available, including when the boundary is the session root.
+
 ## [1.0.4] - 2026-07-16
 
 ### Fixed
@@ -39,7 +45,8 @@ _No unreleased changes._
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
-[Unreleased]: https://github.com/baylarsadigov/omp-undo-redo/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/baylarsadigov/omp-undo-redo/compare/v1.0.5...HEAD
+[1.0.5]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.5
 [1.0.4]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.4
 [1.0.3]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.3
 [1.0.2]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.2
