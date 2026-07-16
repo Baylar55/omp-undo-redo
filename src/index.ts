@@ -1,5 +1,4 @@
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntryLike } from "./core/types.js";
 import { runRedo } from "./commands/redo.js";
 import { runUndo } from "./commands/undo.js";

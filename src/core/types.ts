@@ -24,4 +24,6 @@ export interface Checkpoint {
   leafId: string | null;
 }
 
-export type GitRunner = (args: string[]) => Promise<{ stdout: string; stderr: string; code: number }>;
+export type GitRunner = (
+  args: string[],
+) => Promise<{ stdout: string; stderr: string; code: number }>;

@@ -13,7 +13,10 @@ function mockGit(): GitRunner {
 }
 
 function port(): NavigationPort & { leaf: string; navigateCalls: string[] } {
-  const raw: Record<string, { id: string; parentId: string | null; type: string; message?: { role?: string } }> = {};
+  const raw: Record<
+    string,
+    { id: string; parentId: string | null; type: string; message?: { role?: string } }
+  > = {};
   function add(id: string, parentId: string | null, role?: string) {
     raw[id] = { id, parentId, type: "message", ...(role ? { message: { role } } : {}) };
   }
@@ -32,7 +35,12 @@ function port(): NavigationPort & { leaf: string; navigateCalls: string[] } {
       return raw[id];
     },
     getBranch(fromId?: string) {
-      const result: Array<{ id: string; parentId: string | null; type: string; message?: { role?: string } }> = [];
+      const result: Array<{
+        id: string;
+        parentId: string | null;
+        type: string;
+        message?: { role?: string };
+      }> = [];
       let current = fromId ? raw[fromId] : undefined;
       while (current) {
         result.unshift(current);

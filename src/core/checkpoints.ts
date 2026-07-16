@@ -16,16 +16,11 @@ export function previousCheckpoint(ctx: SessionReader): string | null {
   return null;
 }
 
-export async function captureInitialState(
-  git: GitRunner,
-): Promise<string | null> {
+export async function captureInitialState(git: GitRunner): Promise<string | null> {
   try {
     const add = await git(["add", "-A"]);
     if (add.code !== 0) return null;
-    const commit = await git([
-      "commit", "--allow-empty",
-      "-m", `${COMMIT_PREFIX} initial`,
-    ]);
+    const commit = await git(["commit", "--allow-empty", "-m", `${COMMIT_PREFIX} initial`]);
     if (commit.code !== 0) return null;
     const hash = await git(["rev-parse", "HEAD"]);
     if (hash.code !== 0) return null;
@@ -43,8 +38,10 @@ export async function capturePostTurnCheckpoint(
     const add = await git(["add", "-A"]);
     if (add.code !== 0) return null;
     const commit = await git([
-      "commit", "--allow-empty",
-      "-m", `${COMMIT_PREFIX} turn ${turnIndex}`,
+      "commit",
+      "--allow-empty",
+      "-m",
+      `${COMMIT_PREFIX} turn ${turnIndex}`,
     ]);
     if (commit.code !== 0) return null;
     const hash = await git(["rev-parse", "HEAD"]);
@@ -55,10 +52,7 @@ export async function capturePostTurnCheckpoint(
   }
 }
 
-export async function restoreToCheckpoint(
-  git: GitRunner,
-  commitHash: string,
-): Promise<boolean> {
+export async function restoreToCheckpoint(git: GitRunner, commitHash: string): Promise<boolean> {
   try {
     const reset = await git(["reset", "--hard", commitHash]);
     return reset.code === 0;
