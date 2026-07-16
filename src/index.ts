@@ -15,21 +15,29 @@ function createNavigation(ctx: NavigationContext): SessionNavigation {
   });
 }
 
-export default function ompUndoRedo(pi: ExtensionAPI): void {
-  let navigation: SessionNavigation | undefined;
+const navigations = new Map<string, SessionNavigation>();
 
-  pi.on("session_start", async () => {
-    navigation = undefined;
+export default function ompUndoRedo(pi: ExtensionAPI): void {
+  pi.on("session_start", async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    navigations.delete(sessionId);
   });
 
-  pi.on("turn_end", async () => {
+  pi.on("turn_end", async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const navigation = navigations.get(sessionId);
     navigation?.invalidateIfDiverged();
   });
 
   pi.registerCommand("undo", {
     description: "Move session context back one checkpoint",
     handler: async (_args, ctx) => {
-      navigation ??= createNavigation(ctx);
+      const sessionId = ctx.sessionManager.getSessionId();
+      let navigation = navigations.get(sessionId);
+      if (!navigation) {
+        navigation = createNavigation(ctx);
+        navigations.set(sessionId, navigation);
+      }
       await runUndo(navigation, ctx);
     },
   });
@@ -37,7 +45,12 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   pi.registerCommand("redo", {
     description: "Restore the most recently undone checkpoint",
     handler: async (_args, ctx) => {
-      navigation ??= createNavigation(ctx);
+      const sessionId = ctx.sessionManager.getSessionId();
+      let navigation = navigations.get(sessionId);
+      if (!navigation) {
+        navigation = createNavigation(ctx);
+        navigations.set(sessionId, navigation);
+      }
       await runRedo(navigation, ctx);
     },
   });
