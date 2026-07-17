@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntryLike } from "./core/types.js";
 import { runRedo } from "./commands/redo.js";
 import { runUndo } from "./commands/undo.js";
@@ -75,23 +75,37 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     await nav.recordTurnEnd(turnCounter);
   });
 
+  const undoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const nav = navigations.get(sessionId) ?? createNavigation(pi, ctx as unknown as AnyContext);
+    navigations.set(sessionId, nav);
+    await runUndo(nav, ctx);
+  };
+
+  const redoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const nav = navigations.get(sessionId) ?? createNavigation(pi, ctx as unknown as AnyContext);
+    navigations.set(sessionId, nav);
+    await runRedo(nav, ctx);
+  };
+
   pi.registerCommand("undo", {
-    description: "Revert file changes and session context for the last assistant turn",
-    handler: async (_args, ctx) => {
-      const sessionId = ctx.sessionManager.getSessionId();
-      const nav = navigations.get(sessionId) ?? createNavigation(pi, ctx);
-      navigations.set(sessionId, nav);
-      await runUndo(nav, ctx);
-    },
+    description: "Revert file changes and session context for the last turn",
+    handler: undoHandler,
   });
 
   pi.registerCommand("redo", {
-    description: "Restore the most recently undone assistant turn",
-    handler: async (_args, ctx) => {
-      const sessionId = ctx.sessionManager.getSessionId();
-      const nav = navigations.get(sessionId) ?? createNavigation(pi, ctx);
-      navigations.set(sessionId, nav);
-      await runRedo(nav, ctx);
-    },
+    description: "Restore the most recently undone turn",
+    handler: redoHandler,
+  });
+
+  pi.registerCommand("git-undo", {
+    description: "Git-based undo (alternative name): revert file changes and session context",
+    handler: undoHandler,
+  });
+
+  pi.registerCommand("git-redo", {
+    description: "Git-based redo (alternative name): reapply the most recently undone turn",
+    handler: redoHandler,
   });
 }

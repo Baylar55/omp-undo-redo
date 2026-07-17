@@ -2,6 +2,15 @@ import type { GitRunner, SessionReader } from "./types.js";
 
 const COMMIT_PREFIX = "omp-undo:";
 
+const GIT_AUTHOR = [
+  "-c", "user.name=omp-undo",
+  "-c", "user.email=omp-undo@local",
+];
+
+function gitCommit(git: GitRunner, message: string) {
+  return git([...GIT_AUTHOR, "commit", "--allow-empty", "-m", message]);
+}
+
 export function previousCheckpoint(ctx: SessionReader): string | null {
   const leafId = ctx.getLeafId();
   if (!leafId) return null;
@@ -20,7 +29,7 @@ export async function captureInitialState(git: GitRunner): Promise<string | null
   try {
     const add = await git(["add", "-A"]);
     if (add.code !== 0) return null;
-    const commit = await git(["commit", "--allow-empty", "-m", `${COMMIT_PREFIX} initial`]);
+    const commit = await gitCommit(git, `${COMMIT_PREFIX} initial`);
     if (commit.code !== 0) return null;
     const hash = await git(["rev-parse", "HEAD"]);
     if (hash.code !== 0) return null;
@@ -37,12 +46,7 @@ export async function capturePostTurnCheckpoint(
   try {
     const add = await git(["add", "-A"]);
     if (add.code !== 0) return null;
-    const commit = await git([
-      "commit",
-      "--allow-empty",
-      "-m",
-      `${COMMIT_PREFIX} turn ${turnIndex}`,
-    ]);
+    const commit = await gitCommit(git, `${COMMIT_PREFIX} turn ${turnIndex}`);
     if (commit.code !== 0) return null;
     const hash = await git(["rev-parse", "HEAD"]);
     if (hash.code !== 0) return null;

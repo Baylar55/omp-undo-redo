@@ -7,6 +7,7 @@ export type NavigationOutcome = "moved" | "empty" | "invalid" | "cancelled" | "g
 export class SessionNavigation {
   private checkpoints: Checkpoint[] = [];
   private currentIndex: number = -1;
+  private initialSet: boolean = false;
 
   constructor(
     private readonly port: NavigationPort,
@@ -16,6 +17,7 @@ export class SessionNavigation {
   setInitialCheckpoint(commitHash: string): void {
     this.checkpoints = [{ commitHash, leafId: null }];
     this.currentIndex = 0;
+    this.initialSet = true;
   }
 
   async recordTurnEnd(turnIndex: number): Promise<void> {
@@ -26,6 +28,14 @@ export class SessionNavigation {
     if (this.currentIndex < this.checkpoints.length - 1) {
       this.checkpoints.splice(this.currentIndex + 1);
     }
+
+    if (!this.initialSet && this.checkpoints.length === 0) {
+      this.checkpoints.push({ commitHash: hash, leafId });
+      this.currentIndex = 0;
+      this.initialSet = true;
+      return;
+    }
+
     this.checkpoints.push({ commitHash: hash, leafId });
     this.currentIndex = this.checkpoints.length - 1;
   }
