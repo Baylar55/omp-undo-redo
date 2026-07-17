@@ -2,10 +2,7 @@ import type { GitRunner, SessionReader } from "./types.js";
 
 const COMMIT_PREFIX = "omp-undo:";
 
-const GIT_AUTHOR = [
-  "-c", "user.name=omp-undo",
-  "-c", "user.email=omp-undo@local",
-];
+const GIT_AUTHOR = ["-c", "user.name=omp-undo", "-c", "user.email=omp-undo@local"];
 
 function gitCommit(git: GitRunner, message: string) {
   return git([...GIT_AUTHOR, "commit", "--allow-empty", "-m", message]);
