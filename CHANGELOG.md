@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.10] - 2026-07-17
+
+### Fixed
+
+- Declare the extension entry under both `omp.extensions` and `pi.extensions` so OMP/ Pi plugin loaders across supported releases discover the commands.
+
 ## [1.0.7] - 2026-07-16
 
 ### Changed

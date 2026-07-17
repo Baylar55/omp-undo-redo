@@ -1,6 +1,6 @@
 {
   "name": "@baylarsadigov/omp-undo-redo",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Undo and redo session navigation for Oh My Pi",
   "license": "MIT",
   "type": "module",
@@ -8,6 +8,11 @@
     "node": ">=20"
   },
   "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "pi": {
     "extensions": [
       "./dist/index.js"
     ]
