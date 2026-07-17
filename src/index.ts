@@ -65,7 +65,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
     const typed = ctx as unknown as AnyContext;
     const sessionId = typed.sessionManager.getSessionId();
     const before = pending.get(sessionId);

@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.14] - 2026-07-17
+
+### Fixed
+
+- Finalize the file checkpoint on `agent_end` so redo captures the complete user request, including all tool-loop file changes.
+
 ## [1.0.13] - 2026-07-17
 
 ### Fixed
