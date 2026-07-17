@@ -37,7 +37,7 @@ Both commands wait for the current agent turn to become idle; if OMP remains bus
 
 ## Limitations
 
-Undo/redo restores file snapshots captured at session turn boundaries without creating commits, staging changes, or rewriting Git history. It does not revert shell commands, network requests, editor state, or other external effects. Snapshots are kept in memory and reset when OMP or the extension is reloaded. Navigation can also be cancelled by OMP lifecycle handlers.
+Undo/redo uses temporary Git checkpoints around each turn, then mixed-resets the active branch back to its original `HEAD`. Restoring a checkpoint returns files to the exact before/after state while leaving the branch history unchanged and keeping local changes unstaged. It does not revert shell commands, network requests, editor state, or other external effects. Checkpoints are kept in memory and reset when OMP or the extension is reloaded. Navigation can also be cancelled by OMP lifecycle handlers.
 
 ## Development
 

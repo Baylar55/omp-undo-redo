@@ -19,14 +19,14 @@ export interface NavigationPort extends SessionReader {
   navigateTree(targetId: string): Promise<NavigationResult>;
 }
 
-export interface WorkspaceSnapshot {
-  files: Record<string, string | null>;
+export interface GitCheckpoint {
+  baseHash: string;
+  beforeHash: string;
+  afterHash: string;
+  parentLeafId: string | null;
+  leafId: string | null;
 }
 
-export interface SnapshotStore {
-  capture(): Promise<WorkspaceSnapshot | null>;
-  restore(snapshot: WorkspaceSnapshot): Promise<boolean>;
-}
 export type GitRunner = (
   args: string[],
 ) => Promise<{ stdout: string; stderr: string; code: number }>;

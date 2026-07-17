@@ -22,8 +22,8 @@ export async function runRedo(
     case "cancelled":
       ctx.ui.notify("Redo was cancelled.", "warning");
       break;
-    case "snapshot_failed":
-      ctx.ui.notify("Could not restore the saved file snapshot.", "warning");
+    case "git_failed":
+      ctx.ui.notify("Could not restore the Git checkpoint.", "warning");
       break;
     default:
       ctx.ui.notify("Nothing to redo in this session.", "warning");

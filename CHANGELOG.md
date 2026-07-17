@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.13] - 2026-07-17
+
+### Fixed
+
+- Restore file changes with temporary Git checkpoints while keeping the active branch `HEAD` unchanged.
+- Preserve local changes as unstaged files after undo and redo.
+
 ## [1.0.12] - 2026-07-17
 
 ### Fixed

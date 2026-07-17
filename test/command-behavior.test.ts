@@ -1,16 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { SessionNavigation } from "../src/core/session-navigation.js";
-import type { NavigationPort, SnapshotStore, WorkspaceSnapshot } from "../src/core/types.js";
+import type { GitCheckpoint, GitRunner, NavigationPort } from "../src/core/types.js";
 
-function snapshotStore(restoreResult = true): SnapshotStore {
-  return {
-    async capture() {
-      return { files: {} };
-    },
-    async restore(_snapshot: WorkspaceSnapshot) {
-      return restoreResult;
-    },
-  };
+function mockGit(): GitRunner {
+  return async () => ({ stdout: "", stderr: "", code: 0 });
 }
 
 function port(): NavigationPort & { leaf: string; navigateCalls: string[] } {
@@ -51,37 +44,40 @@ function port(): NavigationPort & { leaf: string; navigateCalls: string[] } {
     },
     async navigateTree(targetId: string) {
       value.navigateCalls.push(targetId);
-      const target = raw[targetId];
-      value.leaf = target?.message?.role === "user" ? (target.parentId ?? "") : targetId;
+      value.leaf = targetId;
       return { cancelled: false };
     },
   };
   return value;
 }
 
+function checkpoint(parentLeafId: string | null, leafId: string): GitCheckpoint {
+  return {
+    baseHash: "base",
+    beforeHash: `before-${leafId}`,
+    afterHash: `after-${leafId}`,
+    parentLeafId,
+    leafId,
+  };
+}
+
 function makeNavigation(
   session: NavigationPort & { leaf: string; navigateCalls: string[] },
 ): SessionNavigation {
-  const nav = new SessionNavigation(session, snapshotStore());
-  nav.setInitialCheckpoint({ files: {} });
-  return nav;
+  return new SessionNavigation(session, mockGit());
 }
 
 describe("session navigation", () => {
   it("supports repeated undo and redo", async () => {
     const session = port();
     const navigation = makeNavigation(session);
-    // turn 1 ends with leaf "a1"
-    session.leaf = "a1";
-    await navigation.recordTurnEnd({ files: {} });
-    // turn 2 ends with leaf "a2"
-    session.leaf = "a2";
-    await navigation.recordTurnEnd({ files: {} });
+    navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    navigation.recordTurnEnd(checkpoint("u2", "a2"));
 
     expect(await navigation.undo()).toBe("moved");
-    expect(session.leaf).toBe("a1");
+    expect(session.leaf).toBe("u2");
     expect(await navigation.undo()).toBe("moved");
-    expect(session.leaf).toBe("");
+    expect(session.leaf).toBe("u1");
     expect(await navigation.undo()).toBe("empty");
 
     expect(await navigation.redo()).toBe("moved");
@@ -91,30 +87,13 @@ describe("session navigation", () => {
     expect(await navigation.redo()).toBe("empty");
   });
 
-  it("supports undo and redo for a first interaction at the session root", async () => {
+  it("clears forward checkpoints on a new branch", async () => {
     const session = port();
     const navigation = makeNavigation(session);
-    session.leaf = "a1";
-    await navigation.recordTurnEnd({ files: {} });
-
-    expect(await navigation.undo()).toBe("moved");
-    expect(session.leaf).toBe("");
-    expect(await navigation.redo()).toBe("moved");
-    expect(session.leaf).toBe("a1");
-  });
-
-  it("clears forward checkpoints via recordTurnEnd", async () => {
-    const session = port();
-    const navigation = makeNavigation(session);
-    session.leaf = "a1";
-    await navigation.recordTurnEnd({ files: {} });
-    session.leaf = "a2";
-    await navigation.recordTurnEnd({ files: {} });
-
+    navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    navigation.recordTurnEnd(checkpoint("u2", "a2"));
     await navigation.undo();
-    // recordTurnEnd with a new checkpoint clears forward checkpoints
-    session.leaf = "new-branch";
-    await navigation.recordTurnEnd({ files: {} });
+    navigation.recordTurnEnd(checkpoint("u1", "new-branch"));
     expect(await navigation.redo()).toBe("empty");
   });
 
@@ -122,18 +101,15 @@ describe("session navigation", () => {
     const session = port();
     session.navigateTree = async () => ({ cancelled: true });
     const navigation = makeNavigation(session);
-    session.leaf = "a1";
-    await navigation.recordTurnEnd({ files: {} });
-
+    navigation.recordTurnEnd(checkpoint("u1", "a1"));
     expect(await navigation.undo()).toBe("cancelled");
   });
 
-  it("reports a failed snapshot restore", async () => {
+  it("reports Git restore failures", async () => {
     const session = port();
-    const navigation = new SessionNavigation(session, snapshotStore(false));
-    navigation.setInitialCheckpoint({ files: {} });
-    session.leaf = "a1";
-    await navigation.recordTurnEnd({ files: {} });
-    expect(await navigation.undo()).toBe("snapshot_failed");
+    const failingGit: GitRunner = async () => ({ stdout: "", stderr: "fatal", code: 128 });
+    const navigation = new SessionNavigation(session, failingGit);
+    navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    expect(await navigation.undo()).toBe("git_failed");
   });
 });
