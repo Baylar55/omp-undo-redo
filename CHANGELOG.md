@@ -90,12 +90,12 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
-[Unreleased]: https://github.com/baylarsadigov/omp-undo-redo/compare/v1.0.7...HEAD
-[1.0.7]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.7
-[1.0.6]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.6
-[1.0.5]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.5
-[1.0.4]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.4
-[1.0.3]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.3
-[1.0.2]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.2
-[1.0.1]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.1
-[1.0.0]: https://github.com/baylarsadigov/omp-undo-redo/releases/tag/v1.0.0
+[Unreleased]: https://github.com/Baylar55/omp-undo-redo/compare/v1.0.7...HEAD
+[1.0.7]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.7
+[1.0.6]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.6
+[1.0.5]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.5
+[1.0.4]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.4
+[1.0.3]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.3
+[1.0.2]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.2
+[1.0.1]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.1
+[1.0.0]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.0

@@ -57,7 +57,7 @@ A release consists of a reviewed change, a clean verification run, an updated `C
 
 ## Security
 
-Please read [SECURITY.md](./SECURITY.md) before reporting a vulnerability. Do not disclose credentials or sensitive data in a public issue. For normal bugs and feature requests, use the [GitHub issue tracker](https://github.com/baylarsadigov/omp-undo-redo/issues).
+Please read [SECURITY.md](./SECURITY.md) before reporting a vulnerability. Do not disclose credentials or sensitive data in a public issue. For normal bugs and feature requests, use the [GitHub issue tracker](https://github.com/Baylar55/omp-undo-redo/issues).
 
 ## License
 

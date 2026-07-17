@@ -6,7 +6,7 @@ Only the latest published version is supported. The extension is tested with OMP
 
 ## Reporting a vulnerability
 
-Please do not report security vulnerabilities in a public issue. Use the repository's GitHub security advisory/private reporting feature: <https://github.com/baylarsadigov/omp-undo-redo/security/advisories/new>.
+Please do not report security vulnerabilities in a public issue. Use the repository's GitHub security advisory/private reporting feature: <https://github.com/Baylar55/omp-undo-redo/security/advisories/new>.
 
 Include a concise description, affected version, reproduction steps, impact, and any proposed mitigation. Remove tokens, credentials, private session data, and unrelated personal information before sending a report. If the private channel is unavailable, open a minimal issue asking for a private contact without including vulnerability details.
 
