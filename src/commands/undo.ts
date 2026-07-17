@@ -14,7 +14,7 @@ export async function runUndo(
   const outcome = await navigation.undo();
   switch (outcome) {
     case "moved":
-      ctx.ui.notify("Undid last turn: session moved back and file changes reverted.", "info");
+      ctx.ui.notify("Undid last turn: session moved back and file snapshot restored.", "info");
       break;
     case "empty":
       ctx.ui.notify("Nothing to undo in this session.", "info");
@@ -22,8 +22,8 @@ export async function runUndo(
     case "cancelled":
       ctx.ui.notify("Undo was cancelled.", "warning");
       break;
-    case "git_failed":
-      ctx.ui.notify("Could not revert file changes (git checkpoint missing).", "warning");
+    case "snapshot_failed":
+      ctx.ui.notify("Could not restore the saved file snapshot.", "warning");
       break;
     default:
       ctx.ui.notify("Nothing to undo in this session.", "warning");

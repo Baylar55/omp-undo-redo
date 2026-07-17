@@ -1,14 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { SessionNavigation } from "../src/core/session-navigation.js";
-import type { GitRunner, NavigationPort } from "../src/core/types.js";
+import type { NavigationPort, SnapshotStore, WorkspaceSnapshot } from "../src/core/types.js";
 
-function mockGit(): GitRunner {
-  return async (args: string[]) => {
-    const cmd = args.join(" ");
-    if (cmd.startsWith("rev-parse HEAD")) {
-      return { stdout: "abc123\n", stderr: "", code: 0 };
-    }
-    return { stdout: "", stderr: "", code: 0 };
+function snapshotStore(restoreResult = true): SnapshotStore {
+  return {
+    async capture() {
+      return { files: {} };
+    },
+    async restore(_snapshot: WorkspaceSnapshot) {
+      return restoreResult;
+    },
   };
 }
 
@@ -58,9 +59,11 @@ function port(): NavigationPort & { leaf: string; navigateCalls: string[] } {
   return value;
 }
 
-function makeNavigation(session: ReturnType<typeof port>): SessionNavigation {
-  const nav = new SessionNavigation(session, mockGit());
-  nav.setInitialCheckpoint("init-hash");
+function makeNavigation(
+  session: NavigationPort & { leaf: string; navigateCalls: string[] },
+): SessionNavigation {
+  const nav = new SessionNavigation(session, snapshotStore());
+  nav.setInitialCheckpoint({ files: {} });
   return nav;
 }
 
@@ -70,10 +73,10 @@ describe("session navigation", () => {
     const navigation = makeNavigation(session);
     // turn 1 ends with leaf "a1"
     session.leaf = "a1";
-    await navigation.recordTurnEnd(1);
+    await navigation.recordTurnEnd({ files: {} });
     // turn 2 ends with leaf "a2"
     session.leaf = "a2";
-    await navigation.recordTurnEnd(2);
+    await navigation.recordTurnEnd({ files: {} });
 
     expect(await navigation.undo()).toBe("moved");
     expect(session.leaf).toBe("a1");
@@ -92,7 +95,7 @@ describe("session navigation", () => {
     const session = port();
     const navigation = makeNavigation(session);
     session.leaf = "a1";
-    await navigation.recordTurnEnd(1);
+    await navigation.recordTurnEnd({ files: {} });
 
     expect(await navigation.undo()).toBe("moved");
     expect(session.leaf).toBe("");
@@ -104,14 +107,14 @@ describe("session navigation", () => {
     const session = port();
     const navigation = makeNavigation(session);
     session.leaf = "a1";
-    await navigation.recordTurnEnd(1);
+    await navigation.recordTurnEnd({ files: {} });
     session.leaf = "a2";
-    await navigation.recordTurnEnd(2);
+    await navigation.recordTurnEnd({ files: {} });
 
     await navigation.undo();
     // recordTurnEnd with a new checkpoint clears forward checkpoints
     session.leaf = "new-branch";
-    await navigation.recordTurnEnd(3);
+    await navigation.recordTurnEnd({ files: {} });
     expect(await navigation.redo()).toBe("empty");
   });
 
@@ -120,21 +123,17 @@ describe("session navigation", () => {
     session.navigateTree = async () => ({ cancelled: true });
     const navigation = makeNavigation(session);
     session.leaf = "a1";
-    await navigation.recordTurnEnd(1);
+    await navigation.recordTurnEnd({ files: {} });
 
     expect(await navigation.undo()).toBe("cancelled");
   });
 
-  it("returns empty when git is unavailable at record time", async () => {
+  it("reports a failed snapshot restore", async () => {
     const session = port();
-    const failingGit: GitRunner = async () => {
-      return { stdout: "", stderr: "fatal: not a git repository", code: 128 };
-    };
-    const navigation = new SessionNavigation(session, failingGit);
-    navigation.setInitialCheckpoint("init-hash");
+    const navigation = new SessionNavigation(session, snapshotStore(false));
+    navigation.setInitialCheckpoint({ files: {} });
     session.leaf = "a1";
-    await navigation.recordTurnEnd(1);
-    // recordTurnEnd silently fails, so there are no checkpoints to undo
-    expect(await navigation.undo()).toBe("empty");
+    await navigation.recordTurnEnd({ files: {} });
+    expect(await navigation.undo()).toBe("snapshot_failed");
   });
 });

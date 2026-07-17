@@ -14,7 +14,7 @@ export async function runRedo(
   const outcome = await navigation.redo();
   switch (outcome) {
     case "moved":
-      ctx.ui.notify("Redid last turn: session moved forward and file changes reapplied.", "info");
+      ctx.ui.notify("Redid last turn: session moved forward and file snapshot restored.", "info");
       break;
     case "empty":
       ctx.ui.notify("Nothing to redo in this session.", "info");
@@ -22,8 +22,8 @@ export async function runRedo(
     case "cancelled":
       ctx.ui.notify("Redo was cancelled.", "warning");
       break;
-    case "git_failed":
-      ctx.ui.notify("Could not reapply file changes (git checkpoint missing).", "warning");
+    case "snapshot_failed":
+      ctx.ui.notify("Could not restore the saved file snapshot.", "warning");
       break;
     default:
       ctx.ui.notify("Nothing to redo in this session.", "warning");

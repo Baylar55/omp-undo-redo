@@ -37,7 +37,7 @@ Both commands wait for the current agent turn to become idle; if OMP remains bus
 
 ## Limitations
 
-Undo/redo changes session-tree position only. It does **not** revert files, shell commands, network requests, editor state, or any other external effect. Redo history is kept in memory and is reset when OMP or the extension is reloaded; it is not persisted to disk. Navigation can also be cancelled by OMP lifecycle handlers.
+Undo/redo restores file snapshots captured at session turn boundaries without creating commits, staging changes, or rewriting Git history. It does not revert shell commands, network requests, editor state, or other external effects. Snapshots are kept in memory and reset when OMP or the extension is reloaded. Navigation can also be cancelled by OMP lifecycle handlers.
 
 ## Development
 
@@ -53,7 +53,7 @@ The implementation uses only public OMP extension APIs. Keep changes focused, pr
 
 ## Release
 
-A release consists of a reviewed change, a clean verification run, an updated `CHANGELOG.md` entry, and a published npm package containing `dist/`, `README.md`, `LICENSE`, and `CHANGELOG.md`. The package manifest is the source of truth for the extension entry point and peer compatibility. Never place npm tokens, registry credentials, or other secrets in the repository or release logs.
+A release consists of a reviewed change, a clean verification run, an updated `CHANGELOG.md` entry, and a published npm package containing `index.js`, `dist/`, `README.md`, `LICENSE`, and `CHANGELOG.md`. The package manifest is the source of truth for the extension entry point and peer compatibility. Never place npm tokens, registry credentials, or other secrets in the repository or release logs.
 
 ## Security
 

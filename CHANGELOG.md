@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.12] - 2026-07-17
+
+### Fixed
+
+- Removed the `git-undo` and `git-redo` commands.
+- Replaced commit-based checkpoints with in-memory workspace file snapshots; undo/redo no longer creates commits or rewrites Git history.
+- Bind session-tree navigation from the command context so `/undo` and `/redo` work with current OMP extension contexts.
+
 ## [1.0.11] - 2026-07-17
 
 ### Fixed
