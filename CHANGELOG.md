@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.11] - 2026-07-17
+
+### Fixed
+
+- Add a package-root `index.js` extension entry and `main` metadata for loaders that discover npm extensions through the package root instead of the manifest entry.
+
 ## [1.0.10] - 2026-07-17
 
 ### Fixed
