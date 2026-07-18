@@ -1,5 +1,10 @@
 # OMP Undo/Redo
 
+[![npm version](https://img.shields.io/npm/v/%40baylarsadigov%2Fomp-undo-redo)](https://www.npmjs.com/package/@baylarsadigov/omp-undo-redo)
+[![CI](https://github.com/Baylar55/omp-undo-redo/actions/workflows/ci.yml/badge.svg)](https://github.com/Baylar55/omp-undo-redo/actions/workflows/ci.yml)
+
+Official npm package: [@baylarsadigov/omp-undo-redo](https://www.npmjs.com/package/@baylarsadigov/omp-undo-redo)
+
 A small Oh My Pi (OMP) extension for moving through the current session's conversation tree. It adds two slash commands without changing OMP's files or session format.
 
 ## Requirements
@@ -9,11 +14,25 @@ A small Oh My Pi (OMP) extension for moving through the current session's conver
 
 ## Installation
 
-Install `@baylarsadigov/omp-undo-redo` from npm, then let OMP discover the extension through the package's plugin manifest. The published manifest contains:
+Install the extension through OMP's plugin manager. Running `npm install` in an arbitrary project only downloads the package; it does not register the extension with OMP:
 
 ```sh
-npm install @baylarsadigov/omp-undo-redo
+omp plugin install @baylarsadigov/omp-undo-redo
 ```
+
+To pin an exact release:
+
+```sh
+omp plugin install @baylarsadigov/omp-undo-redo@1.0.15
+```
+
+To update an existing installation, run the same command with the new version, or use:
+
+```sh
+omp plugin upgrade @baylarsadigov/omp-undo-redo
+```
+
+OMP discovers the compiled entry through the package manifest:
 
 ```json
 {
@@ -23,7 +42,7 @@ npm install @baylarsadigov/omp-undo-redo
 }
 ```
 
-Do not add a second entry for the extension when the package manifest is already being used. OMP loads the compiled entry through that manifest; no source checkout or undocumented OMP command is required.
+The `pi.extensions` manifest is also included for Pi-compatible loaders. Do not add a second extension entry when the package is installed through the plugin manager.
 
 ## Usage
 

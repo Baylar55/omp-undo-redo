@@ -1,8 +1,16 @@
 {
   "name": "@baylarsadigov/omp-undo-redo",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "Undo and redo session navigation for Oh My Pi",
   "license": "MIT",
+  "homepage": "https://github.com/Baylar55/omp-undo-redo#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Baylar55/omp-undo-redo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Baylar55/omp-undo-redo/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "engines": {
