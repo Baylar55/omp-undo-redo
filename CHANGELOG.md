@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.16] - 2026-07-18
+
+### Documentation
+
+- Documented OMP and Pi installation commands, update commands, and project links.
+
 ## [1.0.15] - 2026-07-18
 
 ### Changed

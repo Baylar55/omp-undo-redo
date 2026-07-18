@@ -5,12 +5,21 @@
 
 Official npm package: [@baylarsadigov/omp-undo-redo](https://www.npmjs.com/package/@baylarsadigov/omp-undo-redo)
 
-A small Oh My Pi (OMP) extension for moving through the current session's conversation tree. It adds two slash commands without changing OMP's files or session format.
+A small extension for session and file undo/redo in Oh My Pi (OMP) and Pi. It adds `/undo` and `/redo` without modifying either agent's source code or session format.
+
+## Agent compatibility
+
+This package supports two related coding agents:
+
+- **Oh My Pi (OMP)** — the fork used by this project. Website: [omp.sh](https://omp.sh). Source repository: [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi).
+- **Pi** — the upstream coding agent. Website: [pi.dev](https://pi.dev). Source repository: [badlogic/pi-mono](https://github.com/badlogic/pi-mono).
+
+The extension uses the shared extension APIs provided by compatible OMP and Pi releases. See the links above for the respective projects and installation documentation.
 
 ## Requirements
 
 - Node.js 20 or newer.
-- Oh My Pi 16.5.2. This extension was tested against OMP 16.5.2; other OMP releases are not guaranteed.
+- A compatible OMP or Pi release.
 
 ## Installation
 
@@ -23,7 +32,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.0.15
+omp plugin install @baylarsadigov/omp-undo-redo@1.0.16
 ```
 
 To update an existing installation, run the same command with the new version, or use:
@@ -43,6 +52,28 @@ OMP discovers the compiled entry through the package manifest:
 ```
 
 The `pi.extensions` manifest is also included for Pi-compatible loaders. Do not add a second extension entry when the package is installed through the plugin manager.
+
+### Pi
+
+Install the package through Pi's package manager, not with a standalone `npm install`:
+
+```sh
+pi install npm:@baylarsadigov/omp-undo-redo
+```
+
+To pin a release:
+
+```sh
+pi install npm:@baylarsadigov/omp-undo-redo@1.0.16
+```
+
+To update installed Pi packages:
+
+```sh
+pi update --extensions
+```
+
+Use `pi list` to confirm the package is installed, then restart the Pi TUI. The `/undo` and `/redo` commands should appear in slash-command completion.
 
 ## Usage
 
