@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.15] - 2026-07-18
+
+### Changed
+
+- Added npm, repository, homepage, and issue-tracker links to package metadata and documentation.
+- Documented `omp plugin install` and `omp plugin upgrade` as the supported OMP installation and update commands.
+
 ## [1.0.14] - 2026-07-17
 
 ### Fixed
