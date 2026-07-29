@@ -32,7 +32,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.0.20
+omp plugin install @baylarsadigov/omp-undo-redo@1.0.21
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -58,7 +58,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.0.20
+pi install npm:@baylarsadigov/omp-undo-redo@1.0.21
 ```
 
 To update installed Pi packages:
@@ -78,6 +78,8 @@ The extension exposes exactly these commands:
 
 Commands take no arguments. They navigate OMP's session tree through the official extension API and do not create a new model turn.
 Both commands wait for the current agent turn to become idle; if OMP remains busy, the command leaves the session unchanged and shows a warning.
+
+Every completed turn remains undoable, including conversation-only turns and turns that change only ignored files. When the before and after snapshots have no tracked-file delta, `/undo` and `/redo` navigate the session tree without changing the worktree.
 
 ## Limitations
 

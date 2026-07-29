@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.21] - 2026-07-29
+
+### Fixed
+
+- Allow `/undo` and `/redo` to navigate conversation-only turns whose snapshots have no file delta.
+- Allow turns that change only ignored files to navigate without a false worktree-conflict failure.
+- Preserve existing conflict handling for non-empty file deltas.
+
 ## [1.0.20] - 2026-07-29
 
 ### Fixed
@@ -130,7 +138,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
-[1.0.20]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.20
+[1.0.21]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.21
 [1.0.19]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.19
 [1.0.18]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.18
 [1.0.7]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.7
