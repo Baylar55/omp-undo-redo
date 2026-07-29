@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## Unreleased
+
+### Fixed
+
+- Protect active undo/redo checkpoint commits with private refs so reflog expiry and aggressive Git garbage collection cannot invalidate navigation history.
+
 ## [1.0.16] - 2026-07-18
 
 ### Documentation

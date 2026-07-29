@@ -1,5 +1,5 @@
 import type { GitCheckpoint, GitRunner, NavigationPort } from "./types.js";
-import { restoreCheckpoint } from "./checkpoints.js";
+import { releaseCheckpoint, restoreCheckpoint } from "./checkpoints.js";
 
 export type NavigationOutcome = "moved" | "empty" | "cancelled" | "git_failed";
 
@@ -21,12 +21,21 @@ export class SessionNavigation {
     this.navigateTree = navigateTree;
   }
 
-  recordTurnEnd(checkpoint: GitCheckpoint): void {
-    if (this.currentIndex < this.checkpoints.length - 1) {
-      this.checkpoints.splice(this.currentIndex + 1);
-    }
+  async recordTurnEnd(checkpoint: GitCheckpoint): Promise<void> {
+    const discarded = this.checkpoints.splice(
+      this.currentIndex + 1,
+      this.checkpoints.length - this.currentIndex - 1,
+    );
     this.checkpoints.push(checkpoint);
     this.currentIndex = this.checkpoints.length - 1;
+    await Promise.all(discarded.map((entry) => releaseCheckpoint(this.git, entry)));
+  }
+
+  async dispose(): Promise<void> {
+    const checkpoints = this.checkpoints;
+    this.checkpoints = [];
+    this.currentIndex = -1;
+    await Promise.all(checkpoints.map((entry) => releaseCheckpoint(this.git, entry)));
   }
 
   async undo(): Promise<NavigationOutcome> {

@@ -3,7 +3,11 @@ import type { SessionEntryLike } from "./core/types.js";
 import { runRedo } from "./commands/redo.js";
 import { runUndo } from "./commands/undo.js";
 import { SessionNavigation } from "./core/session-navigation.js";
-import { finishAfterTurn, prepareBeforeTurn } from "./core/checkpoints.js";
+import {
+  finishAfterTurn,
+  prepareBeforeTurn,
+  releasePendingCheckpoint,
+} from "./core/checkpoints.js";
 import type { GitRunner } from "./core/types.js";
 
 type AnyContext = {
@@ -43,12 +47,26 @@ function createNavigation(pi: ExtensionAPI, ctx: AnyContext): SessionNavigation 
 const navigations = new Map<string, SessionNavigation>();
 const pending = new Map<
   string,
-  { baseHash: string; beforeHash: string; parentLeafId: string | null }
+  {
+    baseHash: string;
+    beforeHash: string;
+    beforeRef: string;
+    checkpointId: string;
+    parentLeafId: string | null;
+  }
 >();
 
 export default function ompUndoRedo(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
+    const previous = navigations.get(sessionId);
+    if (previous) await previous.dispose();
+    const previousPending = pending.get(sessionId);
+    if (previousPending)
+      await releasePendingCheckpoint(
+        createGitRunner(pi, (ctx as unknown as AnyContext).cwd),
+        previousPending,
+      );
     navigations.set(sessionId, createNavigation(pi, ctx as unknown as AnyContext));
     pending.delete(sessionId);
   });
@@ -56,7 +74,12 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (_event, ctx) => {
     const typed = ctx as unknown as AnyContext;
     const sessionId = typed.sessionManager.getSessionId();
-    const before = await prepareBeforeTurn(createGitRunner(pi, typed.cwd));
+    const oldPending = pending.get(sessionId);
+    if (oldPending) {
+      await releasePendingCheckpoint(createGitRunner(pi, typed.cwd), oldPending);
+      pending.delete(sessionId);
+    }
+    const before = await prepareBeforeTurn(createGitRunner(pi, typed.cwd), sessionId);
     if (before) {
       pending.set(sessionId, {
         ...before,
@@ -70,17 +93,17 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     const sessionId = typed.sessionManager.getSessionId();
     const before = pending.get(sessionId);
     if (!before) return;
+    pending.delete(sessionId);
     const checkpoint = await finishAfterTurn(
       createGitRunner(pi, typed.cwd),
       before,
       before.parentLeafId,
       typed.sessionManager.getLeafId(),
     );
-    pending.delete(sessionId);
     if (!checkpoint) return;
     const nav = navigations.get(sessionId) ?? createNavigation(pi, typed);
     navigations.set(sessionId, nav);
-    nav.recordTurnEnd(checkpoint);
+    await nav.recordTurnEnd(checkpoint);
   });
 
   const undoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
