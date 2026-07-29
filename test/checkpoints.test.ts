@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import {
+  mkdir,
   chmod,
   lstat,
   mkdtemp,
@@ -192,6 +193,96 @@ describe("history-safe Git checkpoints", () => {
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       expect(await readFile(join(cwd, "agent.txt"), "utf8")).toBe("agent commit\n");
       expect(await readFile(join(cwd, "turn.txt"), "utf8")).toBe("uncommitted turn change\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it("preserves pre-existing changes outside a subdirectory session across undo and redo", async () => {
+    const { cwd, git } = await makeRepo();
+    const nested = join(cwd, "nested");
+    const nestedGit = gitRunner(nested);
+    try {
+      await initializeBranch(git, cwd);
+      await mkdir(nested);
+      await writeFile(join(cwd, "outside-modified.txt"), "outside base\n");
+      await writeFile(join(cwd, "outside-deleted.txt"), "outside deleted\n");
+      await writeFile(join(nested, "inside.txt"), "inside base\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "nested checkpoint fixtures"]);
+
+      await writeFile(join(cwd, "outside-modified.txt"), "outside modified before\n");
+      await rm(join(cwd, "outside-deleted.txt"));
+      await writeFile(join(cwd, "outside-untracked.txt"), "outside untracked before\n");
+
+      const beforeStatus = await text(git, ["status", "--porcelain=v2"]);
+      expect(beforeStatus).toContain("outside-modified.txt");
+      expect(beforeStatus).toContain("outside-deleted.txt");
+      expect(beforeStatus).toContain("outside-untracked.txt");
+      const beforeIndex = await indexState(git, cwd);
+      const head = await text(git, ["rev-parse", "HEAD"]);
+      const refs = await branchRefs(git);
+
+      const before = await prepareBeforeTurn(nestedGit, "subdirectory-scope");
+      expect(before).not.toBeNull();
+      if (!before) return;
+      await writeFile(join(nested, "inside.txt"), "inside after turn\n");
+      const after = await finishAfterTurn(git, before, null, null);
+      expect(after).not.toBeNull();
+      if (!after) return;
+
+      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toBe("applied");
+      expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("inside base\n");
+      expect(await readFile(join(cwd, "outside-modified.txt"), "utf8")).toBe(
+        "outside modified before\n",
+      );
+      await expect(readFile(join(cwd, "outside-deleted.txt"))).rejects.toThrow();
+      expect(await readFile(join(cwd, "outside-untracked.txt"), "utf8")).toBe(
+        "outside untracked before\n",
+      );
+      expect(await text(git, ["rev-parse", "HEAD"])).toBe(head);
+      expect(await branchRefs(git)).toBe(refs);
+      expect(await readFile(await indexPath(git, cwd))).toEqual(beforeIndex.raw);
+
+      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toBe("applied");
+      expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("inside after turn\n");
+      expect(await readFile(join(cwd, "outside-modified.txt"), "utf8")).toBe(
+        "outside modified before\n",
+      );
+      await expect(readFile(join(cwd, "outside-deleted.txt"))).rejects.toThrow();
+      expect(await readFile(join(cwd, "outside-untracked.txt"), "utf8")).toBe(
+        "outside untracked before\n",
+      );
+      expect(await text(git, ["rev-parse", "HEAD"])).toBe(head);
+      expect(await branchRefs(git)).toBe(refs);
+      expect(await readFile(await indexPath(git, cwd))).toEqual(beforeIndex.raw);
+      expect(await text(git, ["status", "--porcelain=v2"])).toContain("nested/inside.txt");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("creates the same snapshot tree regardless of runner cwd", async () => {
+    const { cwd, git } = await makeRepo();
+    const nested = join(cwd, "nested");
+    const nestedGit = gitRunner(nested);
+    try {
+      await initializeBranch(git, cwd);
+      await mkdir(nested);
+      await writeFile(join(cwd, "root.txt"), "root\n");
+      await writeFile(join(nested, "inside.txt"), "inside\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "tree equivalence fixtures"]);
+
+      const rootCheckpoint = await prepareBeforeTurn(git, "root-tree");
+      expect(rootCheckpoint).not.toBeNull();
+      if (!rootCheckpoint) return;
+      const nestedCheckpoint = await prepareBeforeTurn(nestedGit, "nested-tree");
+      expect(nestedCheckpoint).not.toBeNull();
+      if (!nestedCheckpoint) return;
+
+      expect(await text(git, ["rev-parse", `${rootCheckpoint.beforeHash}^{tree}`])).toBe(
+        await text(git, ["rev-parse", `${nestedCheckpoint.beforeHash}^{tree}`]),
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

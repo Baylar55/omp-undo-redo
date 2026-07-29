@@ -12,6 +12,7 @@ import type {
 
 const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-redo@local"];
 const REF_ROOT = "refs/omp-undo-redo";
+const WORKTREE_PATHSPEC = ":(top)";
 
 export function checkpointNamespace(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex");
@@ -73,7 +74,7 @@ async function createSnapshotCommit(git: GitRunner, message: string): Promise<st
   try {
     const seeded = await git(["read-tree", "HEAD"], { env });
     if (seeded.code !== 0) return null;
-    const added = await git(["add", "-A", "--", "."], { env });
+    const added = await git(["add", "-A", "--", WORKTREE_PATHSPEC], { env });
     if (added.code !== 0) return null;
     const tree = await git(["write-tree"], { env });
     if (tree.code !== 0) return null;

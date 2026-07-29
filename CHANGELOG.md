@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.19] - 2026-07-29
+
+### Fixed
+
+- Fixed subdirectory sessions using different before/after snapshot scopes, which could cause `/undo` to revert pre-existing changes elsewhere in the repository.
+
 ## [1.0.18] - 2026-07-29
 
 ### Fixed
@@ -117,7 +123,9 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
-[Unreleased]: https://github.com/Baylar55/omp-undo-redo/compare/v1.0.7...HEAD
+[Unreleased]: https://github.com/Baylar55/omp-undo-redo/compare/v1.0.19...HEAD
+[1.0.19]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.19
+[1.0.18]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.18
 [1.0.7]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.7
 [1.0.6]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.6
 [1.0.5]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.5
