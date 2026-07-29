@@ -120,6 +120,8 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   const activeOperations = new Set<Promise<void>>();
   let closing = false;
   let shutdownPromise: Promise<void> | null = null;
+  let pendingSwitchSourceSessionId: string | null = null;
+  let pendingBranchSourceSessionId: string | null = null;
 
   function track(operation: () => Promise<void>): Promise<void> {
     const { promise: tracked, resolve, reject } = promiseWithResolvers<void>();
@@ -154,6 +156,12 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     ]);
   }
 
+  async function invalidateAllRedo(): Promise<void> {
+    await Promise.allSettled(
+      [...navigations.values()].map((navigation) => navigation.invalidateRedo()),
+    );
+  }
+
   async function drainState(): Promise<void> {
     const detachedNavigations = [...navigations.values()];
     const detachedPending = [...pending.values()];
@@ -174,6 +182,58 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       await disposeDetached(previous ? [previous] : [], previousPending ? [previousPending] : []);
       if (closing) return;
       navigations.set(sessionId, createNavigation(typed));
+    }),
+  );
+
+  pi.on("session_tree", (event, ctx) =>
+    track(async () => {
+      if (closing) return;
+      const typed = ctx as unknown as AnyContext;
+      const navigation = navigations.get(typed.sessionManager.getSessionId());
+      if (!navigation) return;
+      await navigation.handleSessionTreeNavigation(event.oldLeafId, event.newLeafId);
+    }),
+  );
+
+  pi.on("session_before_switch", (_event, ctx) =>
+    track(async () => {
+      if (closing) return;
+      const typed = ctx as unknown as AnyContext;
+      pendingSwitchSourceSessionId = typed.sessionManager.getSessionId();
+    }),
+  );
+
+  pi.on("session_switch", () =>
+    track(async () => {
+      if (closing) return;
+      const sourceSessionId = pendingSwitchSourceSessionId;
+      pendingSwitchSourceSessionId = null;
+      if (sourceSessionId) {
+        await navigations.get(sourceSessionId)?.invalidateRedo();
+      } else {
+        await invalidateAllRedo();
+      }
+    }),
+  );
+
+  pi.on("session_before_branch", (_event, ctx) =>
+    track(async () => {
+      if (closing) return;
+      const typed = ctx as unknown as AnyContext;
+      pendingBranchSourceSessionId = typed.sessionManager.getSessionId();
+    }),
+  );
+
+  pi.on("session_branch", () =>
+    track(async () => {
+      if (closing) return;
+      const sourceSessionId = pendingBranchSourceSessionId;
+      pendingBranchSourceSessionId = null;
+      if (sourceSessionId) {
+        await navigations.get(sourceSessionId)?.invalidateRedo();
+      } else {
+        await invalidateAllRedo();
+      }
     }),
   );
 
@@ -230,6 +290,8 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     if (shutdownPromise) return shutdownPromise;
     closing = true;
+    pendingSwitchSourceSessionId = null;
+    pendingBranchSourceSessionId = null;
     const detachedNavigations = [...navigations.values()];
     const detachedPending = [...pending.values()];
     navigations.clear();

@@ -12,10 +12,16 @@ export type NavigationOutcome = "moved" | "empty" | "cancelled" | "git_failed" |
 
 type GitFailure = "conflict" | "failed" | "rollback_failed";
 
+type ExpectedTreeNavigation = {
+  oldLeafId: string | null;
+  newLeafId: string | null;
+};
+
 export class SessionNavigation {
   private checkpoints: GitCheckpoint[] = [];
   private currentIndex = -1;
   private navigateTree: NavigationPort["navigateTree"] = async () => ({ cancelled: true });
+  private expectedTreeNavigation: ExpectedTreeNavigation | null = null;
   private lastGitFailure: GitFailure | null = null;
   private readonly gitForRepository: GitRunnerFactory;
 
@@ -32,6 +38,38 @@ export class SessionNavigation {
 
   setNavigateTree(navigateTree: NavigationPort["navigateTree"]): void {
     this.navigateTree = navigateTree;
+  }
+
+  private async navigateTo(targetId: string): Promise<NavigationResult> {
+    this.expectedTreeNavigation = {
+      oldLeafId: this.port.getLeafId(),
+      newLeafId: targetId,
+    };
+    try {
+      return await this.navigateTree(targetId);
+    } catch {
+      return { cancelled: true };
+    } finally {
+      this.expectedTreeNavigation = null;
+    }
+  }
+
+  async handleSessionTreeNavigation(
+    oldLeafId: string | null,
+    newLeafId: string | null,
+  ): Promise<void> {
+    const expected = this.expectedTreeNavigation;
+    if (expected && expected.oldLeafId === oldLeafId && expected.newLeafId === newLeafId) {
+      this.expectedTreeNavigation = null;
+      return;
+    }
+    if (oldLeafId === newLeafId) return;
+    await this.invalidateRedo();
+  }
+
+  async invalidateRedo(): Promise<void> {
+    const discarded = this.checkpoints.splice(this.currentIndex + 1);
+    await releaseCheckpoints(this.gitForRepository, discarded);
   }
 
   getLastGitFailure(): GitFailure | null {
@@ -68,7 +106,7 @@ export class SessionNavigation {
     if (checkpoint.parentLeafId) {
       let result: NavigationResult;
       try {
-        result = await this.navigateTree(checkpoint.parentLeafId);
+        result = await this.navigateTo(checkpoint.parentLeafId);
       } catch {
         result = { cancelled: true };
       }
@@ -98,7 +136,7 @@ export class SessionNavigation {
     if (checkpoint.leafId) {
       let result: NavigationResult;
       try {
-        result = await this.navigateTree(checkpoint.leafId);
+        result = await this.navigateTo(checkpoint.leafId);
       } catch {
         result = { cancelled: true };
       }

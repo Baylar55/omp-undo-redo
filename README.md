@@ -32,7 +32,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.0.21
+omp plugin install @baylarsadigov/omp-undo-redo@1.0.22
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -58,7 +58,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.0.21
+pi install npm:@baylarsadigov/omp-undo-redo@1.0.22
 ```
 
 To update installed Pi packages:
@@ -74,7 +74,7 @@ Use `pi list` to confirm the package is installed, then restart the Pi TUI. The 
 The extension exposes exactly these commands:
 
 - `/undo` — move to the latest user-prompt boundary, removing that prompt's assistant/tool activity from the active context. The prompt itself remains as the supported OMP session-tree boundary. If the current context is already at that boundary, it reports that undo is unavailable.
-- `/redo` — restore the most recently undone context checkpoint. Redo is single-use in order: after a new branch or any navigation that is not the matching redo, the in-memory redo history is cleared.
+- `/redo` — restore the most recently undone context checkpoint. Redo is single-use in order: after a new branch or any successful, unrelated tree, session-switch, or session-branch navigation, the in-memory redo history is cleared. Matching `/undo` and `/redo` navigation, no-op navigation, and cancelled navigation preserve redo.
 
 Commands take no arguments. They navigate OMP's session tree through the official extension API and do not create a new model turn.
 Both commands wait for the current agent turn to become idle; if OMP remains busy, the command leaves the session unchanged and shows a warning.

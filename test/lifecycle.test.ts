@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -11,30 +11,72 @@ type Handler = (...args: unknown[]) => unknown;
 
 type TestContext = {
   cwd: string;
+  leaf: string;
   sessionManager: {
     getSessionId(): string;
     getLeafId(): string;
     getBranch(): [];
     getEntry(): undefined;
   };
+  navigateTree(targetId: string): Promise<{ cancelled: boolean }>;
+  waitForIdle(): Promise<void>;
+  isIdle(): boolean;
+  ui: {
+    notifications: Array<{ message: string; level: string }>;
+    notify(message: string, level: string): void;
+  };
 };
 
 class FakeExtensionApi {
   private readonly handlers = new Map<string, Handler>();
+  private readonly commands = new Map<string, Handler>();
 
   on(event: string, handler: Handler): void {
     this.handlers.set(event, handler);
   }
 
-  registerCommand(): void {
-    // Commands are not part of these lifecycle tests.
+  registerCommand(name: string, config: { handler: Handler }): void {
+    this.commands.set(name, config.handler);
   }
 
-  async emit(event: string, context: TestContext): Promise<void> {
+  async runCommand(name: string, context: TestContext): Promise<void> {
+    const handler = this.commands.get(name);
+    if (!handler) throw new Error(`No command registered for ${name}`);
+    await handler("", context);
+  }
+
+  async emit(
+    event: string,
+    context: TestContext,
+    payload?: Record<string, unknown>,
+  ): Promise<void> {
     const handler = this.handlers.get(event);
     if (!handler) throw new Error(`No handler registered for ${event}`);
-    await handler({ type: event }, context);
+    await handler(payload ?? { type: event }, context);
   }
+}
+
+function context(cwd: string, sessionId: string): TestContext {
+  const value: TestContext = {
+    cwd,
+    leaf: "leaf",
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getLeafId: () => value.leaf,
+      getBranch: () => [],
+      getEntry: () => undefined,
+    },
+    navigateTree: async () => ({ cancelled: true }),
+    waitForIdle: async () => {},
+    isIdle: () => true,
+    ui: {
+      notifications: [],
+      notify(message, level) {
+        value.ui.notifications.push({ message, level });
+      },
+    },
+  };
+  return value;
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -54,22 +96,98 @@ async function makeRepository(): Promise<string> {
   return cwd;
 }
 
-function context(cwd: string, sessionId: string): TestContext {
-  return {
-    cwd,
-    sessionManager: {
-      getSessionId: () => sessionId,
-      getLeafId: () => "leaf",
-      getBranch: () => [],
-      getEntry: () => undefined,
-    },
-  };
-}
-
 async function privateRefs(cwd: string): Promise<string[]> {
   const output = await git(cwd, ["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"]);
   return output ? output.split("\n") : [];
 }
+
+async function prepareUndoneSession(
+  pi: FakeExtensionApi,
+  cwd: string,
+  sessionId: string,
+): Promise<TestContext> {
+  const ctx = context(cwd, sessionId);
+  await pi.emit("session_start", ctx);
+  await pi.emit("before_agent_start", ctx);
+  await writeFile(join(cwd, "tracked.txt"), "changed\n");
+  ctx.leaf = "turn";
+  await pi.emit("agent_end", ctx);
+  ctx.navigateTree = async (targetId) => {
+    const oldLeafId = ctx.leaf;
+    ctx.leaf = targetId;
+    await pi.emit("session_tree", ctx, {
+      type: "session_tree",
+      oldLeafId,
+      newLeafId: targetId,
+    });
+    return { cancelled: false };
+  };
+  await pi.runCommand("undo", ctx);
+  return ctx;
+}
+
+describe("navigation invalidation lifecycle", () => {
+  it("clears redo after unrelated session tree navigation", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = await prepareUndoneSession(pi, cwd, "tree-session");
+
+      const oldLeafId = ctx.leaf;
+      ctx.leaf = "unrelated";
+      await pi.emit("session_tree", ctx, {
+        type: "session_tree",
+        oldLeafId,
+        newLeafId: ctx.leaf,
+      });
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
+      expect(await privateRefs(cwd)).toEqual([]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("clears redo for successful source session switches and branches", async () => {
+    for (const event of ["session_switch", "session_branch"] as const) {
+      const cwd = await makeRepository();
+      try {
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never);
+        const ctx = await prepareUndoneSession(pi, cwd, `${event}-session`);
+        const beforeEvent =
+          event === "session_switch" ? "session_before_switch" : "session_before_branch";
+        await pi.emit(beforeEvent, ctx);
+        await pi.emit(event, ctx);
+        await pi.runCommand("redo", ctx);
+
+        expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("preserves redo when a switch is cancelled before its post-event", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = await prepareUndoneSession(pi, cwd, "cancelled-switch-session");
+
+      await pi.emit("session_before_switch", ctx);
+      await pi.runCommand("redo", ctx);
+
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored.",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("extension lifecycle cleanup", () => {
   it("releases completed checkpoints, pending checkpoints, and unrelated refs survive", async () => {
