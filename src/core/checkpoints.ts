@@ -264,8 +264,16 @@ export async function applyCheckpoint(
   const tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
   const patchPath = join(tempDirectory, "checkpoint.patch");
   try {
-    const diff = await git(["diff", "--binary", sourceHash, targetHash, `--output=${patchPath}`]);
-    if (diff.code !== 0) return "failed";
+    const diff = await git([
+      "diff",
+      "--exit-code",
+      "--binary",
+      sourceHash,
+      targetHash,
+      `--output=${patchPath}`,
+    ]);
+    if (diff.code === 0) return "applied";
+    if (diff.code !== 1) return "failed";
 
     const check = await git(["apply", "--check", patchPath]);
     if (check.code !== 0) return "conflict";

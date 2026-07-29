@@ -223,6 +223,108 @@ describe("history-safe Git checkpoints", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("navigates a completed turn with no file changes", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const beforeHead = await text(git, ["rev-parse", "HEAD"]);
+      const beforeRefs = await branchRefs(git);
+      const beforeIndex = await indexState(git, cwd);
+      const beforeContents = await readFile(join(cwd, "tracked.txt"), "utf8");
+
+      const pending = await prepareBeforeTurn(git, "empty-turn");
+      expect(pending).not.toBeNull();
+      if (!pending) return;
+      const checkpoint = await finishAfterTurn(git, pending, "u1", "a1");
+      expect(checkpoint).not.toBeNull();
+      if (!checkpoint) return;
+      expect(await text(git, ["rev-parse", `${checkpoint.beforeHash}^{tree}`])).toBe(
+        await text(git, ["rev-parse", `${checkpoint.afterHash}^{tree}`]),
+      );
+
+      const navigated: string[] = [];
+      const navigationPort: NavigationPort = {
+        getLeafId: () => "a1",
+        getBranch: () => [],
+        getEntry: () => undefined,
+        navigateTree: async (targetId) => {
+          navigated.push(targetId);
+          return { cancelled: false };
+        },
+      };
+      const navigation = new SessionNavigation(navigationPort, git);
+      await navigation.recordTurnEnd(checkpoint);
+
+      expect(await navigation.undo()).toBe("moved");
+      expect(navigated).toEqual(["u1"]);
+      expect(navigation.getLastGitFailure()).toBeNull();
+      expect(await navigation.redo()).toBe("moved");
+      expect(navigated).toEqual(["u1", "a1"]);
+      expect(navigation.getLastGitFailure()).toBeNull();
+
+      expect(await text(git, ["rev-parse", "HEAD"])).toBe(beforeHead);
+      expect(await branchRefs(git)).toBe(beforeRefs);
+      expect(await indexState(git, cwd)).toEqual(beforeIndex);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(beforeContents);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("navigates a turn that changes only ignored files", async () => {
+    const { cwd, git } = await makeRepo();
+    const ignoredPath = join(cwd, "ignored.txt");
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, ".gitignore"), "ignored.txt\n");
+      await git(["add", ".gitignore"]);
+      await git(["commit", "-qm", "ignore fixture"]);
+      const beforeHead = await text(git, ["rev-parse", "HEAD"]);
+      const beforeRefs = await branchRefs(git);
+      const beforeIndex = await indexState(git, cwd);
+      const beforeContents = await readFile(join(cwd, "tracked.txt"), "utf8");
+
+      const pending = await prepareBeforeTurn(git, "ignored-turn");
+      expect(pending).not.toBeNull();
+      if (!pending) return;
+      await writeFile(ignoredPath, "ignored after turn\n");
+      const checkpoint = await finishAfterTurn(git, pending, "u1", "a1");
+      expect(checkpoint).not.toBeNull();
+      if (!checkpoint) return;
+      expect(await text(git, ["rev-parse", `${checkpoint.beforeHash}^{tree}`])).toBe(
+        await text(git, ["rev-parse", `${checkpoint.afterHash}^{tree}`]),
+      );
+
+      const navigated: string[] = [];
+      const navigationPort: NavigationPort = {
+        getLeafId: () => "a1",
+        getBranch: () => [],
+        getEntry: () => undefined,
+        navigateTree: async (targetId) => {
+          navigated.push(targetId);
+          return { cancelled: false };
+        },
+      };
+      const navigation = new SessionNavigation(navigationPort, git);
+      await navigation.recordTurnEnd(checkpoint);
+
+      expect(await navigation.undo()).toBe("moved");
+      expect(navigated).toEqual(["u1"]);
+      expect(navigation.getLastGitFailure()).toBeNull();
+      expect(await navigation.redo()).toBe("moved");
+      expect(navigated).toEqual(["u1", "a1"]);
+      expect(navigation.getLastGitFailure()).toBeNull();
+
+      expect(await text(git, ["rev-parse", "HEAD"])).toBe(beforeHead);
+      expect(await branchRefs(git)).toBe(beforeRefs);
+      expect(await indexState(git, cwd)).toEqual(beforeIndex);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(beforeContents);
+      expect(await readFile(ignoredPath, "utf8")).toBe("ignored after turn\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
   it("preserves pre-existing changes outside a subdirectory session across undo and redo", async () => {
     const { cwd, git } = await makeRepo();
     const nested = join(cwd, "nested");
