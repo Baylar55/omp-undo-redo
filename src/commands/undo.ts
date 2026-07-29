@@ -20,10 +20,21 @@ export async function runUndo(
       ctx.ui.notify("Nothing to undo in this session.", "info");
       break;
     case "cancelled":
-      ctx.ui.notify("Undo was cancelled.", "warning");
+      ctx.ui.notify("Undo was cancelled; files were restored to their original state.", "warning");
+      break;
+    case "rollback_failed":
+      ctx.ui.notify(
+        "Undo navigation was cancelled, but file rollback failed; inspect the session and worktree manually.",
+        "error",
+      );
       break;
     case "git_failed":
-      ctx.ui.notify("Could not restore the Git checkpoint.", "warning");
+      ctx.ui.notify(
+        navigation.getLastGitFailure() === "conflict"
+          ? "Worktree changed; nothing was undone."
+          : "Could not restore the Git checkpoint.",
+        "warning",
+      );
       break;
     default:
       ctx.ui.notify("Nothing to undo in this session.", "warning");

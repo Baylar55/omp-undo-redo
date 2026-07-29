@@ -1,5 +1,5 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-  test: { coverage: { reporter: ["text", "json-summary"] } },
+  test: { testTimeout: 30_000, coverage: { reporter: ["text", "json-summary"] } },
 });

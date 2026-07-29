@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
 import { SessionNavigation } from "../src/core/session-navigation.js";
-import type { GitCheckpoint, GitRunner, NavigationPort } from "../src/core/types.js";
+import { describe, expect, it } from "vitest";
+import type { GitCheckpoint, GitRepository, GitRunner, NavigationPort } from "../src/core/types.js";
 
 function mockGit(): GitRunner {
   return async () => ({ stdout: "", stderr: "", code: 0 });
@@ -52,8 +52,13 @@ function port(): NavigationPort & { leaf: string; navigateCalls: string[] } {
 }
 
 function checkpoint(parentLeafId: string | null, leafId: string): GitCheckpoint {
+  const repository: GitRepository = {
+    worktree: ".",
+    gitDir: ".git",
+    commonDir: ".git",
+  };
   return {
-    baseHash: "base",
+    repository,
     beforeHash: `before-${leafId}`,
     beforeRef: `refs/omp-undo-redo/test/${leafId}/before`,
     afterHash: `after-${leafId}`,
@@ -105,6 +110,7 @@ describe("session navigation", () => {
     const navigation = makeNavigation(session);
     navigation.recordTurnEnd(checkpoint("u1", "a1"));
     expect(await navigation.undo()).toBe("cancelled");
+    expect(await navigation.redo()).toBe("empty");
   });
 
   it("reports Git restore failures", async () => {
