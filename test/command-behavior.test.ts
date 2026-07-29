@@ -55,7 +55,9 @@ function checkpoint(parentLeafId: string | null, leafId: string): GitCheckpoint 
   return {
     baseHash: "base",
     beforeHash: `before-${leafId}`,
+    beforeRef: `refs/omp-undo-redo/test/${leafId}/before`,
     afterHash: `after-${leafId}`,
+    afterRef: `refs/omp-undo-redo/test/${leafId}/after`,
     parentLeafId,
     leafId,
   };

@@ -87,7 +87,7 @@ Both commands wait for the current agent turn to become idle; if OMP remains bus
 
 ## Limitations
 
-Undo/redo uses temporary Git checkpoints around each turn, then mixed-resets the active branch back to its original `HEAD`. Restoring a checkpoint returns files to the exact before/after state while leaving the branch history unchanged and keeping local changes unstaged. It does not revert shell commands, network requests, editor state, or other external effects. Checkpoints are kept in memory and reset when OMP or the extension is reloaded. Navigation can also be cancelled by OMP lifecycle handlers.
+Undo/redo uses temporary Git checkpoints around each turn, then mixed-resets the active branch back to its original `HEAD`. The checkpoints are protected by private refs under `refs/omp-undo-redo/`, which keep active before/after commits safe from Git garbage collection without creating branches or tags. Releasing a checkpoint removes its refs when it leaves the active session history. Restoring a checkpoint returns files to the exact before/after state while leaving the branch history unchanged and keeping local changes unstaged. It does not revert shell commands, network requests, editor state, or other external effects. A forced process termination may leave stale private refs; inspect them with `git for-each-ref refs/omp-undo-redo/` and remove only confirmed orphan refs with `git update-ref -d <ref> <expected-object-id>`. Do not change repository GC settings.
 
 ## Development
 

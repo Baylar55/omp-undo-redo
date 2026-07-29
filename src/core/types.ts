@@ -22,7 +22,9 @@ export interface NavigationPort extends SessionReader {
 export interface GitCheckpoint {
   baseHash: string;
   beforeHash: string;
+  beforeRef: string;
   afterHash: string;
+  afterRef: string;
   parentLeafId: string | null;
   leafId: string | null;
 }
