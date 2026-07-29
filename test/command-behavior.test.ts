@@ -94,6 +94,65 @@ describe("session navigation", () => {
     expect(await navigation.redo()).toBe("empty");
   });
 
+  it("preserves redo for matching internal tree navigation", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    navigation.setNavigateTree(async (targetId) => {
+      const oldLeafId = session.leaf;
+      session.navigateCalls.push(targetId);
+      session.leaf = targetId;
+      await navigation.handleSessionTreeNavigation(oldLeafId, targetId);
+      return { cancelled: false };
+    });
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
+
+    expect(await navigation.undo()).toBe("moved");
+    expect(await navigation.redo()).toBe("moved");
+    expect(await navigation.redo()).toBe("empty");
+  });
+
+  it("invalidates only redo after unrelated tree navigation", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
+    expect(await navigation.undo()).toBe("moved");
+
+    await navigation.handleSessionTreeNavigation("u2", "other");
+
+    expect(await navigation.redo()).toBe("empty");
+    expect(session.navigateCalls).toEqual(["u2"]);
+    expect(await navigation.undo()).toBe("moved");
+    expect(session.navigateCalls).toEqual(["u2", "u1"]);
+  });
+
+  it("treats same-leaf tree events as no-ops", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
+    expect(await navigation.undo()).toBe("moved");
+
+    await navigation.handleSessionTreeNavigation("u2", "u2");
+
+    expect(await navigation.redo()).toBe("moved");
+  });
+
+  it("clears an expected transition after cancelled navigation", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
+    expect(await navigation.undo()).toBe("moved");
+    navigation.setNavigateTree(async () => ({ cancelled: true }));
+
+    expect(await navigation.redo()).toBe("cancelled");
+    await navigation.handleSessionTreeNavigation("u2", "a2");
+
+    expect(await navigation.redo()).toBe("empty");
+  });
+
   it("clears forward checkpoints on a new branch", async () => {
     const session = port();
     const navigation = makeNavigation(session);

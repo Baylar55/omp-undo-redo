@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.22] - 2026-07-29
+
+### Fixed
+
+- Clear redo history after successful unrelated session-tree, session-switch, or session-branch navigation while preserving undo history.
+- Keep redo available for matching extension-generated navigation, no-op navigation, and cancelled navigation.
+
 ## [1.0.21] - 2026-07-29
 
 ### Fixed
