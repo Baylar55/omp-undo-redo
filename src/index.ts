@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntryLike } from "./core/types.js";
@@ -8,12 +8,26 @@ import { SessionNavigation } from "./core/session-navigation.js";
 import {
   finishAfterTurn,
   prepareBeforeTurn,
+  releaseCheckpoint,
   releasePendingCheckpoint,
 } from "./core/checkpoints.js";
 import type { GitRunner, PendingCheckpoint } from "./core/types.js";
 
 const execFileAsync = promisify(execFile);
 
+function promiseWithResolvers<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 type AnyContext = {
   cwd: string;
   sessionManager: {
@@ -26,6 +40,45 @@ type AnyContext = {
 
 function createGitRunner(cwd: string): GitRunner {
   return async (args, options) => {
+    if (options?.stdin !== undefined) {
+      const { promise, resolve } = promiseWithResolvers<{
+        stdout: string;
+        stderr: string;
+        code: number;
+      }>();
+      const child = spawn("git", args, {
+        cwd,
+        env: { ...process.env, ...options.env },
+        windowsHide: true,
+      });
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.once("error", (error) => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          stdout,
+          stderr: `${stderr}${error.message}`,
+          code: 1,
+        });
+      });
+      child.once("close", (code) => {
+        if (settled) return;
+        settled = true;
+        resolve({ stdout, stderr, code: typeof code === "number" ? code : 1 });
+      });
+      child.stdin.end(options.stdin);
+      return await promise;
+    }
     try {
       const result = await execFileAsync("git", args, {
         cwd,
@@ -61,58 +114,132 @@ function createNavigation(ctx: AnyContext): SessionNavigation {
   );
 }
 
-const navigations = new Map<string, SessionNavigation>();
-const pending = new Map<string, PendingCheckpoint>();
-
 export default function ompUndoRedo(pi: ExtensionAPI): void {
-  pi.on("session_start", async (_event, ctx) => {
-    const sessionId = ctx.sessionManager.getSessionId();
-    const previous = navigations.get(sessionId);
-    if (previous) await previous.dispose();
-    const previousPending = pending.get(sessionId);
-    if (previousPending) {
-      await releasePendingCheckpoint(
-        createGitRunner(previousPending.repository.worktree),
-        previousPending,
-      );
-    }
-    navigations.set(sessionId, createNavigation(ctx as unknown as AnyContext));
-    pending.delete(sessionId);
-  });
+  const navigations = new Map<string, SessionNavigation>();
+  const pending = new Map<string, PendingCheckpoint>();
+  const activeOperations = new Set<Promise<void>>();
+  let closing = false;
+  let shutdownPromise: Promise<void> | null = null;
 
-  pi.on("before_agent_start", async (_event, ctx) => {
-    const typed = ctx as unknown as AnyContext;
-    const sessionId = typed.sessionManager.getSessionId();
-    const oldPending = pending.get(sessionId);
-    if (oldPending) {
-      await releasePendingCheckpoint(createGitRunner(oldPending.repository.worktree), oldPending);
+  function track(operation: () => Promise<void>): Promise<void> {
+    const { promise: tracked, resolve, reject } = promiseWithResolvers<void>();
+    activeOperations.add(tracked);
+    void (async () => {
+      try {
+        await operation();
+        resolve();
+      } catch (error) {
+        reject(error);
+      } finally {
+        activeOperations.delete(tracked);
+      }
+    })();
+    return tracked;
+  }
+
+  async function releasePending(pendingCheckpoint: PendingCheckpoint): Promise<void> {
+    await releasePendingCheckpoint(
+      createGitRunner(pendingCheckpoint.repository.worktree),
+      pendingCheckpoint,
+    );
+  }
+
+  async function disposeDetached(
+    detachedNavigations: readonly SessionNavigation[],
+    detachedPending: readonly PendingCheckpoint[],
+  ): Promise<void> {
+    await Promise.allSettled([
+      ...detachedNavigations.map((navigation) => navigation.dispose()),
+      ...detachedPending.map((pendingCheckpoint) => releasePending(pendingCheckpoint)),
+    ]);
+  }
+
+  async function drainState(): Promise<void> {
+    const detachedNavigations = [...navigations.values()];
+    const detachedPending = [...pending.values()];
+    navigations.clear();
+    pending.clear();
+    await disposeDetached(detachedNavigations, detachedPending);
+  }
+
+  pi.on("session_start", (_event, ctx) =>
+    track(async () => {
+      if (closing) return;
+      const typed = ctx as unknown as AnyContext;
+      const sessionId = typed.sessionManager.getSessionId();
+      const previous = navigations.get(sessionId);
+      navigations.delete(sessionId);
+      const previousPending = pending.get(sessionId);
       pending.delete(sessionId);
-    }
-    const before = await prepareBeforeTurn(createGitRunner(typed.cwd), sessionId);
-    if (before) {
-      pending.set(sessionId, {
+      await disposeDetached(previous ? [previous] : [], previousPending ? [previousPending] : []);
+      if (closing) return;
+      navigations.set(sessionId, createNavigation(typed));
+    }),
+  );
+
+  pi.on("before_agent_start", (_event, ctx) =>
+    track(async () => {
+      if (closing) return;
+      const typed = ctx as unknown as AnyContext;
+      const sessionId = typed.sessionManager.getSessionId();
+      const oldPending = pending.get(sessionId);
+      pending.delete(sessionId);
+      if (oldPending) await releasePending(oldPending);
+      const before = await prepareBeforeTurn(createGitRunner(typed.cwd), sessionId);
+      if (!before) return;
+      const checkpoint = {
         ...before,
         parentLeafId: typed.sessionManager.getLeafId(),
-      });
-    }
-  });
+      };
+      if (closing) {
+        await releasePending(checkpoint);
+        return;
+      }
+      pending.set(sessionId, checkpoint);
+    }),
+  );
 
-  pi.on("agent_end", async (_event, ctx) => {
-    const typed = ctx as unknown as AnyContext;
-    const sessionId = typed.sessionManager.getSessionId();
-    const before = pending.get(sessionId);
-    if (!before) return;
-    pending.delete(sessionId);
-    const checkpoint = await finishAfterTurn(
-      createGitRunner(before.repository.worktree),
-      before,
-      before.parentLeafId,
-      typed.sessionManager.getLeafId(),
-    );
-    if (!checkpoint) return;
-    const nav = navigations.get(sessionId) ?? createNavigation(typed);
-    navigations.set(sessionId, nav);
-    await nav.recordTurnEnd(checkpoint);
+  pi.on("agent_end", (_event, ctx) =>
+    track(async () => {
+      const typed = ctx as unknown as AnyContext;
+      const sessionId = typed.sessionManager.getSessionId();
+      const before = pending.get(sessionId);
+      if (!before) return;
+      pending.delete(sessionId);
+      if (closing) {
+        await releasePending(before);
+        return;
+      }
+      const checkpoint = await finishAfterTurn(
+        createGitRunner(before.repository.worktree),
+        before,
+        before.parentLeafId,
+        typed.sessionManager.getLeafId(),
+      );
+      if (!checkpoint) return;
+      if (closing) {
+        await releaseCheckpoint(createGitRunner(checkpoint.repository.worktree), checkpoint);
+        return;
+      }
+      const nav = navigations.get(sessionId) ?? createNavigation(typed);
+      navigations.set(sessionId, nav);
+      await nav.recordTurnEnd(checkpoint);
+    }),
+  );
+
+  pi.on("session_shutdown", () => {
+    if (shutdownPromise) return shutdownPromise;
+    closing = true;
+    const detachedNavigations = [...navigations.values()];
+    const detachedPending = [...pending.values()];
+    navigations.clear();
+    pending.clear();
+    shutdownPromise = (async () => {
+      await disposeDetached(detachedNavigations, detachedPending);
+      await Promise.allSettled([...activeOperations]);
+      await drainState();
+    })();
+    return shutdownPromise;
   });
 
   const undoHandler = async (_args: string, ctx: ExtensionCommandContext) => {

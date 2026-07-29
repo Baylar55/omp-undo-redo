@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.20] - 2026-07-29
+
+### Fixed
+
+- Release active and pending private checkpoint refs during graceful `session_shutdown`, including checkpoints tracked by previously visited sessions and repositories.
+- Batch compare-and-delete private refs while preserving unrelated refs and leaving mismatched refs untouched.
+
 ## [1.0.19] - 2026-07-29
 
 ### Fixed
@@ -123,7 +130,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
-[Unreleased]: https://github.com/Baylar55/omp-undo-redo/compare/v1.0.19...HEAD
+[1.0.20]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.20
 [1.0.19]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.19
 [1.0.18]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.18
 [1.0.7]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.7

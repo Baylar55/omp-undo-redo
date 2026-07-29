@@ -32,13 +32,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.0.16
-```
-
-To update an existing installation, run the same command with the new version, or use:
-
-```sh
-omp plugin upgrade @baylarsadigov/omp-undo-redo
+omp plugin install @baylarsadigov/omp-undo-redo@1.0.20
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -64,7 +58,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.0.16
+pi install npm:@baylarsadigov/omp-undo-redo@1.0.20
 ```
 
 To update installed Pi packages:
@@ -87,7 +81,7 @@ Both commands wait for the current agent turn to become idle; if OMP remains bus
 
 ## Limitations
 
-Undo/redo creates private Git snapshot objects through an alternate index and `git commit-tree`, then retains them with refs under `refs/omp-undo-redo/`. Checkpoint creation never moves `HEAD` or any branch ref. `/undo` and `/redo` apply file deltas only; they do not undo commits or branch switches. The real Git index is preserved, and releasing a checkpoint removes its private refs. A checkpoint covers the complete Git worktree that contains the session cwd; starting OMP from a repository subdirectory does not limit undo/redo to that subtree. Dirty files that existed before the turn are included in both snapshots and remain unchanged by undo/redo. Changes made anywhere in the repository during the turn can be part of the checkpoint because Git snapshots cannot determine authorship; this is an architectural limitation. The supported guarantee is: restores the non-ignored file changes represented by the checkpoint while preserving Git branch history and the real index. Ignored files, empty directories, dirty submodule contents, shell effects, network effects, and editor state are outside the checkpoint. Clean/smudge filters, `core.autocrlf`, submodules, and ignored files prevent a universal byte-for-byte guarantee. If overlapping worktree changes prevent safe application, undo/redo fails instead of overwriting them. A forced process termination may leave stale private refs; inspect them with `git for-each-ref refs/omp-undo-redo/` and remove only confirmed stale refs.
+Undo/redo creates private Git snapshot objects through an alternate index and `git commit-tree`, then retains them with refs under `refs/omp-undo-redo/`. Checkpoint creation never moves `HEAD` or any branch ref. `/undo` and `/redo` apply file deltas only; they do not undo commits or branch switches. The real Git index is preserved, and releasing a checkpoint removes its private refs. A checkpoint covers the complete Git worktree that contains the session cwd; starting OMP from a repository subdirectory does not limit undo/redo to that subtree. Dirty files that existed before the turn are included in both snapshots and remain unchanged by undo/redo. Changes made anywhere in the repository during the turn can be part of the checkpoint because Git snapshots cannot determine authorship; this is an architectural limitation. The supported guarantee is: restores the non-ignored file changes represented by the checkpoint while preserving Git branch history and the real index. Ignored files, empty directories, dirty submodule contents, shell effects, network effects, and editor state are outside the checkpoint. Clean/smudge filters, `core.autocrlf`, submodules, and ignored files prevent a universal byte-for-byte guarantee. If overlapping worktree changes prevent safe application, undo/redo fails instead of overwriting them. Graceful session shutdown releases active and pending private refs. Forced termination, process kill, shutdown-handler timeout, or Git cleanup failure can still leave stale private refs; inspect them with `git for-each-ref refs/omp-undo-redo/` and remove only confirmed stale refs. Do not delete refs from a repository while another OMP process may still be using them.
 
 ## Development
 

@@ -1,4 +1,5 @@
-import { execFile } from "node:child_process";
+import { once } from "node:events";
+import { execFile, spawn } from "node:child_process";
 import {
   mkdir,
   chmod,
@@ -21,8 +22,9 @@ import {
   checkpointNamespace,
   finishAfterTurn,
   prepareBeforeTurn,
-  previousCheckpoint,
   releaseCheckpoint,
+  previousCheckpoint,
+  releaseRefs,
 } from "../src/core/checkpoints.js";
 import type {
   GitCheckpoint,
@@ -60,6 +62,30 @@ const entries: SessionEntryLike[] = [
 
 function gitRunner(cwd: string): GitRunner {
   return async (args, options) => {
+    if (options?.stdin !== undefined) {
+      const child = spawn("git", args, {
+        cwd,
+        env: { ...process.env, ...options.env },
+        windowsHide: true,
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.stdin.end(options.stdin);
+      try {
+        const [code] = (await once(child, "close")) as [number | null];
+        return { stdout, stderr, code: typeof code === "number" ? code : 1 };
+      } catch (error) {
+        return { stdout, stderr: `${stderr}${String(error)}`, code: 1 };
+      }
+    }
     try {
       const result = await execFileAsync("git", args, {
         cwd,
@@ -528,6 +554,48 @@ describe("history-safe Git checkpoints", () => {
       await git(["gc", "--prune=now"]);
       expect((await git(["cat-file", "-e", `${checkpoint.beforeHash}^{commit}`])).code).not.toBe(0);
       expect((await git(["cat-file", "-e", `${checkpoint.afterHash}^{commit}`])).code).not.toBe(0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it("isolates a changed private ref without blocking valid cleanup", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const before = await prepareBeforeTurn(git, "batch");
+      expect(before).not.toBeNull();
+      if (!before) return;
+      await writeFile(join(cwd, "tracked.txt"), "after\n");
+      const checkpoint = await finishAfterTurn(git, before, null, null);
+      expect(checkpoint).not.toBeNull();
+      if (!checkpoint) return;
+      await git(["update-ref", "refs/keep", "HEAD"]);
+      await git(["update-ref", checkpoint.afterRef, checkpoint.beforeHash]);
+
+      const released = await releaseRefs(
+        () => git,
+        [
+          {
+            repository: checkpoint.repository,
+            ref: checkpoint.beforeRef,
+            expectedHash: checkpoint.beforeHash,
+          },
+          {
+            repository: checkpoint.repository,
+            ref: checkpoint.afterRef,
+            expectedHash: checkpoint.afterHash,
+          },
+        ],
+      );
+
+      expect(released).toBe(false);
+      expect((await git(["show-ref", "--verify", checkpoint.beforeRef])).code).not.toBe(0);
+      expect((await git(["rev-parse", checkpoint.afterRef])).stdout.trim()).toBe(
+        checkpoint.beforeHash,
+      );
+      expect((await git(["rev-parse", "refs/keep"])).stdout.trim()).toBe(
+        (await git(["rev-parse", "HEAD"])).stdout.trim(),
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
