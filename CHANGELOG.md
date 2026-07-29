@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.18] - 2026-07-29
+
+### Fixed
+
+- Fixed the critical branch-history rewind: checkpoints no longer use normal commits or `git reset`, so agent commits and branch refs remain unchanged.
+- Preserved the user's real Git index during snapshot capture and file restoration.
+- Made conflicting worktree changes fail safely instead of partially overwriting files.
+
 ## [1.0.17] - 2026-07-29
 
 ### Fixed

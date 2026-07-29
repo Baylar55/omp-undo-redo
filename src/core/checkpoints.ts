@@ -1,5 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { GitCheckpoint, GitRunner, SessionReader } from "./types.js";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
+import type {
+  GitCheckpoint,
+  GitRepository,
+  GitRunner,
+  PendingCheckpoint,
+  SessionReader,
+} from "./types.js";
 
 const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-redo@local"];
 const REF_ROOT = "refs/omp-undo-redo";
@@ -24,17 +33,60 @@ async function run(git: GitRunner, args: string[]): Promise<boolean> {
   }
 }
 
-async function commitCheckpoint(git: GitRunner, message: string): Promise<string | null> {
+async function output(git: GitRunner, args: string[]): Promise<string | null> {
   try {
-    const add = await git(["add", "-A"]);
-    if (add.code !== 0) return null;
-    const commit = await git([...GIT_AUTHOR, "commit", "--allow-empty", "-m", message]);
-    if (commit.code !== 0) return null;
-    const hash = await git(["rev-parse", "HEAD"]);
-    const value = hash.stdout.trim();
-    return hash.code === 0 && value ? value : null;
+    const result = await git(args);
+    if (result.code !== 0) return null;
+    const value = result.stdout.trim();
+    return value || null;
   } catch {
     return null;
+  }
+}
+
+async function canonicalPath(value: string, base: string): Promise<string> {
+  const absolute = isAbsolute(value) ? value : resolve(base, value);
+  try {
+    return await realpath(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
+async function resolveRepository(git: GitRunner): Promise<GitRepository | null> {
+  const worktree = await output(git, ["rev-parse", "--show-toplevel"]);
+  const gitDir = await output(git, ["rev-parse", "--git-dir"]);
+  const commonDir = await output(git, ["rev-parse", "--git-common-dir"]);
+  if (!worktree || !gitDir || !commonDir) return null;
+  const canonicalWorktree = await canonicalPath(worktree, worktree);
+  return {
+    worktree: canonicalWorktree,
+    gitDir: await canonicalPath(gitDir, canonicalWorktree),
+    commonDir: await canonicalPath(commonDir, canonicalWorktree),
+  };
+}
+
+async function createSnapshotCommit(git: GitRunner, message: string): Promise<string | null> {
+  const tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-index-"));
+  const indexPath = join(tempDirectory, "index");
+  const env = { GIT_INDEX_FILE: indexPath };
+  try {
+    const seeded = await git(["read-tree", "HEAD"], { env });
+    if (seeded.code !== 0) return null;
+    const added = await git(["add", "-A", "--", "."], { env });
+    if (added.code !== 0) return null;
+    const tree = await git(["write-tree"], { env });
+    if (tree.code !== 0) return null;
+    const treeHash = tree.stdout.trim();
+    if (!treeHash) return null;
+    const commit = await git([...GIT_AUTHOR, "commit-tree", treeHash, "-m", message]);
+    if (commit.code !== 0) return null;
+    const commitHash = commit.stdout.trim();
+    return commitHash || null;
+  } catch {
+    return null;
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
   }
 }
 
@@ -53,7 +105,7 @@ export async function releaseCheckpoint(
 
 export async function releasePendingCheckpoint(
   git: GitRunner,
-  pending: { beforeHash: string; beforeRef: string },
+  pending: Pick<PendingCheckpoint, "beforeHash" | "beforeRef">,
 ): Promise<boolean> {
   return releaseRef(git, pending.beforeRef, pending.beforeHash);
 }
@@ -61,98 +113,87 @@ export async function releasePendingCheckpoint(
 export async function prepareBeforeTurn(
   git: GitRunner,
   sessionId: string,
-): Promise<{
-  baseHash: string;
-  beforeHash: string;
-  beforeRef: string;
-  checkpointId: string;
-} | null> {
-  let baseHash: string | null = null;
-  let beforeHash: string | null = null;
-  let beforeRef: string | null = null;
-  let protectedCheckpoint = false;
-  try {
-    const base = await git(["rev-parse", "HEAD"]);
-    if (base.code !== 0 || !(baseHash = base.stdout.trim())) return null;
-    const checkpointId = randomUUID();
-    beforeHash = await commitCheckpoint(git, "omp-undo-redo: before turn");
-    if (!beforeHash) return null;
-    beforeRef = checkpointRefs(sessionId, checkpointId).beforeRef;
-    if (
-      !(await run(git, [
-        "update-ref",
-        "-m",
-        "omp-undo-redo: retain before checkpoint",
-        beforeRef,
-        beforeHash,
-      ]))
-    )
-      return null;
-    if (!(await run(git, ["reset", baseHash]))) return null;
-    protectedCheckpoint = true;
-    return { baseHash, beforeHash, beforeRef, checkpointId };
-  } finally {
-    if (baseHash && !protectedCheckpoint) {
-      await run(git, ["reset", baseHash]);
-      if (beforeHash && beforeRef) await releaseRef(git, beforeRef, beforeHash);
-    }
+): Promise<PendingCheckpoint | null> {
+  const repository = await resolveRepository(git);
+  if (!repository) return null;
+  const head = await output(git, ["rev-parse", "HEAD"]);
+  if (!head) return null;
+
+  const checkpointId = randomUUID();
+  const beforeHash = await createSnapshotCommit(git, "omp-undo-redo: before turn");
+  if (!beforeHash) return null;
+  const beforeRef = checkpointRefs(sessionId, checkpointId).beforeRef;
+  if (
+    !(await run(git, [
+      "update-ref",
+      "-m",
+      "omp-undo-redo: retain before checkpoint",
+      beforeRef,
+      beforeHash,
+    ]))
+  ) {
+    return null;
   }
+  return { repository, beforeHash, beforeRef, checkpointId, parentLeafId: null };
 }
+
 export async function finishAfterTurn(
   git: GitRunner,
-  before: { baseHash: string; beforeHash: string; beforeRef: string; checkpointId: string },
+  before: Pick<PendingCheckpoint, "repository" | "beforeHash" | "beforeRef" | "checkpointId">,
   parentLeafId: string | null,
   leafId: string | null,
 ): Promise<GitCheckpoint | null> {
-  let afterHash: string | null = null;
-  let afterRef: string | null = null;
-  let protectedCheckpoint = false;
-  try {
-    afterHash = await commitCheckpoint(git, "omp-undo-redo: after turn");
-    if (!afterHash) return null;
-    afterRef = before.beforeRef.replace(/\/before$/, "/after");
-    if (
-      !(await run(git, [
-        "update-ref",
-        "-m",
-        "omp-undo-redo: retain after checkpoint",
-        afterRef,
-        afterHash,
-      ]))
-    )
-      return null;
-    if (!(await run(git, ["reset", before.baseHash]))) return null;
-    protectedCheckpoint = true;
-    return {
-      baseHash: before.baseHash,
-      beforeHash: before.beforeHash,
-      beforeRef: before.beforeRef,
-      afterHash,
-      afterRef,
-      parentLeafId,
-      leafId,
-    };
-  } finally {
-    await run(git, ["reset", before.baseHash]);
-    if (!protectedCheckpoint) {
-      await releaseRef(git, before.beforeRef, before.beforeHash);
-      if (afterHash && afterRef) await releaseRef(git, afterRef, afterHash);
-    }
+  const afterHash = await createSnapshotCommit(git, "omp-undo-redo: after turn");
+  if (!afterHash) {
+    await releasePendingCheckpoint(git, before);
+    return null;
   }
+  const afterRef = before.beforeRef.replace(/\/before$/, "/after");
+  if (
+    !(await run(git, [
+      "update-ref",
+      "-m",
+      "omp-undo-redo: retain after checkpoint",
+      afterRef,
+      afterHash,
+    ]))
+  ) {
+    await releasePendingCheckpoint(git, before);
+    return null;
+  }
+  return {
+    repository: before.repository,
+    beforeHash: before.beforeHash,
+    beforeRef: before.beforeRef,
+    afterHash,
+    afterRef,
+    parentLeafId,
+    leafId,
+  };
 }
 
-export async function restoreCheckpoint(
+export type CheckpointApplyResult = "applied" | "conflict" | "failed";
+
+export async function applyCheckpoint(
   git: GitRunner,
-  checkpoint: GitCheckpoint,
-  commitHash: string,
-): Promise<boolean> {
+  sourceHash: string,
+  targetHash: string,
+): Promise<CheckpointApplyResult> {
+  const tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
+  const patchPath = join(tempDirectory, "checkpoint.patch");
   try {
-    const restore = await git(["reset", "--hard", commitHash]);
-    if (restore.code !== 0) return false;
-    const reset = await git(["reset", checkpoint.baseHash]);
-    return reset.code === 0;
+    const diff = await git(["diff", "--binary", sourceHash, targetHash, `--output=${patchPath}`]);
+    if (diff.code !== 0) return "failed";
+
+    const check = await git(["apply", "--check", patchPath]);
+    if (check.code !== 0) return "conflict";
+
+    const applied = await git(["apply", patchPath]);
+    return applied.code === 0 ? "applied" : "failed";
   } catch {
-    return false;
+    return "failed";
+  } finally {
+    await rm(tempDirectory, { recursive: true, force: true });
   }
 }
 

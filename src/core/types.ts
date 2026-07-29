@@ -19,8 +19,23 @@ export interface NavigationPort extends SessionReader {
   navigateTree(targetId: string): Promise<NavigationResult>;
 }
 
+export interface GitRunOptions {
+  env?: Record<string, string | undefined>;
+}
+
+export type GitRunner = (
+  args: string[],
+  options?: GitRunOptions,
+) => Promise<{ stdout: string; stderr: string; code: number }>;
+
+export interface GitRepository {
+  worktree: string;
+  gitDir: string;
+  commonDir: string;
+}
+
 export interface GitCheckpoint {
-  baseHash: string;
+  repository: GitRepository;
   beforeHash: string;
   beforeRef: string;
   afterHash: string;
@@ -29,6 +44,12 @@ export interface GitCheckpoint {
   leafId: string | null;
 }
 
-export type GitRunner = (
-  args: string[],
-) => Promise<{ stdout: string; stderr: string; code: number }>;
+export interface PendingCheckpoint {
+  repository: GitRepository;
+  beforeHash: string;
+  beforeRef: string;
+  checkpointId: string;
+  parentLeafId: string | null;
+}
+
+export type GitRunnerFactory = (repository: GitRepository) => GitRunner;
