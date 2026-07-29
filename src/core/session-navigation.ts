@@ -6,7 +6,7 @@ import type {
   NavigationPort,
   NavigationResult,
 } from "./types.js";
-import { applyCheckpoint, releaseCheckpoint } from "./checkpoints.js";
+import { applyCheckpoint, releaseCheckpoints } from "./checkpoints.js";
 
 export type NavigationOutcome = "moved" | "empty" | "cancelled" | "git_failed" | "rollback_failed";
 
@@ -45,18 +45,14 @@ export class SessionNavigation {
     );
     this.checkpoints.push(checkpoint);
     this.currentIndex = this.checkpoints.length - 1;
-    await Promise.all(
-      discarded.map((entry) => releaseCheckpoint(this.gitForRepository(entry.repository), entry)),
-    );
+    await releaseCheckpoints(this.gitForRepository, discarded);
   }
 
   async dispose(): Promise<void> {
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
     this.currentIndex = -1;
-    await Promise.all(
-      checkpoints.map((entry) => releaseCheckpoint(this.gitForRepository(entry.repository), entry)),
-    );
+    await releaseCheckpoints(this.gitForRepository, checkpoints);
   }
 
   async undo(): Promise<NavigationOutcome> {

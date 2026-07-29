@@ -21,6 +21,7 @@ export interface NavigationPort extends SessionReader {
 
 export interface GitRunOptions {
   env?: Record<string, string | undefined>;
+  stdin?: string;
 }
 
 export type GitRunner = (

@@ -91,24 +91,105 @@ async function createSnapshotCommit(git: GitRunner, message: string): Promise<st
   }
 }
 
-async function releaseRef(git: GitRunner, ref: string, hash: string): Promise<boolean> {
-  return run(git, ["update-ref", "-d", ref, hash]);
+export interface RefRelease {
+  repository: GitRepository;
+  ref: string;
+  expectedHash: string;
+}
+
+async function releaseRefBatch(
+  git: GitRunner,
+  refs: readonly Pick<RefRelease, "ref" | "expectedHash">[],
+): Promise<boolean> {
+  if (refs.length === 0) return true;
+  const input = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n");
+  try {
+    const result = await git(["update-ref", "--stdin"], { stdin: `${input}\n` });
+    if (result.code === 0) return true;
+  } catch {
+    // Retry smaller batches below.
+  }
+  if (refs.length === 1) return false;
+  const midpoint = Math.ceil(refs.length / 2);
+  const left = await releaseRefBatch(git, refs.slice(0, midpoint));
+  const right = await releaseRefBatch(git, refs.slice(midpoint));
+  return left && right;
+}
+
+export async function releaseRefs(
+  gitForRepository: (repository: GitRepository) => GitRunner,
+  refs: readonly RefRelease[],
+): Promise<boolean> {
+  const grouped = new Map<string, { repository: GitRepository; refs: RefRelease[] }>();
+  for (const ref of refs) {
+    const key = ref.repository.commonDir;
+    const group = grouped.get(key);
+    if (group) {
+      group.refs.push(ref);
+    } else {
+      grouped.set(key, { repository: ref.repository, refs: [ref] });
+    }
+  }
+
+  const results = await Promise.allSettled(
+    [...grouped.values()].map(async ({ repository, refs: groupedRefs }) => {
+      try {
+        return await releaseRefBatch(gitForRepository(repository), groupedRefs);
+      } catch {
+        return false;
+      }
+    }),
+  );
+  return results.every((result) => result.status === "fulfilled" && result.value);
+}
+
+export async function releaseCheckpoints(
+  gitForRepository: (repository: GitRepository) => GitRunner,
+  checkpoints: readonly GitCheckpoint[],
+): Promise<boolean> {
+  return releaseRefs(
+    gitForRepository,
+    checkpoints.flatMap((checkpoint) => [
+      {
+        repository: checkpoint.repository,
+        ref: checkpoint.beforeRef,
+        expectedHash: checkpoint.beforeHash,
+      },
+      {
+        repository: checkpoint.repository,
+        ref: checkpoint.afterRef,
+        expectedHash: checkpoint.afterHash,
+      },
+    ]),
+  );
 }
 
 export async function releaseCheckpoint(
   git: GitRunner,
   checkpoint: GitCheckpoint,
 ): Promise<boolean> {
-  const before = await releaseRef(git, checkpoint.beforeRef, checkpoint.beforeHash);
-  const after = await releaseRef(git, checkpoint.afterRef, checkpoint.afterHash);
-  return before && after;
+  return releaseRefs(
+    () => git,
+    [
+      {
+        repository: checkpoint.repository,
+        ref: checkpoint.beforeRef,
+        expectedHash: checkpoint.beforeHash,
+      },
+      {
+        repository: checkpoint.repository,
+        ref: checkpoint.afterRef,
+        expectedHash: checkpoint.afterHash,
+      },
+    ],
+  );
 }
 
 export async function releasePendingCheckpoint(
   git: GitRunner,
   pending: Pick<PendingCheckpoint, "beforeHash" | "beforeRef">,
 ): Promise<boolean> {
-  return releaseRef(git, pending.beforeRef, pending.beforeHash);
+  return releaseRefBatch(git, [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }]);
 }
 
 export async function prepareBeforeTurn(
