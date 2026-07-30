@@ -126,10 +126,11 @@ async function seedSnapshotIndex(
 }
 
 async function createSnapshotCommit(git: GitRunner, message: string): Promise<SnapshotResult> {
-  const tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-index-"));
-  const indexPath = join(tempDirectory, "index");
-  const env = { GIT_INDEX_FILE: indexPath };
+  let tempDirectory: string | null = null;
   try {
+    tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-index-"));
+    const indexPath = join(tempDirectory, "index");
+    const env = { GIT_INDEX_FILE: indexPath };
     const seeded = await seedSnapshotIndex(git, env);
     if (seeded === "invalid_head") return { reason: "invalid_head" };
     if (seeded === "failed") return { reason: "snapshot_failed" };
@@ -146,7 +147,9 @@ async function createSnapshotCommit(git: GitRunner, message: string): Promise<Sn
   } catch {
     return { reason: "snapshot_failed" };
   } finally {
-    await rm(tempDirectory, { recursive: true, force: true });
+    if (tempDirectory !== null) {
+      await rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
@@ -380,9 +383,10 @@ export async function applyCheckpoint(
   sourceHash: string,
   targetHash: string,
 ): Promise<CheckpointApplyResult> {
-  const tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
-  const patchPath = join(tempDirectory, "checkpoint.patch");
+  let tempDirectory: string | null = null;
   try {
+    tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
+    const patchPath = join(tempDirectory, "checkpoint.patch");
     const diff = await git([
       "diff",
       "--exit-code",
@@ -402,7 +406,9 @@ export async function applyCheckpoint(
   } catch {
     return "failed";
   } finally {
-    await rm(tempDirectory, { recursive: true, force: true });
+    if (tempDirectory !== null) {
+      await rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
 
