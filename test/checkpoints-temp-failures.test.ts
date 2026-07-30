@@ -147,6 +147,7 @@ function makeGitRunner(cwd: string, options?: { failCommand?: string }): GitRunn
       child.stderr.on("data", (chunk: string) => {
         stderr += chunk;
       });
+      child.stdin.on("error", () => {});
       child.stdin.end(runOpts.stdin);
       try {
         const [code] = (await once(child, "close")) as [number | null];

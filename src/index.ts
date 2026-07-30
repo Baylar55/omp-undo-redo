@@ -78,6 +78,7 @@ function createGitRunner(cwd: string): GitRunner {
         settled = true;
         resolve({ stdout, stderr, code: typeof code === "number" ? code : 1 });
       });
+      child.stdin.on("error", () => {});
       child.stdin.end(options.stdin);
       return await promise;
     }

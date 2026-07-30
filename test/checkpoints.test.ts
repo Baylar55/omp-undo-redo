@@ -79,6 +79,7 @@ function gitRunner(cwd: string): GitRunner {
       child.stderr.on("data", (chunk: string) => {
         stderr += chunk;
       });
+      child.stdin.on("error", () => {});
       child.stdin.end(options.stdin);
       try {
         const [code] = (await once(child, "close")) as [number | null];
