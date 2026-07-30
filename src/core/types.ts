@@ -19,7 +19,8 @@ export type FileCheckpointUnavailableReason =
   | "before_snapshot_failed"
   | "before_ref_failed"
   | "after_snapshot_failed"
-  | "after_ref_failed";
+  | "after_ref_failed"
+  | "file_history_gap";
 
 export type TreeNavigationResult = {
   cancelled: boolean;

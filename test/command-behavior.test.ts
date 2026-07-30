@@ -223,16 +223,28 @@ describe("session navigation", () => {
     });
   });
 
-  it("processes mixed Git and session-only history in order", async () => {
+  it("treats a session-only checkpoint as a file-history continuity barrier", async () => {
     const session = port();
     const navigation = makeNavigation(session);
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(sessionCheckpoint("a1", "a2"));
 
-    expect((await navigation.undo()).files).toBe("unavailable");
-    expect((await navigation.undo()).files).toBe("restored");
-    expect((await navigation.redo()).files).toBe("restored");
-    expect((await navigation.redo()).files).toBe("unavailable");
+    expect(await navigation.undo()).toMatchObject({
+      files: "unavailable",
+      reason: "not_repository",
+    });
+    expect(await navigation.undo()).toMatchObject({
+      files: "unavailable",
+      reason: "file_history_gap",
+    });
+    expect(await navigation.redo()).toMatchObject({
+      files: "unavailable",
+      reason: "file_history_gap",
+    });
+    expect(await navigation.redo()).toMatchObject({
+      files: "unavailable",
+      reason: "not_repository",
+    });
   });
 
   it("does not move the history index when session navigation is cancelled", async () => {

@@ -82,7 +82,7 @@ The extension exposes exactly these commands:
 Commands take no arguments. They navigate OMP's session tree through the official extension API and do not create a new model turn.
 Both commands wait for the current agent turn to become idle; if OMP remains busy, the command leaves the session unchanged and shows a warning.
 
-Every completed turn remains undoable, including conversation-only turns and turns that change only ignored files. When a Git file checkpoint is available, `/undo` and `/redo` restore the corresponding worktree delta as part of the same operation. If Git checkpoint creation is unavailable, the commands navigate session context only, leave files unchanged, and explicitly report that limitation.
+Every completed turn remains navigable, including conversation-only turns and turns that change only ignored files. When a Git file checkpoint is available, `/undo` and `/redo` restore the corresponding worktree delta as part of the same operation. If Git checkpoint creation is unavailable, the commands navigate session context only, leave files unchanged, and explicitly report that limitation. Such a session-only checkpoint is a file-history continuity barrier: older file checkpoints are discarded because applying them across an unknown file delta would be unsafe. Later successful Git checkpoints start a new restorable file-history segment.
 
 ## Limitations
 
