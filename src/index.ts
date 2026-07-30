@@ -11,7 +11,7 @@ import {
   releaseCheckpoint,
   releasePendingCheckpoint,
 } from "./core/checkpoints.js";
-import type { GitRunner, PendingCheckpoint } from "./core/types.js";
+import type { GitRunner, PendingTurnCheckpoint, SessionOnlyCheckpoint } from "./core/types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,12 +39,13 @@ type AnyContext = {
 };
 
 function createGitRunner(cwd: string): GitRunner {
-  return async (args, options) => {
+  const runner: GitRunner = async (args, options) => {
     if (options?.stdin !== undefined) {
       const { promise, resolve } = promiseWithResolvers<{
         stdout: string;
         stderr: string;
         code: number;
+        error?: "unavailable";
       }>();
       const child = spawn("git", args, {
         cwd,
@@ -69,6 +70,7 @@ function createGitRunner(cwd: string): GitRunner {
           stdout,
           stderr: `${stderr}${error.message}`,
           code: 1,
+          error: "unavailable",
         });
       });
       child.once("close", (code) => {
@@ -96,9 +98,12 @@ function createGitRunner(cwd: string): GitRunner {
         stdout: failure.stdout ?? "",
         stderr: failure.stderr ?? "",
         code: typeof failure.code === "number" ? failure.code : 1,
+        ...(typeof failure.code === "number" ? {} : { error: "unavailable" as const }),
       };
     }
   };
+  runner.cwd = cwd;
+  return runner;
 }
 
 function createNavigation(ctx: AnyContext): SessionNavigation {
@@ -116,7 +121,7 @@ function createNavigation(ctx: AnyContext): SessionNavigation {
 
 export default function ompUndoRedo(pi: ExtensionAPI): void {
   const navigations = new Map<string, SessionNavigation>();
-  const pending = new Map<string, PendingCheckpoint>();
+  const pending = new Map<string, PendingTurnCheckpoint>();
   const activeOperations = new Set<Promise<void>>();
   let closing = false;
   let shutdownPromise: Promise<void> | null = null;
@@ -139,7 +144,8 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     return tracked;
   }
 
-  async function releasePending(pendingCheckpoint: PendingCheckpoint): Promise<void> {
+  async function releasePending(pendingCheckpoint: PendingTurnCheckpoint): Promise<void> {
+    if (pendingCheckpoint.kind !== "git") return;
     await releasePendingCheckpoint(
       createGitRunner(pendingCheckpoint.repository.worktree),
       pendingCheckpoint,
@@ -148,7 +154,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
 
   async function disposeDetached(
     detachedNavigations: readonly SessionNavigation[],
-    detachedPending: readonly PendingCheckpoint[],
+    detachedPending: readonly PendingTurnCheckpoint[],
   ): Promise<void> {
     await Promise.allSettled([
       ...detachedNavigations.map((navigation) => navigation.dispose()),
@@ -245,12 +251,13 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       const oldPending = pending.get(sessionId);
       pending.delete(sessionId);
       if (oldPending) await releasePending(oldPending);
-      const before = await prepareBeforeTurn(createGitRunner(typed.cwd), sessionId);
-      if (!before) return;
-      const checkpoint = {
-        ...before,
-        parentLeafId: typed.sessionManager.getLeafId(),
-      };
+
+      const prepared = await prepareBeforeTurn(createGitRunner(typed.cwd), sessionId);
+      const parentLeafId = typed.sessionManager.getLeafId();
+      const checkpoint: PendingTurnCheckpoint =
+        prepared.status === "git"
+          ? { ...prepared.checkpoint, parentLeafId }
+          : { kind: "session", reason: prepared.reason, parentLeafId };
       if (closing) {
         await releasePending(checkpoint);
         return;
@@ -270,20 +277,45 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
         await releasePending(before);
         return;
       }
-      const checkpoint = await finishAfterTurn(
-        createGitRunner(before.repository.worktree),
-        before,
-        before.parentLeafId,
-        typed.sessionManager.getLeafId(),
-      );
-      if (!checkpoint) return;
-      if (closing) {
-        await releaseCheckpoint(createGitRunner(checkpoint.repository.worktree), checkpoint);
-        return;
+
+      let completed: SessionOnlyCheckpoint | undefined;
+      if (before.kind === "session") {
+        completed = {
+          kind: "session",
+          reason: before.reason,
+          parentLeafId: before.parentLeafId,
+          leafId: typed.sessionManager.getLeafId(),
+        };
+      } else {
+        const result = await finishAfterTurn(
+          createGitRunner(before.repository.worktree),
+          before,
+          before.parentLeafId,
+          typed.sessionManager.getLeafId(),
+        );
+        if (result.status === "git") {
+          if (closing) {
+            await releaseCheckpoint(
+              createGitRunner(result.checkpoint.repository.worktree),
+              result.checkpoint,
+            );
+            return;
+          }
+          const nav = navigations.get(sessionId) ?? createNavigation(typed);
+          navigations.set(sessionId, nav);
+          await nav.recordTurnEnd(result.checkpoint);
+          return;
+        }
+        completed = {
+          kind: "session",
+          reason: result.reason,
+          parentLeafId: before.parentLeafId,
+          leafId: typed.sessionManager.getLeafId(),
+        };
       }
       const nav = navigations.get(sessionId) ?? createNavigation(typed);
       navigations.set(sessionId, nav);
-      await nav.recordTurnEnd(checkpoint);
+      await nav.recordTurnEnd(completed);
     }),
   );
 

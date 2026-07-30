@@ -30,6 +30,7 @@ import type {
   GitCheckpoint,
   GitRunner,
   NavigationPort,
+  PendingGitCheckpoint,
   SessionEntryLike,
   SessionReader,
 } from "../src/core/types.js";
@@ -61,7 +62,7 @@ const entries: SessionEntryLike[] = [
 ];
 
 function gitRunner(cwd: string): GitRunner {
-  return async (args, options) => {
+  const runner: GitRunner = async (args, options) => {
     if (options?.stdin !== undefined) {
       const child = spawn("git", args, {
         cwd,
@@ -102,6 +103,8 @@ function gitRunner(cwd: string): GitRunner {
       };
     }
   };
+  runner.cwd = cwd;
+  return runner;
 }
 
 async function makeRepo(): Promise<{ cwd: string; git: GitRunner }> {
@@ -147,12 +150,27 @@ async function indexState(
   return { tree: await text(git, ["write-tree"]), raw: await readFile(path) };
 }
 
+function pendingCheckpoint(
+  result: Awaited<ReturnType<typeof prepareBeforeTurn>>,
+): PendingGitCheckpoint {
+  expect(result.status).toBe("git");
+  if (result.status !== "git") throw new Error(`Expected Git checkpoint, got ${result.reason}`);
+  return result.checkpoint;
+}
+
+function completedCheckpoint(result: Awaited<ReturnType<typeof finishAfterTurn>>): GitCheckpoint {
+  expect(result.status).toBe("git");
+  if (result.status !== "git") throw new Error(`Expected Git checkpoint, got ${result.reason}`);
+  return result.checkpoint;
+}
+
 function checkpointWithRepository(
   beforeHash: string,
   afterHash: string,
   repository: GitCheckpoint["repository"],
 ): GitCheckpoint {
   return {
+    kind: "git",
     repository,
     beforeHash,
     beforeRef: "refs/omp-undo-redo/test/before",
@@ -188,7 +206,7 @@ describe("history-safe Git checkpoints", () => {
     try {
       await initializeBranch(git, cwd);
       const beforeIndex = await indexState(git, cwd);
-      const before = await prepareBeforeTurn(git, "intervening-commit");
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "intervening-commit"));
       expect(before).not.toBeNull();
       if (!before) return;
       expect(await indexState(git, cwd)).toEqual(beforeIndex);
@@ -200,7 +218,7 @@ describe("history-safe Git checkpoints", () => {
       const branchTip = await text(git, ["rev-parse", "refs/heads/A"]);
       const afterAgentIndex = await indexState(git, cwd);
       await writeFile(join(cwd, "turn.txt"), "uncommitted turn change\n");
-      const after = await finishAfterTurn(git, before, null, null);
+      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
@@ -233,10 +251,10 @@ describe("history-safe Git checkpoints", () => {
       const beforeIndex = await indexState(git, cwd);
       const beforeContents = await readFile(join(cwd, "tracked.txt"), "utf8");
 
-      const pending = await prepareBeforeTurn(git, "empty-turn");
+      const pending = pendingCheckpoint(await prepareBeforeTurn(git, "empty-turn"));
       expect(pending).not.toBeNull();
       if (!pending) return;
-      const checkpoint = await finishAfterTurn(git, pending, "u1", "a1");
+      const checkpoint = completedCheckpoint(await finishAfterTurn(git, pending, "u1", "a1"));
       expect(checkpoint).not.toBeNull();
       if (!checkpoint) return;
       expect(await text(git, ["rev-parse", `${checkpoint.beforeHash}^{tree}`])).toBe(
@@ -256,12 +274,10 @@ describe("history-safe Git checkpoints", () => {
       const navigation = new SessionNavigation(navigationPort, git);
       await navigation.recordTurnEnd(checkpoint);
 
-      expect(await navigation.undo()).toBe("moved");
+      expect((await navigation.undo()).status).toBe("moved");
       expect(navigated).toEqual(["u1"]);
-      expect(navigation.getLastGitFailure()).toBeNull();
-      expect(await navigation.redo()).toBe("moved");
+      expect((await navigation.redo()).status).toBe("moved");
       expect(navigated).toEqual(["u1", "a1"]);
-      expect(navigation.getLastGitFailure()).toBeNull();
 
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(beforeHead);
       expect(await branchRefs(git)).toBe(beforeRefs);
@@ -285,11 +301,11 @@ describe("history-safe Git checkpoints", () => {
       const beforeIndex = await indexState(git, cwd);
       const beforeContents = await readFile(join(cwd, "tracked.txt"), "utf8");
 
-      const pending = await prepareBeforeTurn(git, "ignored-turn");
+      const pending = pendingCheckpoint(await prepareBeforeTurn(git, "ignored-turn"));
       expect(pending).not.toBeNull();
       if (!pending) return;
       await writeFile(ignoredPath, "ignored after turn\n");
-      const checkpoint = await finishAfterTurn(git, pending, "u1", "a1");
+      const checkpoint = completedCheckpoint(await finishAfterTurn(git, pending, "u1", "a1"));
       expect(checkpoint).not.toBeNull();
       if (!checkpoint) return;
       expect(await text(git, ["rev-parse", `${checkpoint.beforeHash}^{tree}`])).toBe(
@@ -309,12 +325,10 @@ describe("history-safe Git checkpoints", () => {
       const navigation = new SessionNavigation(navigationPort, git);
       await navigation.recordTurnEnd(checkpoint);
 
-      expect(await navigation.undo()).toBe("moved");
+      expect((await navigation.undo()).status).toBe("moved");
       expect(navigated).toEqual(["u1"]);
-      expect(navigation.getLastGitFailure()).toBeNull();
-      expect(await navigation.redo()).toBe("moved");
+      expect((await navigation.redo()).status).toBe("moved");
       expect(navigated).toEqual(["u1", "a1"]);
-      expect(navigation.getLastGitFailure()).toBeNull();
 
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(beforeHead);
       expect(await branchRefs(git)).toBe(beforeRefs);
@@ -350,11 +364,11 @@ describe("history-safe Git checkpoints", () => {
       const head = await text(git, ["rev-parse", "HEAD"]);
       const refs = await branchRefs(git);
 
-      const before = await prepareBeforeTurn(nestedGit, "subdirectory-scope");
+      const before = pendingCheckpoint(await prepareBeforeTurn(nestedGit, "subdirectory-scope"));
       expect(before).not.toBeNull();
       if (!before) return;
       await writeFile(join(nested, "inside.txt"), "inside after turn\n");
-      const after = await finishAfterTurn(git, before, null, null);
+      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
@@ -401,12 +415,10 @@ describe("history-safe Git checkpoints", () => {
       await git(["add", "."]);
       await git(["commit", "-qm", "tree equivalence fixtures"]);
 
-      const rootCheckpoint = await prepareBeforeTurn(git, "root-tree");
+      const rootCheckpoint = pendingCheckpoint(await prepareBeforeTurn(git, "root-tree"));
       expect(rootCheckpoint).not.toBeNull();
       if (!rootCheckpoint) return;
-      const nestedCheckpoint = await prepareBeforeTurn(nestedGit, "nested-tree");
-      expect(nestedCheckpoint).not.toBeNull();
-      if (!nestedCheckpoint) return;
+      const nestedCheckpoint = pendingCheckpoint(await prepareBeforeTurn(nestedGit, "nested-tree"));
 
       expect(await text(git, ["rev-parse", `${rootCheckpoint.beforeHash}^{tree}`])).toBe(
         await text(git, ["rev-parse", `${nestedCheckpoint.beforeHash}^{tree}`]),
@@ -420,7 +432,7 @@ describe("history-safe Git checkpoints", () => {
     const { cwd, git } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const before = await prepareBeforeTurn(git, "branch-switch");
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "branch-switch"));
       expect(before).not.toBeNull();
       if (!before) return;
       await git(["switch", "-c", "B"]);
@@ -428,7 +440,7 @@ describe("history-safe Git checkpoints", () => {
       const branchBTip = await text(git, ["rev-parse", "B"]);
       const refsAfterSwitch = await branchRefs(git);
       await writeFile(join(cwd, "tracked.txt"), "branch B after\n");
-      const after = await finishAfterTurn(git, before, null, null);
+      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
@@ -471,7 +483,7 @@ describe("history-safe Git checkpoints", () => {
 
       const saved = await indexState(git, cwd);
       const beforeStatus = await text(git, ["status", "--porcelain=v2"]);
-      const before = await prepareBeforeTurn(git, "index-preservation");
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "index-preservation"));
       expect(before).not.toBeNull();
       if (!before) return;
       expect(await indexState(git, cwd)).toEqual(saved);
@@ -479,7 +491,7 @@ describe("history-safe Git checkpoints", () => {
 
       await writeFile(join(cwd, "staged.txt"), "after turn\n");
       await writeFile(join(cwd, "after-only.txt"), "after only\n");
-      const after = await finishAfterTurn(git, before, null, null);
+      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
       expect(await indexState(git, cwd)).toEqual(saved);
@@ -499,12 +511,12 @@ describe("history-safe Git checkpoints", () => {
     try {
       await initializeBranch(git, cwd);
       const refs = await branchRefs(git);
-      const before = await prepareBeforeTurn(git, "ref-invariant");
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "ref-invariant"));
       expect(before).not.toBeNull();
       if (!before) return;
       expect(await branchRefs(git)).toBe(refs);
       await writeFile(join(cwd, "tracked.txt"), "changed\n");
-      const after = await finishAfterTurn(git, before, null, null);
+      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
       expect(await branchRefs(git)).toBe(refs);
@@ -545,7 +557,7 @@ describe("history-safe Git checkpoints", () => {
         symlinkMode && symlinkConfig.code === 0 && symlinkConfig.stdout.trim() === "true";
       await writeFile(join(cwd, "before-only.txt"), "before only\n");
       const executableBefore = (await stat(join(cwd, "executable.sh"))).mode & 0o111;
-      const before = await prepareBeforeTurn(git, "restoration-matrix");
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "restoration-matrix"));
       expect(before).not.toBeNull();
       if (!before) return;
       await rm(join(cwd, "old name.txt"));
@@ -558,7 +570,7 @@ describe("history-safe Git checkpoints", () => {
         await writeFile(join(cwd, "link to old.txt"), "regular file\n");
       }
       await writeFile(join(cwd, "after-only Ω.txt"), "after only\n");
-      const after = await finishAfterTurn(git, before, null, null);
+      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
@@ -592,11 +604,11 @@ describe("history-safe Git checkpoints", () => {
     const { cwd, git } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const before = await prepareBeforeTurn(git, "conflict");
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "conflict"));
       expect(before).not.toBeNull();
       if (!before) return;
       await writeFile(join(cwd, "tracked.txt"), "after\n");
-      const after = await finishAfterTurn(git, before, null, null);
+      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
       const checkpoint = checkpointWithRepository(
@@ -617,12 +629,11 @@ describe("history-safe Git checkpoints", () => {
       const navigation = new SessionNavigation(navigationPort, git);
       await navigation.recordTurnEnd(checkpoint);
 
-      expect(await navigation.undo()).toBe("git_failed");
-      expect(navigation.getLastGitFailure()).toBe("conflict");
+      expect(await navigation.undo()).toEqual({ status: "git_failed", failure: "conflict" });
       expect(await readFile(join(cwd, "tracked.txt"))).toEqual(savedContent);
       expect(await indexState(git, cwd)).toEqual(savedIndex);
       expect(await branchRefs(git)).toBe(savedRefs);
-      expect(await navigation.undo()).toBe("git_failed");
+      expect((await navigation.undo()).status).toBe("git_failed");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -639,12 +650,12 @@ describe("history-safe Git checkpoints", () => {
       await git(["reset", "--mixed", "HEAD^"]);
       await writeFile(join(cwd, "untracked.txt"), "before-only\n");
 
-      const before = await prepareBeforeTurn(git, "gc");
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "gc"));
       expect(before).not.toBeNull();
       if (!before) return;
       await writeFile(join(cwd, "tracked.txt"), "after\n");
       await writeFile(join(cwd, "untracked.txt"), "after-only\n");
-      const checkpoint = await finishAfterTurn(git, before, null, null);
+      const checkpoint = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(checkpoint).not.toBeNull();
       if (!checkpoint) return;
       await git(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"]);
@@ -664,11 +675,11 @@ describe("history-safe Git checkpoints", () => {
     const { cwd, git } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const before = await prepareBeforeTurn(git, "batch");
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "batch"));
       expect(before).not.toBeNull();
       if (!before) return;
       await writeFile(join(cwd, "tracked.txt"), "after\n");
-      const checkpoint = await finishAfterTurn(git, before, null, null);
+      const checkpoint = completedCheckpoint(await finishAfterTurn(git, before, null, null));
       expect(checkpoint).not.toBeNull();
       if (!checkpoint) return;
       await git(["update-ref", "refs/keep", "HEAD"]);
@@ -698,6 +709,79 @@ describe("history-safe Git checkpoints", () => {
       expect((await git(["rev-parse", "refs/keep"])).stdout.trim()).toBe(
         (await git(["rev-parse", "HEAD"])).stdout.trim(),
       );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it("supports full checkpoints in an unborn repository", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      await writeFile(join(cwd, "before.txt"), "before\n");
+      const prepared = await prepareBeforeTurn(git, "unborn");
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+
+      await rm(join(cwd, "before.txt"));
+      await writeFile(join(cwd, "after.txt"), "after\n");
+      const finished = await finishAfterTurn(git, prepared.checkpoint, "u1", "a1");
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+
+      expect(
+        await applyCheckpoint(git, finished.checkpoint.afterHash, finished.checkpoint.beforeHash),
+      ).toBe("applied");
+      await expect(readFile(join(cwd, "before.txt"), "utf8")).resolves.toBe("before\n");
+      await expect(readFile(join(cwd, "after.txt"))).rejects.toThrow();
+
+      expect(
+        await applyCheckpoint(git, finished.checkpoint.beforeHash, finished.checkpoint.afterHash),
+      ).toBe("applied");
+      await expect(readFile(join(cwd, "after.txt"), "utf8")).resolves.toBe("after\n");
+      expect((await git(["rev-parse", "HEAD"])).code).not.toBe(0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("creates valid empty snapshots in an unborn repository", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      const prepared = await prepareBeforeTurn(git, "empty-unborn");
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+      expect(await text(git, ["rev-parse", `${finished.checkpoint.beforeHash}^{tree}`])).toMatch(
+        /^[0-9a-f]{40}$/,
+      );
+      expect(await text(git, ["rev-parse", `${finished.checkpoint.afterHash}^{tree}`])).toMatch(
+        /^[0-9a-f]{40}$/,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a stable reason when the cwd is not a repository", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-non-repo-"));
+    try {
+      const result = await prepareBeforeTurn(gitRunner(cwd), "non-repo");
+      expect(result).toEqual({ status: "session_only", reason: "not_repository" });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies a malformed HEAD instead of treating it as unborn", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, ".git", "HEAD"), "not-a-head\n");
+      expect(await prepareBeforeTurn(git, "invalid-head")).toEqual({
+        status: "session_only",
+        reason: "invalid_head",
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

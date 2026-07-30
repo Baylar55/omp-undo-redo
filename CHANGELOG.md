@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.23] - 2026-07-29
+
+### Fixed
+
+- Keep every completed turn available for session-only undo/redo when Git file checkpointing is unavailable.
+- Support full file checkpoints in initialized unborn Git repositories without changing `HEAD`, branch refs, or the real index.
+- Report stable checkpoint-unavailability reasons in `/undo` and `/redo` notifications.
+
 ## [1.0.22] - 2026-07-29
 
 ### Fixed

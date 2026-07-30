@@ -11,12 +11,34 @@ export interface SessionReader {
   getEntry(id: string): SessionEntryLike | undefined;
 }
 
-export interface NavigationResult {
+export type FileCheckpointUnavailableReason =
+  | "git_unavailable"
+  | "not_repository"
+  | "repository_unresolvable"
+  | "invalid_head"
+  | "before_snapshot_failed"
+  | "before_ref_failed"
+  | "after_snapshot_failed"
+  | "after_ref_failed";
+
+export type TreeNavigationResult = {
   cancelled: boolean;
-}
+};
+
+export type NavigationResult =
+  | { status: "moved"; files: "restored" }
+  | {
+      status: "moved";
+      files: "unavailable";
+      reason: FileCheckpointUnavailableReason;
+    }
+  | { status: "empty" }
+  | { status: "cancelled" }
+  | { status: "git_failed"; failure: "conflict" | "failed" }
+  | { status: "rollback_failed" };
 
 export interface NavigationPort extends SessionReader {
-  navigateTree(targetId: string): Promise<NavigationResult>;
+  navigateTree(targetId: string): Promise<TreeNavigationResult>;
 }
 
 export interface GitRunOptions {
@@ -24,10 +46,17 @@ export interface GitRunOptions {
   stdin?: string;
 }
 
-export type GitRunner = (
+export type GitRunner = ((
   args: string[],
   options?: GitRunOptions,
-) => Promise<{ stdout: string; stderr: string; code: number }>;
+) => Promise<{
+  stdout: string;
+  stderr: string;
+  code: number;
+  error?: "unavailable";
+}>) & {
+  cwd?: string;
+};
 
 export interface GitRepository {
   worktree: string;
@@ -36,6 +65,7 @@ export interface GitRepository {
 }
 
 export interface GitCheckpoint {
+  kind: "git";
   repository: GitRepository;
   beforeHash: string;
   beforeRef: string;
@@ -45,12 +75,30 @@ export interface GitCheckpoint {
   leafId: string | null;
 }
 
-export interface PendingCheckpoint {
+export interface SessionOnlyCheckpoint {
+  kind: "session";
+  reason: FileCheckpointUnavailableReason;
+  parentLeafId: string | null;
+  leafId: string | null;
+}
+
+export type TurnCheckpoint = GitCheckpoint | SessionOnlyCheckpoint;
+
+export interface PendingGitCheckpoint {
+  kind: "git";
   repository: GitRepository;
   beforeHash: string;
   beforeRef: string;
   checkpointId: string;
   parentLeafId: string | null;
 }
+
+export interface PendingSessionCheckpoint {
+  kind: "session";
+  reason: FileCheckpointUnavailableReason;
+  parentLeafId: string | null;
+}
+
+export type PendingTurnCheckpoint = PendingGitCheckpoint | PendingSessionCheckpoint;
 
 export type GitRunnerFactory = (repository: GitRepository) => GitRunner;

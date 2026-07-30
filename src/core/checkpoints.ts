@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type {
+  FileCheckpointUnavailableReason,
   GitCheckpoint,
   GitRepository,
   GitRunner,
-  PendingCheckpoint,
+  PendingGitCheckpoint,
   SessionReader,
 } from "./types.js";
 
@@ -26,23 +27,22 @@ function checkpointRefs(
   return { beforeRef: `${prefix}/before`, afterRef: `${prefix}/after` };
 }
 
-async function run(git: GitRunner, args: string[]): Promise<boolean> {
+type GitCommandResult = Awaited<ReturnType<GitRunner>>;
+
+async function invoke(
+  git: GitRunner,
+  args: string[],
+  options?: Parameters<GitRunner>[1],
+): Promise<GitCommandResult> {
   try {
-    return (await git(args)).code === 0;
+    return await git(args, options);
   } catch {
-    return false;
+    return { stdout: "", stderr: "", code: 1, error: "unavailable" };
   }
 }
 
-async function output(git: GitRunner, args: string[]): Promise<string | null> {
-  try {
-    const result = await git(args);
-    if (result.code !== 0) return null;
-    const value = result.stdout.trim();
-    return value || null;
-  } catch {
-    return null;
-  }
+async function run(git: GitRunner, args: string[]): Promise<boolean> {
+  return (await invoke(git, args)).code === 0;
 }
 
 async function canonicalPath(value: string, base: string): Promise<string> {
@@ -54,38 +54,97 @@ async function canonicalPath(value: string, base: string): Promise<string> {
   }
 }
 
-async function resolveRepository(git: GitRunner): Promise<GitRepository | null> {
-  const worktree = await output(git, ["rev-parse", "--show-toplevel"]);
-  const gitDir = await output(git, ["rev-parse", "--git-dir"]);
-  const commonDir = await output(git, ["rev-parse", "--git-common-dir"]);
-  if (!worktree || !gitDir || !commonDir) return null;
+type RepositoryResolution =
+  | { repository: GitRepository }
+  | { reason: "git_unavailable" | "not_repository" | "repository_unresolvable" };
+
+async function resolveRepository(git: GitRunner): Promise<RepositoryResolution> {
+  const worktreeResult = await invoke(git, ["rev-parse", "--show-toplevel"]);
+  if (worktreeResult.error === "unavailable") return { reason: "git_unavailable" };
+  const worktree = worktreeResult.code === 0 ? worktreeResult.stdout.trim() : "";
+  if (!worktree) {
+    const cwd = git.cwd;
+    if (!cwd) return { reason: "not_repository" };
+    try {
+      const gitPath = join(cwd, ".git");
+      if (!(await stat(gitPath)).isDirectory()) return { reason: "repository_unresolvable" };
+      const canonicalWorktree = await canonicalPath(cwd, cwd);
+      const canonicalGitDir = await canonicalPath(gitPath, canonicalWorktree);
+      return {
+        repository: {
+          worktree: canonicalWorktree,
+          gitDir: canonicalGitDir,
+          commonDir: canonicalGitDir,
+        },
+      };
+    } catch {
+      return { reason: "not_repository" };
+    }
+  }
+
+  const gitDirResult = await invoke(git, ["rev-parse", "--git-dir"]);
+  const commonDirResult = await invoke(git, ["rev-parse", "--git-common-dir"]);
+  if (gitDirResult.error === "unavailable" || commonDirResult.error === "unavailable") {
+    return { reason: "git_unavailable" };
+  }
+  const gitDir = gitDirResult.code === 0 ? gitDirResult.stdout.trim() : "";
+  const commonDir = commonDirResult.code === 0 ? commonDirResult.stdout.trim() : "";
+  if (!gitDir || !commonDir) return { reason: "repository_unresolvable" };
+
   const canonicalWorktree = await canonicalPath(worktree, worktree);
   return {
-    worktree: canonicalWorktree,
-    gitDir: await canonicalPath(gitDir, canonicalWorktree),
-    commonDir: await canonicalPath(commonDir, canonicalWorktree),
+    repository: {
+      worktree: canonicalWorktree,
+      gitDir: await canonicalPath(gitDir, canonicalWorktree),
+      commonDir: await canonicalPath(commonDir, canonicalWorktree),
+    },
   };
 }
 
-async function createSnapshotCommit(git: GitRunner, message: string): Promise<string | null> {
+type SnapshotResult = { hash: string } | { reason: "invalid_head" | "snapshot_failed" };
+
+async function seedSnapshotIndex(
+  git: GitRunner,
+  env: Record<string, string>,
+): Promise<"seeded" | "empty" | "invalid_head" | "failed"> {
+  const headTree = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
+  if (headTree.code === 0 && headTree.stdout.trim()) {
+    const seeded = await invoke(git, ["read-tree", headTree.stdout.trim()], { env });
+    return seeded.code === 0 ? "seeded" : "failed";
+  }
+  if (headTree.error === "unavailable") return "failed";
+
+  const symbolicHead = await invoke(git, ["symbolic-ref", "-q", "HEAD"]);
+  if (symbolicHead.code !== 0 || !symbolicHead.stdout.trim()) return "invalid_head";
+  const branchRef = symbolicHead.stdout.trim();
+  const branch = await invoke(git, ["show-ref", "--verify", "--quiet", branchRef]);
+  if (branch.code === 0) return "invalid_head";
+  if (branch.error === "unavailable") return "failed";
+
+  const empty = await invoke(git, ["read-tree", "--empty"], { env });
+  return empty.code === 0 ? "empty" : "failed";
+}
+
+async function createSnapshotCommit(git: GitRunner, message: string): Promise<SnapshotResult> {
   const tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-index-"));
   const indexPath = join(tempDirectory, "index");
   const env = { GIT_INDEX_FILE: indexPath };
   try {
-    const seeded = await git(["read-tree", "HEAD"], { env });
-    if (seeded.code !== 0) return null;
-    const added = await git(["add", "-A", "--", WORKTREE_PATHSPEC], { env });
-    if (added.code !== 0) return null;
-    const tree = await git(["write-tree"], { env });
-    if (tree.code !== 0) return null;
+    const seeded = await seedSnapshotIndex(git, env);
+    if (seeded === "invalid_head") return { reason: "invalid_head" };
+    if (seeded === "failed") return { reason: "snapshot_failed" };
+    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env });
+    if (added.code !== 0) return { reason: "snapshot_failed" };
+    const tree = await invoke(git, ["write-tree"], { env });
+    if (tree.code !== 0) return { reason: "snapshot_failed" };
     const treeHash = tree.stdout.trim();
-    if (!treeHash) return null;
-    const commit = await git([...GIT_AUTHOR, "commit-tree", treeHash, "-m", message]);
-    if (commit.code !== 0) return null;
+    if (!treeHash) return { reason: "snapshot_failed" };
+    const commit = await invoke(git, [...GIT_AUTHOR, "commit-tree", treeHash, "-m", message]);
+    if (commit.code !== 0) return { reason: "snapshot_failed" };
     const commitHash = commit.stdout.trim();
-    return commitHash || null;
+    return commitHash ? { hash: commitHash } : { reason: "snapshot_failed" };
   } catch {
-    return null;
+    return { reason: "snapshot_failed" };
   } finally {
     await rm(tempDirectory, { recursive: true, force: true });
   }
@@ -97,22 +156,47 @@ export interface RefRelease {
   expectedHash: string;
 }
 
+async function releaseLooseRef(
+  repository: GitRepository,
+  ref: string,
+  expectedHash: string,
+): Promise<boolean> {
+  if (!ref.startsWith("refs/") || ref.includes("..")) return false;
+  const path = join(repository.commonDir, ref);
+  try {
+    if ((await readFile(path, "utf8")).trim() !== expectedHash) return false;
+    await rm(path, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function releaseRefBatch(
   git: GitRunner,
   refs: readonly Pick<RefRelease, "ref" | "expectedHash">[],
+  repository?: GitRepository,
 ): Promise<boolean> {
   if (refs.length === 0) return true;
   const input = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n");
+  const args = ["update-ref", "--stdin"];
+  const options = repository
+    ? { env: { GIT_DIR: repository.commonDir }, stdin: `${input}\n` }
+    : { stdin: `${input}\n` };
   try {
-    const result = await git(["update-ref", "--stdin"], { stdin: `${input}\n` });
+    const result = await git(args, options);
     if (result.code === 0) return true;
   } catch {
     // Retry smaller batches below.
   }
-  if (refs.length === 1) return false;
+  if (refs.length === 1) {
+    return repository
+      ? await releaseLooseRef(repository, refs[0].ref, refs[0].expectedHash)
+      : false;
+  }
   const midpoint = Math.ceil(refs.length / 2);
-  const left = await releaseRefBatch(git, refs.slice(0, midpoint));
-  const right = await releaseRefBatch(git, refs.slice(midpoint));
+  const left = await releaseRefBatch(git, refs.slice(0, midpoint), repository);
+  const right = await releaseRefBatch(git, refs.slice(midpoint), repository);
   return left && right;
 }
 
@@ -134,7 +218,7 @@ export async function releaseRefs(
   const results = await Promise.allSettled(
     [...grouped.values()].map(async ({ repository, refs: groupedRefs }) => {
       try {
-        return await releaseRefBatch(gitForRepository(repository), groupedRefs);
+        return await releaseRefBatch(gitForRepository(repository), groupedRefs, repository);
       } catch {
         return false;
       }
@@ -187,23 +271,38 @@ export async function releaseCheckpoint(
 
 export async function releasePendingCheckpoint(
   git: GitRunner,
-  pending: Pick<PendingCheckpoint, "beforeHash" | "beforeRef">,
+  pending: Pick<PendingGitCheckpoint, "repository" | "beforeHash" | "beforeRef">,
 ): Promise<boolean> {
-  return releaseRefBatch(git, [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }]);
+  return releaseRefBatch(
+    git,
+    [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }],
+    pending.repository,
+  );
 }
+
+export type PrepareBeforeTurnResult =
+  | { status: "git"; checkpoint: PendingGitCheckpoint }
+  | { status: "session_only"; reason: FileCheckpointUnavailableReason };
+
+export type FinishAfterTurnResult =
+  | { status: "git"; checkpoint: GitCheckpoint }
+  | { status: "session_only"; reason: FileCheckpointUnavailableReason };
 
 export async function prepareBeforeTurn(
   git: GitRunner,
   sessionId: string,
-): Promise<PendingCheckpoint | null> {
-  const repository = await resolveRepository(git);
-  if (!repository) return null;
-  const head = await output(git, ["rev-parse", "HEAD"]);
-  if (!head) return null;
+): Promise<PrepareBeforeTurnResult> {
+  const resolved = await resolveRepository(git);
+  if ("reason" in resolved) return { status: "session_only", reason: resolved.reason };
 
   const checkpointId = randomUUID();
-  const beforeHash = await createSnapshotCommit(git, "omp-undo-redo: before turn");
-  if (!beforeHash) return null;
+  const snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn");
+  if (!("hash" in snapshot)) {
+    return {
+      status: "session_only",
+      reason: snapshot.reason === "invalid_head" ? "invalid_head" : "before_snapshot_failed",
+    };
+  }
   const beforeRef = checkpointRefs(sessionId, checkpointId).beforeRef;
   if (
     !(await run(git, [
@@ -211,24 +310,40 @@ export async function prepareBeforeTurn(
       "-m",
       "omp-undo-redo: retain before checkpoint",
       beforeRef,
-      beforeHash,
+      snapshot.hash,
     ]))
   ) {
-    return null;
+    return {
+      status: "session_only",
+      reason: "before_ref_failed",
+    };
   }
-  return { repository, beforeHash, beforeRef, checkpointId, parentLeafId: null };
+  return {
+    status: "git",
+    checkpoint: {
+      kind: "git",
+      repository: resolved.repository,
+      beforeHash: snapshot.hash,
+      beforeRef,
+      checkpointId,
+      parentLeafId: null,
+    },
+  };
 }
 
 export async function finishAfterTurn(
   git: GitRunner,
-  before: Pick<PendingCheckpoint, "repository" | "beforeHash" | "beforeRef" | "checkpointId">,
+  before: Pick<PendingGitCheckpoint, "repository" | "beforeHash" | "beforeRef" | "checkpointId">,
   parentLeafId: string | null,
   leafId: string | null,
-): Promise<GitCheckpoint | null> {
-  const afterHash = await createSnapshotCommit(git, "omp-undo-redo: after turn");
-  if (!afterHash) {
+): Promise<FinishAfterTurnResult> {
+  const snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
+  if (!("hash" in snapshot)) {
     await releasePendingCheckpoint(git, before);
-    return null;
+    return {
+      status: "session_only",
+      reason: snapshot.reason === "invalid_head" ? "invalid_head" : "after_snapshot_failed",
+    };
   }
   const afterRef = before.beforeRef.replace(/\/before$/, "/after");
   if (
@@ -237,20 +352,24 @@ export async function finishAfterTurn(
       "-m",
       "omp-undo-redo: retain after checkpoint",
       afterRef,
-      afterHash,
+      snapshot.hash,
     ]))
   ) {
     await releasePendingCheckpoint(git, before);
-    return null;
+    return { status: "session_only", reason: "after_ref_failed" };
   }
   return {
-    repository: before.repository,
-    beforeHash: before.beforeHash,
-    beforeRef: before.beforeRef,
-    afterHash,
-    afterRef,
-    parentLeafId,
-    leafId,
+    status: "git",
+    checkpoint: {
+      kind: "git",
+      repository: before.repository,
+      beforeHash: before.beforeHash,
+      beforeRef: before.beforeRef,
+      afterHash: snapshot.hash,
+      afterRef,
+      parentLeafId,
+      leafId,
+    },
   };
 }
 
