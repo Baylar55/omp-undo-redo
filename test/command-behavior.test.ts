@@ -1,6 +1,12 @@
 import { SessionNavigation } from "../src/core/session-navigation.js";
 import { describe, expect, it } from "vitest";
-import type { GitCheckpoint, GitRepository, GitRunner, NavigationPort } from "../src/core/types.js";
+import type {
+  GitCheckpoint,
+  GitRepository,
+  GitRunner,
+  NavigationPort,
+  SessionOnlyCheckpoint,
+} from "../src/core/types.js";
 
 function mockGit(): GitRunner {
   return async () => ({ stdout: "", stderr: "", code: 0 });
@@ -58,11 +64,21 @@ function checkpoint(parentLeafId: string | null, leafId: string): GitCheckpoint 
     commonDir: ".git",
   };
   return {
+    kind: "git",
     repository,
     beforeHash: `before-${leafId}`,
     beforeRef: `refs/omp-undo-redo/test/${leafId}/before`,
     afterHash: `after-${leafId}`,
     afterRef: `refs/omp-undo-redo/test/${leafId}/after`,
+    parentLeafId,
+    leafId,
+  };
+}
+
+function sessionCheckpoint(parentLeafId: string | null, leafId: string): SessionOnlyCheckpoint {
+  return {
+    kind: "session",
+    reason: "not_repository",
     parentLeafId,
     leafId,
   };
@@ -81,17 +97,17 @@ describe("session navigation", () => {
     navigation.recordTurnEnd(checkpoint("u1", "a1"));
     navigation.recordTurnEnd(checkpoint("u2", "a2"));
 
-    expect(await navigation.undo()).toBe("moved");
+    expect((await navigation.undo()).status).toBe("moved");
     expect(session.leaf).toBe("u2");
-    expect(await navigation.undo()).toBe("moved");
+    expect((await navigation.undo()).status).toBe("moved");
     expect(session.leaf).toBe("u1");
-    expect(await navigation.undo()).toBe("empty");
+    expect((await navigation.undo()).status).toBe("empty");
 
-    expect(await navigation.redo()).toBe("moved");
+    expect((await navigation.redo()).status).toBe("moved");
     expect(session.leaf).toBe("a1");
-    expect(await navigation.redo()).toBe("moved");
+    expect((await navigation.redo()).status).toBe("moved");
     expect(session.leaf).toBe("a2");
-    expect(await navigation.redo()).toBe("empty");
+    expect((await navigation.redo()).status).toBe("empty");
   });
 
   it("preserves redo for matching internal tree navigation", async () => {
@@ -107,9 +123,9 @@ describe("session navigation", () => {
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
 
-    expect(await navigation.undo()).toBe("moved");
-    expect(await navigation.redo()).toBe("moved");
-    expect(await navigation.redo()).toBe("empty");
+    expect((await navigation.undo()).status).toBe("moved");
+    expect((await navigation.redo()).status).toBe("moved");
+    expect((await navigation.redo()).status).toBe("empty");
   });
 
   it("invalidates only redo after unrelated tree navigation", async () => {
@@ -117,13 +133,13 @@ describe("session navigation", () => {
     const navigation = makeNavigation(session);
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
-    expect(await navigation.undo()).toBe("moved");
+    expect((await navigation.undo()).status).toBe("moved");
 
     await navigation.handleSessionTreeNavigation("u2", "other");
 
-    expect(await navigation.redo()).toBe("empty");
+    expect((await navigation.redo()).status).toBe("empty");
     expect(session.navigateCalls).toEqual(["u2"]);
-    expect(await navigation.undo()).toBe("moved");
+    expect((await navigation.undo()).status).toBe("moved");
     expect(session.navigateCalls).toEqual(["u2", "u1"]);
   });
 
@@ -132,11 +148,11 @@ describe("session navigation", () => {
     const navigation = makeNavigation(session);
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
-    expect(await navigation.undo()).toBe("moved");
+    expect((await navigation.undo()).status).toBe("moved");
 
     await navigation.handleSessionTreeNavigation("u2", "u2");
 
-    expect(await navigation.redo()).toBe("moved");
+    expect((await navigation.redo()).status).toBe("moved");
   });
 
   it("clears an expected transition after cancelled navigation", async () => {
@@ -144,13 +160,13 @@ describe("session navigation", () => {
     const navigation = makeNavigation(session);
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
-    expect(await navigation.undo()).toBe("moved");
+    expect((await navigation.undo()).status).toBe("moved");
     navigation.setNavigateTree(async () => ({ cancelled: true }));
 
-    expect(await navigation.redo()).toBe("cancelled");
+    expect((await navigation.redo()).status).toBe("cancelled");
     await navigation.handleSessionTreeNavigation("u2", "a2");
 
-    expect(await navigation.redo()).toBe("empty");
+    expect((await navigation.redo()).status).toBe("empty");
   });
 
   it("clears forward checkpoints on a new branch", async () => {
@@ -160,7 +176,7 @@ describe("session navigation", () => {
     navigation.recordTurnEnd(checkpoint("u2", "a2"));
     await navigation.undo();
     navigation.recordTurnEnd(checkpoint("u1", "new-branch"));
-    expect(await navigation.redo()).toBe("empty");
+    expect((await navigation.redo()).status).toBe("empty");
   });
 
   it("rejects cancelled navigation", async () => {
@@ -168,8 +184,8 @@ describe("session navigation", () => {
     session.navigateTree = async () => ({ cancelled: true });
     const navigation = makeNavigation(session);
     navigation.recordTurnEnd(checkpoint("u1", "a1"));
-    expect(await navigation.undo()).toBe("cancelled");
-    expect(await navigation.redo()).toBe("empty");
+    expect((await navigation.undo()).status).toBe("cancelled");
+    expect((await navigation.redo()).status).toBe("empty");
   });
 
   it("reports Git restore failures", async () => {
@@ -177,6 +193,68 @@ describe("session navigation", () => {
     const failingGit: GitRunner = async () => ({ stdout: "", stderr: "fatal", code: 128 });
     const navigation = new SessionNavigation(session, failingGit);
     navigation.recordTurnEnd(checkpoint("u1", "a1"));
-    expect(await navigation.undo()).toBe("git_failed");
+    expect((await navigation.undo()).status).toBe("git_failed");
+  });
+  it("supports repeated session-only undo and redo", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    await navigation.recordTurnEnd(sessionCheckpoint("u1", "a1"));
+    await navigation.recordTurnEnd(sessionCheckpoint("u2", "a2"));
+
+    expect(await navigation.undo()).toEqual({
+      status: "moved",
+      files: "unavailable",
+      reason: "not_repository",
+    });
+    expect(await navigation.undo()).toEqual({
+      status: "moved",
+      files: "unavailable",
+      reason: "not_repository",
+    });
+    expect(await navigation.redo()).toEqual({
+      status: "moved",
+      files: "unavailable",
+      reason: "not_repository",
+    });
+    expect(await navigation.redo()).toEqual({
+      status: "moved",
+      files: "unavailable",
+      reason: "not_repository",
+    });
+  });
+
+  it("processes mixed Git and session-only history in order", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(sessionCheckpoint("a1", "a2"));
+
+    expect((await navigation.undo()).files).toBe("unavailable");
+    expect((await navigation.undo()).files).toBe("restored");
+    expect((await navigation.redo()).files).toBe("restored");
+    expect((await navigation.redo()).files).toBe("unavailable");
+  });
+
+  it("does not move the history index when session navigation is cancelled", async () => {
+    const session = port();
+    session.navigateTree = async () => ({ cancelled: true });
+    const navigation = makeNavigation(session);
+    await navigation.recordTurnEnd(sessionCheckpoint("u1", "a1"));
+
+    expect((await navigation.undo()).status).toBe("cancelled");
+    navigation.setNavigateTree(async () => ({ cancelled: false }));
+    expect((await navigation.undo()).status).toBe("moved");
+  });
+
+  it("does not call Git while disposing session-only entries", async () => {
+    let calls = 0;
+    const git: GitRunner = async () => {
+      calls++;
+      return { stdout: "", stderr: "", code: 0 };
+    };
+    const navigation = new SessionNavigation(port(), git);
+    await navigation.recordTurnEnd(sessionCheckpoint("u1", "a1"));
+    await navigation.dispose();
+    expect(calls).toBe(0);
   });
 });

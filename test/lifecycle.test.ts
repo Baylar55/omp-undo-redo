@@ -96,6 +96,15 @@ async function makeRepository(): Promise<string> {
   return cwd;
 }
 
+async function makeUnbornRepository(): Promise<string> {
+  const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-unborn-"));
+  await git(cwd, ["init", "-q"]);
+  await git(cwd, ["config", "user.name", "test"]);
+  await git(cwd, ["config", "user.email", "test@example.com"]);
+  await git(cwd, ["config", "core.autocrlf", "false"]);
+  return cwd;
+}
+
 async function privateRefs(cwd: string): Promise<string[]> {
   const output = await git(cwd, ["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"]);
   return output ? output.split("\n") : [];
@@ -125,6 +134,81 @@ async function prepareUndoneSession(
   await pi.runCommand("undo", ctx);
   return ctx;
 }
+
+describe("session-only lifecycle fallback", () => {
+  it("keeps non-Git turns undoable without changing files", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-non-git-lifecycle-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = await prepareUndoneSession(pi, cwd, "non-git-session");
+
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the working directory is not a Git repository.",
+      );
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid the session turn, but files were not restored because the working directory is not a Git repository.",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("restores files for turns in an unborn repository", async () => {
+    const cwd = await makeUnbornRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = await prepareUndoneSession(pi, cwd, "unborn-session");
+
+      await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored.",
+      );
+      expect(await privateRefs(cwd)).toHaveLength(2);
+      await pi.runCommand("redo", ctx);
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored.",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("retains a session boundary when after-snapshot creation fails", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "after-failure-session");
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(1);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await writeFile(join(cwd, ".git", "HEAD"), "not-a-head\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      await writeFile(join(cwd, ".git", "HEAD"), "ref: refs/heads/master\n");
+      expect(await privateRefs(cwd)).toEqual([]);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the Git repository has an invalid HEAD.",
+      );
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("navigation invalidation lifecycle", () => {
   it("clears redo after unrelated session tree navigation", async () => {

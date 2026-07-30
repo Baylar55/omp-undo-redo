@@ -5,12 +5,13 @@ import type {
   GitRunnerFactory,
   NavigationPort,
   NavigationResult,
+  SessionOnlyCheckpoint,
+  TreeNavigationResult,
+  TurnCheckpoint,
 } from "./types.js";
 import { applyCheckpoint, releaseCheckpoints } from "./checkpoints.js";
 
-export type NavigationOutcome = "moved" | "empty" | "cancelled" | "git_failed" | "rollback_failed";
-
-type GitFailure = "conflict" | "failed" | "rollback_failed";
+export type NavigationOutcome = NavigationResult;
 
 type ExpectedTreeNavigation = {
   oldLeafId: string | null;
@@ -18,11 +19,10 @@ type ExpectedTreeNavigation = {
 };
 
 export class SessionNavigation {
-  private checkpoints: GitCheckpoint[] = [];
+  private checkpoints: TurnCheckpoint[] = [];
   private currentIndex = -1;
   private navigateTree: NavigationPort["navigateTree"] = async () => ({ cancelled: true });
   private expectedTreeNavigation: ExpectedTreeNavigation | null = null;
-  private lastGitFailure: GitFailure | null = null;
   private readonly gitForRepository: GitRunnerFactory;
 
   constructor(
@@ -40,7 +40,7 @@ export class SessionNavigation {
     this.navigateTree = navigateTree;
   }
 
-  private async navigateTo(targetId: string): Promise<NavigationResult> {
+  private async navigateTo(targetId: string): Promise<TreeNavigationResult> {
     this.expectedTreeNavigation = {
       oldLeafId: this.port.getLeafId(),
       newLeafId: targetId,
@@ -69,87 +69,88 @@ export class SessionNavigation {
 
   async invalidateRedo(): Promise<void> {
     const discarded = this.checkpoints.splice(this.currentIndex + 1);
-    await releaseCheckpoints(this.gitForRepository, discarded);
+    await releaseCheckpoints(
+      this.gitForRepository,
+      discarded.filter((checkpoint): checkpoint is GitCheckpoint => checkpoint.kind === "git"),
+    );
   }
 
-  getLastGitFailure(): GitFailure | null {
-    return this.lastGitFailure;
-  }
-
-  async recordTurnEnd(checkpoint: GitCheckpoint): Promise<void> {
+  async recordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
     const discarded = this.checkpoints.splice(
       this.currentIndex + 1,
       this.checkpoints.length - this.currentIndex - 1,
     );
     this.checkpoints.push(checkpoint);
     this.currentIndex = this.checkpoints.length - 1;
-    await releaseCheckpoints(this.gitForRepository, discarded);
+    await releaseCheckpoints(
+      this.gitForRepository,
+      discarded.filter((entry): entry is GitCheckpoint => entry.kind === "git"),
+    );
   }
 
   async dispose(): Promise<void> {
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
     this.currentIndex = -1;
-    await releaseCheckpoints(this.gitForRepository, checkpoints);
+    await releaseCheckpoints(
+      this.gitForRepository,
+      checkpoints.filter((checkpoint): checkpoint is GitCheckpoint => checkpoint.kind === "git"),
+    );
   }
 
-  async undo(): Promise<NavigationOutcome> {
-    this.lastGitFailure = null;
-    if (this.currentIndex < 0) return "empty";
+  private async navigateSession(targetId: string | null): Promise<boolean> {
+    if (!targetId) return true;
+    const result = await this.navigateTo(targetId);
+    return !result.cancelled;
+  }
+
+  private sessionOnlyResult(checkpoint: SessionOnlyCheckpoint): NavigationResult {
+    return { status: "moved", files: "unavailable", reason: checkpoint.reason };
+  }
+
+  async undo(): Promise<NavigationResult> {
+    if (this.currentIndex < 0) return { status: "empty" };
     const checkpoint = this.checkpoints[this.currentIndex];
+    if (checkpoint.kind === "session") {
+      if (!(await this.navigateSession(checkpoint.parentLeafId))) return { status: "cancelled" };
+      this.currentIndex--;
+      return this.sessionOnlyResult(checkpoint);
+    }
+
     const git = this.gitForRepository(checkpoint.repository);
     const applied = await applyCheckpoint(git, checkpoint.afterHash, checkpoint.beforeHash);
     if (applied !== "applied") {
-      this.lastGitFailure = applied;
-      return "git_failed";
+      return { status: "git_failed", failure: applied === "conflict" ? "conflict" : "failed" };
     }
-    if (checkpoint.parentLeafId) {
-      let result: NavigationResult;
-      try {
-        result = await this.navigateTo(checkpoint.parentLeafId);
-      } catch {
-        result = { cancelled: true };
-      }
-      if (result.cancelled) {
-        const compensated = await applyCheckpoint(git, checkpoint.beforeHash, checkpoint.afterHash);
-        if (compensated !== "applied") {
-          this.lastGitFailure = "rollback_failed";
-          return "rollback_failed";
-        }
-        return "cancelled";
-      }
+    if (!(await this.navigateSession(checkpoint.parentLeafId))) {
+      const compensated = await applyCheckpoint(git, checkpoint.beforeHash, checkpoint.afterHash);
+      if (compensated !== "applied") return { status: "rollback_failed" };
+      return { status: "cancelled" };
     }
     this.currentIndex--;
-    return "moved";
+    return { status: "moved", files: "restored" };
   }
 
-  async redo(): Promise<NavigationOutcome> {
-    this.lastGitFailure = null;
-    if (this.currentIndex >= this.checkpoints.length - 1) return "empty";
+  async redo(): Promise<NavigationResult> {
+    if (this.currentIndex >= this.checkpoints.length - 1) return { status: "empty" };
     const checkpoint = this.checkpoints[this.currentIndex + 1];
+    if (checkpoint.kind === "session") {
+      if (!(await this.navigateSession(checkpoint.leafId))) return { status: "cancelled" };
+      this.currentIndex++;
+      return this.sessionOnlyResult(checkpoint);
+    }
+
     const git = this.gitForRepository(checkpoint.repository);
     const applied = await applyCheckpoint(git, checkpoint.beforeHash, checkpoint.afterHash);
     if (applied !== "applied") {
-      this.lastGitFailure = applied;
-      return "git_failed";
+      return { status: "git_failed", failure: applied === "conflict" ? "conflict" : "failed" };
     }
-    if (checkpoint.leafId) {
-      let result: NavigationResult;
-      try {
-        result = await this.navigateTo(checkpoint.leafId);
-      } catch {
-        result = { cancelled: true };
-      }
-      if (result.cancelled) {
-        const compensated = await applyCheckpoint(git, checkpoint.afterHash, checkpoint.beforeHash);
-        if (compensated !== "applied") {
-          this.lastGitFailure = "rollback_failed";
-          return "rollback_failed";
-        }
-        return "cancelled";
-      }
+    if (!(await this.navigateSession(checkpoint.leafId))) {
+      const compensated = await applyCheckpoint(git, checkpoint.afterHash, checkpoint.beforeHash);
+      if (compensated !== "applied") return { status: "rollback_failed" };
+      return { status: "cancelled" };
     }
     this.currentIndex++;
-    return "moved";
+    return { status: "moved", files: "restored" };
   }
 }
