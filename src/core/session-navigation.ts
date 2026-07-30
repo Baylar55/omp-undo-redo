@@ -75,17 +75,34 @@ export class SessionNavigation {
     );
   }
 
+  private convertEarlierGitCheckpoints(): GitCheckpoint[] {
+    const converted: GitCheckpoint[] = [];
+    for (let index = 0; index < this.checkpoints.length; index++) {
+      const entry = this.checkpoints[index];
+      if (entry.kind !== "git") continue;
+      converted.push(entry);
+      this.checkpoints[index] = {
+        kind: "session",
+        reason: "file_history_gap",
+        parentLeafId: entry.parentLeafId,
+        leafId: entry.leafId,
+      };
+    }
+    return converted;
+  }
+
   async recordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
     const discarded = this.checkpoints.splice(
       this.currentIndex + 1,
       this.checkpoints.length - this.currentIndex - 1,
     );
+    const converted = checkpoint.kind === "session" ? this.convertEarlierGitCheckpoints() : [];
     this.checkpoints.push(checkpoint);
     this.currentIndex = this.checkpoints.length - 1;
-    await releaseCheckpoints(
-      this.gitForRepository,
-      discarded.filter((entry): entry is GitCheckpoint => entry.kind === "git"),
-    );
+    await releaseCheckpoints(this.gitForRepository, [
+      ...discarded.filter((entry): entry is GitCheckpoint => entry.kind === "git"),
+      ...converted,
+    ]);
   }
 
   async dispose(): Promise<void> {

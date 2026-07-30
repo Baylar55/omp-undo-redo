@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.24] - 2026-07-30
+
+### Fixed
+
+- Treat session-only checkpoints as file-history continuity barriers so older Git patches are never applied across unknown file changes.
+- Release invalidated private refs while allowing later Git checkpoints to start a new restorable file-history segment.
+
 ## [1.0.23] - 2026-07-29
 
 ### Fixed

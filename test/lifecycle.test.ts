@@ -208,6 +208,60 @@ describe("session-only lifecycle fallback", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("keeps undo and redo traversable across a file-history gap", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "file-history-gap-session");
+      await pi.emit("session_start", ctx);
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "B\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "C\n");
+      const head = await readFile(join(cwd, ".git", "HEAD"), "utf8");
+      await writeFile(join(cwd, ".git", "HEAD"), "not-a-head\n");
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+      await writeFile(join(cwd, ".git", "HEAD"), head);
+      expect(await privateRefs(cwd)).toEqual([]);
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "D\n");
+      ctx.leaf = "turn-3";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because a later turn had no file checkpoint, so this older file checkpoint was discarded.",
+      );
+
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("D\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("navigation invalidation lifecycle", () => {
