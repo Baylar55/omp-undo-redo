@@ -4,7 +4,7 @@ Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narr
 
 ## Before opening a change
 
-1. Read `README.md`, `IMPLEMENTATION_PLAN.md`, and the applicable policy documents.
+1. Read `README.md` and the applicable policy documents. Read `RELEASE.md` before a release change.
 2. Open an issue for substantial behavior changes so the command contract can be agreed first.
 3. Do not include npm credentials, API keys, session transcripts, or other private data in commits, tests, or issue reports.
 
@@ -13,6 +13,10 @@ Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narr
 Use Node.js 20 or newer. Install dependencies with npm and use the existing scripts in `package.json`; do not modify the OMP dependency package under `package/`. Keep source changes under `src/` and tests under `test/` (or the existing test layout).
 
 At minimum, run the focused tests and type-check for the area you changed. Before submitting a release-oriented change, run `npm run verify`. Do not commit generated files, coverage output, local configuration, or credentials.
+
+## Releases
+
+Follow [`RELEASE.md`](./RELEASE.md) for version changes, protected-branch integration, Git tags, GitHub Releases, and npm publication. The runbook is the source of truth for maintainers and AI agents.
 
 ## Pull requests
 

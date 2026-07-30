@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.25] - 2026-07-30
+
+### Fixed
+
+- Prevent temporary-directory allocation and cleanup failures during snapshot creation and patch application from bypassing session fallback or rejecting lifecycle events and commands.
+- Catch temporary directory allocation errors in `createSnapshotCommit` and `applyCheckpoint` so before/after snapshot failures record session-only checkpoints and patch allocation failures report standard failure notifications without mutating state.
+- Suppress temporary directory cleanup rejections in `finally` blocks so cleanup errors cannot override primary snapshot or patch results.
+
 ## [1.0.24] - 2026-07-30
 
 ### Fixed
@@ -160,6 +168,10 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
+[1.0.25]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.25
+[1.0.24]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.24
+[1.0.23]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.23
+[1.0.22]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.22
 [1.0.21]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.21
 [1.0.19]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.19
 [1.0.18]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.18
