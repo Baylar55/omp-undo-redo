@@ -257,19 +257,22 @@ describe("history-safe Git checkpoints", () => {
       expect(after).not.toBeNull();
       if (!after) return;
 
+      const savedIndexPath = await indexPath(git, cwd);
       const savedIndex = await indexState(git, cwd);
       expect(await text(git, ["status", "--short"])).toBe("M  tracked.txt");
 
       expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toBe("applied");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
-      expect(await indexState(git, cwd)).toEqual(savedIndex);
+      expect(await readFile(savedIndexPath)).toEqual(savedIndex.raw);
+      expect(await text(git, ["write-tree"])).toBe(savedIndex.tree);
       expect(await text(git, ["status", "--short"])).toBe("MM tracked.txt");
       expect(await text(git, ["diff", "--cached", "--", "tracked.txt"])).toContain("-base\n+turn");
       expect(await text(git, ["diff", "--", "tracked.txt"])).toContain("-turn\n+base");
 
       expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toBe("applied");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
-      expect(await indexState(git, cwd)).toEqual(savedIndex);
+      expect(await readFile(savedIndexPath)).toEqual(savedIndex.raw);
+      expect(await text(git, ["write-tree"])).toBe(savedIndex.tree);
       expect(await text(git, ["status", "--short"])).toBe("M  tracked.txt");
       expect(await text(git, ["diff", "--cached", "--", "tracked.txt"])).toContain("-base\n+turn");
     } finally {
