@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.26] - 2026-07-31
+
+### Fixed
+
+- Ensure clean `dist/` build by removing output directory before emitting compiled files and enforcing exact output path parity with `src/**/*.ts`.
+- Automatically trigger clean build before `npm pack` and `npm publish` via `prepack` hook to prevent stale or orphaned generated artifacts from being packaged.
+- Add package entry smoke check (`npm run smoke:package`) to verify the compiled extension loads and registers commands correctly without behavior changes to `/undo` or `/redo`.
+
 ## [1.0.25] - 2026-07-30
 
 ### Fixed
@@ -168,6 +176,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
+[1.0.26]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.26
 [1.0.25]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.25
 [1.0.24]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.24
 [1.0.23]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.23

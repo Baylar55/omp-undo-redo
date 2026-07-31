@@ -1,6 +1,6 @@
 {
   "name": "@baylarsadigov/omp-undo-redo",
-  "version": "1.0.25",
+  "version": "1.0.26",
   "description": "Undo and redo session navigation for Oh My Pi",
   "license": "MIT",
   "homepage": "https://github.com/Baylar55/omp-undo-redo#readme",
@@ -34,15 +34,20 @@
     "CHANGELOG.md"
   ],
   "scripts": {
+    "clean": "node scripts/clean-dist.mjs",
+    "prebuild": "npm run clean",
     "build": "tsc -p tsconfig.json",
+    "postbuild": "node scripts/check-dist.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "smoke:package": "node scripts/smoke-package.mjs",
     "pack:check": "npm pack --dry-run",
-    "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run build && npm run pack:check"
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run build && npm run smoke:package && npm run pack:check"
   },
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": ">=16.5.2"
