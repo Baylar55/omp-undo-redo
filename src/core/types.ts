@@ -3,6 +3,7 @@ export interface SessionEntryLike {
   parentId: string | null;
   type: string;
   message?: { role?: string };
+  customType?: string;
 }
 
 export interface SessionReader {
