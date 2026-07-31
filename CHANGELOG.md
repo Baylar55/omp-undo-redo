@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.27] - 2026-07-31
+
+### Fixed
+
+- Clarify that full-mode `/undo` and `/redo` restore the worktree while leaving the Git index unchanged.
+- Add regression coverage for staged-turn worktree/index divergence across undo and redo.
+- Document how to inspect preserved staged and unstaged changes before committing.
+
 ## [1.0.26] - 2026-07-31
 
 ### Fixed

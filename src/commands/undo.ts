@@ -34,7 +34,7 @@ export async function runUndo(
     case "moved":
       ctx.ui.notify(
         outcome.files === "restored"
-          ? "Undid last turn: session moved back and file snapshot restored."
+          ? "Undid last turn: session moved back and worktree snapshot restored; Git index left unchanged."
           : `Undid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`,
         "info",
       );

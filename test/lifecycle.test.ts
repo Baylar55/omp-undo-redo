@@ -166,13 +166,13 @@ describe("session-only lifecycle fallback", () => {
 
       await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Undid last turn: session moved back and file snapshot restored.",
+        "Undid last turn: session moved back and worktree snapshot restored; Git index left unchanged.",
       );
       expect(await privateRefs(cwd)).toHaveLength(2);
       await pi.runCommand("redo", ctx);
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Redid last turn: session moved forward and file snapshot restored.",
+        "Redid last turn: session moved forward and worktree snapshot restored; Git index left unchanged.",
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -319,7 +319,7 @@ describe("navigation invalidation lifecycle", () => {
       await pi.runCommand("redo", ctx);
 
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Redid last turn: session moved forward and file snapshot restored.",
+        "Redid last turn: session moved forward and worktree snapshot restored; Git index left unchanged.",
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });

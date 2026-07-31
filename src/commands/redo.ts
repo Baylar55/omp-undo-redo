@@ -34,7 +34,7 @@ export async function runRedo(
     case "moved":
       ctx.ui.notify(
         outcome.files === "restored"
-          ? "Redid last turn: session moved forward and file snapshot restored."
+          ? "Redid last turn: session moved forward and worktree snapshot restored; Git index left unchanged."
           : `Redid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`,
         "info",
       );

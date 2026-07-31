@@ -125,8 +125,12 @@ async function initializeBranch(git: GitRunner, cwd: string): Promise<void> {
   await git(["branch", "-M", "A"]);
 }
 
-async function text(git: GitRunner, args: string[]): Promise<string> {
-  const result = await git(args);
+async function text(
+  git: GitRunner,
+  args: string[],
+  options?: Parameters<GitRunner>[1],
+): Promise<string> {
+  const result = await git(args, options);
   expect(result.code, result.stderr).toBe(0);
   return result.stdout.trim();
 }
@@ -238,6 +242,59 @@ describe("history-safe Git checkpoints", () => {
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       expect(await readFile(join(cwd, "agent.txt"), "utf8")).toBe("agent commit\n");
       expect(await readFile(join(cwd, "turn.txt"), "utf8")).toBe("uncommitted turn change\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves staged turn state while undoing and redoing the worktree", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const before = pendingCheckpoint(await prepareBeforeTurn(git, "staged-turn-divergence"));
+      expect(before).not.toBeNull();
+      if (!before) return;
+
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      await git(["add", "tracked.txt"]);
+      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      expect(after).not.toBeNull();
+      if (!after) return;
+
+      const savedIndexPath = await indexPath(git, cwd);
+      const savedIndex = await indexState(git, cwd);
+      expect(await text(git, ["status", "--short"], { env: { GIT_OPTIONAL_LOCKS: "0" } })).toBe(
+        "M  tracked.txt",
+      );
+
+      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toBe("applied");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await readFile(savedIndexPath)).toEqual(savedIndex.raw);
+      expect(await text(git, ["write-tree"])).toBe(savedIndex.tree);
+      expect(await text(git, ["status", "--short"], { env: { GIT_OPTIONAL_LOCKS: "0" } })).toBe(
+        "MM tracked.txt",
+      );
+      expect(
+        await text(git, ["diff", "--cached", "--", "tracked.txt"], {
+          env: { GIT_OPTIONAL_LOCKS: "0" },
+        }),
+      ).toContain("-base\n+turn");
+      expect(
+        await text(git, ["diff", "--", "tracked.txt"], { env: { GIT_OPTIONAL_LOCKS: "0" } }),
+      ).toContain("-turn\n+base");
+
+      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toBe("applied");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
+      expect(await readFile(savedIndexPath)).toEqual(savedIndex.raw);
+      expect(await text(git, ["write-tree"])).toBe(savedIndex.tree);
+      expect(await text(git, ["status", "--short"], { env: { GIT_OPTIONAL_LOCKS: "0" } })).toBe(
+        "M  tracked.txt",
+      );
+      expect(
+        await text(git, ["diff", "--cached", "--", "tracked.txt"], {
+          env: { GIT_OPTIONAL_LOCKS: "0" },
+        }),
+      ).toContain("-base\n+turn");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
