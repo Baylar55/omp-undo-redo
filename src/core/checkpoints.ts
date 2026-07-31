@@ -2,11 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
 import type {
   FileCheckpointUnavailableReason,
   GitCheckpoint,
   GitRepository,
   GitRunner,
+  OwnershipMode,
   PendingGitCheckpoint,
   SessionReader,
 } from "./types.js";
@@ -22,8 +24,13 @@ export function checkpointNamespace(sessionId: string): string {
 function checkpointRefs(
   sessionId: string,
   checkpointId: string,
+  ownership: OwnershipMode,
+  ownerId?: string,
 ): { beforeRef: string; afterRef: string } {
-  const prefix = `${REF_ROOT}/${checkpointNamespace(sessionId)}/${checkpointId}`;
+  const prefix =
+    ownership === "v2" && ownerId
+      ? `${REF_ROOT}/v2/${ownerId}/${checkpointNamespace(sessionId)}/${checkpointId}`
+      : `${REF_ROOT}/${checkpointNamespace(sessionId)}/${checkpointId}`;
   return { beforeRef: `${prefix}/before`, afterRef: `${prefix}/after` };
 }
 
@@ -179,16 +186,17 @@ async function releaseRefBatch(
   git: GitRunner,
   refs: readonly Pick<RefRelease, "ref" | "expectedHash">[],
   repository?: GitRepository,
+  timeoutMs?: number,
 ): Promise<boolean> {
   if (refs.length === 0) return true;
   const input = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n");
-  const args = ["update-ref", "--stdin"];
   const options = repository
-    ? { env: { GIT_DIR: repository.commonDir }, stdin: `${input}\n` }
-    : { stdin: `${input}\n` };
+    ? { env: { GIT_DIR: repository.commonDir }, stdin: `${input}\n`, timeoutMs }
+    : { stdin: `${input}\n`, timeoutMs };
   try {
-    const result = await git(args, options);
+    const result = await git(["update-ref", "--stdin"], options);
     if (result.code === 0) return true;
+    if (result.error === "timeout") return false;
   } catch {
     // Retry smaller batches below.
   }
@@ -198,8 +206,8 @@ async function releaseRefBatch(
       : false;
   }
   const midpoint = Math.ceil(refs.length / 2);
-  const left = await releaseRefBatch(git, refs.slice(0, midpoint), repository);
-  const right = await releaseRefBatch(git, refs.slice(midpoint), repository);
+  const left = await releaseRefBatch(git, refs.slice(0, midpoint), repository, timeoutMs);
+  const right = await releaseRefBatch(git, refs.slice(midpoint), repository, timeoutMs);
   return left && right;
 }
 
@@ -294,10 +302,14 @@ export type FinishAfterTurnResult =
 export async function prepareBeforeTurn(
   git: GitRunner,
   sessionId: string,
+  ownerRegistry?: CheckpointOwnerRegistry,
 ): Promise<PrepareBeforeTurnResult> {
   const resolved = await resolveRepository(git);
   if ("reason" in resolved) return { status: "session_only", reason: resolved.reason };
 
+  const ownership = ownerRegistry
+    ? await ownerRegistry.ensureInitialized(resolved.repository, git)
+    : "legacy";
   const checkpointId = randomUUID();
   const snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn");
   if (!("hash" in snapshot)) {
@@ -306,7 +318,7 @@ export async function prepareBeforeTurn(
       reason: snapshot.reason === "invalid_head" ? "invalid_head" : "before_snapshot_failed",
     };
   }
-  const beforeRef = checkpointRefs(sessionId, checkpointId).beforeRef;
+  const { beforeRef } = checkpointRefs(sessionId, checkpointId, ownership, ownerRegistry?.ownerId);
   if (
     !(await run(git, [
       "update-ref",

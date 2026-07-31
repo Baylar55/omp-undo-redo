@@ -45,17 +45,21 @@ export interface NavigationPort extends SessionReader {
 export interface GitRunOptions {
   env?: Record<string, string | undefined>;
   stdin?: string;
+  timeoutMs?: number;
 }
 
-export type GitRunner = ((
-  args: string[],
-  options?: GitRunOptions,
-) => Promise<{
+export type GitRunError = "unavailable" | "timeout";
+
+export type OwnershipMode = "v2" | "legacy";
+
+export type GitCommandResult = {
   stdout: string;
   stderr: string;
   code: number;
-  error?: "unavailable";
-}>) & {
+  error?: GitRunError;
+};
+
+export type GitRunner = ((args: string[], options?: GitRunOptions) => Promise<GitCommandResult>) & {
   cwd?: string;
 };
 

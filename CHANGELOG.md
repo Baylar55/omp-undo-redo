@@ -2,11 +2,24 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.29] - 2026-07-31
+
+### Added
+
+- Add conservative owner-scoped checkpoint leases and automatic cleanup for provably stale same-host runtimes, with runtime-scope protection for Linux PID namespaces.
+
+### Fixed
+
+- Preserve full undo/redo through legacy ownerless fallback when lease publication is unavailable.
+- Bound maintenance Git operations and keep stale cleanup asynchronous, compare-and-delete based, and safe under concurrent runtimes.
+
 ## [1.0.28] - 2026-07-31
 
 ### Fixed
 
 - Make staged-state regression assertions stable across Git platforms by separating extension apply checks from Git index stat refreshes.
+- Add conservative owner-scoped v2 checkpoint refs with repository-local leases and asynchronous cleanup for only provably stale same-host owners. Linux cleanup is additionally bound to kernel boot and PID namespace identity; unresolved runtime scope, existing ownerless refs, and uncertain ownership cases remain manual-cleanup paths.
+- Make the Prettier verification gate honor the checked-out platform line endings so Windows CRLF worktrees do not fail on otherwise formatted files.
 
 ## [1.0.27] - 2026-07-31
 
