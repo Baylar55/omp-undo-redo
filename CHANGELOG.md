@@ -2,7 +2,7 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
-## [1.0.31] - 2026-07-31
+## [1.0.32] - 2026-07-31
 
 ### Added
 
@@ -13,6 +13,10 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 - Retain completed checkpoints on graceful shutdown while continuing to release interrupted pending checkpoints.
 - Replace the misleading pre-turn warning with state-specific empty-history and closing-session messages.
+
+### Fixed
+
+- Ignore OMP's trailing `session_exit` diagnostic entry when validating resumed history, so quitting with Ctrl+C does not downgrade a valid Git checkpoint to session-only undo.
 
 ## [1.0.30] - 2026-07-31
 

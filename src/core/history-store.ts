@@ -9,6 +9,7 @@ import type {
   GitRunner,
   NavigationState,
   SessionReader,
+  SessionEntryLike,
   TurnCheckpoint,
 } from "./types.js";
 
@@ -155,6 +156,22 @@ function entryExists(reader: SessionReader, id: string | null): boolean {
   return id === null || reader.getEntry(id) !== undefined;
 }
 
+function isSessionExitEntry(entry: SessionEntryLike | undefined): boolean {
+  return entry?.type === "custom" && entry.customType === "session_exit";
+}
+
+function effectiveLeaf(reader: SessionReader): string | null {
+  let leafId = reader.getLeafId();
+  const visited = new Set<string>();
+  while (leafId && !visited.has(leafId)) {
+    visited.add(leafId);
+    const entry = reader.getEntry(leafId);
+    if (!isSessionExitEntry(entry)) return leafId;
+    leafId = entry?.parentId ?? null;
+  }
+  return leafId;
+}
+
 function expectedLeaf(state: NavigationState): string | null {
   if (state.checkpoints.length === 0) return null;
   return state.currentIndex >= 0
@@ -163,7 +180,9 @@ function expectedLeaf(state: NavigationState): string | null {
 }
 
 export function reconstructSessionHistory(reader: SessionReader): NavigationState {
-  const branch = reader.getBranch(reader.getLeafId() ?? undefined);
+  const branch = reader
+    .getBranch(reader.getLeafId() ?? undefined)
+    .filter((entry) => !isSessionExitEntry(entry));
   const checkpoints: TurnCheckpoint[] = [];
   for (let index = 0; index < branch.length; index++) {
     const entry = branch[index];
@@ -230,7 +249,7 @@ export class SessionHistoryStore {
             !entryExists(reader, checkpoint.parentLeafId) ||
             !entryExists(reader, checkpoint.leafId),
         ) ||
-        expectedLeaf(state) !== reader.getLeafId()
+        expectedLeaf(state) !== effectiveLeaf(reader)
       )
         return null;
       return state;

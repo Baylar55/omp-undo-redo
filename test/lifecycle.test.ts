@@ -14,6 +14,7 @@ type TestEntry = {
   parentId: string | null;
   type: string;
   message?: { role?: string };
+  customType?: string;
 };
 
 type TestContext = {
@@ -354,6 +355,18 @@ describe("resumed session history", () => {
       type: "message",
       message: { role: "assistant" },
     };
+    const firstExit: TestEntry = {
+      id: "first-exit",
+      parentId: response.id,
+      type: "custom",
+      customType: "session_exit",
+    };
+    const secondExit: TestEntry = {
+      id: "second-exit",
+      parentId: prompt.id,
+      type: "custom",
+      customType: "session_exit",
+    };
     try {
       const firstApi = new FakeExtensionApi();
       ompUndoRedo(firstApi as never);
@@ -373,9 +386,9 @@ describe("resumed session history", () => {
       const secondApi = new FakeExtensionApi();
       ompUndoRedo(secondApi as never);
       const second = context(cwd, sessionId);
-      second.leaf = response.id;
-      second.branch = [prompt, response];
-      second.entries = [prompt, response];
+      second.leaf = firstExit.id;
+      second.branch = [prompt, response, firstExit];
+      second.entries = [prompt, response, firstExit];
       second.navigateTree = async (targetId) => {
         second.leaf = targetId;
         second.branch = targetId === prompt.id ? [prompt] : [prompt, response];
@@ -384,7 +397,7 @@ describe("resumed session history", () => {
       await secondApi.emit("session_start", second);
       await writeFile(join(cwd, "tracked.txt"), "manual\n");
       await secondApi.runCommand("undo", second);
-      expect(second.leaf).toBe(response.id);
+      expect(second.leaf).toBe(firstExit.id);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("manual\n");
       expect(second.ui.notifications.at(-1)?.message).toBe("Worktree changed; nothing was undone.");
       await writeFile(join(cwd, "tracked.txt"), "changed\n");
@@ -396,9 +409,9 @@ describe("resumed session history", () => {
       const thirdApi = new FakeExtensionApi();
       ompUndoRedo(thirdApi as never);
       const third = context(cwd, sessionId);
-      third.leaf = prompt.id;
-      third.branch = [prompt];
-      third.entries = [prompt, response];
+      third.leaf = secondExit.id;
+      third.branch = [prompt, secondExit];
+      third.entries = [prompt, response, firstExit, secondExit];
       third.navigateTree = async (targetId) => {
         third.leaf = targetId;
         third.branch = targetId === prompt.id ? [prompt] : [prompt, response];
