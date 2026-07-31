@@ -24,6 +24,7 @@ export class SessionNavigation {
   private navigateTree: NavigationPort["navigateTree"] = async () => ({ cancelled: true });
   private expectedTreeNavigation: ExpectedTreeNavigation | null = null;
   private readonly gitForRepository: GitRunnerFactory;
+  private navigationTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly port: Omit<NavigationPort, "navigateTree"> & {
@@ -38,6 +39,15 @@ export class SessionNavigation {
 
   setNavigateTree(navigateTree: NavigationPort["navigateTree"]): void {
     this.navigateTree = navigateTree;
+  }
+
+  private serializeNavigation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.navigationTail.then(operation);
+    this.navigationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private async navigateTo(targetId: string): Promise<TreeNavigationResult> {
@@ -125,7 +135,11 @@ export class SessionNavigation {
     return { status: "moved", files: "unavailable", reason: checkpoint.reason };
   }
 
-  async undo(): Promise<NavigationResult> {
+  undo(): Promise<NavigationResult> {
+    return this.serializeNavigation(() => this.performUndo());
+  }
+
+  private async performUndo(): Promise<NavigationResult> {
     if (this.currentIndex < 0) return { status: "empty" };
     const checkpoint = this.checkpoints[this.currentIndex];
     if (checkpoint.kind === "session") {
@@ -148,7 +162,11 @@ export class SessionNavigation {
     return { status: "moved", files: "restored" };
   }
 
-  async redo(): Promise<NavigationResult> {
+  redo(): Promise<NavigationResult> {
+    return this.serializeNavigation(() => this.performRedo());
+  }
+
+  private async performRedo(): Promise<NavigationResult> {
     if (this.currentIndex >= this.checkpoints.length - 1) return { status: "empty" };
     const checkpoint = this.checkpoints[this.currentIndex + 1];
     if (checkpoint.kind === "session") {
