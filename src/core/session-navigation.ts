@@ -5,6 +5,7 @@ import type {
   GitRunnerFactory,
   NavigationPort,
   NavigationResult,
+  NavigationState,
   SessionOnlyCheckpoint,
   TreeNavigationResult,
   TurnCheckpoint,
@@ -25,6 +26,7 @@ export class SessionNavigation {
   private expectedTreeNavigation: ExpectedTreeNavigation | null = null;
   private readonly gitForRepository: GitRunnerFactory;
   private navigationTail: Promise<void> = Promise.resolve();
+  private readonly stateChanged: (state: NavigationState) => Promise<void>;
 
   constructor(
     private readonly port: Omit<NavigationPort, "navigateTree"> & {
@@ -32,9 +34,23 @@ export class SessionNavigation {
     },
     git: GitRunner,
     gitFactory?: GitRunnerFactory,
+    stateChanged?: (state: NavigationState) => Promise<void>,
   ) {
     this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git);
+    this.stateChanged = stateChanged ?? (async () => undefined);
     if (port.navigateTree) this.navigateTree = port.navigateTree.bind(port);
+  }
+
+  restoreState(state: NavigationState): void {
+    this.checkpoints = [...state.checkpoints];
+    this.currentIndex = state.currentIndex;
+  }
+
+  private async persistState(): Promise<void> {
+    await this.stateChanged({
+      checkpoints: [...this.checkpoints],
+      currentIndex: this.currentIndex,
+    }).catch(() => undefined);
   }
 
   setNavigateTree(navigateTree: NavigationPort["navigateTree"]): void {
@@ -79,6 +95,7 @@ export class SessionNavigation {
 
   async invalidateRedo(): Promise<void> {
     const discarded = this.checkpoints.splice(this.currentIndex + 1);
+    await this.persistState();
     await releaseCheckpoints(
       this.gitForRepository,
       discarded.filter((checkpoint): checkpoint is GitCheckpoint => checkpoint.kind === "git"),
@@ -109,19 +126,36 @@ export class SessionNavigation {
     const converted = checkpoint.kind === "session" ? this.convertEarlierGitCheckpoints() : [];
     this.checkpoints.push(checkpoint);
     this.currentIndex = this.checkpoints.length - 1;
+    await this.persistState();
     await releaseCheckpoints(this.gitForRepository, [
       ...discarded.filter((entry): entry is GitCheckpoint => entry.kind === "git"),
       ...converted,
     ]);
   }
 
-  async dispose(): Promise<void> {
+  async dispose(release = true): Promise<void> {
+    const checkpoints = this.checkpoints;
+    this.checkpoints = [];
+    this.currentIndex = -1;
+    if (!release) return;
+    await this.persistState();
+    await releaseCheckpoints(
+      this.gitForRepository,
+      checkpoints.filter((checkpoint): checkpoint is GitCheckpoint => checkpoint.kind === "git"),
+    );
+  }
+
+  async suspend(): Promise<void> {
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
     this.currentIndex = -1;
     await releaseCheckpoints(
       this.gitForRepository,
-      checkpoints.filter((checkpoint): checkpoint is GitCheckpoint => checkpoint.kind === "git"),
+      checkpoints.filter(
+        (checkpoint): checkpoint is GitCheckpoint =>
+          checkpoint.kind === "git" &&
+          !checkpoint.beforeRef.startsWith("refs/omp-undo-redo/history/"),
+      ),
     );
   }
 
@@ -145,6 +179,7 @@ export class SessionNavigation {
     if (checkpoint.kind === "session") {
       if (!(await this.navigateSession(checkpoint.parentLeafId))) return { status: "cancelled" };
       this.currentIndex--;
+      await this.persistState();
       return this.sessionOnlyResult(checkpoint);
     }
 
@@ -159,6 +194,7 @@ export class SessionNavigation {
       return { status: "cancelled" };
     }
     this.currentIndex--;
+    await this.persistState();
     return { status: "moved", files: "restored" };
   }
 
@@ -172,6 +208,7 @@ export class SessionNavigation {
     if (checkpoint.kind === "session") {
       if (!(await this.navigateSession(checkpoint.leafId))) return { status: "cancelled" };
       this.currentIndex++;
+      await this.persistState();
       return this.sessionOnlyResult(checkpoint);
     }
 
@@ -186,6 +223,7 @@ export class SessionNavigation {
       return { status: "cancelled" };
     }
     this.currentIndex++;
+    await this.persistState();
     return { status: "moved", files: "restored" };
   }
 }

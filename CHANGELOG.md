@@ -2,6 +2,18 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.31] - 2026-07-31
+
+### Added
+
+- Preserve full undo and redo history across terminal restarts when the same session and worktree are resumed.
+- Reconstruct session-only undo boundaries when durable Git checkpoint metadata is unavailable.
+
+### Changed
+
+- Retain completed checkpoints on graceful shutdown while continuing to release interrupted pending checkpoints.
+- Replace the misleading pre-turn warning with state-specific empty-history and closing-session messages.
+
 ## [1.0.30] - 2026-07-31
 
 ### Fixed

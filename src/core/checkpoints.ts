@@ -61,11 +61,11 @@ async function canonicalPath(value: string, base: string): Promise<string> {
   }
 }
 
-type RepositoryResolution =
+export type RepositoryResolution =
   | { repository: GitRepository }
   | { reason: "git_unavailable" | "not_repository" | "repository_unresolvable" };
 
-async function resolveRepository(git: GitRunner): Promise<RepositoryResolution> {
+export async function resolveRepository(git: GitRunner): Promise<RepositoryResolution> {
   const worktreeResult = await invoke(git, ["rev-parse", "--show-toplevel"]);
   if (worktreeResult.error === "unavailable") return { reason: "git_unavailable" };
   const worktree = worktreeResult.code === 0 ? worktreeResult.stdout.trim() : "";
@@ -386,6 +386,26 @@ export async function finishAfterTurn(
       leafId,
     },
   };
+}
+
+export async function retainCheckpointForResume(
+  git: GitRunner,
+  sessionId: string,
+  checkpoint: GitCheckpoint,
+): Promise<GitCheckpoint> {
+  const checkpointId = randomUUID();
+  const prefix = `${REF_ROOT}/history/${checkpointNamespace(sessionId)}/${checkpointId}`;
+  const beforeRef = `${prefix}/before`;
+  const afterRef = `${prefix}/after`;
+  const input = [
+    `create ${beforeRef} ${checkpoint.beforeHash}`,
+    `create ${afterRef} ${checkpoint.afterHash}`,
+    `delete ${checkpoint.beforeRef} ${checkpoint.beforeHash}`,
+    `delete ${checkpoint.afterRef} ${checkpoint.afterHash}`,
+  ].join("\n");
+  const retained = await invoke(git, ["update-ref", "--stdin"], { stdin: `${input}\n` });
+  if (retained.code !== 0) return checkpoint;
+  return { ...checkpoint, beforeRef, afterRef };
 }
 
 export type CheckpointApplyResult = "applied" | "conflict" | "failed";

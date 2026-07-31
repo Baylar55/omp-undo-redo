@@ -9,14 +9,21 @@ import ompUndoRedo from "../src/index.js";
 const execFileAsync = promisify(execFile);
 type Handler = (...args: unknown[]) => unknown;
 
+type TestEntry = {
+  id: string;
+  parentId: string | null;
+  type: string;
+  message?: { role?: string };
+};
+
 type TestContext = {
-  cwd: string;
-  leaf: string;
+  branch: TestEntry[];
+  entries: TestEntry[];
   sessionManager: {
     getSessionId(): string;
     getLeafId(): string;
-    getBranch(): [];
-    getEntry(): undefined;
+    getBranch(): TestEntry[];
+    getEntry(id: string): TestEntry | undefined;
   };
   navigateTree(targetId: string): Promise<{ cancelled: boolean }>;
   waitForIdle(): Promise<void>;
@@ -60,11 +67,13 @@ function context(cwd: string, sessionId: string): TestContext {
   const value: TestContext = {
     cwd,
     leaf: "leaf",
+    branch: [],
+    entries: [],
     sessionManager: {
       getSessionId: () => sessionId,
       getLeafId: () => value.leaf,
-      getBranch: () => [],
-      getEntry: () => undefined,
+      getBranch: () => value.branch,
+      getEntry: (id) => value.entries.find((entry) => entry.id === id),
     },
     navigateTree: async () => ({ cancelled: true }),
     waitForIdle: async () => {},
@@ -170,7 +179,7 @@ describe("session-only lifecycle fallback", () => {
       );
       expect(await privateRefs(cwd)).toHaveLength(2);
       const refs = await privateRefs(cwd);
-      expect(refs.every((ref) => ref.startsWith("refs/omp-undo-redo/v2/"))).toBe(true);
+      expect(refs.every((ref) => ref.startsWith("refs/omp-undo-redo/history/"))).toBe(true);
       await pi.runCommand("redo", ctx);
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
@@ -329,8 +338,128 @@ describe("navigation invalidation lifecycle", () => {
   });
 });
 
+describe("resumed session history", () => {
+  it("restores undo and redo checkpoints across runtime restarts", async () => {
+    const cwd = await makeRepository();
+    const sessionId = "resumed-session";
+    const prompt: TestEntry = {
+      id: "prompt",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: TestEntry = {
+      id: "response",
+      parentId: prompt.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    try {
+      const firstApi = new FakeExtensionApi();
+      ompUndoRedo(firstApi as never);
+      const first = context(cwd, sessionId);
+      first.leaf = prompt.id;
+      first.branch = [prompt];
+      first.entries = [prompt];
+      await firstApi.emit("session_start", first);
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      first.leaf = response.id;
+      first.branch = [prompt, response];
+      first.entries = [prompt, response];
+      await firstApi.emit("agent_end", first);
+      await firstApi.emit("session_shutdown", first);
+
+      const secondApi = new FakeExtensionApi();
+      ompUndoRedo(secondApi as never);
+      const second = context(cwd, sessionId);
+      second.leaf = response.id;
+      second.branch = [prompt, response];
+      second.entries = [prompt, response];
+      second.navigateTree = async (targetId) => {
+        second.leaf = targetId;
+        second.branch = targetId === prompt.id ? [prompt] : [prompt, response];
+        return { cancelled: false };
+      };
+      await secondApi.emit("session_start", second);
+      await writeFile(join(cwd, "tracked.txt"), "manual\n");
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(response.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("manual\n");
+      expect(second.ui.notifications.at(-1)?.message).toBe("Worktree changed; nothing was undone.");
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(prompt.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      await secondApi.emit("session_shutdown", second);
+
+      const thirdApi = new FakeExtensionApi();
+      ompUndoRedo(thirdApi as never);
+      const third = context(cwd, sessionId);
+      third.leaf = prompt.id;
+      third.branch = [prompt];
+      third.entries = [prompt, response];
+      third.navigateTree = async (targetId) => {
+        third.leaf = targetId;
+        third.branch = targetId === prompt.id ? [prompt] : [prompt, response];
+        return { cancelled: false };
+      };
+      await thirdApi.emit("session_start", third);
+      await thirdApi.runCommand("redo", third);
+      expect(third.leaf).toBe(response.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(third.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and worktree snapshot restored; Git index left unchanged.",
+      );
+      await thirdApi.emit("session_shutdown", third);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("reconstructs conversation-only undo when no durable file history exists", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-resumed-session-only-"));
+    const prompt: TestEntry = {
+      id: "prompt",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: TestEntry = {
+      id: "response",
+      parentId: prompt.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "resumed-session-only");
+      ctx.leaf = response.id;
+      ctx.branch = [prompt, response];
+      ctx.entries = [prompt, response];
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        ctx.branch = [prompt];
+        return { cancelled: false };
+      };
+
+      await pi.emit("session_start", ctx);
+      await pi.runCommand("undo", ctx);
+
+      expect(ctx.leaf).toBe(prompt.id);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the resumed turn has no usable file checkpoint.",
+      );
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("extension lifecycle cleanup", () => {
-  it("releases completed checkpoints, pending checkpoints, and unrelated refs survive", async () => {
+  it("retains completed checkpoints, releases pending checkpoints, and preserves unrelated refs", async () => {
     const cwd = await makeRepository();
     try {
       await git(cwd, ["update-ref", "refs/keep", "HEAD"]);
@@ -346,15 +475,10 @@ describe("extension lifecycle cleanup", () => {
 
       await pi.emit("session_shutdown", ctx);
       await pi.emit("session_shutdown", ctx);
-      expect(await privateRefs(cwd)).toEqual([]);
+      expect(await privateRefs(cwd)).toHaveLength(2);
       expect(await git(cwd, ["rev-parse", "refs/keep"])).toBe(
         await git(cwd, ["rev-parse", "HEAD"]),
       );
-
-      await pi.emit("session_start", ctx);
-      await pi.emit("before_agent_start", ctx);
-      await pi.emit("session_shutdown", ctx);
-      expect(await privateRefs(cwd)).toEqual([]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -377,7 +501,7 @@ describe("extension lifecycle cleanup", () => {
     }
   });
 
-  it("drains every in-memory session and repository", async () => {
+  it("retains resumable history for every in-memory session and repository", async () => {
     const first = await makeRepository();
     const second = await makeRepository();
     try {
@@ -398,8 +522,8 @@ describe("extension lifecycle cleanup", () => {
       expect(await privateRefs(second)).toHaveLength(2);
 
       await pi.emit("session_shutdown", secondContext);
-      expect(await privateRefs(first)).toEqual([]);
-      expect(await privateRefs(second)).toEqual([]);
+      expect(await privateRefs(first)).toHaveLength(2);
+      expect(await privateRefs(second)).toHaveLength(2);
     } finally {
       await Promise.all([
         rm(first, { recursive: true, force: true }),

@@ -14,7 +14,10 @@ import {
   prepareBeforeTurn,
   releaseCheckpoint,
   releasePendingCheckpoint,
+  resolveRepository,
+  retainCheckpointForResume,
 } from "./core/checkpoints.js";
+import { reconstructSessionHistory, SessionHistoryStore } from "./core/history-store.js";
 import type { PendingTurnCheckpoint, SessionOnlyCheckpoint } from "./core/types.js";
 
 function promiseWithResolvers<T>(): {
@@ -40,7 +43,7 @@ type AnyContext = {
   };
 };
 
-function createNavigation(ctx: AnyContext): SessionNavigation {
+function createNavigation(ctx: AnyContext, store?: SessionHistoryStore): SessionNavigation {
   const manager = ctx.sessionManager;
   return new SessionNavigation(
     {
@@ -50,6 +53,7 @@ function createNavigation(ctx: AnyContext): SessionNavigation {
     },
     createGitRunner(ctx.cwd),
     (repository) => createGitRunner(repository.worktree),
+    store ? (state) => store.save(state) : undefined,
   );
 }
 
@@ -60,11 +64,52 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   });
   const navigations = new Map<string, SessionNavigation>();
   const pending = new Map<string, PendingTurnCheckpoint>();
+  const initializations = new Map<string, Promise<SessionNavigation>>();
   const activeOperations = new Set<Promise<void>>();
   let closing = false;
   let shutdownPromise: Promise<void> | null = null;
   let pendingSwitchSourceSessionId: string | null = null;
   let pendingBranchSourceSessionId: string | null = null;
+
+  async function initializeNavigation(
+    ctx: AnyContext,
+    replaceExisting: boolean,
+  ): Promise<SessionNavigation> {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (!replaceExisting) {
+      const current = navigations.get(sessionId);
+      if (current) return current;
+      const active = initializations.get(sessionId);
+      if (active) return active;
+    }
+    const initialization = (async () => {
+      const previous = navigations.get(sessionId);
+      navigations.delete(sessionId);
+      if (previous) await previous.suspend();
+      const git = createGitRunner(ctx.cwd);
+      const resolved = await resolveRepository(git);
+      const store =
+        "repository" in resolved
+          ? new SessionHistoryStore(sessionId, resolved.repository, git)
+          : undefined;
+      const navigation = createNavigation(ctx, store);
+      const restored = store ? await store.load(ctx.sessionManager) : null;
+      navigation.restoreState(restored ?? reconstructSessionHistory(ctx.sessionManager));
+      if (!closing) navigations.set(sessionId, navigation);
+      return navigation;
+    })();
+    initializations.set(sessionId, initialization);
+    try {
+      return await initialization;
+    } finally {
+      if (initializations.get(sessionId) === initialization) initializations.delete(sessionId);
+    }
+  }
+
+  async function ensureNavigation(ctx: AnyContext): Promise<SessionNavigation | null> {
+    if (closing) return null;
+    return initializeNavigation(ctx, false);
+  }
 
   function track(operation: () => Promise<void>): Promise<void> {
     const { promise: tracked, resolve, reject } = promiseWithResolvers<void>();
@@ -93,9 +138,12 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   async function disposeDetached(
     detachedNavigations: readonly SessionNavigation[],
     detachedPending: readonly PendingTurnCheckpoint[],
+    releaseNavigations = true,
   ): Promise<void> {
     await Promise.allSettled([
-      ...detachedNavigations.map((navigation) => navigation.dispose()),
+      ...detachedNavigations.map((navigation) =>
+        releaseNavigations ? navigation.dispose() : navigation.suspend(),
+      ),
       ...detachedPending.map((pendingCheckpoint) => releasePending(pendingCheckpoint)),
     ]);
   }
@@ -111,7 +159,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     const detachedPending = [...pending.values()];
     navigations.clear();
     pending.clear();
-    await disposeDetached(detachedNavigations, detachedPending);
+    await disposeDetached(detachedNavigations, detachedPending, false);
   }
 
   pi.on("session_start", (_event, ctx) =>
@@ -119,13 +167,11 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       if (closing) return;
       const typed = ctx as unknown as AnyContext;
       const sessionId = typed.sessionManager.getSessionId();
-      const previous = navigations.get(sessionId);
-      navigations.delete(sessionId);
       const previousPending = pending.get(sessionId);
       pending.delete(sessionId);
-      await disposeDetached(previous ? [previous] : [], previousPending ? [previousPending] : []);
+      if (previousPending) await releasePending(previousPending);
       if (closing) return;
-      navigations.set(sessionId, createNavigation(typed));
+      await initializeNavigation(typed, true);
     }),
   );
 
@@ -243,9 +289,14 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
             );
             return;
           }
-          const nav = navigations.get(sessionId) ?? createNavigation(typed);
+          const retained = await retainCheckpointForResume(
+            createGitRunner(result.checkpoint.repository.worktree),
+            sessionId,
+            result.checkpoint,
+          );
+          const nav = (await ensureNavigation(typed)) ?? createNavigation(typed);
           navigations.set(sessionId, nav);
-          await nav.recordTurnEnd(result.checkpoint);
+          await nav.recordTurnEnd(retained);
           return;
         }
         completed = {
@@ -255,7 +306,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
           leafId: typed.sessionManager.getLeafId(),
         };
       }
-      const nav = navigations.get(sessionId) ?? createNavigation(typed);
+      const nav = (await ensureNavigation(typed)) ?? createNavigation(typed);
       navigations.set(sessionId, nav);
       await nav.recordTurnEnd(completed);
     }),
@@ -269,9 +320,10 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     const detachedNavigations = [...navigations.values()];
     const detachedPending = [...pending.values()];
     navigations.clear();
+    initializations.clear();
     pending.clear();
     shutdownPromise = (async () => {
-      await disposeDetached(detachedNavigations, detachedPending);
+      await disposeDetached(detachedNavigations, detachedPending, false);
       await Promise.allSettled([...activeOperations]);
       await drainState();
       await ownerRegistry.shutdown();
@@ -280,9 +332,9 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   });
 
   const undoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
-    const nav = navigations.get(ctx.sessionManager.getSessionId());
+    const nav = await ensureNavigation(ctx as unknown as AnyContext);
     if (!nav) {
-      ctx.ui.notify("Undo is unavailable until a turn completes.", "warning");
+      ctx.ui.notify("Undo is unavailable while the session is closing.", "warning");
       return;
     }
     nav.setNavigateTree(ctx.navigateTree);
@@ -290,9 +342,9 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   };
 
   const redoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
-    const nav = navigations.get(ctx.sessionManager.getSessionId());
+    const nav = await ensureNavigation(ctx as unknown as AnyContext);
     if (!nav) {
-      ctx.ui.notify("Redo is unavailable until a turn completes.", "warning");
+      ctx.ui.notify("Redo is unavailable while the session is closing.", "warning");
       return;
     }
     nav.setNavigateTree(ctx.navigateTree);
