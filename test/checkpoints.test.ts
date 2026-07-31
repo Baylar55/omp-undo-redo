@@ -282,10 +282,11 @@ describe("history-safe Git checkpoints", () => {
       expect(
         await text(git, ["diff", "--", "tracked.txt"], { env: { GIT_OPTIONAL_LOCKS: "0" } }),
       ).toContain("-turn\n+base");
+      const indexBeforeRedo = await readFile(savedIndexPath);
 
       expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toBe("applied");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
-      expect(await readFile(savedIndexPath)).toEqual(savedIndex.raw);
+      expect(await readFile(savedIndexPath)).toEqual(indexBeforeRedo);
       expect(await text(git, ["write-tree"])).toBe(savedIndex.tree);
       expect(await text(git, ["status", "--short"], { env: { GIT_OPTIONAL_LOCKS: "0" } })).toBe(
         "M  tracked.txt",

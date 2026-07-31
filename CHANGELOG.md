@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.28] - 2026-07-31
+
+### Fixed
+
+- Make staged-state regression assertions stable across Git platforms by separating extension apply checks from Git index stat refreshes.
+
 ## [1.0.27] - 2026-07-31
 
 ### Fixed
