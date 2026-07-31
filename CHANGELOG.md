@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.0.30] - 2026-07-31
+
+### Fixed
+
+- Serialize overlapping undo and redo operations so each command advances exactly one checkpoint without corrupting the history position.
+
 ## [1.0.29] - 2026-07-31
 
 ### Added
@@ -203,6 +209,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
+[1.0.30]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.30
 [1.0.26]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.26
 [1.0.25]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.25
 [1.0.24]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.24

@@ -110,6 +110,25 @@ describe("session navigation", () => {
     expect((await navigation.redo()).status).toBe("empty");
   });
 
+  it("serializes overlapping undo and redo operations", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    await navigation.recordTurnEnd(sessionCheckpoint("u1", "a1"));
+    await navigation.recordTurnEnd(sessionCheckpoint("u2", "a2"));
+
+    const undoResults = await Promise.all([navigation.undo(), navigation.undo()]);
+    expect(undoResults.map((result) => result.status)).toEqual(["moved", "moved"]);
+    expect(session.navigateCalls).toEqual(["u2", "u1"]);
+    expect(session.leaf).toBe("u1");
+    expect((await navigation.undo()).status).toBe("empty");
+
+    const redoResults = await Promise.all([navigation.redo(), navigation.redo()]);
+    expect(redoResults.map((result) => result.status)).toEqual(["moved", "moved"]);
+    expect(session.navigateCalls).toEqual(["u2", "u1", "a1", "a2"]);
+    expect(session.leaf).toBe("a2");
+    expect((await navigation.redo()).status).toBe("empty");
+  });
+
   it("preserves redo for matching internal tree navigation", async () => {
     const session = port();
     const navigation = makeNavigation(session);
