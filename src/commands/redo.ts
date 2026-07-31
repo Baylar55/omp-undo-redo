@@ -14,6 +14,8 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "the Git repository has an invalid HEAD.";
     case "file_history_gap":
       return "a later turn had no file checkpoint, so this older file checkpoint was discarded.";
+    case "resumed_checkpoint_unavailable":
+      return "the resumed turn has no usable file checkpoint.";
     default:
       return "the file checkpoint could not be created.";
   }

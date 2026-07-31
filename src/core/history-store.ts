@@ -1,0 +1,284 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { checkpointNamespace } from "./checkpoints.js";
+import type {
+  FileCheckpointUnavailableReason,
+  GitCheckpoint,
+  GitRepository,
+  GitRunner,
+  NavigationState,
+  SessionReader,
+  TurnCheckpoint,
+} from "./types.js";
+
+const HISTORY_SCHEMA = 1;
+const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
+const GIT_OBJECT_ID = /^[0-9a-f]{40,64}$/;
+const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
+  git_unavailable: true,
+  not_repository: true,
+  repository_unresolvable: true,
+  invalid_head: true,
+  before_snapshot_failed: true,
+  before_ref_failed: true,
+  after_snapshot_failed: true,
+  after_ref_failed: true,
+  file_history_gap: true,
+  resumed_checkpoint_unavailable: true,
+};
+
+type StoredHistory = {
+  schemaVersion: number;
+  sessionHash: string;
+  repository: GitRepository;
+  checkpoints: TurnCheckpoint[];
+  currentIndex: number;
+};
+
+function historyDirectory(repository: GitRepository): string {
+  return join(repository.commonDir, "omp-undo-redo", "history");
+}
+
+export function historyPath(repository: GitRepository, sessionId: string): string {
+  return join(historyDirectory(repository), `${checkpointNamespace(sessionId)}.json`);
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isRepository(value: unknown): value is GitRepository {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.worktree === "string" &&
+    typeof candidate.gitDir === "string" &&
+    typeof candidate.commonDir === "string"
+  );
+}
+
+function isSessionCheckpoint(value: unknown): value is TurnCheckpoint {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.kind === "session" &&
+    typeof candidate.reason === "string" &&
+    candidate.reason in UNAVAILABLE_REASONS &&
+    isNullableString(candidate.parentLeafId) &&
+    isNullableString(candidate.leafId)
+  );
+}
+
+function isGitCheckpoint(value: unknown, refPrefix: string): value is GitCheckpoint {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.kind === "git" &&
+    isRepository(candidate.repository) &&
+    typeof candidate.beforeHash === "string" &&
+    GIT_OBJECT_ID.test(candidate.beforeHash) &&
+    typeof candidate.afterHash === "string" &&
+    GIT_OBJECT_ID.test(candidate.afterHash) &&
+    typeof candidate.beforeRef === "string" &&
+    candidate.beforeRef.startsWith(refPrefix) &&
+    candidate.beforeRef.endsWith("/before") &&
+    typeof candidate.afterRef === "string" &&
+    candidate.afterRef === candidate.beforeRef.replace(/\/before$/, "/after") &&
+    isNullableString(candidate.parentLeafId) &&
+    isNullableString(candidate.leafId)
+  );
+}
+
+function sameRepository(left: GitRepository, right: GitRepository): boolean {
+  return (
+    left.worktree === right.worktree &&
+    left.gitDir === right.gitDir &&
+    left.commonDir === right.commonDir
+  );
+}
+
+function parseHistory(
+  value: unknown,
+  sessionId: string,
+  repository: GitRepository,
+): StoredHistory | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  const sessionHash = checkpointNamespace(sessionId);
+  const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+  if (
+    candidate.schemaVersion !== HISTORY_SCHEMA ||
+    candidate.sessionHash !== sessionHash ||
+    !isRepository(candidate.repository) ||
+    !sameRepository(candidate.repository, repository) ||
+    !Array.isArray(candidate.checkpoints) ||
+    !Number.isInteger(candidate.currentIndex)
+  )
+    return null;
+  if (
+    !candidate.checkpoints.every(
+      (checkpoint) => isSessionCheckpoint(checkpoint) || isGitCheckpoint(checkpoint, refPrefix),
+    )
+  )
+    return null;
+  const checkpoints = candidate.checkpoints as TurnCheckpoint[];
+  const currentIndex = candidate.currentIndex as number;
+  if (currentIndex < -1 || currentIndex >= checkpoints.length) return null;
+  return {
+    schemaVersion: HISTORY_SCHEMA,
+    sessionHash,
+    repository,
+    checkpoints,
+    currentIndex,
+  };
+}
+
+async function existingRefs(git: GitRunner, prefix: string): Promise<Map<string, string> | null> {
+  try {
+    const result = await git(["for-each-ref", "--format=%(refname)%00%(objectname)", prefix]);
+    if (result.code !== 0 || result.error) return null;
+    const refs = new Map<string, string>();
+    for (const line of result.stdout.split(/\r?\n/)) {
+      if (!line) continue;
+      const separator = line.indexOf("\0");
+      if (separator < 0 || line.indexOf("\0", separator + 1) >= 0) return null;
+      refs.set(line.slice(0, separator), line.slice(separator + 1));
+    }
+    return refs;
+  } catch {
+    return null;
+  }
+}
+
+function entryExists(reader: SessionReader, id: string | null): boolean {
+  return id === null || reader.getEntry(id) !== undefined;
+}
+
+function expectedLeaf(state: NavigationState): string | null {
+  if (state.checkpoints.length === 0) return null;
+  return state.currentIndex >= 0
+    ? state.checkpoints[state.currentIndex].leafId
+    : state.checkpoints[0].parentLeafId;
+}
+
+export function reconstructSessionHistory(reader: SessionReader): NavigationState {
+  const branch = reader.getBranch(reader.getLeafId() ?? undefined);
+  const checkpoints: TurnCheckpoint[] = [];
+  for (let index = 0; index < branch.length; index++) {
+    const entry = branch[index];
+    if (entry.type !== "message" || entry.message?.role !== "user") continue;
+    let leafIndex = index;
+    while (
+      leafIndex + 1 < branch.length &&
+      !(branch[leafIndex + 1].type === "message" && branch[leafIndex + 1].message?.role === "user")
+    ) {
+      leafIndex++;
+    }
+    if (leafIndex === index) continue;
+    checkpoints.push({
+      kind: "session",
+      reason: "resumed_checkpoint_unavailable",
+      parentLeafId: entry.id,
+      leafId: branch[leafIndex].id,
+    });
+    index = leafIndex;
+  }
+  return { checkpoints, currentIndex: checkpoints.length - 1 };
+}
+
+export class SessionHistoryStore {
+  constructor(
+    private readonly sessionId: string,
+    private readonly repository: GitRepository,
+    private readonly git: GitRunner,
+  ) {}
+
+  async load(reader: SessionReader): Promise<NavigationState | null> {
+    const path = historyPath(this.repository, this.sessionId);
+    try {
+      const metadata = await stat(path);
+      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) return null;
+      const parsed = parseHistory(
+        JSON.parse(await readFile(path, "utf8")) as unknown,
+        this.sessionId,
+        this.repository,
+      );
+      if (!parsed) return null;
+      const refPrefix = `refs/omp-undo-redo/history/${parsed.sessionHash}/`;
+      const refs = await existingRefs(this.git, refPrefix);
+      if (refs === null) return null;
+      const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
+        if (checkpoint.kind === "session") return checkpoint;
+        if (
+          refs.get(checkpoint.beforeRef) === checkpoint.beforeHash &&
+          refs.get(checkpoint.afterRef) === checkpoint.afterHash &&
+          sameRepository(checkpoint.repository, this.repository)
+        )
+          return checkpoint;
+        return {
+          kind: "session",
+          reason: "resumed_checkpoint_unavailable",
+          parentLeafId: checkpoint.parentLeafId,
+          leafId: checkpoint.leafId,
+        };
+      });
+      const state = { checkpoints, currentIndex: parsed.currentIndex };
+      if (
+        checkpoints.some(
+          (checkpoint) =>
+            !entryExists(reader, checkpoint.parentLeafId) ||
+            !entryExists(reader, checkpoint.leafId),
+        ) ||
+        expectedLeaf(state) !== reader.getLeafId()
+      )
+        return null;
+      return state;
+    } catch {
+      return null;
+    }
+  }
+
+  async save(state: NavigationState): Promise<void> {
+    const directory = historyDirectory(this.repository);
+    const path = historyPath(this.repository, this.sessionId);
+    if (state.checkpoints.length === 0) {
+      await rm(path, { force: true }).catch(() => undefined);
+      return;
+    }
+    const sessionHash = checkpointNamespace(this.sessionId);
+    const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+    const checkpoints = state.checkpoints.map((checkpoint): TurnCheckpoint => {
+      if (
+        checkpoint.kind === "session" ||
+        (checkpoint.beforeRef.startsWith(refPrefix) &&
+          sameRepository(checkpoint.repository, this.repository))
+      )
+        return checkpoint;
+      return {
+        kind: "session",
+        reason: "resumed_checkpoint_unavailable",
+        parentLeafId: checkpoint.parentLeafId,
+        leafId: checkpoint.leafId,
+      };
+    });
+    const stored: StoredHistory = {
+      schemaVersion: HISTORY_SCHEMA,
+      sessionHash,
+      repository: this.repository,
+      checkpoints,
+      currentIndex: state.currentIndex,
+    };
+    const temporary = join(
+      directory,
+      `.${checkpointNamespace(this.sessionId)}.${randomUUID()}.tmp`,
+    );
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(temporary, JSON.stringify(stored), { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, path);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+  }
+}

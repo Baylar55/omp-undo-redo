@@ -20,7 +20,8 @@ export type FileCheckpointUnavailableReason =
   | "before_ref_failed"
   | "after_snapshot_failed"
   | "after_ref_failed"
-  | "file_history_gap";
+  | "file_history_gap"
+  | "resumed_checkpoint_unavailable";
 
 export type TreeNavigationResult = {
   cancelled: boolean;
@@ -88,6 +89,11 @@ export interface SessionOnlyCheckpoint {
 }
 
 export type TurnCheckpoint = GitCheckpoint | SessionOnlyCheckpoint;
+
+export interface NavigationState {
+  checkpoints: TurnCheckpoint[];
+  currentIndex: number;
+}
 
 export interface PendingGitCheckpoint {
   kind: "git";
