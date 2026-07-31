@@ -88,6 +88,26 @@ Every completed turn remains navigable, including conversation-only turns and tu
 
 Undo/redo has two modes. **Full mode** creates private Git snapshot objects through an alternate index and `git commit-tree`, then retains them with refs under `refs/omp-undo-redo/`; `/undo` and `/redo` restore only the worktree snapshot and navigate session context. **Session-only mode** navigates session context without changing files when Git is unavailable, the cwd is outside a repository, the repository cannot be resolved, `HEAD` is invalid, or snapshot creation fails. Checkpoint creation never moves `HEAD` or any branch ref. The real Git index is preserved, and releasing a checkpoint removes its private refs. A checkpoint covers the complete Git worktree that contains the session cwd; starting OMP from a repository subdirectory does not limit undo/redo to that subtree. Dirty files that existed before the turn are included in both snapshots and remain unchanged by undo/redo. Changes made anywhere in the repository during the turn can be part of the checkpoint because Git snapshots cannot determine authorship; this is an architectural limitation. Ignored files, empty directories, dirty submodule contents, shell effects, network effects, and editor state are outside the checkpoint. Clean/smudge filters, `core.autocrlf`, submodules, and ignored files prevent a universal byte-for-byte guarantee. If overlapping worktree changes prevent safe application, undo/redo fails instead of overwriting them. Graceful session shutdown releases active and pending private refs. Forced termination, process kill, shutdown-handler timeout, or Git cleanup failure can still leave stale private refs; inspect them with `git for-each-ref refs/omp-undo-redo/` and remove only confirmed stale refs. Do not delete refs from a repository while another OMP process may still be using them.
 
+### Checkpoint ownership and stale cleanup
+
+New full-mode checkpoints use owner-scoped v2 refs:
+
+```text
+refs/omp-undo-redo/v2/<ownerId>/<sessionHash>/<checkpointId>/before
+refs/omp-undo-redo/v2/<ownerId>/<sessionHash>/<checkpointId>/after
+```
+
+The extension publishes a repository-local lease before it creates a v2 ref. A later runtime automatically removes refs only when the lease is valid, has the same persistent host ID, hostname, and runtime scope, and its PID probe returns `ESRCH`. On Linux, the runtime scope binds cleanup to both the current kernel boot ID and PID namespace, preventing a container or WSL process outside that namespace from being mistaken for a dead local process. If that scope cannot be resolved, automatic cleanup is disabled while v2 checkpointing and graceful cleanup continue. Current, live, remote, malformed, future-version, unreadable, and otherwise uncertain owners are preserved. Existing ownerless refs are always manual-cleanup refs. Automatic maintenance runs once per runtime and repository, in the background, with bounded Git operations; maintenance failure does not block checkpoint creation or commands.
+
+For manual inspection, stop all OMP/Pi processes that use the repository, then use Git commands only:
+
+```sh
+git for-each-ref --format="%(refname) %(objectname)" refs/omp-undo-redo/
+git update-ref -d <exact-ref> <expected-object-id>
+```
+
+Replace the placeholders with the exact ref and object ID printed by the first command. Do not delete a ref by name alone. Removing a ref makes its objects eligible for later Git reclamation; it does not immediately or securely erase the object data. Unreadable host identity or Linux runtime-scope state, malformed leases, and future ref versions remain manual-cleanup cases. The persistent host-ID directory must not be copied or shared between independent native machines that use the same repository and hostname; native Windows and macOS cleanup assumes that identity is machine-local.
+
 ### Git index and staged changes
 
 `/undo` and `/redo` are worktree operations, not staging operations. Staged changes that existed before or were created during a turn remain staged, even when navigation restores an earlier worktree snapshot. A touched path can therefore show `MM`, `AM`, `MD`, or another two-column porcelain state after navigation. `git diff --cached` shows what a commit would take from the preserved index. `git diff` shows unstaged differences between that index and the restored worktree. Inspect both views and deliberately stage the desired files before committing. The extension does not recommend an automatic `git add -A`, `git reset`, or `git restore --staged` command because each can alter unrelated staging intent.

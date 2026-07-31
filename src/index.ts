@@ -1,9 +1,13 @@
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import type { SessionEntryLike } from "./core/types.js";
 import { runRedo } from "./commands/redo.js";
 import { runUndo } from "./commands/undo.js";
+import {
+  CheckpointOwnerRegistry,
+  resolvePersistentHostId,
+  resolveRuntimeScope,
+} from "./core/checkpoint-owners.js";
+import { createGitRunner } from "./core/git-runner.js";
 import { SessionNavigation } from "./core/session-navigation.js";
 import {
   finishAfterTurn,
@@ -11,9 +15,7 @@ import {
   releaseCheckpoint,
   releasePendingCheckpoint,
 } from "./core/checkpoints.js";
-import type { GitRunner, PendingTurnCheckpoint, SessionOnlyCheckpoint } from "./core/types.js";
-
-const execFileAsync = promisify(execFile);
+import type { PendingTurnCheckpoint, SessionOnlyCheckpoint } from "./core/types.js";
 
 function promiseWithResolvers<T>(): {
   promise: Promise<T>;
@@ -38,75 +40,6 @@ type AnyContext = {
   };
 };
 
-function createGitRunner(cwd: string): GitRunner {
-  const runner: GitRunner = async (args, options) => {
-    if (options?.stdin !== undefined) {
-      const { promise, resolve } = promiseWithResolvers<{
-        stdout: string;
-        stderr: string;
-        code: number;
-        error?: "unavailable";
-      }>();
-      const child = spawn("git", args, {
-        cwd,
-        env: { ...process.env, ...options.env },
-        windowsHide: true,
-      });
-      let stdout = "";
-      let stderr = "";
-      let settled = false;
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => {
-        stdout += chunk;
-      });
-      child.stderr.on("data", (chunk: string) => {
-        stderr += chunk;
-      });
-      child.once("error", (error) => {
-        if (settled) return;
-        settled = true;
-        resolve({
-          stdout,
-          stderr: `${stderr}${error.message}`,
-          code: 1,
-          error: "unavailable",
-        });
-      });
-      child.once("close", (code) => {
-        if (settled) return;
-        settled = true;
-        resolve({ stdout, stderr, code: typeof code === "number" ? code : 1 });
-      });
-      child.stdin.on("error", () => {});
-      child.stdin.end(options.stdin);
-      return await promise;
-    }
-    try {
-      const result = await execFileAsync("git", args, {
-        cwd,
-        env: { ...process.env, ...options?.env },
-        windowsHide: true,
-      });
-      return { stdout: result.stdout, stderr: result.stderr, code: 0 };
-    } catch (error) {
-      const failure = error as {
-        stdout?: string;
-        stderr?: string;
-        code?: number;
-      };
-      return {
-        stdout: failure.stdout ?? "",
-        stderr: failure.stderr ?? "",
-        code: typeof failure.code === "number" ? failure.code : 1,
-        ...(typeof failure.code === "number" ? {} : { error: "unavailable" as const }),
-      };
-    }
-  };
-  runner.cwd = cwd;
-  return runner;
-}
-
 function createNavigation(ctx: AnyContext): SessionNavigation {
   const manager = ctx.sessionManager;
   return new SessionNavigation(
@@ -121,6 +54,10 @@ function createNavigation(ctx: AnyContext): SessionNavigation {
 }
 
 export default function ompUndoRedo(pi: ExtensionAPI): void {
+  const ownerRegistry = new CheckpointOwnerRegistry({
+    resolveHostIdentity: resolvePersistentHostId,
+    resolveRuntimeScope,
+  });
   const navigations = new Map<string, SessionNavigation>();
   const pending = new Map<string, PendingTurnCheckpoint>();
   const activeOperations = new Set<Promise<void>>();
@@ -253,7 +190,11 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       pending.delete(sessionId);
       if (oldPending) await releasePending(oldPending);
 
-      const prepared = await prepareBeforeTurn(createGitRunner(typed.cwd), sessionId);
+      const prepared = await prepareBeforeTurn(
+        createGitRunner(typed.cwd),
+        sessionId,
+        ownerRegistry,
+      );
       const parentLeafId = typed.sessionManager.getLeafId();
       const checkpoint: PendingTurnCheckpoint =
         prepared.status === "git"
@@ -333,6 +274,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       await disposeDetached(detachedNavigations, detachedPending);
       await Promise.allSettled([...activeOperations]);
       await drainState();
+      await ownerRegistry.shutdown();
     })();
     return shutdownPromise;
   });

@@ -169,6 +169,8 @@ describe("session-only lifecycle fallback", () => {
         "Undid last turn: session moved back and worktree snapshot restored; Git index left unchanged.",
       );
       expect(await privateRefs(cwd)).toHaveLength(2);
+      const refs = await privateRefs(cwd);
+      expect(refs.every((ref) => ref.startsWith("refs/omp-undo-redo/v2/"))).toBe(true);
       await pi.runCommand("redo", ctx);
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
