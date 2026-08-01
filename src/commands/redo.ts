@@ -1,5 +1,9 @@
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
-import type { FileCheckpointUnavailableReason, NavigationResult } from "../core/types.js";
+import type {
+  CommandNavigationResult,
+  FileCheckpointUnavailableReason,
+  NavigationResult,
+} from "../core/types.js";
 import type { SessionNavigation } from "../core/session-navigation.js";
 
 function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
@@ -24,11 +28,11 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
 export async function runRedo(
   navigation: SessionNavigation,
   ctx: ExtensionCommandContext,
-): Promise<void> {
+): Promise<CommandNavigationResult> {
   await ctx.waitForIdle();
   if (!ctx.isIdle()) {
     ctx.ui.notify("Cannot redo while the agent is busy.", "warning");
-    return;
+    return { status: "busy" };
   }
 
   const outcome: NavigationResult = await navigation.redo();
@@ -62,4 +66,5 @@ export async function runRedo(
       );
       break;
   }
+  return outcome;
 }

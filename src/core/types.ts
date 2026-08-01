@@ -40,6 +40,23 @@ export type NavigationResult =
   | { status: "git_failed"; failure: "conflict" | "failed" }
   | { status: "rollback_failed" };
 
+export type ActionId = "undo" | "redo";
+
+export interface ActionInvocationResult {
+  id: ActionId;
+  applied: boolean;
+  token: string;
+}
+
+export interface RuntimeActionState {
+  actions: Array<{ id: ActionId; enabled: boolean }>;
+  sessionRevision: string;
+  activeSessionLeaf: string | null;
+  actionResult?: ActionInvocationResult;
+}
+
+export type CommandNavigationResult = NavigationResult | { status: "busy" } | { status: "closing" };
+
 export interface NavigationPort extends SessionReader {
   navigateTree(targetId: string): Promise<TreeNavigationResult>;
 }

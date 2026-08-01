@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { checkpointNamespace } from "../src/core/checkpoints.js";
+import { runtimeRootDirectory } from "../src/core/runtime-action-state-store.js";
 import ompUndoRedo from "../src/index.js";
 
 const execFileAsync = promisify(execFile);
@@ -118,6 +120,16 @@ async function makeUnbornRepository(): Promise<string> {
 async function privateRefs(cwd: string): Promise<string[]> {
   const output = await git(cwd, ["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"]);
   return output ? output.split("\n") : [];
+}
+
+async function runtimeState(sessionId: string): Promise<Record<string, unknown>> {
+  const path = join(
+    runtimeRootDirectory(),
+    String(process.pid),
+    "sessions",
+    `${checkpointNamespace(sessionId)}.json`,
+  );
+  return JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
 }
 
 async function prepareUndoneSession(
@@ -270,6 +282,130 @@ describe("session-only lifecycle fallback", () => {
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
       await pi.runCommand("redo", ctx);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("D\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runtime action-state lifecycle", () => {
+  it("publishes non-Git turn availability and active leaf", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-runtime-lifecycle-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const sessionId = "runtime-turn-session";
+      const ctx = context(cwd, sessionId);
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+
+      const published = await runtimeState(sessionId);
+      expect(published.actions).toEqual([
+        { id: "undo", enabled: true },
+        { id: "redo", enabled: false },
+      ]);
+      expect(published.activeSessionLeaf).toBe("turn");
+      expect(published.actionResult).toBeUndefined();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes Undo and Redo results with selected leaves", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-runtime-navigation-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const sessionId = "runtime-navigation-session";
+      const ctx = await prepareUndoneSession(pi, cwd, sessionId);
+
+      const undone = await runtimeState(sessionId);
+      expect(undone.actions).toEqual([
+        { id: "undo", enabled: false },
+        { id: "redo", enabled: true },
+      ]);
+      expect(undone.activeSessionLeaf).toBe("leaf");
+      expect(undone.actionResult).toMatchObject({ id: "undo", applied: true });
+
+      await pi.runCommand("redo", ctx);
+      const redone = await runtimeState(sessionId);
+      expect(redone.actions).toEqual([
+        { id: "undo", enabled: true },
+        { id: "redo", enabled: false },
+      ]);
+      expect(redone.activeSessionLeaf).toBe("turn");
+      expect(redone.actionResult).toMatchObject({ id: "redo", applied: true });
+
+      await pi.emit("session_start", ctx);
+      expect((await runtimeState(sessionId)).actionResult).toBeUndefined();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes fresh failed results without changing navigation revision", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-runtime-results-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const sessionId = "runtime-result-session";
+      const ctx = await prepareUndoneSession(pi, cwd, sessionId);
+      const first = await runtimeState(sessionId);
+      const firstToken = (first.actionResult as { token: string }).token;
+
+      await pi.runCommand("undo", ctx);
+      const empty = await runtimeState(sessionId);
+      expect(empty.actionResult).toMatchObject({ id: "undo", applied: false });
+      expect((empty.actionResult as { token: string }).token).not.toBe(firstToken);
+      expect(empty.sessionRevision).toBe(first.sessionRevision);
+
+      const cancelledId = "runtime-cancelled-session";
+      const cancelled = context(cwd, cancelledId);
+      await pi.emit("session_start", cancelled);
+      await pi.emit("before_agent_start", cancelled);
+      cancelled.leaf = "cancelled-turn";
+      await pi.emit("agent_end", cancelled);
+      const beforeCancel = await runtimeState(cancelledId);
+      await pi.runCommand("undo", cancelled);
+      const afterCancel = await runtimeState(cancelledId);
+      expect(afterCancel.actionResult).toMatchObject({ id: "undo", applied: false });
+      expect(afterCancel.sessionRevision).toBe(beforeCancel.sessionRevision);
+
+      const busyId = "runtime-busy-session";
+      const busy = context(cwd, busyId);
+      await pi.emit("session_start", busy);
+      busy.isIdle = () => false;
+      await pi.runCommand("undo", busy);
+      const afterBusy = await runtimeState(busyId);
+      expect(afterBusy.actionResult).toMatchObject({ id: "undo", applied: false });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("clears Redo and publishes new leaf after unrelated navigation", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const sessionId = "runtime-branch-session";
+      const ctx = await prepareUndoneSession(pi, cwd, sessionId);
+      const oldLeafId = ctx.leaf;
+      ctx.leaf = "unrelated";
+      await pi.emit("session_tree", ctx, {
+        type: "session_tree",
+        oldLeafId,
+        newLeafId: ctx.leaf,
+      });
+
+      const published = await runtimeState(sessionId);
+      expect(published.actions).toEqual([
+        { id: "undo", enabled: false },
+        { id: "redo", enabled: false },
+      ]);
+      expect(published.activeSessionLeaf).toBe("unrelated");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
