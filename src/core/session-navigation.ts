@@ -46,6 +46,13 @@ export class SessionNavigation {
     this.currentIndex = state.currentIndex;
   }
 
+  snapshot(): NavigationState {
+    return {
+      checkpoints: [...this.checkpoints],
+      currentIndex: this.currentIndex,
+    };
+  }
+
   private async persistState(): Promise<void> {
     await this.stateChanged({
       checkpoints: [...this.checkpoints],

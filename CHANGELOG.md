@@ -2,6 +2,19 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.1.0] - 2026-08-01
+
+### Added
+
+- Publish authoritative schema-2 Undo/Redo action state for Git and non-Git sessions.
+- Publish selected session leaf, navigation revision, action availability, and exact action results for external clients.
+- Isolate runtime state by extension PID and runtime ID with atomic private files and best-effort cleanup.
+- Add regression coverage for runtime-store ordering, isolation, stale cleanup, shutdown, filesystem failures, and lifecycle publication.
+
+### Changed
+
+- Reset stale action results when a session starts or resumes.
+
 ## [1.0.32] - 2026-07-31
 
 ### Added

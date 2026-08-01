@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import { randomUUID } from "node:crypto";
 import type { SessionEntryLike } from "./core/types.js";
 import { runRedo } from "./commands/redo.js";
 import { runUndo } from "./commands/undo.js";
@@ -18,7 +19,8 @@ import {
   retainCheckpointForResume,
 } from "./core/checkpoints.js";
 import { reconstructSessionHistory, SessionHistoryStore } from "./core/history-store.js";
-import type { PendingTurnCheckpoint, SessionOnlyCheckpoint } from "./core/types.js";
+import type { ActionId, PendingTurnCheckpoint, SessionOnlyCheckpoint } from "./core/types.js";
+import { RuntimeActionStateStore } from "./core/runtime-action-state-store.js";
 
 function promiseWithResolvers<T>(): {
   promise: Promise<T>;
@@ -43,7 +45,12 @@ type AnyContext = {
   };
 };
 
-function createNavigation(ctx: AnyContext, store?: SessionHistoryStore): SessionNavigation {
+function createNavigation(
+  ctx: AnyContext,
+  sessionId: string,
+  store: SessionHistoryStore | undefined,
+  runtimeStore: RuntimeActionStateStore,
+): SessionNavigation {
   const manager = ctx.sessionManager;
   return new SessionNavigation(
     {
@@ -53,7 +60,13 @@ function createNavigation(ctx: AnyContext, store?: SessionHistoryStore): Session
     },
     createGitRunner(ctx.cwd),
     (repository) => createGitRunner(repository.worktree),
-    store ? (state) => store.save(state) : undefined,
+    async (state) => {
+      const activeSessionLeaf = manager.getLeafId();
+      await Promise.allSettled([
+        ...(store ? [store.save(state)] : []),
+        runtimeStore.publishNavigation(sessionId, state, activeSessionLeaf),
+      ]);
+    },
   );
 }
 
@@ -62,6 +75,8 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     resolveHostIdentity: resolvePersistentHostId,
     resolveRuntimeScope,
   });
+  const runtimeStore = new RuntimeActionStateStore();
+  const runtimeReady = runtimeStore.initialize();
   const navigations = new Map<string, SessionNavigation>();
   const pending = new Map<string, PendingTurnCheckpoint>();
   const initializations = new Map<string, Promise<SessionNavigation>>();
@@ -83,6 +98,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       if (active) return active;
     }
     const initialization = (async () => {
+      await runtimeReady;
       const previous = navigations.get(sessionId);
       navigations.delete(sessionId);
       if (previous) await previous.suspend();
@@ -92,9 +108,14 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
         "repository" in resolved
           ? new SessionHistoryStore(sessionId, resolved.repository, git)
           : undefined;
-      const navigation = createNavigation(ctx, store);
+      const navigation = createNavigation(ctx, sessionId, store, runtimeStore);
       const restored = store ? await store.load(ctx.sessionManager) : null;
       navigation.restoreState(restored ?? reconstructSessionHistory(ctx.sessionManager));
+      await runtimeStore.initializeSession(
+        sessionId,
+        navigation.snapshot(),
+        ctx.sessionManager.getLeafId(),
+      );
       if (!closing) navigations.set(sessionId, navigation);
       return navigation;
     })();
@@ -125,6 +146,22 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       }
     })();
     return tracked;
+  }
+
+  async function publishActionResult(
+    sessionId: string,
+    navigation: SessionNavigation,
+    ctx: AnyContext,
+    id: ActionId,
+    token: string,
+    applied: boolean,
+  ): Promise<void> {
+    await runtimeStore.publishActionResult(
+      sessionId,
+      navigation.snapshot(),
+      ctx.sessionManager.getLeafId(),
+      { id, applied, token },
+    );
   }
 
   async function releasePending(pendingCheckpoint: PendingTurnCheckpoint): Promise<void> {
@@ -294,7 +331,9 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
             sessionId,
             result.checkpoint,
           );
-          const nav = (await ensureNavigation(typed)) ?? createNavigation(typed);
+          const nav =
+            (await ensureNavigation(typed)) ??
+            createNavigation(typed, sessionId, undefined, runtimeStore);
           navigations.set(sessionId, nav);
           await nav.recordTurnEnd(retained);
           return;
@@ -306,7 +345,9 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
           leafId: typed.sessionManager.getLeafId(),
         };
       }
-      const nav = (await ensureNavigation(typed)) ?? createNavigation(typed);
+      const nav =
+        (await ensureNavigation(typed)) ??
+        createNavigation(typed, sessionId, undefined, runtimeStore);
       navigations.set(sessionId, nav);
       await nav.recordTurnEnd(completed);
     }),
@@ -327,28 +368,49 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       await Promise.allSettled([...activeOperations]);
       await drainState();
       await ownerRegistry.shutdown();
+      await runtimeStore.shutdown();
     })();
     return shutdownPromise;
   });
 
   const undoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
-    const nav = await ensureNavigation(ctx as unknown as AnyContext);
+    const token = randomUUID();
+    const typed = ctx as unknown as AnyContext;
+    const nav = await ensureNavigation(typed);
     if (!nav) {
       ctx.ui.notify("Undo is unavailable while the session is closing.", "warning");
       return;
     }
     nav.setNavigateTree(ctx.navigateTree);
-    await runUndo(nav, ctx);
+    const outcome = await runUndo(nav, ctx);
+    await publishActionResult(
+      typed.sessionManager.getSessionId(),
+      nav,
+      typed,
+      "undo",
+      token,
+      outcome.status === "moved",
+    );
   };
 
   const redoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
-    const nav = await ensureNavigation(ctx as unknown as AnyContext);
+    const token = randomUUID();
+    const typed = ctx as unknown as AnyContext;
+    const nav = await ensureNavigation(typed);
     if (!nav) {
       ctx.ui.notify("Redo is unavailable while the session is closing.", "warning");
       return;
     }
     nav.setNavigateTree(ctx.navigateTree);
-    await runRedo(nav, ctx);
+    const outcome = await runRedo(nav, ctx);
+    await publishActionResult(
+      typed.sessionManager.getSessionId(),
+      nav,
+      typed,
+      "redo",
+      token,
+      outcome.status === "moved",
+    );
   };
 
   pi.registerCommand("undo", {
