@@ -1,4 +1,5 @@
 import type {
+  BlobCheckpoint,
   GitCheckpoint,
   GitRepository,
   GitRunner,
@@ -10,7 +11,8 @@ import type {
   TreeNavigationResult,
   TurnCheckpoint,
 } from "./types.js";
-import { applyCheckpoint, releaseCheckpoints } from "./checkpoints.js";
+import { applyCheckpoint, releaseCheckpoints, type CheckpointApplyResult } from "./checkpoints.js";
+import type { BlobApplyResult, BlobStore } from "./blob-store.js";
 
 export type NavigationOutcome = NavigationResult;
 
@@ -18,6 +20,51 @@ type ExpectedTreeNavigation = {
   oldLeafId: string | null;
   newLeafId: string | null;
 };
+
+export interface CheckpointApplier {
+  git(
+    checkpoint: GitCheckpoint,
+    sourceHash: string,
+    targetHash: string,
+  ): Promise<CheckpointApplyResult>;
+  blob(
+    checkpoint: BlobCheckpoint,
+    sourceTreeId: string,
+    targetTreeId: string,
+  ): Promise<BlobApplyResult>;
+}
+
+export interface CheckpointReleaser {
+  git(checkpoints: readonly GitCheckpoint[]): Promise<boolean>;
+  blob(checkpoints: readonly BlobCheckpoint[]): Promise<boolean>;
+  blobShouldReleaseOnSuspend(checkpoint: BlobCheckpoint): Promise<boolean>;
+}
+
+export function blobNavigationApplier(store: BlobStore): Pick<CheckpointApplier, "blob"> {
+  return {
+    blob: (checkpoint, sourceTreeId, targetTreeId) =>
+      store.applySnapshot(
+        checkpoint.workspaceRoot,
+        checkpoint.sessionHash,
+        sourceTreeId,
+        targetTreeId,
+      ),
+  };
+}
+
+export function blobNavigationReleaser(
+  store: BlobStore,
+): Pick<CheckpointReleaser, "blob" | "blobShouldReleaseOnSuspend"> {
+  return {
+    blob: (checkpoints) =>
+      store.releaseCheckpointRefs(
+        checkpoints[0]?.sessionHash ?? "",
+        checkpoints.map((checkpoint) => checkpoint.checkpointId),
+      ),
+    blobShouldReleaseOnSuspend: async (checkpoint) =>
+      store.hasActiveRefs(checkpoint.sessionHash, checkpoint.checkpointId),
+  };
+}
 
 export class SessionNavigation {
   private checkpoints: TurnCheckpoint[] = [];
@@ -27,6 +74,8 @@ export class SessionNavigation {
   private readonly gitForRepository: GitRunnerFactory;
   private navigationTail: Promise<void> = Promise.resolve();
   private readonly stateChanged: (state: NavigationState) => Promise<void>;
+  private readonly applier: CheckpointApplier;
+  private readonly releaser: CheckpointReleaser;
 
   constructor(
     private readonly port: Omit<NavigationPort, "navigateTree"> & {
@@ -35,9 +84,23 @@ export class SessionNavigation {
     git: GitRunner,
     gitFactory?: GitRunnerFactory,
     stateChanged?: (state: NavigationState) => Promise<void>,
+    applier?: Partial<CheckpointApplier>,
+    releaser?: Partial<CheckpointReleaser>,
   ) {
     this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git);
     this.stateChanged = stateChanged ?? (async () => undefined);
+    this.applier = {
+      git: (checkpoint, sourceHash, targetHash) =>
+        applyCheckpoint(this.gitForRepository(checkpoint.repository), sourceHash, targetHash),
+      blob: async () => ({ status: "failed" }),
+      ...applier,
+    };
+    this.releaser = {
+      git: (checkpoints) => releaseCheckpoints(this.gitForRepository, checkpoints),
+      blob: async () => true,
+      blobShouldReleaseOnSuspend: async () => true,
+      ...releaser,
+    };
     if (port.navigateTree) this.navigateTree = port.navigateTree.bind(port);
   }
 
@@ -47,10 +110,7 @@ export class SessionNavigation {
   }
 
   snapshot(): NavigationState {
-    return {
-      checkpoints: [...this.checkpoints],
-      currentIndex: this.currentIndex,
-    };
+    return { checkpoints: [...this.checkpoints], currentIndex: this.currentIndex };
   }
 
   private async persistState(): Promise<void> {
@@ -103,17 +163,14 @@ export class SessionNavigation {
   async invalidateRedo(): Promise<void> {
     const discarded = this.checkpoints.splice(this.currentIndex + 1);
     await this.persistState();
-    await releaseCheckpoints(
-      this.gitForRepository,
-      discarded.filter((checkpoint): checkpoint is GitCheckpoint => checkpoint.kind === "git"),
-    );
+    await this.releaseFileCheckpoints(discarded);
   }
 
-  private convertEarlierGitCheckpoints(): GitCheckpoint[] {
-    const converted: GitCheckpoint[] = [];
+  private convertEarlierFileCheckpoints(): Array<GitCheckpoint | BlobCheckpoint> {
+    const converted: Array<GitCheckpoint | BlobCheckpoint> = [];
     for (let index = 0; index < this.checkpoints.length; index++) {
       const entry = this.checkpoints[index];
-      if (entry.kind !== "git") continue;
+      if (entry.kind === "session") continue;
       converted.push(entry);
       this.checkpoints[index] = {
         kind: "session",
@@ -125,19 +182,23 @@ export class SessionNavigation {
     return converted;
   }
 
+  private async releaseFileCheckpoints(entries: readonly TurnCheckpoint[]): Promise<void> {
+    await Promise.allSettled([
+      this.releaser.git(entries.filter((entry): entry is GitCheckpoint => entry.kind === "git")),
+      this.releaser.blob(entries.filter((entry): entry is BlobCheckpoint => entry.kind === "blob")),
+    ]);
+  }
+
   async recordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
     const discarded = this.checkpoints.splice(
       this.currentIndex + 1,
       this.checkpoints.length - this.currentIndex - 1,
     );
-    const converted = checkpoint.kind === "session" ? this.convertEarlierGitCheckpoints() : [];
+    const converted = checkpoint.kind === "session" ? this.convertEarlierFileCheckpoints() : [];
     this.checkpoints.push(checkpoint);
     this.currentIndex = this.checkpoints.length - 1;
     await this.persistState();
-    await releaseCheckpoints(this.gitForRepository, [
-      ...discarded.filter((entry): entry is GitCheckpoint => entry.kind === "git"),
-      ...converted,
-    ]);
+    await this.releaseFileCheckpoints([...discarded, ...converted]);
   }
 
   async dispose(release = true): Promise<void> {
@@ -146,24 +207,31 @@ export class SessionNavigation {
     this.currentIndex = -1;
     if (!release) return;
     await this.persistState();
-    await releaseCheckpoints(
-      this.gitForRepository,
-      checkpoints.filter((checkpoint): checkpoint is GitCheckpoint => checkpoint.kind === "git"),
-    );
+    await this.releaseFileCheckpoints(checkpoints);
   }
 
   async suspend(): Promise<void> {
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
     this.currentIndex = -1;
-    await releaseCheckpoints(
-      this.gitForRepository,
-      checkpoints.filter(
-        (checkpoint): checkpoint is GitCheckpoint =>
-          checkpoint.kind === "git" &&
-          !checkpoint.beforeRef.startsWith("refs/omp-undo-redo/history/"),
-      ),
+    const blobs = checkpoints.filter(
+      (checkpoint): checkpoint is BlobCheckpoint => checkpoint.kind === "blob",
     );
+    const releasableBlobs: BlobCheckpoint[] = [];
+    for (const checkpoint of blobs) {
+      if (await this.releaser.blobShouldReleaseOnSuspend(checkpoint))
+        releasableBlobs.push(checkpoint);
+    }
+    await Promise.allSettled([
+      this.releaser.git(
+        checkpoints.filter(
+          (checkpoint): checkpoint is GitCheckpoint =>
+            checkpoint.kind === "git" &&
+            !checkpoint.beforeRef.startsWith("refs/omp-undo-redo/history/"),
+        ),
+      ),
+      this.releaser.blob(releasableBlobs),
+    ]);
   }
 
   private async navigateSession(targetId: string | null): Promise<boolean> {
@@ -174,6 +242,26 @@ export class SessionNavigation {
 
   private sessionOnlyResult(checkpoint: SessionOnlyCheckpoint): NavigationResult {
     return { status: "moved", files: "unavailable", reason: checkpoint.reason };
+  }
+
+  private async applyFileCheckpoint(
+    checkpoint: GitCheckpoint | BlobCheckpoint,
+    source: "before" | "after",
+  ): Promise<{ status: "applied"; partial: boolean } | { status: "conflict" | "failed" }> {
+    if (checkpoint.kind === "blob") {
+      const result = await this.applier.blob(
+        checkpoint,
+        source === "before" ? checkpoint.afterTreeId : checkpoint.beforeTreeId,
+        source === "before" ? checkpoint.beforeTreeId : checkpoint.afterTreeId,
+      );
+      return result;
+    }
+    const result = await this.applier.git(
+      checkpoint,
+      source === "before" ? checkpoint.afterHash : checkpoint.beforeHash,
+      source === "before" ? checkpoint.beforeHash : checkpoint.afterHash,
+    );
+    return result === "applied" ? { status: "applied", partial: false } : { status: result };
   }
 
   undo(): Promise<NavigationResult> {
@@ -190,19 +278,21 @@ export class SessionNavigation {
       return this.sessionOnlyResult(checkpoint);
     }
 
-    const git = this.gitForRepository(checkpoint.repository);
-    const applied = await applyCheckpoint(git, checkpoint.afterHash, checkpoint.beforeHash);
-    if (applied !== "applied") {
-      return { status: "git_failed", failure: applied === "conflict" ? "conflict" : "failed" };
+    const applied = await this.applyFileCheckpoint(checkpoint, "before");
+    if (applied.status !== "applied") {
+      return {
+        status: checkpoint.kind === "blob" ? "blob_failed" : "git_failed",
+        failure: applied.status === "conflict" ? "conflict" : "failed",
+      };
     }
     if (!(await this.navigateSession(checkpoint.parentLeafId))) {
-      const compensated = await applyCheckpoint(git, checkpoint.beforeHash, checkpoint.afterHash);
-      if (compensated !== "applied") return { status: "rollback_failed" };
+      const compensated = await this.applyFileCheckpoint(checkpoint, "after");
+      if (compensated.status !== "applied") return { status: "rollback_failed" };
       return { status: "cancelled" };
     }
     this.currentIndex--;
     await this.persistState();
-    return { status: "moved", files: "restored" };
+    return { status: "moved", files: applied.partial ? "partially_restored" : "restored" };
   }
 
   redo(): Promise<NavigationResult> {
@@ -219,18 +309,20 @@ export class SessionNavigation {
       return this.sessionOnlyResult(checkpoint);
     }
 
-    const git = this.gitForRepository(checkpoint.repository);
-    const applied = await applyCheckpoint(git, checkpoint.beforeHash, checkpoint.afterHash);
-    if (applied !== "applied") {
-      return { status: "git_failed", failure: applied === "conflict" ? "conflict" : "failed" };
+    const applied = await this.applyFileCheckpoint(checkpoint, "after");
+    if (applied.status !== "applied") {
+      return {
+        status: checkpoint.kind === "blob" ? "blob_failed" : "git_failed",
+        failure: applied.status === "conflict" ? "conflict" : "failed",
+      };
     }
     if (!(await this.navigateSession(checkpoint.leafId))) {
-      const compensated = await applyCheckpoint(git, checkpoint.afterHash, checkpoint.beforeHash);
-      if (compensated !== "applied") return { status: "rollback_failed" };
+      const compensated = await this.applyFileCheckpoint(checkpoint, "before");
+      if (compensated.status !== "applied") return { status: "rollback_failed" };
       return { status: "cancelled" };
     }
     this.currentIndex++;
     await this.persistState();
-    return { status: "moved", files: "restored" };
+    return { status: "moved", files: applied.partial ? "partially_restored" : "restored" };
   }
 }

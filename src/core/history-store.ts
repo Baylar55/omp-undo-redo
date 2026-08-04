@@ -9,9 +9,20 @@ import type {
   GitRunner,
   NavigationState,
   SessionReader,
-  SessionEntryLike,
   TurnCheckpoint,
 } from "./types.js";
+import {
+  effectiveLeaf,
+  entryExists,
+  expectedLeaf,
+  isSessionExitEntry,
+} from "./session-tree-utils.js";
+export {
+  effectiveLeaf,
+  entryExists,
+  expectedLeaf,
+  isSessionExitEntry,
+} from "./session-tree-utils.js";
 
 const HISTORY_SCHEMA = 1;
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
@@ -27,6 +38,10 @@ const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
   after_ref_failed: true,
   file_history_gap: true,
   resumed_checkpoint_unavailable: true,
+  workspace_unresolvable: true,
+  before_blob_failed: true,
+  after_blob_failed: true,
+  blob_apply_failed: true,
 };
 
 type StoredHistory = {
@@ -152,33 +167,6 @@ async function existingRefs(git: GitRunner, prefix: string): Promise<Map<string,
   }
 }
 
-function entryExists(reader: SessionReader, id: string | null): boolean {
-  return id === null || reader.getEntry(id) !== undefined;
-}
-
-function isSessionExitEntry(entry: SessionEntryLike | undefined): boolean {
-  return entry?.type === "custom" && entry.customType === "session_exit";
-}
-
-function effectiveLeaf(reader: SessionReader): string | null {
-  let leafId = reader.getLeafId();
-  const visited = new Set<string>();
-  while (leafId && !visited.has(leafId)) {
-    visited.add(leafId);
-    const entry = reader.getEntry(leafId);
-    if (!isSessionExitEntry(entry)) return leafId;
-    leafId = entry?.parentId ?? null;
-  }
-  return leafId;
-}
-
-function expectedLeaf(state: NavigationState): string | null {
-  if (state.checkpoints.length === 0) return null;
-  return state.currentIndex >= 0
-    ? state.checkpoints[state.currentIndex].leafId
-    : state.checkpoints[0].parentLeafId;
-}
-
 export function reconstructSessionHistory(reader: SessionReader): NavigationState {
   const branch = reader
     .getBranch(reader.getLeafId() ?? undefined)
@@ -229,6 +217,13 @@ export class SessionHistoryStore {
       if (refs === null) return null;
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
         if (checkpoint.kind === "session") return checkpoint;
+        if (checkpoint.kind !== "git")
+          return {
+            kind: "session",
+            reason: "resumed_checkpoint_unavailable",
+            parentLeafId: checkpoint.parentLeafId,
+            leafId: checkpoint.leafId,
+          };
         if (
           refs.get(checkpoint.beforeRef) === checkpoint.beforeHash &&
           refs.get(checkpoint.afterRef) === checkpoint.afterHash &&
@@ -270,7 +265,8 @@ export class SessionHistoryStore {
     const checkpoints = state.checkpoints.map((checkpoint): TurnCheckpoint => {
       if (
         checkpoint.kind === "session" ||
-        (checkpoint.beforeRef.startsWith(refPrefix) &&
+        (checkpoint.kind === "git" &&
+          checkpoint.beforeRef.startsWith(refPrefix) &&
           sameRepository(checkpoint.repository, this.repository))
       )
         return checkpoint;
