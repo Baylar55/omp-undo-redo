@@ -9,7 +9,21 @@ import {
   resolveRuntimeScope,
 } from "./core/checkpoint-owners.js";
 import { createGitRunner } from "./core/git-runner.js";
-import { SessionNavigation } from "./core/session-navigation.js";
+import { BlobStore, blobStoreRootDirectory } from "./core/blob-store.js";
+import {
+  finishAfterTurnBlob,
+  prepareBeforeTurnBlob,
+  releaseBlobCheckpoint,
+  releaseBlobPendingCheckpoint,
+  retainBlobCheckpointForResume,
+} from "./core/blob-checkpoints.js";
+import { BlobHistoryStore } from "./core/blob-history-store.js";
+import {
+  blobNavigationApplier,
+  blobNavigationReleaser,
+  SessionNavigation,
+} from "./core/session-navigation.js";
+import { checkpointNamespace } from "./core/checkpoints.js";
 import {
   finishAfterTurn,
   prepareBeforeTurn,
@@ -19,7 +33,13 @@ import {
   retainCheckpointForResume,
 } from "./core/checkpoints.js";
 import { reconstructSessionHistory, SessionHistoryStore } from "./core/history-store.js";
-import type { ActionId, PendingTurnCheckpoint, SessionOnlyCheckpoint } from "./core/types.js";
+import type {
+  ActionId,
+  GitRepository,
+  NavigationState,
+  PendingTurnCheckpoint,
+  SessionOnlyCheckpoint,
+} from "./core/types.js";
 import { RuntimeActionStateStore } from "./core/runtime-action-state-store.js";
 
 function promiseWithResolvers<T>(): {
@@ -45,13 +65,64 @@ type AnyContext = {
   };
 };
 
+type FileBackend =
+  | { kind: "git"; repository: GitRepository; git: ReturnType<typeof createGitRunner> }
+  | { kind: "blob"; store: BlobStore; workspaceRoot: string }
+  | { kind: "session"; reason: "git_unavailable" | "not_repository" | "repository_unresolvable" };
+
+type HistoryWriter = { save(state: NavigationState): Promise<void> };
+
+async function hasGitMarkerInAncestors(cwd: string): Promise<boolean> {
+  const { lstat } = await import("node:fs/promises");
+  const { dirname, resolve } = await import("node:path");
+  let current = resolve(cwd);
+  while (true) {
+    try {
+      await lstat(`${current}/.git`);
+      return true;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return false;
+      current = parent;
+    }
+  }
+}
+
+async function resolveBackend(
+  cwd: string,
+  blobStoreFor: (workspaceRoot: string) => BlobStore,
+): Promise<FileBackend> {
+  const git = createGitRunner(cwd);
+  const resolved = await resolveRepository(git);
+  if ("repository" in resolved) return { kind: "git", repository: resolved.repository, git };
+  const marker = await hasGitMarkerInAncestors(cwd);
+  if (resolved.reason !== "not_repository" && !(resolved.reason === "git_unavailable" && !marker)) {
+    return { kind: "session", reason: resolved.reason };
+  }
+  try {
+    const { realpath } = await import("node:fs/promises");
+    const workspaceRoot = await realpath(cwd);
+    return { kind: "blob", store: blobStoreFor(workspaceRoot), workspaceRoot };
+  } catch {
+    return { kind: "session", reason: "repository_unresolvable" };
+  }
+}
+
 function createNavigation(
   ctx: AnyContext,
   sessionId: string,
-  store: SessionHistoryStore | undefined,
+  store: HistoryWriter | undefined,
   runtimeStore: RuntimeActionStateStore,
+  backend?: FileBackend,
 ): SessionNavigation {
   const manager = ctx.sessionManager;
+  const blobDependencies =
+    backend?.kind === "blob"
+      ? {
+          applier: blobNavigationApplier(backend.store),
+          releaser: blobNavigationReleaser(backend.store),
+        }
+      : undefined;
   return new SessionNavigation(
     {
       getLeafId: () => manager.getLeafId(),
@@ -67,6 +138,8 @@ function createNavigation(
         runtimeStore.publishNavigation(sessionId, state, activeSessionLeaf),
       ]);
     },
+    blobDependencies?.applier,
+    blobDependencies?.releaser,
   );
 }
 
@@ -78,6 +151,8 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   const runtimeStore = new RuntimeActionStateStore();
   const runtimeReady = runtimeStore.initialize();
   const navigations = new Map<string, SessionNavigation>();
+  const backends = new Map<string, FileBackend>();
+  const blobStores = new Map<string, BlobStore>();
   const pending = new Map<string, PendingTurnCheckpoint>();
   const initializations = new Map<string, Promise<SessionNavigation>>();
   const activeOperations = new Set<Promise<void>>();
@@ -85,6 +160,16 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   let shutdownPromise: Promise<void> | null = null;
   let pendingSwitchSourceSessionId: string | null = null;
   let pendingBranchSourceSessionId: string | null = null;
+
+  function blobStoreFor(_workspaceRoot: string): BlobStore {
+    const root = blobStoreRootDirectory();
+    const existing = blobStores.get(root);
+    if (existing) return existing;
+    const store = new BlobStore(root);
+    blobStores.set(root, store);
+    void store.garbageCollect().catch(() => undefined);
+    return store;
+  }
 
   async function initializeNavigation(
     ctx: AnyContext,
@@ -102,13 +187,15 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       const previous = navigations.get(sessionId);
       navigations.delete(sessionId);
       if (previous) await previous.suspend();
-      const git = createGitRunner(ctx.cwd);
-      const resolved = await resolveRepository(git);
+      const backend = await resolveBackend(ctx.cwd, (workspaceRoot) => blobStoreFor(workspaceRoot));
+      backends.set(sessionId, backend);
       const store =
-        "repository" in resolved
-          ? new SessionHistoryStore(sessionId, resolved.repository, git)
-          : undefined;
-      const navigation = createNavigation(ctx, sessionId, store, runtimeStore);
+        backend.kind === "git"
+          ? new SessionHistoryStore(sessionId, backend.repository, backend.git)
+          : backend.kind === "blob"
+            ? new BlobHistoryStore(sessionId, backend.workspaceRoot, backend.store)
+            : undefined;
+      const navigation = createNavigation(ctx, sessionId, store, runtimeStore, backend);
       const restored = store ? await store.load(ctx.sessionManager) : null;
       navigation.restoreState(restored ?? reconstructSessionHistory(ctx.sessionManager));
       await runtimeStore.initializeSession(
@@ -165,11 +252,18 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   }
 
   async function releasePending(pendingCheckpoint: PendingTurnCheckpoint): Promise<void> {
-    if (pendingCheckpoint.kind !== "git") return;
-    await releasePendingCheckpoint(
-      createGitRunner(pendingCheckpoint.repository.worktree),
-      pendingCheckpoint,
-    );
+    if (pendingCheckpoint.kind === "git") {
+      await releasePendingCheckpoint(
+        createGitRunner(pendingCheckpoint.repository.worktree),
+        pendingCheckpoint,
+      );
+      return;
+    }
+    if (pendingCheckpoint.kind === "blob") {
+      const store =
+        blobStores.get(blobStoreRootDirectory()) ?? new BlobStore(blobStoreRootDirectory());
+      await releaseBlobPendingCheckpoint(store, pendingCheckpoint);
+    }
   }
 
   async function disposeDetached(
@@ -273,16 +367,27 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       pending.delete(sessionId);
       if (oldPending) await releasePending(oldPending);
 
-      const prepared = await prepareBeforeTurn(
-        createGitRunner(typed.cwd),
-        sessionId,
-        ownerRegistry,
-      );
+      const backend =
+        backends.get(sessionId) ??
+        (await resolveBackend(typed.cwd, (workspaceRoot) => blobStoreFor(workspaceRoot)));
+      backends.set(sessionId, backend);
+      const prepared =
+        backend.kind === "git"
+          ? await prepareBeforeTurn(backend.git, sessionId, ownerRegistry)
+          : backend.kind === "blob"
+            ? await prepareBeforeTurnBlob(
+                backend.store,
+                backend.workspaceRoot,
+                checkpointNamespace(sessionId),
+              )
+            : { status: "session_only" as const, reason: backend.reason };
       const parentLeafId = typed.sessionManager.getLeafId();
       const checkpoint: PendingTurnCheckpoint =
         prepared.status === "git"
           ? { ...prepared.checkpoint, parentLeafId }
-          : { kind: "session", reason: prepared.reason, parentLeafId };
+          : prepared.status === "blob"
+            ? { ...prepared.checkpoint, parentLeafId }
+            : { kind: "session", reason: prepared.reason, parentLeafId };
       if (closing) {
         await releasePending(checkpoint);
         return;
@@ -311,7 +416,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
           parentLeafId: before.parentLeafId,
           leafId: typed.sessionManager.getLeafId(),
         };
-      } else {
+      } else if (before.kind === "git") {
         const result = await finishAfterTurn(
           createGitRunner(before.repository.worktree),
           before,
@@ -344,6 +449,45 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
           parentLeafId: before.parentLeafId,
           leafId: typed.sessionManager.getLeafId(),
         };
+      } else {
+        const backend = backends.get(sessionId);
+        const store =
+          backend?.kind === "blob" ? backend.store : new BlobStore(blobStoreRootDirectory());
+        const result = await finishAfterTurnBlob(
+          store,
+          before,
+          before.parentLeafId,
+          typed.sessionManager.getLeafId(),
+        );
+        if (result.status === "blob") {
+          if (closing) {
+            await releaseBlobCheckpoint(store, result.checkpoint);
+            return;
+          }
+          const retained = await retainBlobCheckpointForResume(store, sessionId, result.checkpoint);
+          if (retained) {
+            const nav =
+              (await ensureNavigation(typed)) ??
+              createNavigation(typed, sessionId, undefined, runtimeStore, backend);
+            navigations.set(sessionId, nav);
+            await nav.recordTurnEnd(retained);
+            return;
+          }
+          await releaseBlobCheckpoint(store, result.checkpoint);
+          completed = {
+            kind: "session",
+            reason: "after_blob_failed",
+            parentLeafId: before.parentLeafId,
+            leafId: typed.sessionManager.getLeafId(),
+          };
+        } else {
+          completed = {
+            kind: "session",
+            reason: result.reason,
+            parentLeafId: before.parentLeafId,
+            leafId: typed.sessionManager.getLeafId(),
+          };
+        }
       }
       const nav =
         (await ensureNavigation(typed)) ??
@@ -368,6 +512,12 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       await Promise.allSettled([...activeOperations]);
       await drainState();
       await ownerRegistry.shutdown();
+      await Promise.allSettled(
+        [...blobStores.values()].map(async (store) => {
+          await store.garbageCollect().catch(() => undefined);
+          await store.shutdown();
+        }),
+      );
       await runtimeStore.shutdown();
     })();
     return shutdownPromise;

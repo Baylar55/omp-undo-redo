@@ -1,0 +1,1079 @@
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import {
+  mkdir,
+  lstat,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { homedir, hostname } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+
+export interface TreeEntry {
+  path: string;
+  blobHash: string;
+  mode: number;
+}
+
+export interface TreeManifest {
+  treeId: string;
+  entries: TreeEntry[];
+  skippedPaths: string[];
+}
+
+export type SnapshotPhase = "before" | "after";
+export type BlobApplyResult =
+  { status: "applied"; partial: boolean } | { status: "conflict" } | { status: "failed" };
+
+export const DEFAULT_BLOB_IGNORES = [
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  ".history",
+  "dist",
+  "coverage",
+  ".omp",
+  ".next",
+  "build",
+  "out",
+  "target",
+] as const;
+
+export function blobStoreRootDirectory(): string {
+  if (process.env.OMP_UNDO_REDO_BLOB_DIR) return resolve(process.env.OMP_UNDO_REDO_BLOB_DIR);
+  if (process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
+    const runtime = resolve(process.env.OMP_UNDO_REDO_RUNTIME_DIR);
+    return basenameIsRuntime(runtime) ? dirname(runtime) : runtime;
+  }
+  return resolve(join(homedir(), ".omp", "omp-undo-redo"));
+}
+
+function basenameIsRuntime(value: string): boolean {
+  return value.endsWith(`${sep}runtime`) || value.endsWith("/runtime");
+}
+
+function sha256(value: Buffer | string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalManifest(entries: readonly TreeEntry[], skippedPaths: readonly string[]): string {
+  return JSON.stringify({
+    entries: [...entries].sort((left, right) => left.path.localeCompare(right.path)),
+    skippedPaths: [...skippedPaths].sort(),
+  });
+}
+
+function depth(value: string): number {
+  return value.split("/").length;
+}
+
+function isHash(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function safeId(value: string): boolean {
+  return /^[0-9a-fA-F-]{1,128}$/.test(value);
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export class BlobStore {
+  private readonly maxFileBytes: number;
+  private readonly ignore: ReadonlySet<string>;
+  private readonly clock: () => Date;
+  private readonly locks = new Map<string, Promise<void>>();
+  private readonly ownerId = randomUUID();
+  private leasePublished = false;
+
+  constructor(
+    readonly rootDirectory: string,
+    options: { maxFileBytes?: number; ignore?: readonly string[]; clock?: () => Date } = {},
+  ) {
+    this.rootDirectory = resolve(rootDirectory);
+    this.maxFileBytes = options.maxFileBytes ?? 16 * 1024 * 1024;
+    this.ignore = new Set(options.ignore ?? DEFAULT_BLOB_IGNORES);
+    this.clock = options.clock ?? (() => new Date());
+  }
+
+  private blobPath(hash: string): string {
+    return join(this.rootDirectory, "blobs", hash.slice(0, 2), hash.slice(2));
+  }
+
+  private treePath(treeId: string): string {
+    return join(this.rootDirectory, "trees", `${treeId}.json`);
+  }
+
+  private refPath(
+    namespace: "active" | "history",
+    sessionHash: string,
+    checkpointId: string,
+    phase: SnapshotPhase,
+  ): string {
+    return join(this.rootDirectory, "refs", namespace, sessionHash, checkpointId, `${phase}.ref`);
+  }
+
+  private async atomicWrite(path: string, content: string | Buffer): Promise<void> {
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, content, { mode: 0o600 });
+      await rename(temporary, path);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async publishLease(): Promise<void> {
+    if (this.leasePublished) return;
+    await this.atomicWrite(
+      join(this.rootDirectory, "leases", `${this.ownerId}.json`),
+      JSON.stringify({
+        ownerId: this.ownerId,
+        pid: process.pid,
+        hostname: hostname(),
+        startedAt: this.clock().toISOString(),
+      }),
+    );
+    this.leasePublished = true;
+  }
+
+  private async acquireFilesystemLock(name: string): Promise<() => Promise<void>> {
+    const lockPath = join(this.rootDirectory, "locks", `${sha256(name)}.lock`);
+    await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+    const deadline = Date.now() + 10_000;
+    while (true) {
+      try {
+        await mkdir(lockPath, { mode: 0o700 });
+        try {
+          await writeFile(
+            join(lockPath, "owner.json"),
+            JSON.stringify({ pid: process.pid, hostname: hostname(), ownerId: this.ownerId }),
+            { mode: 0o600 },
+          );
+        } catch (error) {
+          await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+          throw error;
+        }
+        return async () => {
+          await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+        };
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST") throw error;
+        try {
+          const owner = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as {
+            pid?: number;
+            hostname?: string;
+          };
+          if (owner.hostname === hostname() && typeof owner.pid === "number") {
+            try {
+              process.kill(owner.pid, 0);
+            } catch (probeError) {
+              if ((probeError as NodeJS.ErrnoException).code === "ESRCH") {
+                await rm(lockPath, { recursive: true, force: true });
+                continue;
+              }
+            }
+          }
+        } catch {
+          // A process can crash between mkdir and owner publication. Reap only an old,
+          // ownerless lock; a live publisher gets a generous completion window.
+          try {
+            const metadata = await stat(lockPath);
+            if (Date.now() - metadata.mtimeMs > 30_000) {
+              await rm(lockPath, { recursive: true, force: true });
+              continue;
+            }
+          } catch {
+            continue;
+          }
+        }
+        if (Date.now() >= deadline) throw new Error("blob store lock timeout");
+        await delay(25);
+      }
+    }
+  }
+
+  private async withStoreLock<T>(operation: () => Promise<T>): Promise<T> {
+    return this.withWorkspaceLock(`store:${this.rootDirectory}`, async () => {
+      const release = await this.acquireFilesystemLock(`store:${this.rootDirectory}`);
+      try {
+        return await operation();
+      } finally {
+        await release();
+      }
+    });
+  }
+
+  private async writeBlob(hash: string, content: Buffer): Promise<void> {
+    const path = this.blobPath(hash);
+    if (await exists(path)) return;
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
+    try {
+      try {
+        await writeFile(temporary, content, { mode: 0o600, flag: "wx" });
+      } catch {
+        if (await exists(path)) return;
+        throw new Error("blob write failed");
+      }
+      try {
+        await rename(temporary, path);
+      } catch {
+        if (!(await exists(path))) throw new Error("blob rename failed");
+      }
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async hashFile(path: string): Promise<{ hash: string; content?: Buffer }> {
+    const hash = createHash("sha256");
+    const stream = createReadStream(path);
+    for await (const chunk of stream) hash.update(chunk as Buffer);
+    return { hash: hash.digest("hex") };
+  }
+
+  private async walkWorkspace(workspaceRoot: string): Promise<{
+    entries: TreeEntry[];
+    skippedPaths: string[];
+  }> {
+    const entries: TreeEntry[] = [];
+    const skippedPaths: string[] = [];
+    const storageRoot = await realpath(this.rootDirectory).catch(() => resolve(this.rootDirectory));
+    const normalized = (value: string) =>
+      process.platform === "win32" ? value.toLowerCase() : value;
+    const normalizedStorageRoot = normalized(storageRoot);
+    const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
+      const children = await readdir(directory, { withFileTypes: true });
+      for (const child of children) {
+        if (this.ignore.has(child.name)) continue;
+        const relativePath = relativeDirectory ? `${relativeDirectory}/${child.name}` : child.name;
+        const fullPath = join(directory, child.name);
+        const normalizedFullPath = normalized(
+          await realpath(fullPath).catch(() => resolve(fullPath)),
+        );
+        if (
+          normalizedFullPath === normalizedStorageRoot ||
+          normalizedFullPath.startsWith(`${normalizedStorageRoot}${sep}`)
+        )
+          continue;
+        if (child.isDirectory()) {
+          await walk(fullPath, relativePath);
+        } else if (child.isSymbolicLink()) {
+          skippedPaths.push(relativePath);
+        } else if (child.isFile()) {
+          const metadata = await lstat(fullPath);
+          if (metadata.size > this.maxFileBytes) {
+            skippedPaths.push(relativePath);
+            continue;
+          }
+          const content = await readFile(fullPath);
+          const hash = sha256(content);
+          await this.writeBlob(hash, content);
+          entries.push({ path: relativePath, blobHash: hash, mode: metadata.mode & 0o777 });
+        } else {
+          skippedPaths.push(relativePath);
+        }
+      }
+    };
+    await walk(workspaceRoot, "");
+    return { entries, skippedPaths };
+  }
+
+  private async recoverWorkspace(workspaceRoot: string): Promise<boolean> {
+    const directory = join(this.rootDirectory, "journals");
+    let files: string[];
+    try {
+      files = await readdir(directory);
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT";
+    }
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const journalPath = join(directory, file);
+      try {
+        const value = JSON.parse(await readFile(journalPath, "utf8")) as {
+          workspaceRoot?: unknown;
+          sourceTreeId?: unknown;
+          targetTreeId?: unknown;
+          paths?: unknown;
+        };
+        if (value.workspaceRoot !== workspaceRoot) continue;
+        if (
+          !isHash(value.sourceTreeId) ||
+          !isHash(value.targetTreeId) ||
+          !Array.isArray(value.paths) ||
+          !value.paths.every((path) => typeof path === "string" && this.validPath(path))
+        ) {
+          await this.failJournal(journalPath);
+          return false;
+        }
+        const journalPaths = value.paths as string[];
+        const source = await this.loadManifest(value.sourceTreeId);
+        const target = await this.loadManifest(value.targetTreeId);
+        if (!source || !target) {
+          await this.failJournal(journalPath);
+          return false;
+        }
+        const sourceMap = new Map(source.entries.map((entry) => [entry.path, entry]));
+        const targetMap = new Map(target.entries.map((entry) => [entry.path, entry]));
+        const expectedPaths = this.changedPaths(sourceMap, targetMap);
+        if (
+          expectedPaths.length !== journalPaths.length ||
+          expectedPaths.some((path, index) => path !== [...journalPaths].sort()[index])
+        ) {
+          await this.failJournal(journalPath);
+          return false;
+        }
+        if (!(await this.rollbackSnapshot(workspaceRoot, sourceMap, targetMap, expectedPaths))) {
+          await this.failJournal(journalPath);
+          return false;
+        }
+        await rm(journalPath, { force: true });
+      } catch {
+        await this.failJournal(journalPath);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async failJournal(journalPath: string): Promise<void> {
+    const failedDirectory = join(this.rootDirectory, "journals", "failed");
+    await mkdir(failedDirectory, { recursive: true, mode: 0o700 }).catch(() => undefined);
+    await rename(journalPath, join(failedDirectory, basename(journalPath))).catch(() => undefined);
+  }
+
+  private changedPaths(source: Map<string, TreeEntry>, target: Map<string, TreeEntry>): string[] {
+    return [...new Set([...source.keys(), ...target.keys()])]
+      .filter((path) => {
+        const left = source.get(path);
+        const right = target.get(path);
+        return !left || !right || left.blobHash !== right.blobHash || left.mode !== right.mode;
+      })
+      .sort();
+  }
+
+  async captureSnapshot(
+    workspaceRoot: string,
+    sessionHash: string,
+    checkpointId: string,
+    phase: SnapshotPhase,
+  ): Promise<TreeManifest | { reason: "workspace_unresolvable" | "blob_capture_failed" }> {
+    if (!isHash(sessionHash) || !safeId(checkpointId)) return { reason: "blob_capture_failed" };
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = await realpath(workspaceRoot);
+      if (!(await lstat(canonicalRoot)).isDirectory()) return { reason: "workspace_unresolvable" };
+    } catch {
+      return { reason: "workspace_unresolvable" };
+    }
+    try {
+      return await this.withStoreLock(async () => {
+        if (!(await this.recoverWorkspace(canonicalRoot))) {
+          return { reason: "blob_capture_failed" } as const;
+        }
+        await this.publishLease();
+        const walked = await this.walkWorkspace(canonicalRoot);
+        walked.entries.sort((left, right) => left.path.localeCompare(right.path));
+        walked.skippedPaths.sort();
+        const content = canonicalManifest(walked.entries, walked.skippedPaths);
+        const treeId = sha256(content);
+        const manifest: TreeManifest = { treeId, ...walked };
+        const treePath = this.treePath(treeId);
+        if (!(await exists(treePath))) await this.atomicWrite(treePath, JSON.stringify(manifest));
+        await this.atomicWrite(
+          this.refPath("active", sessionHash, checkpointId, phase),
+          JSON.stringify({ treeId, ownerId: this.ownerId }),
+        );
+        return manifest;
+      });
+    } catch {
+      return { reason: "blob_capture_failed" };
+    }
+  }
+
+  private async loadManifest(treeId: string): Promise<TreeManifest | null> {
+    if (!isHash(treeId)) return null;
+    try {
+      const value = JSON.parse(await readFile(this.treePath(treeId), "utf8")) as unknown;
+      if (!value || typeof value !== "object") return null;
+      const candidate = value as Record<string, unknown>;
+      if (
+        candidate.treeId !== treeId ||
+        !Array.isArray(candidate.entries) ||
+        !Array.isArray(candidate.skippedPaths)
+      )
+        return null;
+      const entries: TreeEntry[] = [];
+      const paths = new Set<string>();
+      for (const entry of candidate.entries) {
+        if (!entry || typeof entry !== "object") return null;
+        const item = entry as Record<string, unknown>;
+        if (
+          typeof item.path !== "string" ||
+          !isHash(item.blobHash) ||
+          !Number.isInteger(item.mode) ||
+          Number(item.mode) < 0 ||
+          Number(item.mode) > 0o777 ||
+          !this.validPath(item.path) ||
+          paths.has(item.path)
+        )
+          return null;
+        paths.add(item.path);
+        entries.push({ path: item.path, blobHash: item.blobHash, mode: Number(item.mode) });
+      }
+      const skippedPaths = candidate.skippedPaths.filter(
+        (path): path is string => typeof path === "string",
+      );
+      if (
+        skippedPaths.length !== candidate.skippedPaths.length ||
+        !skippedPaths.every((path) => this.validPath(path)) ||
+        sha256(canonicalManifest(entries, skippedPaths)) !== treeId
+      )
+        return null;
+      const folded = new Set<string>();
+      for (const path of paths) {
+        const key = process.platform === "win32" ? path.toLowerCase() : path;
+        if (folded.has(key)) return null;
+        folded.add(key);
+        const parts = path.split("/");
+        for (let index = 1; index < parts.length; index++) {
+          if (paths.has(parts.slice(0, index).join("/"))) return null;
+        }
+      }
+      return { treeId, entries, skippedPaths };
+    } catch {
+      return null;
+    }
+  }
+
+  private validPath(value: string): boolean {
+    if (
+      !value ||
+      value.includes("\0") ||
+      value.includes("\\") ||
+      isAbsolute(value) ||
+      /^[A-Za-z]:/.test(value)
+    )
+      return false;
+    const parts = value.split("/");
+    return parts.every((part) => part.length > 0 && part !== "." && part !== "..");
+  }
+
+  private async safeParent(root: string, value: string): Promise<boolean> {
+    const parent = dirname(value);
+    const parts = relative(root, parent).split(sep).filter(Boolean);
+    let current = root;
+    for (const part of parts) {
+      current = join(current, part);
+      try {
+        const metadata = await lstat(current);
+        if (metadata.isSymbolicLink() || !metadata.isDirectory()) return false;
+      } catch {
+        break;
+      }
+    }
+    return true;
+  }
+
+  private async currentFile(
+    root: string,
+    path: string,
+  ): Promise<{ hash: string; mode: number } | null> {
+    try {
+      const fullPath = join(root, ...path.split("/"));
+      const metadata = await lstat(fullPath);
+      if (!metadata.isFile()) return null;
+      return { hash: (await this.hashFile(fullPath)).hash, mode: metadata.mode & 0o777 };
+    } catch {
+      return null;
+    }
+  }
+
+  private async directoryMatchesEntries(
+    root: string,
+    path: string,
+    expected: Map<string, TreeEntry>,
+  ): Promise<boolean> {
+    const prefix = `${path}/`;
+    const actual = new Map<string, { hash: string; mode: number }>();
+    const walk = async (directory: string, relativeDirectory: string): Promise<boolean> => {
+      for (const child of await readdir(directory, { withFileTypes: true })) {
+        const relativePath = relativeDirectory ? `${relativeDirectory}/${child.name}` : child.name;
+        const fullPath = join(directory, child.name);
+        if (child.isSymbolicLink()) return false;
+        if (child.isDirectory()) {
+          if (!(await walk(fullPath, relativePath))) return false;
+        } else if (child.isFile()) {
+          const metadata = await lstat(fullPath);
+          actual.set(relativePath, {
+            hash: (await this.hashFile(fullPath)).hash,
+            mode: metadata.mode & 0o777,
+          });
+        } else {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!(await walk(join(root, ...path.split("/")), path))) return false;
+    const expectedPaths = [...expected.keys()].filter((value) => value.startsWith(prefix));
+    if (expectedPaths.length !== actual.size) return false;
+    for (const expectedPath of expectedPaths) {
+      const entry = expected.get(expectedPath)!;
+      const current = actual.get(expectedPath);
+      if (!current || current.hash !== entry.blobHash || current.mode !== entry.mode) return false;
+    }
+    return true;
+  }
+
+  private async pathState(
+    root: string,
+    path: string,
+  ): Promise<"missing" | "file" | "directory" | "symlink"> {
+    try {
+      const metadata = await lstat(join(root, ...path.split("/")));
+      if (metadata.isSymbolicLink()) return "symlink";
+      if (metadata.isFile()) return "file";
+      if (metadata.isDirectory()) return "directory";
+      return "symlink";
+    } catch {
+      return "missing";
+    }
+  }
+
+  private async withWorkspaceLock<T>(root: string, operation: () => Promise<T>): Promise<T> {
+    const prior = this.locks.get(root) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    const tail = prior.then(() => current);
+    this.locks.set(root, tail);
+    await prior;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.locks.get(root) === tail) this.locks.delete(root);
+    }
+  }
+
+  async applySnapshot(
+    workspaceRoot: string,
+    _sessionHash: string,
+    sourceTreeId: string,
+    targetTreeId: string,
+  ): Promise<BlobApplyResult> {
+    let root: string;
+    try {
+      root = await realpath(workspaceRoot);
+    } catch {
+      return { status: "failed" };
+    }
+    try {
+      return await this.withStoreLock(() =>
+        this.withWorkspaceLock(root, async () => {
+          if (!(await this.recoverWorkspace(root))) return { status: "failed" };
+          const source = await this.loadManifest(sourceTreeId);
+          const target = await this.loadManifest(targetTreeId);
+          if (!source || !target) return { status: "failed" };
+          const sourceMap = new Map(source.entries.map((entry) => [entry.path, entry]));
+          const targetMap = new Map(target.entries.map((entry) => [entry.path, entry]));
+          for (const entry of target.entries) {
+            if (!(await this.blobExists(entry.blobHash))) return { status: "failed" };
+          }
+          for (const entry of source.entries) {
+            if (!(await this.blobExists(entry.blobHash))) return { status: "failed" };
+          }
+          const mutations = this.changedPaths(sourceMap, targetMap);
+
+          for (const path of mutations) {
+            if (!this.validPath(path)) return { status: "conflict" };
+            if (!(await this.safeParent(root, join(root, ...path.split("/"))))) {
+              const parent = dirname(path);
+              const sourceParent = sourceMap.get(parent);
+              const targetParent = targetMap.get(parent);
+              if (!sourceParent || targetParent) return { status: "conflict" };
+            }
+            const left = sourceMap.get(path);
+            const right = targetMap.get(path);
+            const state = await this.pathState(root, path);
+            if (!left) {
+              if (state === "missing") continue;
+              if (
+                state === "directory" &&
+                right &&
+                (await this.directoryMatchesEntries(root, path, sourceMap))
+              ) {
+                continue;
+              }
+              if (state !== "file") return { status: "conflict" };
+              const current = await this.currentFile(root, path);
+              if (!current || current.hash !== right?.blobHash) {
+                return { status: "conflict" };
+              }
+            } else if (!right) {
+              if (
+                state === "directory" &&
+                (await this.directoryMatchesEntries(root, path, targetMap))
+              ) {
+                continue;
+              }
+              const current = await this.currentFile(root, path);
+              if (!current || current.hash !== left.blobHash || current.mode !== left.mode) {
+                return { status: "conflict" };
+              }
+            } else {
+              const current = await this.currentFile(root, path);
+              if (!current || current.hash !== left.blobHash || current.mode !== left.mode) {
+                return { status: "conflict" };
+              }
+            }
+          }
+
+          const journalPath = join(this.rootDirectory, "journals", `${randomUUID()}.json`);
+          try {
+            await this.atomicWrite(
+              journalPath,
+              JSON.stringify({
+                workspaceRoot: root,
+                sourceTreeId,
+                targetTreeId,
+                createdAt: this.clock().toISOString(),
+                paths: mutations,
+              }),
+            );
+            const removals = mutations
+              .filter(
+                (path) =>
+                  sourceMap.has(path) &&
+                  (!targetMap.has(path) ||
+                    sourceMap.get(path)?.mode !== targetMap.get(path)?.mode ||
+                    sourceMap.get(path)?.blobHash !== targetMap.get(path)?.blobHash),
+              )
+              .sort((left, right) => depth(right) - depth(left));
+            for (const path of removals) {
+              const fullPath = join(root, ...path.split("/"));
+              if ((await this.pathState(root, path)) === "file")
+                await rm(fullPath, { force: true });
+            }
+            const writes = mutations
+              .filter((path) => targetMap.has(path))
+              .sort((left, right) => depth(left) - depth(right));
+            for (const path of writes) {
+              const entry = targetMap.get(path)!;
+              const fullPath = join(root, ...path.split("/"));
+              if (!(await this.safeParent(root, fullPath))) throw new Error("unsafe parent");
+              if ((await this.pathState(root, path)) === "directory") {
+                if ((await readdir(fullPath)).length > 0) throw new Error("directory obstruction");
+                await rm(fullPath, { recursive: true });
+              }
+              await mkdir(dirname(fullPath), { recursive: true, mode: 0o700 });
+              const blob = await readFile(this.blobPath(entry.blobHash));
+              const temporary = join(dirname(fullPath), `.${randomUUID()}.tmp`);
+              try {
+                await writeFile(temporary, blob, { mode: entry.mode || 0o600 });
+                await rename(temporary, fullPath);
+                await chmodSafe(fullPath, entry.mode);
+              } finally {
+                await rm(temporary, { force: true }).catch(() => undefined);
+              }
+            }
+            await this.cleanupEmptyDirectories(root, sourceMap, targetMap, mutations);
+            await rm(journalPath, { force: true });
+            return {
+              status: "applied",
+              partial: source.skippedPaths.length > 0 || target.skippedPaths.length > 0,
+            };
+          } catch {
+            const rolledBack = await this.rollbackSnapshot(root, sourceMap, targetMap, mutations);
+            if (rolledBack) {
+              await rm(journalPath, { force: true }).catch(() => undefined);
+            } else {
+              const failedDirectory = join(this.rootDirectory, "journals", "failed");
+              await mkdir(failedDirectory, { recursive: true, mode: 0o700 }).catch(() => undefined);
+              await rename(journalPath, join(failedDirectory, basename(journalPath))).catch(
+                () => undefined,
+              );
+            }
+            return { status: "failed" };
+          }
+        }),
+      );
+    } catch {
+      return { status: "failed" };
+    }
+  }
+
+  private async rollbackSnapshot(
+    root: string,
+    source: Map<string, TreeEntry>,
+    target: Map<string, TreeEntry>,
+    mutations: readonly string[],
+  ): Promise<boolean> {
+    try {
+      // Accept source state, target state, or a missing intermediate caused by delete-before-write.
+      // Reject unknown content/types so recovery never overwrites a later user edit.
+      for (const path of mutations) {
+        const state = await this.pathState(root, path);
+        if (state === "symlink") return false;
+        if (state === "file") {
+          const current = await this.currentFile(root, path);
+          const sourceEntry = source.get(path);
+          const targetEntry = target.get(path);
+          const matches = (entry: TreeEntry | undefined) =>
+            entry && current?.hash === entry.blobHash && current.mode === entry.mode;
+          if (!matches(sourceEntry) && !matches(targetEntry)) return false;
+        } else if (state === "directory") {
+          const sourceMatches = await this.directoryMatchesEntries(root, path, source).catch(
+            () => false,
+          );
+          const targetMatches = await this.directoryMatchesEntries(root, path, target).catch(
+            () => false,
+          );
+          const empty = (await readdir(join(root, ...path.split("/")))).length === 0;
+          if (!sourceMatches && !targetMatches && !empty) return false;
+        }
+      }
+
+      // Remove known source/target/intermediate files, then rebuild exact source state.
+      for (const path of [...mutations].sort((left, right) => depth(right) - depth(left))) {
+        const fullPath = join(root, ...path.split("/"));
+        if ((await this.pathState(root, path)) === "file") await rm(fullPath, { force: true });
+      }
+      await this.cleanupEmptyDirectories(root, target, source, mutations);
+      for (const path of mutations
+        .filter((value) => source.has(value))
+        .sort((left, right) => depth(left) - depth(right))) {
+        const entry = source.get(path)!;
+        const fullPath = join(root, ...path.split("/"));
+        if (!(await this.safeParent(root, fullPath))) return false;
+        if ((await this.pathState(root, path)) === "directory") {
+          if ((await readdir(fullPath)).length > 0) return false;
+          await rm(fullPath, { recursive: true });
+        }
+        await mkdir(dirname(fullPath), { recursive: true, mode: 0o700 });
+        const temporary = join(dirname(fullPath), `.${randomUUID()}.rollback.tmp`);
+        try {
+          await writeFile(temporary, await readFile(this.blobPath(entry.blobHash)), {
+            mode: entry.mode || 0o600,
+          });
+          await rename(temporary, fullPath);
+          await chmodSafe(fullPath, entry.mode);
+        } finally {
+          await rm(temporary, { force: true }).catch(() => undefined);
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async cleanupEmptyDirectories(
+    root: string,
+    source: Map<string, TreeEntry>,
+    target: Map<string, TreeEntry>,
+    mutations: readonly string[],
+  ): Promise<void> {
+    const candidates = new Set<string>();
+    for (const path of mutations) {
+      let current = dirname(path);
+      while (current !== "." && current !== "") {
+        candidates.add(current);
+        current = dirname(current);
+      }
+    }
+    for (const directory of [...candidates].sort((left, right) => depth(right) - depth(left))) {
+      const hasTargetChild = [...target.keys()].some((path) => path.startsWith(`${directory}/`));
+      if (hasTargetChild || [...source.keys()].some((path) => path === directory)) continue;
+      const fullPath = join(root, ...directory.split("/"));
+      if ((await this.pathState(root, directory)) !== "directory") continue;
+      if ((await readdir(fullPath).catch(() => [])).length === 0) {
+        await rm(fullPath, { recursive: true }).catch(() => undefined);
+      }
+    }
+  }
+
+  async releaseCheckpointRefs(
+    sessionHash: string,
+    checkpointIds: readonly string[],
+  ): Promise<boolean> {
+    if (checkpointIds.length === 0) return true;
+    if (!isHash(sessionHash)) return false;
+    try {
+      return await this.withStoreLock(async () => {
+        let result = true;
+        for (const checkpointId of checkpointIds) {
+          if (!safeId(checkpointId)) {
+            result = false;
+            continue;
+          }
+          for (const namespace of ["active", "history"] as const) {
+            await rm(join(this.rootDirectory, "refs", namespace, sessionHash, checkpointId), {
+              recursive: true,
+              force: true,
+            }).catch(() => {
+              result = false;
+            });
+          }
+        }
+        return result;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  async retainCheckpointForResume(sessionHash: string, checkpointId: string): Promise<boolean> {
+    if (!isHash(sessionHash) || !safeId(checkpointId)) return false;
+    try {
+      return await this.withStoreLock(async () => {
+        const activeDirectory = join(
+          this.rootDirectory,
+          "refs",
+          "active",
+          sessionHash,
+          checkpointId,
+        );
+        const historyDirectory = join(
+          this.rootDirectory,
+          "refs",
+          "history",
+          sessionHash,
+          checkpointId,
+        );
+        if (
+          !(await exists(join(activeDirectory, "before.ref"))) ||
+          !(await exists(join(activeDirectory, "after.ref")))
+        )
+          return false;
+        await mkdir(dirname(historyDirectory), { recursive: true, mode: 0o700 });
+        try {
+          await rename(activeDirectory, historyDirectory);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  async hasActiveRefs(sessionHash: string, checkpointId: string): Promise<boolean> {
+    return isHash(sessionHash) && safeId(checkpointId)
+      ? exists(this.refPath("active", sessionHash, checkpointId, "before"))
+      : false;
+  }
+
+  async hasHistoryRef(
+    sessionHash: string,
+    checkpointId: string,
+    phase: SnapshotPhase,
+  ): Promise<boolean> {
+    return exists(this.refPath("history", sessionHash, checkpointId, phase));
+  }
+
+  private async readRef(path: string): Promise<{ treeId: string; ownerId?: string } | null> {
+    try {
+      const content = (await readFile(path, "utf8")).trim();
+      if (isHash(content)) return { treeId: content };
+      const value = JSON.parse(content) as { treeId?: unknown; ownerId?: unknown };
+      if (!isHash(value.treeId)) return null;
+      return {
+        treeId: value.treeId,
+        ...(typeof value.ownerId === "string" ? { ownerId: value.ownerId } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async refMatches(
+    sessionHash: string,
+    checkpointId: string,
+    phase: SnapshotPhase,
+    treeId: string,
+    namespace: "active" | "history" = "history",
+  ): Promise<boolean> {
+    if (!isHash(sessionHash) || !safeId(checkpointId) || !isHash(treeId)) return false;
+    return (
+      (await this.readRef(this.refPath(namespace, sessionHash, checkpointId, phase)))?.treeId ===
+      treeId
+    );
+  }
+
+  private async ownerIsProvablyStale(ownerId: string): Promise<boolean> {
+    try {
+      const value = JSON.parse(
+        await readFile(join(this.rootDirectory, "leases", `${ownerId}.json`), "utf8"),
+      ) as { ownerId?: unknown; pid?: unknown; hostname?: unknown };
+      if (
+        value.ownerId !== ownerId ||
+        typeof value.pid !== "number" ||
+        value.hostname !== hostname()
+      )
+        return false;
+      try {
+        process.kill(value.pid, 0);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  private async cleanupStaleActiveRefs(): Promise<void> {
+    const activeRoot = join(this.rootDirectory, "refs", "active");
+    const scan = async (directory: string): Promise<void> => {
+      let children;
+      try {
+        children = await readdir(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const child of children) {
+        const path = join(directory, child.name);
+        if (child.isDirectory()) {
+          await scan(path);
+          continue;
+        }
+        if (!child.name.endsWith(".ref")) continue;
+        const ref = await this.readRef(path);
+        if (ref?.ownerId && (await this.ownerIsProvablyStale(ref.ownerId))) {
+          await rm(dirname(path), { recursive: true, force: true });
+        }
+      }
+    };
+    await scan(activeRoot);
+  }
+
+  async collectGarbage(): Promise<void> {
+    await this.withStoreLock(async () => {
+      await this.cleanupStaleActiveRefs();
+      const referencedTrees = new Set<string>();
+      const scanRefs = async (directory: string): Promise<void> => {
+        let children;
+        try {
+          children = await readdir(directory, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const child of children) {
+          const path = join(directory, child.name);
+          if (child.isDirectory()) await scanRefs(path);
+          else if (child.name.endsWith(".ref")) {
+            const ref = await this.readRef(path);
+            if (ref) referencedTrees.add(ref.treeId);
+          }
+        }
+      };
+      await scanRefs(join(this.rootDirectory, "refs"));
+      const referencedBlobs = new Set<string>();
+      for (const treeId of referencedTrees) {
+        const manifest = await this.loadManifest(treeId);
+        for (const entry of manifest?.entries ?? []) referencedBlobs.add(entry.blobHash);
+      }
+      try {
+        for (const child of await readdir(join(this.rootDirectory, "trees"))) {
+          if (!child.endsWith(".json")) continue;
+          const treeId = child.slice(0, -5);
+          if (!referencedTrees.has(treeId))
+            await rm(join(this.rootDirectory, "trees", child), { force: true });
+        }
+      } catch {
+        // Nothing to collect.
+      }
+      try {
+        for (const prefix of await readdir(join(this.rootDirectory, "blobs"))) {
+          const directory = join(this.rootDirectory, "blobs", prefix);
+          for (const child of await readdir(directory)) {
+            const hash = `${prefix}${child}`;
+            if (!referencedBlobs.has(hash)) await rm(join(directory, child), { force: true });
+          }
+        }
+      } catch {
+        // Nothing to collect.
+      }
+    });
+  }
+
+  async garbageCollect(): Promise<void> {
+    await this.collectGarbage();
+  }
+
+  private async ownerHasActiveRefs(): Promise<boolean> {
+    const scan = async (directory: string): Promise<boolean> => {
+      let children;
+      try {
+        children = await readdir(directory, { withFileTypes: true });
+      } catch {
+        return false;
+      }
+      for (const child of children) {
+        const path = join(directory, child.name);
+        if (child.isDirectory()) {
+          if (await scan(path)) return true;
+        } else if (child.name.endsWith(".ref")) {
+          if ((await this.readRef(path))?.ownerId === this.ownerId) return true;
+        }
+      }
+      return false;
+    };
+    return scan(join(this.rootDirectory, "refs", "active"));
+  }
+
+  async shutdown(): Promise<void> {
+    if (!this.leasePublished || (await this.ownerHasActiveRefs())) return;
+    await rm(join(this.rootDirectory, "leases", `${this.ownerId}.json`), { force: true }).catch(
+      () => undefined,
+    );
+    this.leasePublished = false;
+  }
+
+  async treeExists(treeId: string): Promise<boolean> {
+    return exists(this.treePath(treeId));
+  }
+
+  async blobExists(blobHash: string): Promise<boolean> {
+    return isHash(blobHash) && exists(this.blobPath(blobHash));
+  }
+
+  async treeUsable(treeId: string): Promise<boolean> {
+    const manifest = await this.loadManifest(treeId);
+    if (!manifest) return false;
+    for (const entry of manifest.entries) {
+      if (!(await this.blobExists(entry.blobHash))) return false;
+    }
+    return true;
+  }
+}
+
+async function chmodSafe(path: string, mode: number): Promise<void> {
+  try {
+    const { chmod } = await import("node:fs/promises");
+    await chmod(path, mode & 0o777);
+  } catch {
+    // Windows and filesystems without POSIX modes are allowed to ignore mode restoration.
+  }
+}

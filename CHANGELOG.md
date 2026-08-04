@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.2.0] - 2026-08-04
+
+### Added
+
+- Add file undo/redo for non-Git workspaces through a content-addressed snapshot store.
+
 ## [1.1.0] - 2026-08-01
 
 ### Added

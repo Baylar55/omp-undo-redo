@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narrow scope of the extension: session-tree navigation and Git-backed file-delta restoration when Git is available, using public OMP extension APIs.
+Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narrow scope of the extension: session-tree navigation and Git-backed or blob-backed file restoration, using public OMP extension APIs.
 
 ## Before opening a change
 

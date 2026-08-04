@@ -22,14 +22,18 @@ export type FileCheckpointUnavailableReason =
   | "after_snapshot_failed"
   | "after_ref_failed"
   | "file_history_gap"
-  | "resumed_checkpoint_unavailable";
+  | "resumed_checkpoint_unavailable"
+  | "workspace_unresolvable"
+  | "before_blob_failed"
+  | "after_blob_failed"
+  | "blob_apply_failed";
 
 export type TreeNavigationResult = {
   cancelled: boolean;
 };
 
 export type NavigationResult =
-  | { status: "moved"; files: "restored" }
+  | { status: "moved"; files: "restored" | "partially_restored" }
   | {
       status: "moved";
       files: "unavailable";
@@ -38,6 +42,7 @@ export type NavigationResult =
   | { status: "empty" }
   | { status: "cancelled" }
   | { status: "git_failed"; failure: "conflict" | "failed" }
+  | { status: "blob_failed"; failure: "conflict" | "failed" }
   | { status: "rollback_failed" };
 
 export type ActionId = "undo" | "redo";
@@ -99,6 +104,17 @@ export interface GitCheckpoint {
   leafId: string | null;
 }
 
+export interface BlobCheckpoint {
+  kind: "blob";
+  workspaceRoot: string;
+  sessionHash: string;
+  checkpointId: string;
+  beforeTreeId: string;
+  afterTreeId: string;
+  parentLeafId: string | null;
+  leafId: string | null;
+}
+
 export interface SessionOnlyCheckpoint {
   kind: "session";
   reason: FileCheckpointUnavailableReason;
@@ -106,7 +122,7 @@ export interface SessionOnlyCheckpoint {
   leafId: string | null;
 }
 
-export type TurnCheckpoint = GitCheckpoint | SessionOnlyCheckpoint;
+export type TurnCheckpoint = GitCheckpoint | BlobCheckpoint | SessionOnlyCheckpoint;
 
 export interface NavigationState {
   checkpoints: TurnCheckpoint[];
@@ -122,12 +138,22 @@ export interface PendingGitCheckpoint {
   parentLeafId: string | null;
 }
 
+export interface PendingBlobCheckpoint {
+  kind: "blob";
+  workspaceRoot: string;
+  sessionHash: string;
+  checkpointId: string;
+  beforeTreeId: string;
+  parentLeafId: string | null;
+}
+
 export interface PendingSessionCheckpoint {
   kind: "session";
   reason: FileCheckpointUnavailableReason;
   parentLeafId: string | null;
 }
 
-export type PendingTurnCheckpoint = PendingGitCheckpoint | PendingSessionCheckpoint;
+export type PendingTurnCheckpoint =
+  PendingGitCheckpoint | PendingBlobCheckpoint | PendingSessionCheckpoint;
 
 export type GitRunnerFactory = (repository: GitRepository) => GitRunner;

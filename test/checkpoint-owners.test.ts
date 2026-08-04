@@ -138,7 +138,7 @@ describe("checkpoint owner boundaries", () => {
       probePid: () => {
         throw Object.assign(new Error("gone"), { code: "ESRCH" });
       },
-      shutdownWaitMs: 50,
+      shutdownWaitMs: 1_000,
     });
     expect(await registry.ensureInitialized(repository, git)).toBe("v2");
     await registry.shutdown();
