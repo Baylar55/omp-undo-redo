@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.2.1] - 2026-08-06
+
+### Changed
+
+- Add Pi catalog discovery keywords and publish metadata for the package gallery.
+- Update pinned installation examples to version 1.2.1.
+
 ## [1.2.0] - 2026-08-04
 
 ### Added

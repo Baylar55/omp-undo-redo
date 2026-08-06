@@ -1,8 +1,15 @@
 {
   "name": "@baylarsadigov/omp-undo-redo",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Undo and redo session navigation for Oh My Pi",
   "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "undo",
+    "redo"
+  ],
   "homepage": "https://github.com/Baylar55/omp-undo-redo#readme",
   "repository": {
     "type": "git",
