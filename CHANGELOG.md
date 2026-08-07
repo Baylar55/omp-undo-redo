@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.2.3] - 2026-08-07
+
+### Changed
+
+- Reuse and safely normalize the private Git snapshot index between turn boundaries, avoiding repeated content hashing for unchanged tracked files while preserving fresh-index ignore and type semantics.
+
 ## [1.2.2] - 2026-08-07
 
 ### Fixed

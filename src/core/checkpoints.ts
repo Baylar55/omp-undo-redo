@@ -10,6 +10,7 @@ import type {
   GitRunner,
   OwnershipMode,
   PendingGitCheckpoint,
+  SnapshotIndexLease,
   SessionReader,
 } from "./types.js";
 
@@ -108,55 +109,159 @@ export async function resolveRepository(git: GitRunner): Promise<RepositoryResol
   };
 }
 
-type SnapshotResult = { hash: string } | { reason: "invalid_head" | "snapshot_failed" };
+type SnapshotResult =
+  | { hash: string; snapshotIndexLease?: SnapshotIndexLease }
+  | { reason: "invalid_head" | "snapshot_failed" };
+
+type SeedSnapshotIndexResult =
+  { status: "seeded"; headTree: string } | { status: "empty" | "invalid_head" | "failed" };
 
 async function seedSnapshotIndex(
   git: GitRunner,
   env: Record<string, string>,
-): Promise<"seeded" | "empty" | "invalid_head" | "failed"> {
+): Promise<SeedSnapshotIndexResult> {
   const headTree = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
-  if (headTree.code === 0 && headTree.stdout.trim()) {
-    const seeded = await invoke(git, ["read-tree", headTree.stdout.trim()], { env });
-    return seeded.code === 0 ? "seeded" : "failed";
+  const hash = headTree.stdout.trim();
+  if (headTree.code === 0 && hash) {
+    const seeded = await invoke(git, ["read-tree", hash], { env });
+    return seeded.code === 0 ? { status: "seeded", headTree: hash } : { status: "failed" };
   }
-  if (headTree.error === "unavailable") return "failed";
+  if (headTree.error === "unavailable") return { status: "failed" };
 
   const symbolicHead = await invoke(git, ["symbolic-ref", "-q", "HEAD"]);
-  if (symbolicHead.code !== 0 || !symbolicHead.stdout.trim()) return "invalid_head";
+  if (symbolicHead.code !== 0 || !symbolicHead.stdout.trim()) return { status: "invalid_head" };
   const branchRef = symbolicHead.stdout.trim();
   const branch = await invoke(git, ["show-ref", "--verify", "--quiet", branchRef]);
-  if (branch.code === 0) return "invalid_head";
-  if (branch.error === "unavailable") return "failed";
+  if (branch.code === 0) return { status: "invalid_head" };
+  if (branch.error === "unavailable") return { status: "failed" };
 
   const empty = await invoke(git, ["read-tree", "--empty"], { env });
-  return empty.code === 0 ? "empty" : "failed";
+  return empty.code === 0 ? { status: "empty" } : { status: "failed" };
 }
 
-async function createSnapshotCommit(git: GitRunner, message: string): Promise<SnapshotResult> {
+async function createCommitForTree(
+  git: GitRunner,
+  treeHash: string,
+  message: string,
+): Promise<SnapshotResult> {
+  const commit = await invoke(git, [...GIT_AUTHOR, "commit-tree", treeHash, "-m", message]);
+  if (commit.code !== 0) return { reason: "snapshot_failed" };
+  const commitHash = commit.stdout.trim();
+  return commitHash ? { hash: commitHash } : { reason: "snapshot_failed" };
+}
+
+async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined): Promise<boolean> {
+  if (!lease) return true;
+  try {
+    await rm(lease.directory, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function createSnapshotCommit(
+  git: GitRunner,
+  message: string,
+  retainIndex = false,
+): Promise<SnapshotResult> {
   let tempDirectory: string | null = null;
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-index-"));
     const indexPath = join(tempDirectory, "index");
     const env = { GIT_INDEX_FILE: indexPath };
     const seeded = await seedSnapshotIndex(git, env);
-    if (seeded === "invalid_head") return { reason: "invalid_head" };
-    if (seeded === "failed") return { reason: "snapshot_failed" };
+    if (seeded.status === "invalid_head") return { reason: "invalid_head" };
+    if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env });
     if (added.code !== 0) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     if (tree.code !== 0) return { reason: "snapshot_failed" };
     const treeHash = tree.stdout.trim();
     if (!treeHash) return { reason: "snapshot_failed" };
-    const commit = await invoke(git, [...GIT_AUTHOR, "commit-tree", treeHash, "-m", message]);
-    if (commit.code !== 0) return { reason: "snapshot_failed" };
-    const commitHash = commit.stdout.trim();
-    return commitHash ? { hash: commitHash } : { reason: "snapshot_failed" };
+    const commit = await createCommitForTree(git, treeHash, message);
+    if (!("hash" in commit)) return commit;
+    if (retainIndex && seeded.status === "seeded") {
+      const snapshotIndexLease = {
+        directory: tempDirectory,
+        indexPath,
+        headTree: seeded.headTree,
+      };
+      tempDirectory = null;
+      return { hash: commit.hash, snapshotIndexLease };
+    }
+    return commit;
   } catch {
     return { reason: "snapshot_failed" };
   } finally {
     if (tempDirectory !== null) {
       await rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
+  }
+}
+
+async function createSnapshotCommitFromLease(
+  git: GitRunner,
+  lease: SnapshotIndexLease,
+  message: string,
+): Promise<SnapshotResult> {
+  const currentHead = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
+  if (currentHead.code !== 0 || currentHead.stdout.trim() !== lease.headTree) {
+    return { reason: "snapshot_failed" };
+  }
+
+  const normalizationPath = join(lease.directory, `normalize-${randomUUID()}.nul`);
+  const env = { GIT_INDEX_FILE: lease.indexPath };
+  try {
+    const differences = await invoke(
+      git,
+      [
+        "diff-index",
+        "--cached",
+        "--no-renames",
+        "--diff-filter=ADT",
+        "--name-only",
+        "-z",
+        `--output=${normalizationPath}`,
+        lease.headTree,
+        "--",
+      ],
+      { env },
+    );
+    if (differences.code !== 0) return { reason: "snapshot_failed" };
+
+    const normalization = await stat(normalizationPath);
+    if (normalization.size > 0) {
+      const reset = await invoke(
+        git,
+        [
+          "--literal-pathspecs",
+          "reset",
+          "-q",
+          lease.headTree,
+          `--pathspec-from-file=${normalizationPath}`,
+          "--pathspec-file-nul",
+        ],
+        { env },
+      );
+      if (reset.code !== 0) return { reason: "snapshot_failed" };
+    }
+
+    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env });
+    if (added.code !== 0) return { reason: "snapshot_failed" };
+    const tree = await invoke(git, ["write-tree"], { env });
+    const treeHash = tree.stdout.trim();
+    if (tree.code !== 0 || !treeHash) return { reason: "snapshot_failed" };
+
+    const verifiedHead = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
+    if (verifiedHead.code !== 0 || verifiedHead.stdout.trim() !== lease.headTree) {
+      return { reason: "snapshot_failed" };
+    }
+    return createCommitForTree(git, treeHash, message);
+  } catch {
+    return { reason: "snapshot_failed" };
+  } finally {
+    await rm(normalizationPath, { force: true }).catch(() => undefined);
   }
 }
 
@@ -282,13 +387,20 @@ export async function releaseCheckpoint(
 
 export async function releasePendingCheckpoint(
   git: GitRunner,
-  pending: Pick<PendingGitCheckpoint, "repository" | "beforeHash" | "beforeRef">,
+  pending: Pick<
+    PendingGitCheckpoint,
+    "repository" | "beforeHash" | "beforeRef" | "snapshotIndexLease"
+  >,
 ): Promise<boolean> {
-  return releaseRefBatch(
-    git,
-    [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }],
-    pending.repository,
-  );
+  const [releasedRef, releasedLease] = await Promise.all([
+    releaseRefBatch(
+      git,
+      [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }],
+      pending.repository,
+    ),
+    releaseSnapshotIndexLease(pending.snapshotIndexLease),
+  ]);
+  return releasedRef && releasedLease;
 }
 
 export type PrepareBeforeTurnResult =
@@ -311,7 +423,7 @@ export async function prepareBeforeTurn(
     ? await ownerRegistry.ensureInitialized(resolved.repository, git)
     : "legacy";
   const checkpointId = randomUUID();
-  const snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn");
+  const snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn", true);
   if (!("hash" in snapshot)) {
     return {
       status: "session_only",
@@ -328,6 +440,7 @@ export async function prepareBeforeTurn(
       snapshot.hash,
     ]))
   ) {
+    await releaseSnapshotIndexLease(snapshot.snapshotIndexLease);
     return {
       status: "session_only",
       reason: "before_ref_failed",
@@ -341,6 +454,7 @@ export async function prepareBeforeTurn(
       beforeHash: snapshot.hash,
       beforeRef,
       checkpointId,
+      ...(snapshot.snapshotIndexLease ? { snapshotIndexLease: snapshot.snapshotIndexLease } : {}),
       parentLeafId: null,
     },
   };
@@ -348,11 +462,30 @@ export async function prepareBeforeTurn(
 
 export async function finishAfterTurn(
   git: GitRunner,
-  before: Pick<PendingGitCheckpoint, "repository" | "beforeHash" | "beforeRef" | "checkpointId">,
+  before: Pick<
+    PendingGitCheckpoint,
+    "repository" | "beforeHash" | "beforeRef" | "checkpointId" | "snapshotIndexLease"
+  >,
   parentLeafId: string | null,
   leafId: string | null,
 ): Promise<FinishAfterTurnResult> {
-  const snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
+  let snapshot: SnapshotResult;
+  if (before.snapshotIndexLease) {
+    try {
+      snapshot = await createSnapshotCommitFromLease(
+        git,
+        before.snapshotIndexLease,
+        "omp-undo-redo: after turn",
+      );
+    } finally {
+      await releaseSnapshotIndexLease(before.snapshotIndexLease);
+    }
+    if (!("hash" in snapshot)) {
+      snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
+    }
+  } else {
+    snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
+  }
   if (!("hash" in snapshot)) {
     await releasePendingCheckpoint(git, before);
     return {

@@ -270,6 +270,8 @@ describe("temp-directory failure resilience", () => {
 
       mockState.failMkdtempPrefix = "omp-undo-redo-index-";
       await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await rawGit(cwd, ["add", "tracked.txt"]);
+      await rawGit(cwd, ["commit", "-qm", "move HEAD during turn"]);
       ctx.leaf = "turn-1";
 
       await expect(pi.emit("agent_end", ctx)).resolves.toBeUndefined();
