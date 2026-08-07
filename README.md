@@ -35,7 +35,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.2.1
+omp plugin install @baylarsadigov/omp-undo-redo@1.2.2
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -61,7 +61,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.2.1
+pi install npm:@baylarsadigov/omp-undo-redo@1.2.2
 ```
 
 To update installed Pi packages:
@@ -82,7 +82,7 @@ The extension exposes exactly these commands:
 Commands take no arguments. They navigate OMP's session tree through the official extension API and do not create a new model turn.
 Both commands wait for the current agent turn to become idle; if OMP remains busy, the command leaves the session unchanged and shows a warning.
 
-Every completed turn remains navigable, including conversation-only turns and turns that change only ignored files. In Git projects, `/undo` and `/redo` restore worktree snapshots without rewriting the Git index. In non-Git workspaces, the built-in snapshot store restores regular files, binary content, and executable modes. Unsupported symlinks and files above the 16 MiB limit are reported as partial restoration. If checkpoint creation fails, commands navigate session context only and report that limitation. Such a session-only checkpoint is a file-history continuity barrier: older file checkpoints are discarded because applying them across an unknown file delta would be unsafe.
+Every completed turn remains navigable, including conversation-only turns and turns that change only ignored files. In Git projects, `/undo` and `/redo` restore worktree snapshots without rewriting the Git index. In non-Git workspaces, the built-in snapshot store restores regular files, binary content, and executable modes. Unsupported symlinks and files above the 16 MiB limit are reported as partial restoration. Skipped paths and their overlapping parent or descendant paths remain untouched during partial restoration. Such a session-only checkpoint is a file-history continuity barrier: older file checkpoints are discarded because applying them across an unknown file delta would be unsafe.
 
 Completed Git or non-Git checkpoints and the undo/redo cursor survive a normal terminal restart. Resuming the same session in the same worktree restores both `/undo` and `/redo` history. If durable file metadata is missing or unusable, the extension reconstructs completed turns from the active session branch and offers session-only undo with an explicit warning. A changed worktree must still pass the normal conflict check; resuming never bypasses file-safety checks.
 

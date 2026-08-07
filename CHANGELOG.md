@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.2.2] - 2026-08-07
+
+### Fixed
+
+- Keep skipped non-Git snapshot paths and overlapping parents or descendants untouched during partial undo and redo, preventing uncaptured files from being deleted.
+- Reject pre-upgrade in-flight journals whose recorded mutations overlap skipped paths rather than replaying an unsafe deletion.
+
 ## [1.2.1] - 2026-08-06
 
 ### Changed
