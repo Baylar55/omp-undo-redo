@@ -93,6 +93,12 @@ export interface GitRepository {
   commonDir: string;
 }
 
+export interface SnapshotIndexLease {
+  directory: string;
+  indexPath: string;
+  headTree: string;
+}
+
 export interface GitCheckpoint {
   kind: "git";
   repository: GitRepository;
@@ -135,6 +141,7 @@ export interface PendingGitCheckpoint {
   beforeHash: string;
   beforeRef: string;
   checkpointId: string;
+  snapshotIndexLease?: SnapshotIndexLease;
   parentLeafId: string | null;
 }
 
