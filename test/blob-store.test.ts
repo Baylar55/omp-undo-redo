@@ -231,6 +231,84 @@ describe("non-Git blob store", () => {
     await store.shutdown();
   });
 
+  it("leaves skipped-to-captured paths untouched while restoring safe paths", async () => {
+    const workspace = await temporaryDirectory("omp-blob-skipped-transition-workspace-");
+    const storage = await temporaryDirectory("omp-blob-skipped-transition-storage-");
+    const store = new BlobStore(storage, { maxFileBytes: 3 });
+    const session = sessionHash("skipped-transition");
+    const checkpoint = randomUUID();
+    await writeFile(join(workspace, "changing.bin"), "1234");
+    await writeFile(join(workspace, "safe.txt"), "old");
+    const before = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    await writeFile(join(workspace, "changing.bin"), "ok");
+    await writeFile(join(workspace, "safe.txt"), "new");
+    const after = await store.captureSnapshot(workspace, session, checkpoint, "after");
+    if ("reason" in before || "reason" in after) throw new Error("snapshot failed");
+    expect(before.skippedPaths).toEqual(["changing.bin"]);
+    expect(after.skippedPaths).toEqual([]);
+
+    expect(await store.applySnapshot(workspace, session, after.treeId, before.treeId)).toEqual({
+      status: "applied",
+      partial: true,
+    });
+    await expect(readFile(join(workspace, "changing.bin"), "utf8")).resolves.toBe("ok");
+    await expect(readFile(join(workspace, "safe.txt"), "utf8")).resolves.toBe("old");
+    await store.shutdown();
+  });
+
+  it("leaves captured-to-skipped paths untouched while restoring safe paths", async () => {
+    const workspace = await temporaryDirectory("omp-blob-reverse-skipped-workspace-");
+    const storage = await temporaryDirectory("omp-blob-reverse-skipped-storage-");
+    const store = new BlobStore(storage, { maxFileBytes: 3 });
+    const session = sessionHash("reverse-skipped-transition");
+    const checkpoint = randomUUID();
+    await writeFile(join(workspace, "changing.bin"), "ok");
+    await writeFile(join(workspace, "safe.txt"), "old");
+    const before = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    await writeFile(join(workspace, "changing.bin"), "1234");
+    await writeFile(join(workspace, "safe.txt"), "new");
+    const after = await store.captureSnapshot(workspace, session, checkpoint, "after");
+    if ("reason" in before || "reason" in after) throw new Error("snapshot failed");
+    expect(before.skippedPaths).toEqual([]);
+    expect(after.skippedPaths).toEqual(["changing.bin"]);
+
+    expect(await store.applySnapshot(workspace, session, after.treeId, before.treeId)).toEqual({
+      status: "applied",
+      partial: true,
+    });
+    await expect(readFile(join(workspace, "changing.bin"), "utf8")).resolves.toBe("1234");
+    await expect(readFile(join(workspace, "safe.txt"), "utf8")).resolves.toBe("old");
+    await store.shutdown();
+  });
+
+  it("protects ancestors and descendants of skipped paths", async () => {
+    const workspace = await temporaryDirectory("omp-blob-skipped-namespace-workspace-");
+    const storage = await temporaryDirectory("omp-blob-skipped-namespace-storage-");
+    const store = new BlobStore(storage, { maxFileBytes: 3 });
+    const session = sessionHash("skipped-namespace");
+    const checkpoint = randomUUID();
+    await mkdir(join(workspace, "ancestor"));
+    await writeFile(join(workspace, "ancestor", "large.bin"), "1234");
+    await writeFile(join(workspace, "descendant"), "1234");
+    const before = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    await rm(join(workspace, "ancestor"), { recursive: true });
+    await writeFile(join(workspace, "ancestor"), "ok");
+    await rm(join(workspace, "descendant"));
+    await mkdir(join(workspace, "descendant"));
+    await writeFile(join(workspace, "descendant", "child.txt"), "ok");
+    const after = await store.captureSnapshot(workspace, session, checkpoint, "after");
+    if ("reason" in before || "reason" in after) throw new Error("snapshot failed");
+    expect(before.skippedPaths).toEqual(["ancestor/large.bin", "descendant"]);
+
+    expect(await store.applySnapshot(workspace, session, after.treeId, before.treeId)).toEqual({
+      status: "applied",
+      partial: true,
+    });
+    await expect(readFile(join(workspace, "ancestor"), "utf8")).resolves.toBe("ok");
+    await expect(readFile(join(workspace, "descendant", "child.txt"), "utf8")).resolves.toBe("ok");
+    await store.shutdown();
+  });
+
   it("does not split refs when history promotion fails", async () => {
     const workspace = await temporaryDirectory("omp-blob-promotion-workspace-");
     const storage = await temporaryDirectory("omp-blob-promotion-storage-");

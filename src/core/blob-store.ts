@@ -332,7 +332,12 @@ export class BlobStore {
         }
         const sourceMap = new Map(source.entries.map((entry) => [entry.path, entry]));
         const targetMap = new Map(target.entries.map((entry) => [entry.path, entry]));
-        const expectedPaths = this.changedPaths(sourceMap, targetMap);
+        const expectedPaths = this.changedPaths(
+          sourceMap,
+          targetMap,
+          source.skippedPaths,
+          target.skippedPaths,
+        );
         if (
           expectedPaths.length !== journalPaths.length ||
           expectedPaths.some((path, index) => path !== [...journalPaths].sort()[index])
@@ -359,8 +364,32 @@ export class BlobStore {
     await rename(journalPath, join(failedDirectory, basename(journalPath))).catch(() => undefined);
   }
 
-  private changedPaths(source: Map<string, TreeEntry>, target: Map<string, TreeEntry>): string[] {
+  private changedPaths(
+    source: Map<string, TreeEntry>,
+    target: Map<string, TreeEntry>,
+    sourceSkipped: readonly string[] = [],
+    targetSkipped: readonly string[] = [],
+  ): string[] {
+    const skipped = new Set([...sourceSkipped, ...targetSkipped]);
+    const skippedAndAncestors = new Set<string>();
+    for (const skippedPath of skipped) {
+      let current = skippedPath;
+      while (current !== "." && current !== "") {
+        skippedAndAncestors.add(current);
+        current = dirname(current);
+      }
+    }
+    const overlapsSkipped = (path: string): boolean => {
+      if (skippedAndAncestors.has(path)) return true;
+      let current = dirname(path);
+      while (current !== "." && current !== "") {
+        if (skipped.has(current)) return true;
+        current = dirname(current);
+      }
+      return false;
+    };
     return [...new Set([...source.keys(), ...target.keys()])]
+      .filter((path) => !overlapsSkipped(path))
       .filter((path) => {
         const left = source.get(path);
         const right = target.get(path);
@@ -602,7 +631,12 @@ export class BlobStore {
           for (const entry of source.entries) {
             if (!(await this.blobExists(entry.blobHash))) return { status: "failed" };
           }
-          const mutations = this.changedPaths(sourceMap, targetMap);
+          const mutations = this.changedPaths(
+            sourceMap,
+            targetMap,
+            source.skippedPaths,
+            target.skippedPaths,
+          );
 
           for (const path of mutations) {
             if (!this.validPath(path)) return { status: "conflict" };
