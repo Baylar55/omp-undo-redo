@@ -1,6 +1,6 @@
 {
   "name": "@baylarsadigov/omp-undo-redo",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "Undo and redo session navigation for Pi and Oh My Pi",
   "license": "MIT",
   "keywords": [
@@ -58,6 +58,11 @@
   },
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": ">=16.5.2"
+  },
+  "peerDependenciesMeta": {
+    "@oh-my-pi/pi-coding-agent": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@oh-my-pi/pi-coding-agent": "16.5.2",

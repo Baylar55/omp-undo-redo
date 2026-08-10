@@ -64,6 +64,33 @@ describe("non-Git blob store", () => {
     await store.shutdown();
   });
 
+  it("validates blobs only for changed paths when applying a snapshot", async () => {
+    const workspace = await temporaryDirectory("omp-blob-delta-workspace-");
+    const storage = await temporaryDirectory("omp-blob-delta-storage-");
+    const store = new BlobStore(storage);
+    const session = sessionHash("delta-validation");
+    const checkpoint = randomUUID();
+    await writeFile(join(workspace, "changed.txt"), "before\n");
+    await writeFile(join(workspace, "unchanged.txt"), "unchanged\n");
+    const before = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    await writeFile(join(workspace, "changed.txt"), "after\n");
+    const after = await store.captureSnapshot(workspace, session, checkpoint, "after");
+    if ("reason" in before || "reason" in after) throw new Error("snapshot failed");
+
+    const unchanged = before.entries.find((entry) => entry.path === "unchanged.txt");
+    if (!unchanged) throw new Error("unchanged entry missing");
+    await rm(join(storage, "blobs", unchanged.blobHash.slice(0, 2), unchanged.blobHash.slice(2)), {
+      force: true,
+    });
+
+    await expect(
+      store.applySnapshot(workspace, session, after.treeId, before.treeId),
+    ).resolves.toEqual({ status: "applied", partial: false });
+    await expect(readFile(join(workspace, "changed.txt"), "utf8")).resolves.toBe("before\n");
+    await expect(readFile(join(workspace, "unchanged.txt"), "utf8")).resolves.toBe("unchanged\n");
+    await store.shutdown();
+  });
+
   it("does not read unchanged workspace files", async () => {
     const workspace = await temporaryDirectory("omp-blob-cache-workspace-");
     const storage = await temporaryDirectory("omp-blob-cache-storage-");

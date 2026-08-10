@@ -751,18 +751,24 @@ export class BlobStore {
           if (!source || !target) return { status: "failed" };
           const sourceMap = new Map(source.entries.map((entry) => [entry.path, entry]));
           const targetMap = new Map(target.entries.map((entry) => [entry.path, entry]));
-          for (const entry of target.entries) {
-            if (!(await this.blobExists(entry.blobHash))) return { status: "failed" };
-          }
-          for (const entry of source.entries) {
-            if (!(await this.blobExists(entry.blobHash))) return { status: "failed" };
-          }
           const mutations = this.changedPaths(
             sourceMap,
             targetMap,
             source.skippedPaths,
             target.skippedPaths,
           );
+          // Only changed entries can be read while applying or rolling back. Checking every
+          // manifest entry makes a small undo/redo perform two full-tree stat passes.
+          const requiredBlobHashes = new Set<string>();
+          for (const path of mutations) {
+            const sourceEntry = sourceMap.get(path);
+            const targetEntry = targetMap.get(path);
+            if (sourceEntry) requiredBlobHashes.add(sourceEntry.blobHash);
+            if (targetEntry) requiredBlobHashes.add(targetEntry.blobHash);
+          }
+          for (const blobHash of requiredBlobHashes) {
+            if (!(await this.blobExists(blobHash))) return { status: "failed" };
+          }
 
           for (const path of mutations) {
             if (!this.validPath(path)) return { status: "conflict" };
