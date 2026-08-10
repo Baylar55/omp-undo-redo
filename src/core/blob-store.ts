@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
+import type { Stats } from "node:fs";
 import {
   mkdir,
   lstat,
@@ -27,6 +28,32 @@ export interface TreeManifest {
   skippedPaths: string[];
 }
 
+interface FileFingerprint {
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  birthtimeMs: number;
+  dev: number;
+  ino: number;
+  mode: number;
+}
+
+interface CachedWorkspaceFile {
+  fingerprint: FileFingerprint;
+  entry: TreeEntry;
+}
+
+interface WorkspaceCache {
+  treeId: string;
+  files: Map<string, CachedWorkspaceFile>;
+  /** Wall-clock epoch (ms) when this cache was populated.  The racily-clean
+   *  guard compares each file's cached mtime against this value so that only
+   *  files whose mtime falls within RACILY_CLEAN_MS of the *prior* capture
+   *  are forced to re-read — closing the FAT/SMB coarse-tick window where a
+   *  rewrite and the observation land on the same tick. */
+  captureTime: number;
+}
+
 export type SnapshotPhase = "before" | "after";
 export type BlobApplyResult =
   { status: "applied"; partial: boolean } | { status: "conflict" } | { status: "failed" };
@@ -46,6 +73,11 @@ export const DEFAULT_BLOB_IGNORES = [
   "target",
 ] as const;
 
+const MAX_CACHED_WORKSPACES = 16;
+const MAX_CACHED_FILES_PER_WORKSPACE = 100_000;
+const MAX_CACHED_FILES = 100_000;
+const RACILY_CLEAN_MS = 4_000;
+
 export function blobStoreRootDirectory(): string {
   if (process.env.OMP_UNDO_REDO_BLOB_DIR) return resolve(process.env.OMP_UNDO_REDO_BLOB_DIR);
   if (process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
@@ -61,6 +93,30 @@ function basenameIsRuntime(value: string): boolean {
 
 function sha256(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function fileFingerprint(metadata: Stats): FileFingerprint {
+  return {
+    size: metadata.size,
+    mtimeMs: metadata.mtimeMs,
+    ctimeMs: metadata.ctimeMs,
+    birthtimeMs: metadata.birthtimeMs,
+    dev: metadata.dev,
+    ino: metadata.ino,
+    mode: metadata.mode & 0o777,
+  };
+}
+
+function sameFingerprint(left: FileFingerprint, right: FileFingerprint): boolean {
+  return (
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs &&
+    left.birthtimeMs === right.birthtimeMs &&
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode
+  );
 }
 
 function canonicalManifest(entries: readonly TreeEntry[], skippedPaths: readonly string[]): string {
@@ -95,18 +151,26 @@ export class BlobStore {
   private readonly maxFileBytes: number;
   private readonly ignore: ReadonlySet<string>;
   private readonly clock: () => Date;
+  private readonly readWorkspaceFile: (path: string) => Promise<Buffer>;
   private readonly locks = new Map<string, Promise<void>>();
   private readonly ownerId = randomUUID();
   private leasePublished = false;
+  private readonly workspaceCaches = new Map<string, WorkspaceCache>();
 
   constructor(
     readonly rootDirectory: string,
-    options: { maxFileBytes?: number; ignore?: readonly string[]; clock?: () => Date } = {},
+    options: {
+      maxFileBytes?: number;
+      ignore?: readonly string[];
+      clock?: () => Date;
+      readWorkspaceFile?: (path: string) => Promise<Buffer>;
+    } = {},
   ) {
     this.rootDirectory = resolve(rootDirectory);
     this.maxFileBytes = options.maxFileBytes ?? 16 * 1024 * 1024;
     this.ignore = new Set(options.ignore ?? DEFAULT_BLOB_IGNORES);
     this.clock = options.clock ?? (() => new Date());
+    this.readWorkspaceFile = options.readWorkspaceFile ?? readFile;
   }
 
   private blobPath(hash: string): string {
@@ -248,12 +312,42 @@ export class BlobStore {
     return { hash: hash.digest("hex") };
   }
 
-  private async walkWorkspace(workspaceRoot: string): Promise<{
+  private cacheWorkspace(
+    workspaceRoot: string,
+    treeId: string,
+    files: Map<string, CachedWorkspaceFile>,
+    captureTime: number,
+  ): void {
+    this.workspaceCaches.delete(workspaceRoot);
+    if (files.size > MAX_CACHED_FILES_PER_WORKSPACE) return;
+
+    this.workspaceCaches.set(workspaceRoot, { treeId, files, captureTime });
+    let cachedFileCount = 0;
+    for (const cache of this.workspaceCaches.values()) cachedFileCount += cache.files.size;
+    while (
+      this.workspaceCaches.size > MAX_CACHED_WORKSPACES ||
+      cachedFileCount > MAX_CACHED_FILES
+    ) {
+      const oldest = this.workspaceCaches.entries().next().value;
+      if (!oldest) return;
+      const [oldestWorkspaceRoot, oldestCache] = oldest;
+      this.workspaceCaches.delete(oldestWorkspaceRoot);
+      cachedFileCount -= oldestCache.files.size;
+    }
+  }
+
+  private async walkWorkspace(
+    workspaceRoot: string,
+    cachedFiles: ReadonlyMap<string, CachedWorkspaceFile> | undefined,
+    guardTime: number,
+  ): Promise<{
     entries: TreeEntry[];
     skippedPaths: string[];
+    files: Map<string, CachedWorkspaceFile>;
   }> {
     const entries: TreeEntry[] = [];
     const skippedPaths: string[] = [];
+    const files = new Map<string, CachedWorkspaceFile>();
     const storageRoot = await realpath(this.rootDirectory).catch(() => resolve(this.rootDirectory));
     const normalized = (value: string) =>
       process.platform === "win32" ? value.toLowerCase() : value;
@@ -282,17 +376,36 @@ export class BlobStore {
             skippedPaths.push(relativePath);
             continue;
           }
-          const content = await readFile(fullPath);
+          const fingerprint = fileFingerprint(metadata);
+          const cached = cachedFiles?.get(relativePath);
+          if (cached && sameFingerprint(cached.fingerprint, fingerprint)) {
+            // Racily-clean guard: a same-size in-place rewrite that lands inside the
+            // filesystem's timestamp resolution window (≤2 s on FAT/SMB) produces an
+            // identical fingerprint.  We compare the file's mtime against the *prior*
+            // capture's wall-clock — the window that matters is whether the file was
+            // touched close to when we last observed it.  Two tick-widths (4 s) closes
+            // the coarse-tick corner on FAT where a rewrite and the prior observation
+            // land on the same tick.
+            const racilyClean = Math.abs(cached.fingerprint.mtimeMs - guardTime) < RACILY_CLEAN_MS;
+            if (!racilyClean) {
+              entries.push(cached.entry);
+              files.set(relativePath, cached);
+              continue;
+            }
+          }
+          const content = await this.readWorkspaceFile(fullPath);
           const hash = sha256(content);
           await this.writeBlob(hash, content);
-          entries.push({ path: relativePath, blobHash: hash, mode: metadata.mode & 0o777 });
+          const entry = { path: relativePath, blobHash: hash, mode: fingerprint.mode };
+          entries.push(entry);
+          files.set(relativePath, { fingerprint, entry });
         } else {
           skippedPaths.push(relativePath);
         }
       }
     };
     await walk(workspaceRoot, "");
-    return { entries, skippedPaths };
+    return { entries, skippedPaths, files };
   }
 
   private async recoverWorkspace(workspaceRoot: string): Promise<boolean> {
@@ -345,6 +458,7 @@ export class BlobStore {
           await this.failJournal(journalPath);
           return false;
         }
+        this.workspaceCaches.delete(workspaceRoot);
         if (!(await this.rollbackSnapshot(workspaceRoot, sourceMap, targetMap, expectedPaths))) {
           await this.failJournal(journalPath);
           return false;
@@ -418,18 +532,30 @@ export class BlobStore {
           return { reason: "blob_capture_failed" } as const;
         }
         await this.publishLease();
-        const walked = await this.walkWorkspace(canonicalRoot);
+        const cache = this.workspaceCaches.get(canonicalRoot);
+        // GC shares this lock and clears these entries, so a present tree has retained its blobs.
+        const cachedFiles =
+          cache && (await exists(this.treePath(cache.treeId))) ? cache.files : undefined;
+        if (cache && !cachedFiles) this.workspaceCaches.delete(canonicalRoot);
+        const captureTime = this.clock().getTime();
+        const guardTime = cache?.captureTime ?? captureTime;
+        const walked = await this.walkWorkspace(canonicalRoot, cachedFiles, guardTime);
         walked.entries.sort((left, right) => left.path.localeCompare(right.path));
         walked.skippedPaths.sort();
         const content = canonicalManifest(walked.entries, walked.skippedPaths);
         const treeId = sha256(content);
-        const manifest: TreeManifest = { treeId, ...walked };
+        const manifest: TreeManifest = {
+          treeId,
+          entries: walked.entries,
+          skippedPaths: walked.skippedPaths,
+        };
         const treePath = this.treePath(treeId);
         if (!(await exists(treePath))) await this.atomicWrite(treePath, JSON.stringify(manifest));
         await this.atomicWrite(
           this.refPath("active", sessionHash, checkpointId, phase),
           JSON.stringify({ treeId, ownerId: this.ownerId }),
         );
+        this.cacheWorkspace(canonicalRoot, treeId, walked.files, captureTime);
         return manifest;
       });
     } catch {
@@ -682,6 +808,7 @@ export class BlobStore {
             }
           }
 
+          this.workspaceCaches.delete(root);
           const journalPath = join(this.rootDirectory, "journals", `${randomUUID()}.json`);
           try {
             await this.atomicWrite(
@@ -1049,6 +1176,7 @@ export class BlobStore {
       } catch {
         // Nothing to collect.
       }
+      this.workspaceCaches.clear();
     });
   }
 

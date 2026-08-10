@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rm,
   stat,
@@ -60,6 +61,107 @@ describe("non-Git blob store", () => {
       store.applySnapshot(workspace, session, before.treeId, after.treeId),
     ).resolves.toEqual({ status: "applied", partial: false });
     await expect(readFile(join(workspace, "file.txt"), "utf8")).resolves.toBe("after\n");
+    await store.shutdown();
+  });
+
+  it("does not read unchanged workspace files", async () => {
+    const workspace = await temporaryDirectory("omp-blob-cache-workspace-");
+    const storage = await temporaryDirectory("omp-blob-cache-storage-");
+    let workspaceReads = 0;
+    const store = new BlobStore(storage, {
+      readWorkspaceFile: async (path) => {
+        workspaceReads += 1;
+        return readFile(path);
+      },
+    });
+    const session = sessionHash("cache");
+    const checkpoint = randomUUID();
+    const path = join(workspace, "unchanged.txt");
+    await writeFile(path, "unchanged\n");
+    const oldTime = new Date(Date.now() - 10_000);
+    await utimes(path, oldTime, oldTime);
+    const before = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    if ("reason" in before) throw new Error("snapshot failed");
+    expect(workspaceReads).toBe(1);
+    workspaceReads = 0;
+    const after = await store.captureSnapshot(workspace, session, checkpoint, "after");
+    if ("reason" in after) throw new Error("snapshot failed");
+    expect(after.treeId).toBe(before.treeId);
+    expect(workspaceReads).toBe(0);
+    await store.shutdown();
+  });
+
+  it("re-reads files with racily-clean timestamps to prevent stale cache hits", async () => {
+    const workspace = await temporaryDirectory("omp-blob-racy-workspace-");
+    const storage = await temporaryDirectory("omp-blob-racy-storage-");
+    let workspaceReads = 0;
+    // Clock pinned so captureTime ≈ file mtime → racily-clean window triggers.
+    const frozenTime = new Date();
+    const store = new BlobStore(storage, {
+      clock: () => frozenTime,
+      readWorkspaceFile: async (path) => {
+        workspaceReads += 1;
+        return readFile(path);
+      },
+    });
+    const session = sessionHash("racy");
+    const filePath = join(workspace, "file.txt");
+    await writeFile(filePath, "original\n");
+    // Set mtime to exactly frozenTime so the guard's |mtime - captureTime| ≈ 0.
+    await utimes(filePath, frozenTime, frozenTime);
+
+    const before = await store.captureSnapshot(workspace, session, randomUUID(), "before");
+    if ("reason" in before) throw new Error("snapshot failed");
+    expect(workspaceReads).toBe(1);
+
+    // Second capture: file untouched, fingerprint identical, but mtime is within
+    // RACILY_CLEAN_MS of the prior captureTime → guard forces a re-read.
+    workspaceReads = 0;
+    const after = await store.captureSnapshot(workspace, session, randomUUID(), "after");
+    if ("reason" in after) throw new Error("snapshot failed");
+    // Same content → same tree, but the guard must have re-read the file.
+    expect(after.treeId).toBe(before.treeId);
+    expect(workspaceReads).toBe(1);
+    await store.shutdown();
+  });
+
+  it("evicts least-recently-used workspace cache at hard cap", async () => {
+    const storage = await temporaryDirectory("omp-blob-cache-cap-storage-");
+    const store = new BlobStore(storage);
+    const session = sessionHash("cache-cap");
+    const workspaces: Array<{ root: string; path: string }> = [];
+    for (let index = 0; index <= 16; index += 1) {
+      const root = await temporaryDirectory(`omp-blob-cache-cap-workspace-${index}-`);
+      const path = join(root, "file.txt");
+      workspaces.push({ root, path });
+      await writeFile(path, "cached\n");
+      const snapshot = await store.captureSnapshot(root, session, randomUUID(), "before");
+      if ("reason" in snapshot) throw new Error("snapshot failed");
+    }
+    const first = workspaces[0];
+    const caches = Reflect.get(store, "workspaceCaches") as Map<string, unknown>;
+    expect(caches.size).toBe(16);
+    expect(caches.has(first.root)).toBe(false);
+    await store.shutdown();
+  });
+
+  it("rebuilds cache after garbage collection removes its tree", async () => {
+    const workspace = await temporaryDirectory("omp-blob-gc-cache-workspace-");
+    const storage = await temporaryDirectory("omp-blob-gc-cache-storage-");
+    const store = new BlobStore(storage);
+    const session = sessionHash("gc-cache");
+    const checkpoint = randomUUID();
+    const path = join(workspace, "file.txt");
+    await writeFile(path, "cached\n");
+    const before = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    if ("reason" in before) throw new Error("snapshot failed");
+
+    await store.releaseCheckpointRefs(session, [checkpoint]);
+    await store.collectGarbage();
+
+    const after = await store.captureSnapshot(workspace, session, checkpoint, "after");
+    if ("reason" in after) throw new Error("snapshot failed");
+    await expect(store.blobExists(after.entries[0].blobHash)).resolves.toBe(true);
     await store.shutdown();
   });
 
@@ -366,6 +468,7 @@ describe("non-Git blob store", () => {
     await writeFile(join(workspace, "stale.txt"), "stale");
     const snapshot = await store.captureSnapshot(workspace, session, checkpoint, "before");
     if ("reason" in snapshot) throw new Error("snapshot failed");
+    expect(await readdir(join(storage, "leases"))).toHaveLength(1);
     const staleOwner = randomUUID();
     const refPath = join(storage, "refs", "active", session, checkpoint, "before.ref");
     await writeFile(refPath, JSON.stringify({ treeId: snapshot.treeId, ownerId: staleOwner }));

@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.2.4] - 2026-08-10
+
+### Performance
+
+- Cache unchanged non-Git workspace files in `BlobStore` using file fingerprints (size, mtime, ctime, birthtime, dev) and a racily-clean guard to avoid unnecessary disk re-reads.
+
 ## [1.2.3] - 2026-08-07
 
 ### Changed
