@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { BlobHistoryStore } from "../src/core/blob-history-store.js";
 import { BlobStore } from "../src/core/blob-store.js";
 import { checkpointNamespace } from "../src/core/checkpoints.js";
@@ -82,6 +82,41 @@ describe("blob history store", () => {
       currentIndex: 0,
     });
     await secondStore.shutdown();
+  });
+
+  it("validates a shared tree only once per load", async () => {
+    const workspace = await temporaryDirectory("omp-blob-shared-tree-workspace-");
+    const storage = await temporaryDirectory("omp-blob-shared-tree-storage-");
+    const sessionId = "blob-shared-tree-session";
+    const sessionHash = checkpointNamespace(sessionId);
+    const checkpointId = randomUUID();
+    const store = new BlobStore(storage);
+    await writeFile(join(workspace, "file.txt"), "unchanged");
+    const before = await store.captureSnapshot(workspace, sessionHash, checkpointId, "before");
+    const after = await store.captureSnapshot(workspace, sessionHash, checkpointId, "after");
+    if ("reason" in before || "reason" in after) throw new Error("snapshot failed");
+    expect(after.treeId).toBe(before.treeId);
+    await store.retainCheckpointForResume(sessionHash, checkpointId);
+    const checkpoint: BlobCheckpoint = {
+      kind: "blob",
+      workspaceRoot: await realpath(workspace),
+      sessionHash,
+      checkpointId,
+      beforeTreeId: before.treeId,
+      afterTreeId: after.treeId,
+      parentLeafId: "prompt",
+      leafId: "response",
+    };
+    const history = new BlobHistoryStore(sessionId, workspace, store);
+    await history.save({ checkpoints: [checkpoint], currentIndex: 0 });
+    const treeUsable = vi.spyOn(store, "treeUsable");
+
+    await expect(history.load(reader())).resolves.toEqual({
+      checkpoints: [checkpoint],
+      currentIndex: 0,
+    });
+    expect(treeUsable).toHaveBeenCalledTimes(1);
+    await store.shutdown();
   });
 
   it("downgrades a checkpoint when a retained tree is missing", async () => {

@@ -123,6 +123,14 @@ export class BlobHistoryStore {
         return null;
       }
       const checkpoints: TurnCheckpoint[] = [];
+      const usableTrees = new Map<string, boolean>();
+      const treeUsable = async (treeId: string): Promise<boolean> => {
+        const cached = usableTrees.get(treeId);
+        if (cached !== undefined) return cached;
+        const usable = await this.store.treeUsable(treeId);
+        usableTrees.set(treeId, usable);
+        return usable;
+      };
       for (const checkpoint of candidate.checkpoints as TurnCheckpoint[]) {
         if (checkpoint.kind === "session") {
           checkpoints.push(checkpoint);
@@ -152,8 +160,8 @@ export class BlobHistoryStore {
             "after",
             checkpoint.afterTreeId,
           )) &&
-          (await this.store.treeUsable(checkpoint.beforeTreeId)) &&
-          (await this.store.treeUsable(checkpoint.afterTreeId));
+          (await treeUsable(checkpoint.beforeTreeId)) &&
+          (await treeUsable(checkpoint.afterTreeId));
         checkpoints.push(
           valid
             ? checkpoint

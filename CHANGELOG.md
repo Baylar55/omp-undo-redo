@@ -2,6 +2,16 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.2.5] - 2026-08-10
+
+### Changed
+
+- Add `peerDependenciesMeta` for `@oh-my-pi/pi-coding-agent` in `package.json` to mark the peer dependency as optional, preventing package managers from installing duplicate OMP package instances in plugin directories.
+
+### Performance
+
+- Optimize non-Git snapshot restoration and history verification by validating blob existence only for changed paths in `BlobStore` and deduplicating shared tree checks per history load in `BlobHistoryStore`.
+
 ## [1.2.4] - 2026-08-10
 
 ### Performance
@@ -270,6 +280,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
+[1.2.5]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.2.5
 [1.0.30]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.30
 [1.0.26]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.26
 [1.0.25]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.25
