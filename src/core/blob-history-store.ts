@@ -7,13 +7,16 @@ import { checkpointNamespace } from "./checkpoints.js";
 import { effectiveLeaf, entryExists, expectedLeaf } from "./session-tree-utils.js";
 import type {
   BlobCheckpoint,
+  ExpirationTombstone,
   FileCheckpointUnavailableReason,
+  HistoryLoadResult,
   NavigationState,
   SessionReader,
   TurnCheckpoint,
 } from "./types.js";
 
-const HISTORY_SCHEMA = 1;
+const HISTORY_SCHEMA_CURRENT = 2;
+const ACCEPTED_SCHEMAS = new Set([1, 2]);
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
 const HASH = /^[0-9a-f]{64}$/;
 const REASONS: Record<FileCheckpointUnavailableReason, true> = {
@@ -31,6 +34,7 @@ const REASONS: Record<FileCheckpointUnavailableReason, true> = {
   before_blob_failed: true,
   after_blob_failed: true,
   blob_apply_failed: true,
+  history_expired: true,
 };
 
 type StoredHistory = {
@@ -39,6 +43,7 @@ type StoredHistory = {
   workspaceRoot: string;
   checkpoints: TurnCheckpoint[];
   currentIndex: number;
+  lastAccessedAt?: string;
 };
 
 function isNullableString(value: unknown): value is string | null {
@@ -77,6 +82,44 @@ export function blobHistoryPath(sessionId: string, root = blobStoreRootDirectory
   return join(root, "history", `${checkpointNamespace(sessionId)}.json`);
 }
 
+export function blobTombstonePath(
+  sessionIdOrHash: string,
+  root = blobStoreRootDirectory(),
+): string {
+  const sessionHash = HASH.test(sessionIdOrHash)
+    ? sessionIdOrHash
+    : checkpointNamespace(sessionIdOrHash);
+  return join(root, "history", `${sessionHash}.expired.json`);
+}
+
+async function readTombstone(
+  tombstoneFilePath: string,
+  sessionHash: string,
+): Promise<ExpirationTombstone | null> {
+  try {
+    const content = await readFile(tombstoneFilePath, "utf8");
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    const candidate = parsed as Record<string, unknown>;
+    if (
+      candidate.expired === true &&
+      candidate.sessionHash === sessionHash &&
+      typeof candidate.expiredAt === "string" &&
+      (candidate.reason === "age" || candidate.reason === "storage_cap")
+    ) {
+      return {
+        expired: true,
+        sessionHash,
+        expiredAt: candidate.expiredAt,
+        reason: candidate.reason,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export class BlobHistoryStore {
   readonly sessionHash: string;
   private readonly path: string;
@@ -100,27 +143,34 @@ export class BlobHistoryStore {
     }
   }
 
-  async load(reader: SessionReader): Promise<NavigationState | null> {
+  async load(reader: SessionReader): Promise<HistoryLoadResult> {
+    const tombstoneFile = blobTombstonePath(this.sessionId, this.store.rootDirectory);
+    const tombstone = await readTombstone(tombstoneFile, this.sessionHash);
+    if (tombstone) {
+      return { status: "expired", reason: tombstone.reason };
+    }
+
     const workspace = await this.canonicalWorkspace();
-    if (!workspace) return null;
+    if (!workspace) return { status: "unavailable" };
     try {
       const metadata = await stat(this.path);
-      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) return null;
+      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) return { status: "unavailable" };
       const value = JSON.parse(await readFile(this.path, "utf8")) as unknown;
-      if (!value || typeof value !== "object") return null;
+      if (!value || typeof value !== "object") return { status: "unavailable" };
       const candidate = value as Record<string, unknown>;
       if (
-        candidate.schemaVersion !== HISTORY_SCHEMA ||
+        typeof candidate.schemaVersion !== "number" ||
+        !ACCEPTED_SCHEMAS.has(candidate.schemaVersion) ||
         candidate.sessionHash !== this.sessionHash ||
         candidate.workspaceRoot !== workspace ||
         !Array.isArray(candidate.checkpoints) ||
         !Number.isInteger(candidate.currentIndex)
       )
-        return null;
+        return { status: "unavailable" };
       if (
         !candidate.checkpoints.every((checkpoint) => isSession(checkpoint) || isBlob(checkpoint))
       ) {
-        return null;
+        return { status: "unavailable" };
       }
       const checkpoints: TurnCheckpoint[] = [];
       const usableTrees = new Map<string, boolean>();
@@ -174,7 +224,7 @@ export class BlobHistoryStore {
         );
       }
       const currentIndex = candidate.currentIndex as number;
-      if (currentIndex < -1 || currentIndex >= checkpoints.length) return null;
+      if (currentIndex < -1 || currentIndex >= checkpoints.length) return { status: "unavailable" };
       const state = { checkpoints, currentIndex };
       if (
         checkpoints.some(
@@ -184,10 +234,13 @@ export class BlobHistoryStore {
         ) ||
         expectedLeaf(state) !== effectiveLeaf(reader)
       )
-        return null;
-      return state;
+        return { status: "unavailable" };
+
+      await this.save(state).catch(() => undefined);
+
+      return { status: "loaded", state };
     } catch {
-      return null;
+      return { status: "unavailable" };
     }
   }
 
@@ -215,11 +268,12 @@ export class BlobHistoryStore {
       };
     });
     const stored: StoredHistory = {
-      schemaVersion: HISTORY_SCHEMA,
+      schemaVersion: HISTORY_SCHEMA_CURRENT,
       sessionHash: this.sessionHash,
       workspaceRoot: workspace,
       checkpoints,
       currentIndex: state.currentIndex,
+      lastAccessedAt: new Date().toISOString(),
     };
     const temporary = join(directory, `.${this.sessionHash}.${randomUUID()}.tmp`);
     try {

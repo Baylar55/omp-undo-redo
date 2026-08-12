@@ -26,7 +26,8 @@ export type FileCheckpointUnavailableReason =
   | "workspace_unresolvable"
   | "before_blob_failed"
   | "after_blob_failed"
-  | "blob_apply_failed";
+  | "blob_apply_failed"
+  | "history_expired";
 
 export type TreeNavigationResult = {
   cancelled: boolean;
@@ -159,6 +160,18 @@ export interface PendingSessionCheckpoint {
   reason: FileCheckpointUnavailableReason;
   parentLeafId: string | null;
 }
+
+export interface ExpirationTombstone {
+  expired: true;
+  sessionHash: string;
+  expiredAt: string;
+  reason: "age" | "storage_cap";
+}
+
+export type HistoryLoadResult =
+  | { status: "loaded"; state: NavigationState }
+  | { status: "expired"; reason: "age" | "storage_cap" }
+  | { status: "unavailable" };
 
 export type PendingTurnCheckpoint =
   PendingGitCheckpoint | PendingBlobCheckpoint | PendingSessionCheckpoint;

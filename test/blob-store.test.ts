@@ -540,4 +540,43 @@ describe("non-Git blob store", () => {
     expect(await store.treeExists(orphan.treeId)).toBe(false);
     await store.shutdown();
   });
+
+  it("measures store bytes correctly", async () => {
+    const workspace = await temporaryDirectory("omp-blob-measure-workspace-");
+    const storage = await temporaryDirectory("omp-blob-measure-storage-");
+    const store = new BlobStore(storage);
+    const session = sessionHash("measure");
+    const checkpoint = randomUUID();
+
+    expect(await store.measureStoreBytes()).toBe(0);
+
+    await writeFile(join(workspace, "measure.txt"), "hello world");
+    const snapshot = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    if ("reason" in snapshot) throw new Error("snapshot failed");
+
+    const bytes = await store.measureStoreBytes();
+    expect(bytes).toBeGreaterThan(0);
+    await store.shutdown();
+  });
+
+  it("releases all session refs", async () => {
+    const workspace = await temporaryDirectory("omp-blob-release-workspace-");
+    const storage = await temporaryDirectory("omp-blob-release-storage-");
+    const store = new BlobStore(storage);
+    const session = sessionHash("release");
+    const checkpoint = randomUUID();
+
+    await writeFile(join(workspace, "release.txt"), "content");
+    const before = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    const after = await store.captureSnapshot(workspace, session, checkpoint, "after");
+    if ("reason" in before || "reason" in after) throw new Error("snapshot failed");
+    await store.retainCheckpointForResume(session, checkpoint);
+
+    expect(await store.hasHistoryRef(session, checkpoint, "before")).toBe(true);
+
+    const released = await store.releaseSessionRefs(session);
+    expect(released).toBe(true);
+    expect(await store.hasHistoryRef(session, checkpoint, "before")).toBe(false);
+    await store.shutdown();
+  });
 });
