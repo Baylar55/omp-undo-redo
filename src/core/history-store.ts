@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { checkpointNamespace } from "./checkpoints.js";
 import type {
+  ExpirationTombstone,
   FileCheckpointUnavailableReason,
   GitCheckpoint,
   GitRepository,
   GitRunner,
+  HistoryLoadResult,
   NavigationState,
   SessionReader,
   TurnCheckpoint,
@@ -24,9 +26,11 @@ export {
   isSessionExitEntry,
 } from "./session-tree-utils.js";
 
-const HISTORY_SCHEMA = 1;
+const HISTORY_SCHEMA_CURRENT = 2;
+const ACCEPTED_SCHEMAS = new Set([1, 2]);
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
 const GIT_OBJECT_ID = /^[0-9a-f]{40,64}$/;
+const HASH = /^[0-9a-f]{64}$/;
 const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
   git_unavailable: true,
   not_repository: true,
@@ -42,6 +46,7 @@ const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
   before_blob_failed: true,
   after_blob_failed: true,
   blob_apply_failed: true,
+  history_expired: true,
 };
 
 type StoredHistory = {
@@ -50,14 +55,50 @@ type StoredHistory = {
   repository: GitRepository;
   checkpoints: TurnCheckpoint[];
   currentIndex: number;
+  lastAccessedAt?: string;
 };
 
-function historyDirectory(repository: GitRepository): string {
+export function historyDirectory(repository: GitRepository): string {
   return join(repository.commonDir, "omp-undo-redo", "history");
 }
 
 export function historyPath(repository: GitRepository, sessionId: string): string {
   return join(historyDirectory(repository), `${checkpointNamespace(sessionId)}.json`);
+}
+
+export function tombstonePath(repository: GitRepository, sessionIdOrHash: string): string {
+  const sessionHash = HASH.test(sessionIdOrHash)
+    ? sessionIdOrHash
+    : checkpointNamespace(sessionIdOrHash);
+  return join(historyDirectory(repository), `${sessionHash}.expired.json`);
+}
+
+async function readTombstone(
+  tombstoneFilePath: string,
+  sessionHash: string,
+): Promise<ExpirationTombstone | null> {
+  try {
+    const content = await readFile(tombstoneFilePath, "utf8");
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== "object") return null;
+    const candidate = parsed as Record<string, unknown>;
+    if (
+      candidate.expired === true &&
+      candidate.sessionHash === sessionHash &&
+      typeof candidate.expiredAt === "string" &&
+      (candidate.reason === "age" || candidate.reason === "storage_cap")
+    ) {
+      return {
+        expired: true,
+        sessionHash,
+        expiredAt: candidate.expiredAt,
+        reason: candidate.reason,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -124,7 +165,8 @@ function parseHistory(
   const sessionHash = checkpointNamespace(sessionId);
   const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
   if (
-    candidate.schemaVersion !== HISTORY_SCHEMA ||
+    typeof candidate.schemaVersion !== "number" ||
+    !ACCEPTED_SCHEMAS.has(candidate.schemaVersion) ||
     candidate.sessionHash !== sessionHash ||
     !isRepository(candidate.repository) ||
     !sameRepository(candidate.repository, repository) ||
@@ -141,12 +183,15 @@ function parseHistory(
   const checkpoints = candidate.checkpoints as TurnCheckpoint[];
   const currentIndex = candidate.currentIndex as number;
   if (currentIndex < -1 || currentIndex >= checkpoints.length) return null;
+  const lastAccessedAt =
+    typeof candidate.lastAccessedAt === "string" ? candidate.lastAccessedAt : undefined;
   return {
-    schemaVersion: HISTORY_SCHEMA,
+    schemaVersion: candidate.schemaVersion,
     sessionHash,
     repository,
     checkpoints,
     currentIndex,
+    lastAccessedAt,
   };
 }
 
@@ -194,6 +239,93 @@ export function reconstructSessionHistory(reader: SessionReader): NavigationStat
   return { checkpoints, currentIndex: checkpoints.length - 1 };
 }
 
+export async function expireGitSessionHistories(
+  repository: GitRepository,
+  git: GitRunner,
+  retentionDays: number,
+  activeSessionHashes: ReadonlySet<string> | (() => ReadonlySet<string>),
+): Promise<void> {
+  if (retentionDays <= 0) return;
+  const dir = historyDirectory(repository);
+  let files: string[];
+  try {
+    files = await readdir(dir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+  const getActive = () =>
+    typeof activeSessionHashes === "function" ? activeSessionHashes() : activeSessionHashes;
+  for (const file of files) {
+    if (!file.endsWith(".json") || file.endsWith(".expired.json") || file.startsWith(".")) continue;
+    const sessionHash = file.slice(0, -5);
+    if (!HASH.test(sessionHash)) continue;
+    if (getActive().has(sessionHash)) continue;
+
+    const filePath = join(dir, file);
+    let lastAccessedAtMs: number;
+    try {
+      const content = await readFile(filePath, "utf8");
+      const parsed = JSON.parse(content) as unknown;
+      if (!parsed || typeof parsed !== "object") continue;
+      const candidate = parsed as Record<string, unknown>;
+      if (typeof candidate.lastAccessedAt === "string") {
+        lastAccessedAtMs = Date.parse(candidate.lastAccessedAt);
+        if (Number.isNaN(lastAccessedAtMs)) continue;
+      } else {
+        const metadata = await stat(filePath);
+        lastAccessedAtMs = metadata.mtimeMs;
+      }
+    } catch {
+      continue;
+    }
+
+    if (lastAccessedAtMs > cutoff) continue;
+
+    // Re-check active set right before deletion to prevent racing concurrent session startup
+    if (getActive().has(sessionHash)) continue;
+
+    const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+    const refsMap = await existingRefs(git, refPrefix);
+    if (refsMap === null) continue;
+
+    if (refsMap.size > 0) {
+      const deleteCommands = Array.from(refsMap.entries())
+        .map(([ref, hash]) => `delete ${ref} ${hash}`)
+        .join("\n");
+      try {
+        const updateResult = await git(["update-ref", "--stdin"], {
+          stdin: `${deleteCommands}\n`,
+        });
+        if (updateResult.code !== 0 || updateResult.error) continue;
+      } catch {
+        continue;
+      }
+    }
+
+    // Write tombstone first, then delete history JSON
+    const tombstoneFile = tombstonePath(repository, sessionHash);
+    const tombstoneData: ExpirationTombstone = {
+      expired: true,
+      sessionHash,
+      expiredAt: new Date().toISOString(),
+      reason: "age",
+    };
+    const temporary = join(dir, `.${sessionHash}.${randomUUID()}.tmp`);
+    try {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await writeFile(temporary, JSON.stringify(tombstoneData), { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, tombstoneFile);
+    } catch {
+      // tombstone write failure is non-fatal
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
+
+    await rm(filePath, { force: true }).catch(() => undefined);
+  }
+}
+
 export class SessionHistoryStore {
   constructor(
     private readonly sessionId: string,
@@ -201,20 +333,27 @@ export class SessionHistoryStore {
     private readonly git: GitRunner,
   ) {}
 
-  async load(reader: SessionReader): Promise<NavigationState | null> {
+  async load(reader: SessionReader): Promise<HistoryLoadResult> {
+    const sessionHash = checkpointNamespace(this.sessionId);
+    const tombstoneFile = tombstonePath(this.repository, this.sessionId);
+    const tombstone = await readTombstone(tombstoneFile, sessionHash);
+    if (tombstone) {
+      return { status: "expired", reason: tombstone.reason };
+    }
+
     const path = historyPath(this.repository, this.sessionId);
     try {
       const metadata = await stat(path);
-      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) return null;
+      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) return { status: "unavailable" };
       const parsed = parseHistory(
         JSON.parse(await readFile(path, "utf8")) as unknown,
         this.sessionId,
         this.repository,
       );
-      if (!parsed) return null;
+      if (!parsed) return { status: "unavailable" };
       const refPrefix = `refs/omp-undo-redo/history/${parsed.sessionHash}/`;
       const refs = await existingRefs(this.git, refPrefix);
-      if (refs === null) return null;
+      if (refs === null) return { status: "unavailable" };
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
         if (checkpoint.kind === "session") return checkpoint;
         if (checkpoint.kind !== "git")
@@ -246,10 +385,13 @@ export class SessionHistoryStore {
         ) ||
         expectedLeaf(state) !== effectiveLeaf(reader)
       )
-        return null;
-      return state;
+        return { status: "unavailable" };
+
+      await this.save(state).catch(() => undefined);
+
+      return { status: "loaded", state };
     } catch {
-      return null;
+      return { status: "unavailable" };
     }
   }
 
@@ -278,11 +420,12 @@ export class SessionHistoryStore {
       };
     });
     const stored: StoredHistory = {
-      schemaVersion: HISTORY_SCHEMA,
+      schemaVersion: HISTORY_SCHEMA_CURRENT,
       sessionHash,
       repository: this.repository,
       checkpoints,
       currentIndex: state.currentIndex,
+      lastAccessedAt: new Date().toISOString(),
     };
     const temporary = join(
       directory,

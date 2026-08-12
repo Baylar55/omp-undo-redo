@@ -84,9 +84,62 @@ Both commands wait for the current agent turn to become idle; if OMP remains bus
 
 Every completed turn remains navigable, including conversation-only turns and turns that change only ignored files. In Git projects, `/undo` and `/redo` restore worktree snapshots without rewriting the Git index. In non-Git workspaces, the built-in snapshot store restores regular files, binary content, and executable modes. Unsupported symlinks and files above the 16 MiB limit are reported as partial restoration. Skipped paths and their overlapping parent or descendant paths remain untouched during partial restoration. Such a session-only checkpoint is a file-history continuity barrier: older file checkpoints are discarded because applying them across an unknown file delta would be unsafe.
 
-Completed Git or non-Git checkpoints and the undo/redo cursor survive a normal terminal restart. Resuming the same session in the same worktree restores both `/undo` and `/redo` history. If durable file metadata is missing or unusable, the extension reconstructs completed turns from the active session branch and offers session-only undo with an explicit warning. A changed worktree must still pass the normal conflict check; resuming never bypasses file-safety checks.
+Completed Git or non-Git checkpoints and the undo/redo cursor survive a normal terminal restart. Resuming the same session in the same worktree restores both `/undo` and `/redo` history, unless the session's file history was removed by the retention policy (see [Configuration](#configuration)). If durable file metadata is missing or unusable, the extension reconstructs completed turns from the active session branch and offers session-only undo with an explicit warning. A changed worktree must still pass the normal conflict check; resuming never bypasses file-safety checks.
 
 While the extension process is running, it publishes normalized Undo/Redo action state for external clients. State lives in a private process-scoped directory at `~/.omp/omp-undo-redo/runtime/<pid>/`; set `OMP_UNDO_REDO_RUNTIME_DIR` to override the root for tests or deployments. Session filenames use SHA-256 session namespaces, and state includes action availability, selected leaf, navigation revision, and the latest action result. Runtime publication is observational and does not add file restoration to session-only mode.
+
+## Configuration
+
+The extension supports optional environment variables to configure snapshot history retention and storage limits:
+
+- `OMP_UNDO_REDO_RETENTION_DAYS` — Inactivity retention threshold in days (default: `2`). Dormant session history untouched for longer than this limit is deleted on extension startup. The clock counts from the session's last access; resuming or using a session refreshes it. Set to `0` to disable age-based expiration.
+- `OMP_UNDO_REDO_MAX_STORE_MB` — Maximum storage cap for the non-Git blob store in MiB (default: `1024`, i.e., 1 GiB). If store size exceeds this limit, the oldest inactive session histories are evicted iteratively until total size drops below the cap. Set to `0` to disable storage cap enforcement. Applies to the non-Git blob store only.
+
+### Setting the variables
+
+Set these in your Pi/OMP process environment. The extension reads them **once, when it loads**, so set them before starting the agent — changing them while a session is open has no effect. The values are global to the agent process, not per project.
+
+**Linux / macOS (bash, zsh)** — export in the current terminal, or add to `~/.bashrc` / `~/.zshrc` so they persist across sessions:
+
+```sh
+export OMP_UNDO_REDO_RETENTION_DAYS=7
+export OMP_UNDO_REDO_MAX_STORE_MB=2048
+```
+
+**Windows PowerShell** — for the current session:
+
+```powershell
+$env:OMP_UNDO_REDO_RETENTION_DAYS = "7"
+$env:OMP_UNDO_REDO_MAX_STORE_MB = "2048"
+```
+
+**Windows (persistent)** — use `setx`, then open a new terminal:
+
+```powershell
+setx OMP_UNDO_REDO_RETENTION_DAYS 7
+setx OMP_UNDO_REDO_MAX_STORE_MB 2048
+```
+
+To disable either behavior, set its value to `0`; setting both to `0` disables automatic cleanup entirely (indefinite retention).
+
+### Setting interaction rules
+
+| `RETENTION_DAYS` | `MAX_STORE_MB`   | Behavior                                                                                                  |
+| ---------------- | ---------------- | --------------------------------------------------------------------------------------------------------- |
+| `2` (default)    | `1024` (default) | Age expiration (2 days) + blob storage cap enforcement (1 GiB)                                            |
+| `0`              | `1024`           | No age expiration; storage cap can still evict oldest inactive sessions if total blob store exceeds 1 GiB |
+| `2`              | `0`              | Age expiration (2 days); no storage cap enforcement                                                       |
+| `0`              | `0`              | No automatic cleanup (indefinite retention)                                                               |
+
+> **Note:** `OMP_UNDO_REDO_RETENTION_DAYS=0` disables age-based expiration but does **not** guarantee indefinite history retention when a storage cap is active (`MAX_STORE_MB > 0`). The cap can still evict the oldest inactive session histories to free up storage space. Active sessions are never evicted by age or storage cap.
+
+### Expiration behavior
+
+Cleanup runs automatically at extension startup; nothing runs during active work, and sessions currently in use are never expired or evicted. Successful cleanup is silent. When a dormant session's file history is expired, resuming that session shows a warning: session navigation still works, but file changes from the expired turns cannot be restored, and `/undo`/`/redo` degrade to session-only navigation.
+
+In Git workspaces, expiration removes the session's history refs under `refs/omp-undo-redo/history/<sessionHash>/` and its history file. The referenced commit objects become unreachable and are reclaimed later by the repository's normal `git gc`; `.git` size does not shrink immediately. No storage cap applies to Git object storage.
+
+In non-Git workspaces, expiration removes the session's refs and history file, then garbage-collects orphaned blobs and tree manifests from `~/.omp/omp-undo-redo/`. When the storage cap is set, the oldest inactive sessions are evicted iteratively until the store is back under the cap.
 
 ## Limitations
 

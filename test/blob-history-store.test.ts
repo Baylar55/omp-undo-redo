@@ -78,8 +78,11 @@ describe("blob history store", () => {
     await expect(
       new BlobHistoryStore(sessionId, workspace, secondStore).load(reader()),
     ).resolves.toEqual({
-      checkpoints: [checkpoint],
-      currentIndex: 0,
+      status: "loaded",
+      state: {
+        checkpoints: [checkpoint],
+        currentIndex: 0,
+      },
     });
     await secondStore.shutdown();
   });
@@ -112,8 +115,11 @@ describe("blob history store", () => {
     const treeUsable = vi.spyOn(store, "treeUsable");
 
     await expect(history.load(reader())).resolves.toEqual({
-      checkpoints: [checkpoint],
-      currentIndex: 0,
+      status: "loaded",
+      state: {
+        checkpoints: [checkpoint],
+        currentIndex: 0,
+      },
     });
     expect(treeUsable).toHaveBeenCalledTimes(1);
     await store.shutdown();
@@ -147,16 +153,49 @@ describe("blob history store", () => {
     await rm(join(storage, "trees", `${before.treeId}.json`), { force: true });
 
     await expect(history.load(reader())).resolves.toEqual({
-      checkpoints: [
-        {
-          kind: "session",
-          reason: "resumed_checkpoint_unavailable",
-          parentLeafId: "prompt",
-          leafId: "response",
-        },
-      ],
-      currentIndex: 0,
+      status: "loaded",
+      state: {
+        checkpoints: [
+          {
+            kind: "session",
+            reason: "resumed_checkpoint_unavailable",
+            parentLeafId: "prompt",
+            leafId: "response",
+          },
+        ],
+        currentIndex: 0,
+      },
     });
+    await store.shutdown();
+  });
+
+  it("returns status expired when tombstone file exists", async () => {
+    const workspace = await temporaryDirectory("omp-blob-tombstone-workspace-");
+    const storage = await temporaryDirectory("omp-blob-tombstone-storage-");
+    const sessionId = "tombstone-session";
+    const sessionHash = checkpointNamespace(sessionId);
+    const store = new BlobStore(storage);
+
+    const historyDir = join(storage, "history");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(historyDir, { recursive: true });
+
+    await writeFile(
+      join(historyDir, `${sessionHash}.expired.json`),
+      JSON.stringify({
+        expired: true,
+        sessionHash,
+        expiredAt: new Date().toISOString(),
+        reason: "age",
+      }),
+    );
+
+    const history = new BlobHistoryStore(sessionId, workspace, store);
+    await expect(history.load(reader())).resolves.toEqual({
+      status: "expired",
+      reason: "age",
+    });
+
     await store.shutdown();
   });
 });

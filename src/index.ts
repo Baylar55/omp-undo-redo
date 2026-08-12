@@ -32,7 +32,11 @@ import {
   resolveRepository,
   retainCheckpointForResume,
 } from "./core/checkpoints.js";
-import { reconstructSessionHistory, SessionHistoryStore } from "./core/history-store.js";
+import {
+  expireGitSessionHistories,
+  reconstructSessionHistory,
+  SessionHistoryStore,
+} from "./core/history-store.js";
 import type {
   ActionId,
   GitRepository,
@@ -63,7 +67,19 @@ type AnyContext = {
     getBranch(fromId?: string): SessionEntryLike[];
     getEntry(id: string): SessionEntryLike | undefined;
   };
+  ui?: {
+    notify(message: string, level: string): void;
+  };
 };
+
+function readRetentionConfig(): { retentionDays: number; maxStoreBytes: number } {
+  const days = parseInt(process.env.OMP_UNDO_REDO_RETENTION_DAYS ?? "", 10);
+  const mb = parseInt(process.env.OMP_UNDO_REDO_MAX_STORE_MB ?? "", 10);
+  return {
+    retentionDays: Number.isFinite(days) && days >= 0 ? days : 2,
+    maxStoreBytes: Number.isFinite(mb) && mb >= 0 ? mb * 1024 * 1024 : 1024 * 1024 * 1024,
+  };
+}
 
 type FileBackend =
   | { kind: "git"; repository: GitRepository; git: ReturnType<typeof createGitRunner> }
@@ -144,6 +160,7 @@ function createNavigation(
 }
 
 export default function ompUndoRedo(pi: ExtensionAPI): void {
+  const retentionConfig = readRetentionConfig();
   const ownerRegistry = new CheckpointOwnerRegistry({
     resolveHostIdentity: resolvePersistentHostId,
     resolveRuntimeScope,
@@ -160,6 +177,25 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   let shutdownPromise: Promise<void> | null = null;
   let pendingSwitchSourceSessionId: string | null = null;
   let pendingBranchSourceSessionId: string | null = null;
+  const expirationPromises = new Map<string, Promise<void>>();
+  const explicitActiveHashes = new Set<string>();
+
+  function activeSessionHashes(): ReadonlySet<string> {
+    const hashes = new Set<string>();
+    for (const sessionId of navigations.keys()) {
+      hashes.add(checkpointNamespace(sessionId));
+    }
+    for (const sessionId of pending.keys()) {
+      hashes.add(checkpointNamespace(sessionId));
+    }
+    for (const sessionId of initializations.keys()) {
+      hashes.add(checkpointNamespace(sessionId));
+    }
+    for (const hash of explicitActiveHashes) {
+      hashes.add(hash);
+    }
+    return hashes;
+  }
 
   function blobStoreFor(_workspaceRoot: string): BlobStore {
     const root = blobStoreRootDirectory();
@@ -167,7 +203,16 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     if (existing) return existing;
     const store = new BlobStore(root);
     blobStores.set(root, store);
-    void store.garbageCollect().catch(() => undefined);
+    const { retentionDays, maxStoreBytes } = retentionConfig;
+    if (retentionDays > 0 || maxStoreBytes > 0) {
+      const expiration = store
+        .expireAndCollect(retentionDays, maxStoreBytes, () => activeSessionHashes())
+        .catch(() => undefined);
+      expirationPromises.set(`blob:${root}`, expiration);
+    } else {
+      const gc = store.garbageCollect().catch(() => undefined);
+      expirationPromises.set(`blob:${root}`, gc);
+    }
     return store;
   }
 
@@ -176,6 +221,8 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     replaceExisting: boolean,
   ): Promise<SessionNavigation> {
     const sessionId = ctx.sessionManager.getSessionId();
+    const sessionHash = checkpointNamespace(sessionId);
+    explicitActiveHashes.add(sessionHash);
     if (!replaceExisting) {
       const current = navigations.get(sessionId);
       if (current) return current;
@@ -189,6 +236,31 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       if (previous) await previous.suspend();
       const backend = await resolveBackend(ctx.cwd, (workspaceRoot) => blobStoreFor(workspaceRoot));
       backends.set(sessionId, backend);
+
+      if (
+        backend.kind === "git" &&
+        !expirationPromises.has(`git:${backend.repository.commonDir}`)
+      ) {
+        const { retentionDays } = retentionConfig;
+        const expiration = expireGitSessionHistories(
+          backend.repository,
+          backend.git,
+          retentionDays,
+          () => activeSessionHashes(),
+        ).catch(() => undefined);
+        expirationPromises.set(`git:${backend.repository.commonDir}`, expiration);
+      }
+
+      const expirationKey =
+        backend.kind === "blob"
+          ? `blob:${blobStoreRootDirectory()}`
+          : backend.kind === "git"
+            ? `git:${backend.repository.commonDir}`
+            : undefined;
+      if (expirationKey) {
+        await expirationPromises.get(expirationKey);
+      }
+
       const store =
         backend.kind === "git"
           ? new SessionHistoryStore(sessionId, backend.repository, backend.git)
@@ -196,7 +268,28 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
             ? new BlobHistoryStore(sessionId, backend.workspaceRoot, backend.store)
             : undefined;
       const navigation = createNavigation(ctx, sessionId, store, runtimeStore, backend);
-      const restored = store ? await store.load(ctx.sessionManager) : null;
+      const loadResult = store ? await store.load(ctx.sessionManager) : null;
+      let restored: NavigationState | null = null;
+      if (loadResult?.status === "loaded") {
+        restored = loadResult.state;
+      } else if (loadResult?.status === "expired") {
+        restored = null;
+        if (ctx.ui?.notify) {
+          if (loadResult.reason === "age") {
+            ctx.ui.notify(
+              "Undo/redo file history for this session expired due to inactivity.\nSession navigation still works, but file changes cannot be restored.",
+              "warning",
+            );
+          } else if (loadResult.reason === "storage_cap") {
+            ctx.ui.notify(
+              "Undo/redo file history for this session was removed to free storage space.\nSession navigation still works, but file changes cannot be restored.",
+              "warning",
+            );
+          }
+        }
+      } else {
+        restored = null;
+      }
       navigation.restoreState(restored ?? reconstructSessionHistory(ctx.sessionManager));
       await runtimeStore.initializeSession(
         sessionId,
@@ -507,6 +600,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     navigations.clear();
     initializations.clear();
     pending.clear();
+    explicitActiveHashes.clear();
     shutdownPromise = (async () => {
       await disposeDetached(detachedNavigations, detachedPending, false);
       await Promise.allSettled([...activeOperations]);

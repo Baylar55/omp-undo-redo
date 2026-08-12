@@ -1029,4 +1029,98 @@ describe("history-safe Git checkpoints", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("handles HistoryLoadResult, tombstone detection, and schema v1 to v2 upgrade in SessionHistoryStore", async () => {
+    const { cwd, git } = await makeRepo();
+    const repository = {
+      worktree: cwd,
+      gitDir: join(cwd, ".git"),
+      commonDir: join(cwd, ".git"),
+    };
+    const sessionId = "chk-schema-session";
+    const prompt: SessionEntryLike = {
+      id: "p1",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: SessionEntryLike = {
+      id: "r1",
+      parentId: "p1",
+      type: "message",
+      message: { role: "assistant" },
+    };
+
+    try {
+      await initializeBranch(git, cwd);
+      const { SessionHistoryStore, historyPath, tombstonePath } =
+        await import("../src/core/history-store.js");
+      const store = new SessionHistoryStore(sessionId, repository, git);
+      const r = reader([prompt, response], "r1");
+
+      // 1. Load empty -> returns status: "unavailable"
+      await expect(store.load(r)).resolves.toEqual({ status: "unavailable" });
+
+      // 2. Write schema v1 file without lastAccessedAt
+      const hPath = historyPath(repository, sessionId);
+      await mkdir(join(repository.commonDir, "omp-undo-redo", "history"), { recursive: true });
+      await writeFile(
+        hPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          sessionHash: checkpointNamespace(sessionId),
+          repository,
+          checkpoints: [
+            {
+              kind: "session",
+              reason: "resumed_checkpoint_unavailable",
+              parentLeafId: "p1",
+              leafId: "r1",
+            },
+          ],
+          currentIndex: 0,
+        }),
+      );
+
+      // 3. Load accepts schema v1, returns status: "loaded", and re-saves as v2 with lastAccessedAt
+      const loaded = await store.load(r);
+      expect(loaded).toMatchObject({
+        status: "loaded",
+        state: {
+          currentIndex: 0,
+          checkpoints: [
+            {
+              kind: "session",
+              reason: "resumed_checkpoint_unavailable",
+              parentLeafId: "p1",
+              leafId: "r1",
+            },
+          ],
+        },
+      });
+
+      // Verify JSON was upgraded to schemaVersion 2 with lastAccessedAt
+      const upgradedContent = JSON.parse(await readFile(hPath, "utf8"));
+      expect(upgradedContent.schemaVersion).toBe(2);
+      expect(typeof upgradedContent.lastAccessedAt).toBe("string");
+
+      // 4. Tombstone detection -> load() returns status: "expired"
+      await writeFile(
+        tombstonePath(repository, sessionId),
+        JSON.stringify({
+          expired: true,
+          sessionHash: checkpointNamespace(sessionId),
+          expiredAt: new Date().toISOString(),
+          reason: "age",
+        }),
+      );
+
+      await expect(store.load(r)).resolves.toEqual({
+        status: "expired",
+        reason: "age",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

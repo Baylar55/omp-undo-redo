@@ -119,15 +119,30 @@ function sameFingerprint(left: FileFingerprint, right: FileFingerprint): boolean
   );
 }
 
+function comparePaths(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function sortCanonical(entries: TreeEntry[], skippedPaths: string[]): void {
+  entries.sort((left, right) => comparePaths(left.path, right.path));
+  skippedPaths.sort(comparePaths);
+}
+
 function canonicalManifest(entries: readonly TreeEntry[], skippedPaths: readonly string[]): string {
-  return JSON.stringify({
-    entries: [...entries].sort((left, right) => left.path.localeCompare(right.path)),
-    skippedPaths: [...skippedPaths].sort(),
-  });
+  // Pure serializer of the exact order given. Producers (captureSnapshot) must pre-sort
+  // via sortCanonical so the SHA-256 treeId is deterministic. loadManifest intentionally
+  // does NOT re-sort: it must reproduce the exact on-disk order that was hashed at write
+  // time (newer snapshots used comparePaths, older ones localeCompare), otherwise the
+  // stored treeId wouldn't match and existing snapshots would be rejected.
+  return JSON.stringify({ entries, skippedPaths });
 }
 
 function depth(value: string): number {
-  return value.split("/").length;
+  let count = 1;
+  for (let index = 0; index < value.length; index++) {
+    if (value.charCodeAt(index) === 47) count++; // "/"
+  }
+  return count;
 }
 
 function isHash(value: unknown): value is string {
@@ -502,7 +517,10 @@ export class BlobStore {
       }
       return false;
     };
-    return [...new Set([...source.keys(), ...target.keys()])]
+    const merged = new Set<string>();
+    for (const key of source.keys()) merged.add(key);
+    for (const key of target.keys()) merged.add(key);
+    return [...merged]
       .filter((path) => !overlapsSkipped(path))
       .filter((path) => {
         const left = source.get(path);
@@ -540,8 +558,9 @@ export class BlobStore {
         const captureTime = this.clock().getTime();
         const guardTime = cache?.captureTime ?? captureTime;
         const walked = await this.walkWorkspace(canonicalRoot, cachedFiles, guardTime);
-        walked.entries.sort((left, right) => left.path.localeCompare(right.path));
-        walked.skippedPaths.sort();
+        // Sort the walked arrays once, explicitly, so the on-disk manifest is sorted
+        // and canonicalManifest stays a pure serializer (no redundant second sort).
+        sortCanonical(walked.entries, walked.skippedPaths);
         const content = canonicalManifest(walked.entries, walked.skippedPaths);
         const treeId = sha256(content);
         const manifest: TreeManifest = {
@@ -1137,53 +1156,57 @@ export class BlobStore {
 
   async collectGarbage(): Promise<void> {
     await this.withStoreLock(async () => {
-      await this.cleanupStaleActiveRefs();
-      const referencedTrees = new Set<string>();
-      const scanRefs = async (directory: string): Promise<void> => {
-        let children;
-        try {
-          children = await readdir(directory, { withFileTypes: true });
-        } catch {
-          return;
-        }
-        for (const child of children) {
-          const path = join(directory, child.name);
-          if (child.isDirectory()) await scanRefs(path);
-          else if (child.name.endsWith(".ref")) {
-            const ref = await this.readRef(path);
-            if (ref) referencedTrees.add(ref.treeId);
-          }
-        }
-      };
-      await scanRefs(join(this.rootDirectory, "refs"));
-      const referencedBlobs = new Set<string>();
-      for (const treeId of referencedTrees) {
-        const manifest = await this.loadManifest(treeId);
-        for (const entry of manifest?.entries ?? []) referencedBlobs.add(entry.blobHash);
-      }
-      try {
-        for (const child of await readdir(join(this.rootDirectory, "trees"))) {
-          if (!child.endsWith(".json")) continue;
-          const treeId = child.slice(0, -5);
-          if (!referencedTrees.has(treeId))
-            await rm(join(this.rootDirectory, "trees", child), { force: true });
-        }
-      } catch {
-        // Nothing to collect.
-      }
-      try {
-        for (const prefix of await readdir(join(this.rootDirectory, "blobs"))) {
-          const directory = join(this.rootDirectory, "blobs", prefix);
-          for (const child of await readdir(directory)) {
-            const hash = `${prefix}${child}`;
-            if (!referencedBlobs.has(hash)) await rm(join(directory, child), { force: true });
-          }
-        }
-      } catch {
-        // Nothing to collect.
-      }
-      this.workspaceCaches.clear();
+      await this.collectGarbageUnlocked();
     });
+  }
+
+  private async collectGarbageUnlocked(): Promise<void> {
+    await this.cleanupStaleActiveRefs();
+    const referencedTrees = new Set<string>();
+    const scanRefs = async (directory: string): Promise<void> => {
+      let children;
+      try {
+        children = await readdir(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const child of children) {
+        const path = join(directory, child.name);
+        if (child.isDirectory()) await scanRefs(path);
+        else if (child.name.endsWith(".ref")) {
+          const ref = await this.readRef(path);
+          if (ref) referencedTrees.add(ref.treeId);
+        }
+      }
+    };
+    await scanRefs(join(this.rootDirectory, "refs"));
+    const referencedBlobs = new Set<string>();
+    for (const treeId of referencedTrees) {
+      const manifest = await this.loadManifest(treeId);
+      for (const entry of manifest?.entries ?? []) referencedBlobs.add(entry.blobHash);
+    }
+    try {
+      for (const child of await readdir(join(this.rootDirectory, "trees"))) {
+        if (!child.endsWith(".json")) continue;
+        const treeId = child.slice(0, -5);
+        if (!referencedTrees.has(treeId))
+          await rm(join(this.rootDirectory, "trees", child), { force: true });
+      }
+    } catch {
+      // Nothing to collect.
+    }
+    try {
+      for (const prefix of await readdir(join(this.rootDirectory, "blobs"))) {
+        const directory = join(this.rootDirectory, "blobs", prefix);
+        for (const child of await readdir(directory)) {
+          const hash = `${prefix}${child}`;
+          if (!referencedBlobs.has(hash)) await rm(join(directory, child), { force: true });
+        }
+      }
+    } catch {
+      // Nothing to collect.
+    }
+    this.workspaceCaches.clear();
   }
 
   async garbageCollect(): Promise<void> {
@@ -1217,6 +1240,183 @@ export class BlobStore {
       () => undefined,
     );
     this.leasePublished = false;
+  }
+
+  async measureStoreBytes(): Promise<number> {
+    let totalBytes = 0;
+    const scanDir = async (directory: string): Promise<void> => {
+      let children;
+      try {
+        children = await readdir(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const child of children) {
+        const fullPath = join(directory, child.name);
+        if (child.isDirectory()) {
+          await scanDir(fullPath);
+        } else if (child.isFile()) {
+          try {
+            const metadata = await stat(fullPath);
+            totalBytes += metadata.size;
+          } catch {
+            // Ignore transient errors
+          }
+        }
+      }
+    };
+    await scanDir(join(this.rootDirectory, "blobs"));
+    await scanDir(join(this.rootDirectory, "trees"));
+    return totalBytes;
+  }
+
+  async releaseSessionRefs(sessionHash: string): Promise<boolean> {
+    if (!isHash(sessionHash)) return false;
+    try {
+      return await this.withStoreLock(async () => {
+        let success = true;
+        for (const namespace of ["history", "active"] as const) {
+          await rm(join(this.rootDirectory, "refs", namespace, sessionHash), {
+            recursive: true,
+            force: true,
+          }).catch(() => {
+            success = false;
+          });
+        }
+        return success;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  async expireAndCollect(
+    retentionDays: number,
+    maxStoreBytes: number,
+    activeSessionHashes: ReadonlySet<string> | (() => ReadonlySet<string>),
+  ): Promise<void> {
+    await this.withStoreLock(async () => {
+      const historyDir = join(this.rootDirectory, "history");
+      const getActive = () =>
+        typeof activeSessionHashes === "function" ? activeSessionHashes() : activeSessionHashes;
+
+      const getHistoryFiles = async (): Promise<string[]> => {
+        try {
+          const files = await readdir(historyDir);
+          return files.filter(
+            (f) => f.endsWith(".json") && !f.endsWith(".expired.json") && !f.startsWith("."),
+          );
+        } catch {
+          return [];
+        }
+      };
+
+      const removeSessionRefsInternal = async (sessionHash: string): Promise<boolean> => {
+        try {
+          for (const namespace of ["history", "active"] as const) {
+            await rm(join(this.rootDirectory, "refs", namespace, sessionHash), {
+              recursive: true,
+              force: true,
+            });
+          }
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      const parseSessionTimestamp = async (
+        file: string,
+      ): Promise<{ sessionHash: string; timestamp: number; filePath: string } | null> => {
+        const sessionHash = file.slice(0, -5);
+        if (!isHash(sessionHash)) return null;
+        if (getActive().has(sessionHash)) return null;
+        const filePath = join(historyDir, file);
+        try {
+          const content = await readFile(filePath, "utf8");
+          const parsed = JSON.parse(content) as unknown;
+          if (!parsed || typeof parsed !== "object") return null;
+          const candidate = parsed as Record<string, unknown>;
+          let timestamp: number;
+          if (typeof candidate.lastAccessedAt === "string") {
+            timestamp = Date.parse(candidate.lastAccessedAt);
+            if (Number.isNaN(timestamp)) return null;
+          } else {
+            const st = await stat(filePath);
+            timestamp = st.mtimeMs;
+          }
+          return { sessionHash, timestamp, filePath };
+        } catch {
+          return null;
+        }
+      };
+
+      // Phase 1: Age-based expiration
+      if (retentionDays > 0) {
+        const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+        const files = await getHistoryFiles();
+        for (const file of files) {
+          const item = await parseSessionTimestamp(file);
+          if (!item) continue;
+          if (item.timestamp <= cutoff) {
+            if (getActive().has(item.sessionHash)) continue;
+            const refsDeleted = await removeSessionRefsInternal(item.sessionHash);
+            if (!refsDeleted) continue;
+
+            const tombstoneFile = join(historyDir, `${item.sessionHash}.expired.json`);
+            const tombstoneData = {
+              expired: true,
+              sessionHash: item.sessionHash,
+              expiredAt: new Date().toISOString(),
+              reason: "age",
+            };
+            await this.atomicWrite(tombstoneFile, JSON.stringify(tombstoneData)).catch(
+              () => undefined,
+            );
+            await rm(item.filePath, { force: true }).catch(() => undefined);
+          }
+        }
+      }
+
+      // Phase 2: Storage cap eviction
+      if (maxStoreBytes > 0) {
+        let currentBytes = await this.measureStoreBytes();
+        if (currentBytes > maxStoreBytes) {
+          const files = await getHistoryFiles();
+          const items: Array<{ sessionHash: string; timestamp: number; filePath: string }> = [];
+          for (const file of files) {
+            const item = await parseSessionTimestamp(file);
+            if (item) items.push(item);
+          }
+          items.sort((a, b) => a.timestamp - b.timestamp);
+
+          for (const item of items) {
+            if (getActive().has(item.sessionHash)) continue;
+            currentBytes = await this.measureStoreBytes();
+            if (currentBytes <= maxStoreBytes) break;
+
+            const refsDeleted = await removeSessionRefsInternal(item.sessionHash);
+            if (!refsDeleted) continue;
+
+            const tombstoneFile = join(historyDir, `${item.sessionHash}.expired.json`);
+            const tombstoneData = {
+              expired: true,
+              sessionHash: item.sessionHash,
+              expiredAt: new Date().toISOString(),
+              reason: "storage_cap",
+            };
+            await this.atomicWrite(tombstoneFile, JSON.stringify(tombstoneData)).catch(
+              () => undefined,
+            );
+            await rm(item.filePath, { force: true }).catch(() => undefined);
+            await this.collectGarbageUnlocked();
+          }
+        }
+      }
+
+      // Always perform garbage collection and stale active-ref cleanup
+      await this.collectGarbageUnlocked();
+    });
   }
 
   async treeExists(treeId: string): Promise<boolean> {

@@ -2,6 +2,25 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.3.0] - 2026-08-12
+
+### Added
+
+- Add snapshot history retention: dormant session histories untouched for longer than `OMP_UNDO_REDO_RETENTION_DAYS` (default `2`) are expired automatically at startup, so Git refs, blob objects, and history files no longer grow without bound. Expired sessions resume with a warning and session-only undo/redo.
+- Add a storage cap for the non-Git blob store via `OMP_UNDO_REDO_MAX_STORE_MB` (default `1024`, i.e., 1 GiB): when the store exceeds the cap, the oldest inactive session histories are evicted iteratively until it drops back below.
+- Track history access with `lastAccessedAt` (history schema v2, backward compatible with v1) and write expiration tombstones so expired history is reported distinctly from missing or corrupt history.
+- Verify candidate sessions against a live active-session set during expiration so sessions that start concurrently are never expired by their own startup.
+
+### Changed
+
+- Bump history store schema to v2; readers accept v1 and v2, and re-saving writes v2 with a refreshed `lastAccessedAt`.
+- Delete both resumable and stale active refs during expiration and always run garbage collection after cleanup, keeping the blob store consistent.
+- Default retention and storage cap are each `0`-disablable; setting both to `0` disables automatic cleanup entirely (indefinite retention).
+
+### Documentation
+
+- Document retention and storage-cap configuration, the interaction rules between the two variables, how to set them per platform, and the expiration behavior and user-visible messages.
+
 ## [1.2.5] - 2026-08-10
 
 ### Changed
@@ -280,6 +299,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
+[1.3.0]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.3.0
 [1.2.5]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.2.5
 [1.0.30]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.30
 [1.0.26]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.0.26

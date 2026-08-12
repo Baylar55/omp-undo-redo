@@ -27,6 +27,8 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "the file snapshot could not be created.";
     case "blob_apply_failed":
       return "the file snapshot could not be restored.";
+    case "history_expired":
+      return "undo/redo file history for this session expired due to inactivity.";
     default:
       return "the file checkpoint could not be created.";
   }
