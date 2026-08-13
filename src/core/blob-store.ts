@@ -77,6 +77,8 @@ const MAX_CACHED_WORKSPACES = 16;
 const MAX_CACHED_FILES_PER_WORKSPACE = 100_000;
 const MAX_CACHED_FILES = 100_000;
 const RACILY_CLEAN_MS = 4_000;
+const DEFAULT_WALK_CONCURRENCY = 16;
+const MAX_WALK_CONCURRENCY = 64;
 
 export function blobStoreRootDirectory(): string {
   if (process.env.OMP_UNDO_REDO_BLOB_DIR) return resolve(process.env.OMP_UNDO_REDO_BLOB_DIR);
@@ -167,10 +169,12 @@ export class BlobStore {
   private readonly ignore: ReadonlySet<string>;
   private readonly clock: () => Date;
   private readonly readWorkspaceFile: (path: string) => Promise<Buffer>;
+  private readonly walkConcurrency: number;
   private readonly locks = new Map<string, Promise<void>>();
   private readonly ownerId = randomUUID();
   private leasePublished = false;
   private readonly workspaceCaches = new Map<string, WorkspaceCache>();
+  private storageRoot: Promise<string> | null = null;
 
   constructor(
     readonly rootDirectory: string,
@@ -179,6 +183,7 @@ export class BlobStore {
       ignore?: readonly string[];
       clock?: () => Date;
       readWorkspaceFile?: (path: string) => Promise<Buffer>;
+      walkConcurrency?: number;
     } = {},
   ) {
     this.rootDirectory = resolve(rootDirectory);
@@ -186,6 +191,10 @@ export class BlobStore {
     this.ignore = new Set(options.ignore ?? DEFAULT_BLOB_IGNORES);
     this.clock = options.clock ?? (() => new Date());
     this.readWorkspaceFile = options.readWorkspaceFile ?? readFile;
+    this.walkConcurrency = Math.max(
+      1,
+      Math.min(options.walkConcurrency ?? DEFAULT_WALK_CONCURRENCY, MAX_WALK_CONCURRENCY),
+    );
   }
 
   private blobPath(hash: string): string {
@@ -327,6 +336,10 @@ export class BlobStore {
     return { hash: hash.digest("hex") };
   }
 
+  private manifestFileContent(manifest: TreeManifest, canonical: string): string {
+    return `{"treeId":${JSON.stringify(manifest.treeId)},${canonical.slice(1)}`;
+  }
+
   private cacheWorkspace(
     workspaceRoot: string,
     treeId: string,
@@ -351,6 +364,11 @@ export class BlobStore {
     }
   }
 
+  private canonicalStorageRoot(): Promise<string> {
+    this.storageRoot ??= realpath(this.rootDirectory).catch(() => resolve(this.rootDirectory));
+    return this.storageRoot;
+  }
+
   private async walkWorkspace(
     workspaceRoot: string,
     cachedFiles: ReadonlyMap<string, CachedWorkspaceFile> | undefined,
@@ -363,63 +381,136 @@ export class BlobStore {
     const entries: TreeEntry[] = [];
     const skippedPaths: string[] = [];
     const files = new Map<string, CachedWorkspaceFile>();
-    const storageRoot = await realpath(this.rootDirectory).catch(() => resolve(this.rootDirectory));
+    // Storage-root containment without a per-entry realpath: workspaceRoot and the
+    // storage root are both canonical (resolved by captureSnapshot and
+    // canonicalStorageRoot), and entries are walked by name, so a normalized
+    // string-prefix comparison is equivalent to resolving every path. Symbolic
+    // links are the only entries whose true target can diverge from their name
+    // path, so they keep the (rare) realpath check below.
+    const storageRoot = await this.canonicalStorageRoot();
     const normalized = (value: string) =>
       process.platform === "win32" ? value.toLowerCase() : value;
     const normalizedStorageRoot = normalized(storageRoot);
+    if (normalized(workspaceRoot) === normalizedStorageRoot) {
+      // Degenerate configuration: the workspace root IS the blob store. Capturing
+      // the store's own blobs/trees/refs would pollute the tree, so the historical
+      // per-entry containment check yielded an empty snapshot; preserve that.
+      return { entries, skippedPaths, files };
+    }
+    const storageRelative = relative(workspaceRoot, storageRoot);
+    const storagePrefix =
+      storageRelative && !storageRelative.startsWith("..") && !isAbsolute(storageRelative)
+        ? normalized(storageRelative.split(sep).join("/"))
+        : null;
+    const underStorageRoot = (value: string): boolean => {
+      const resolved = normalized(value);
+      return (
+        resolved === normalizedStorageRoot || resolved.startsWith(`${normalizedStorageRoot}${sep}`)
+      );
+    };
+
+    // A single global concurrency limit for the whole tree. A per-directory batch
+    // would multiply through depth (C workers per directory -> C^depth in flight).
+    // There is no sound shortcut that skips the per-file lstat pass: a directory's
+    // mtime/ctime changes only on entry add/remove/rename — in-place content
+    // rewrites (the case the racily-clean guard protects) leave it untouched — so
+    // an "unchanged directory" cannot prove its files unchanged.
+    const queue: Array<() => Promise<void>> = [];
+    let head = 0;
+    let running = 0;
+    let pending = 0;
+    let failure: unknown = null;
+    let resolveDrained!: () => void;
+    const drained = new Promise<void>((resolve) => {
+      resolveDrained = resolve;
+    });
+    const pump = (): void => {
+      while (running < this.walkConcurrency && head < queue.length) {
+        const task = queue[head];
+        head += 1;
+        running += 1;
+        void task()
+          .catch((error: unknown) => {
+            failure ??= error;
+          })
+          .finally(() => {
+            running -= 1;
+            pending -= 1;
+            if (head === queue.length) {
+              queue.length = 0;
+              head = 0;
+            }
+            if (pending === 0) resolveDrained();
+            else pump();
+          });
+      }
+    };
+    const enqueue = (task: () => Promise<void>): void => {
+      pending += 1;
+      queue.push(task);
+      pump();
+    };
+
+    const processFile = async (fullPath: string, relativePath: string): Promise<void> => {
+      const metadata = await lstat(fullPath);
+      if (metadata.size > this.maxFileBytes) {
+        skippedPaths.push(relativePath);
+        return;
+      }
+      const fingerprint = fileFingerprint(metadata);
+      const cached = cachedFiles?.get(relativePath);
+      if (cached && sameFingerprint(cached.fingerprint, fingerprint)) {
+        // Racily-clean guard: a same-size in-place rewrite that lands inside the
+        // filesystem's timestamp resolution window (≤2 s on FAT/SMB) produces an
+        // identical fingerprint.  We compare the file's mtime against the *prior*
+        // capture's wall-clock — the window that matters is whether the file was
+        // touched close to when we last observed it.  Two tick-widths (4 s) closes
+        // the coarse-tick corner on FAT where a rewrite and the prior observation
+        // land on the same tick.
+        const racilyClean = Math.abs(cached.fingerprint.mtimeMs - guardTime) < RACILY_CLEAN_MS;
+        if (!racilyClean) {
+          entries.push(cached.entry);
+          files.set(relativePath, cached);
+          return;
+        }
+      }
+      const content = await this.readWorkspaceFile(fullPath);
+      const hash = sha256(content);
+      await this.writeBlob(hash, content);
+      const entry = { path: relativePath, blobHash: hash, mode: fingerprint.mode };
+      entries.push(entry);
+      files.set(relativePath, { fingerprint, entry });
+    };
+
     const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
       const children = await readdir(directory, { withFileTypes: true });
       for (const child of children) {
         if (this.ignore.has(child.name)) continue;
         const relativePath = relativeDirectory ? `${relativeDirectory}/${child.name}` : child.name;
         const fullPath = join(directory, child.name);
-        const normalizedFullPath = normalized(
-          await realpath(fullPath).catch(() => resolve(fullPath)),
-        );
+        const normalizedRelativePath = normalized(relativePath);
         if (
-          normalizedFullPath === normalizedStorageRoot ||
-          normalizedFullPath.startsWith(`${normalizedStorageRoot}${sep}`)
+          storagePrefix !== null &&
+          (normalizedRelativePath === storagePrefix ||
+            normalizedRelativePath.startsWith(`${storagePrefix}/`))
         )
           continue;
         if (child.isDirectory()) {
-          await walk(fullPath, relativePath);
+          enqueue(() => walk(fullPath, relativePath));
         } else if (child.isSymbolicLink()) {
-          skippedPaths.push(relativePath);
+          const resolved = await realpath(fullPath).catch(() => resolve(fullPath));
+          if (!underStorageRoot(resolved)) skippedPaths.push(relativePath);
         } else if (child.isFile()) {
-          const metadata = await lstat(fullPath);
-          if (metadata.size > this.maxFileBytes) {
-            skippedPaths.push(relativePath);
-            continue;
-          }
-          const fingerprint = fileFingerprint(metadata);
-          const cached = cachedFiles?.get(relativePath);
-          if (cached && sameFingerprint(cached.fingerprint, fingerprint)) {
-            // Racily-clean guard: a same-size in-place rewrite that lands inside the
-            // filesystem's timestamp resolution window (≤2 s on FAT/SMB) produces an
-            // identical fingerprint.  We compare the file's mtime against the *prior*
-            // capture's wall-clock — the window that matters is whether the file was
-            // touched close to when we last observed it.  Two tick-widths (4 s) closes
-            // the coarse-tick corner on FAT where a rewrite and the prior observation
-            // land on the same tick.
-            const racilyClean = Math.abs(cached.fingerprint.mtimeMs - guardTime) < RACILY_CLEAN_MS;
-            if (!racilyClean) {
-              entries.push(cached.entry);
-              files.set(relativePath, cached);
-              continue;
-            }
-          }
-          const content = await this.readWorkspaceFile(fullPath);
-          const hash = sha256(content);
-          await this.writeBlob(hash, content);
-          const entry = { path: relativePath, blobHash: hash, mode: fingerprint.mode };
-          entries.push(entry);
-          files.set(relativePath, { fingerprint, entry });
+          enqueue(() => processFile(fullPath, relativePath));
         } else {
           skippedPaths.push(relativePath);
         }
       }
     };
-    await walk(workspaceRoot, "");
+
+    enqueue(() => walk(workspaceRoot, ""));
+    await drained;
+    if (failure) throw failure;
     return { entries, skippedPaths, files };
   }
 
@@ -569,7 +660,14 @@ export class BlobStore {
           skippedPaths: walked.skippedPaths,
         };
         const treePath = this.treePath(treeId);
-        if (!(await exists(treePath))) await this.atomicWrite(treePath, JSON.stringify(manifest));
+        if (!(cache && cachedFiles && cache.treeId === treeId)) {
+          // When the treeId matches the validated cache, the tree file was verified
+          // present above and GC shares this lock, so no exists() check or rewrite
+          // is needed.
+          if (!(await exists(treePath))) {
+            await this.atomicWrite(treePath, this.manifestFileContent(manifest, content));
+          }
+        }
         await this.atomicWrite(
           this.refPath("active", sessionHash, checkpointId, phase),
           JSON.stringify({ treeId, ownerId: this.ownerId }),

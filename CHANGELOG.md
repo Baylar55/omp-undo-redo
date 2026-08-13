@@ -2,6 +2,15 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.3.1] - 2026-08-13
+
+### Performance
+
+- Drop the per-entry `realpath` from non-Git workspace walks; storage-root containment is now a normalized string-prefix comparison against canonical roots, with `realpath` retained only for the rare symbolic-link entries whose true target can diverge from their name path.
+- Replace per-directory stat batches with a single global concurrency limit (`walkConcurrency` option on `BlobStore`, default `16`, capped at `64`), overlapping directory reads and per-file metadata stats across the whole tree without multiplying through depth.
+- Skip the tree-manifest rewrite and its `exists` probe when the captured tree ID matches the validated workspace cache, and write the on-disk manifest from the already-hashed canonical string instead of serializing the entries a second time.
+- Add `npm run bench:walk` (`scripts/bench-walk.mjs`) to measure cold, warm, and incremental non-Git captures on a synthetic workspace.
+
 ## [1.3.0] - 2026-08-12
 
 ### Added

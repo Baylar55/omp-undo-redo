@@ -311,6 +311,94 @@ describe("non-Git blob store", () => {
     await store.shutdown();
   });
 
+  it("excludes a blob store nested inside the workspace from snapshots", async () => {
+    const workspace = await temporaryDirectory("omp-blob-nested-workspace-");
+    const store = new BlobStore(join(workspace, "store"));
+    const session = sessionHash("nested-store");
+    const checkpoint = randomUUID();
+    await writeFile(join(workspace, "tracked.txt"), "tracked");
+    await mkdir(join(workspace, "store", "inner"), { recursive: true });
+    await writeFile(join(workspace, "store", "inner", "sneaky.txt"), "sneaky");
+    await mkdir(join(workspace, "vendor", "data"), { recursive: true });
+    await writeFile(join(workspace, "vendor", "data", "decoy.txt"), "decoy");
+    const snapshot = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    if ("reason" in snapshot) throw new Error("snapshot failed");
+    expect(snapshot.entries.map((entry) => entry.path)).toEqual([
+      "tracked.txt",
+      "vendor/data/decoy.txt",
+    ]);
+    expect(snapshot.skippedPaths).toEqual([]);
+    expect(await store.treeUsable(snapshot.treeId)).toBe(true);
+    await store.shutdown();
+  });
+
+  it("captures an empty snapshot when the workspace root is the blob store root", async () => {
+    const workspace = await temporaryDirectory("omp-blob-degenerate-workspace-");
+    const store = new BlobStore(workspace);
+    const session = sessionHash("degenerate-root");
+    const checkpoint = randomUUID();
+    await writeFile(join(workspace, "stray.txt"), "stray");
+    const snapshot = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    if ("reason" in snapshot) throw new Error("snapshot failed");
+    expect(snapshot.entries).toEqual([]);
+    expect(snapshot.skippedPaths).toEqual([]);
+    await store.shutdown();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "drops symlinks that resolve into the blob store",
+    async () => {
+      const workspace = await temporaryDirectory("omp-blob-symlink-store-workspace-");
+      const storage = await temporaryDirectory("omp-blob-symlink-store-storage-");
+      const store = new BlobStore(storage);
+      const session = sessionHash("symlink-store");
+      const checkpoint = randomUUID();
+      await writeFile(join(workspace, "tracked.txt"), "tracked");
+      await writeFile(join(storage, "payload.txt"), "payload");
+      await symlink(join(storage, "payload.txt"), join(workspace, "alias.txt"));
+      const snapshot = await store.captureSnapshot(workspace, session, checkpoint, "before");
+      if ("reason" in snapshot) throw new Error("snapshot failed");
+      expect(snapshot.entries.map((entry) => entry.path)).toEqual(["tracked.txt"]);
+      expect(snapshot.skippedPaths).toEqual([]);
+      await store.shutdown();
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "records symlinks that resolve outside the blob store in skippedPaths",
+    async () => {
+      const workspace = await temporaryDirectory("omp-blob-symlink-outside-workspace-");
+      const storage = await temporaryDirectory("omp-blob-symlink-outside-storage-");
+      const outside = await temporaryDirectory("omp-blob-symlink-outside-target-");
+      const store = new BlobStore(storage);
+      const session = sessionHash("symlink-outside");
+      const checkpoint = randomUUID();
+      await writeFile(join(workspace, "tracked.txt"), "tracked");
+      await writeFile(join(outside, "target.txt"), "target");
+      await symlink(join(outside, "target.txt"), join(workspace, "alias.txt"));
+      const snapshot = await store.captureSnapshot(workspace, session, checkpoint, "before");
+      if ("reason" in snapshot) throw new Error("snapshot failed");
+      expect(snapshot.entries.map((entry) => entry.path)).toEqual(["tracked.txt"]);
+      expect(snapshot.skippedPaths).toEqual(["alias.txt"]);
+      await store.shutdown();
+    },
+  );
+
+  it("honors the walk concurrency option", async () => {
+    const workspace = await temporaryDirectory("omp-blob-concurrency-workspace-");
+    const storage = await temporaryDirectory("omp-blob-concurrency-storage-");
+    const store = new BlobStore(storage, { walkConcurrency: 1 });
+    const session = sessionHash("concurrency-option");
+    const checkpoint = randomUUID();
+    await mkdir(join(workspace, "sub"));
+    await writeFile(join(workspace, "a.txt"), "a");
+    await writeFile(join(workspace, "sub", "b.txt"), "b");
+    const snapshot = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    if ("reason" in snapshot) throw new Error("snapshot failed");
+    expect(snapshot.entries.map((entry) => entry.path)).toEqual(["a.txt", "sub/b.txt"]);
+    await store.shutdown();
+  });
+
   it("recovers an interrupted delete from its journal", async () => {
     const workspace = await temporaryDirectory("omp-blob-recovery-workspace-");
     const storage = await temporaryDirectory("omp-blob-recovery-storage-");
