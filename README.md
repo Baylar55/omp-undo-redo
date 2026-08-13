@@ -135,7 +135,7 @@ To disable either behavior, set its value to `0`; setting both to `0` disables a
 
 ### Expiration behavior
 
-Cleanup runs automatically at extension startup; nothing runs during active work, and sessions currently in use are never expired or evicted. Successful cleanup is silent. When a dormant session's file history is expired, resuming that session shows a warning: session navigation still works, but file changes from the expired turns cannot be restored, and `/undo`/`/redo` degrade to session-only navigation.
+Cleanup runs automatically in the background shortly after extension startup and never blocks session initialization or the first undo/redo; sessions currently in use are never expired or evicted. Successful cleanup is silent. When a dormant session's file history is expired, resuming that session shows a warning: session navigation still works, but file changes from the expired turns cannot be restored, and `/undo`/`/redo` degrade to session-only navigation.
 
 In Git workspaces, expiration removes the session's history refs under `refs/omp-undo-redo/history/<sessionHash>/` and its history file. The referenced commit objects become unreachable and are reclaimed later by the repository's normal `git gc`; `.git` size does not shrink immediately. No storage cap applies to Git object storage.
 

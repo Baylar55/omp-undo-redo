@@ -178,7 +178,12 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   let pendingSwitchSourceSessionId: string | null = null;
   let pendingBranchSourceSessionId: string | null = null;
   const expirationPromises = new Map<string, Promise<void>>();
+  const expirationCancels = new Map<string, () => void>();
   const explicitActiveHashes = new Set<string>();
+  // Defer the background expiry sweep so the first capture of a fresh process
+  // (agent start or undo) wins the store lock instead of queueing behind a
+  // whole-store scan. The sweep still runs shortly after and always at close.
+  const EXPIRATION_GRACE_MS = 2_000;
 
   function activeSessionHashes(): ReadonlySet<string> {
     const hashes = new Set<string>();
@@ -204,15 +209,31 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     const store = new BlobStore(root);
     blobStores.set(root, store);
     const { retentionDays, maxStoreBytes } = retentionConfig;
-    if (retentionDays > 0 || maxStoreBytes > 0) {
-      const expiration = store
-        .expireAndCollect(retentionDays, maxStoreBytes, () => activeSessionHashes())
-        .catch(() => undefined);
-      expirationPromises.set(`blob:${root}`, expiration);
-    } else {
-      const gc = store.garbageCollect().catch(() => undefined);
-      expirationPromises.set(`blob:${root}`, gc);
-    }
+    const key = `blob:${root}`;
+    const operation =
+      retentionDays > 0 || maxStoreBytes > 0
+        ? () => store.expireAndCollect(retentionDays, maxStoreBytes, () => activeSessionHashes())
+        : () => store.garbageCollect();
+    let cancel: (() => void) | undefined;
+    const expiration = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        expirationCancels.delete(key);
+        void operation()
+          .catch(() => undefined)
+          .then(resolve);
+      }, EXPIRATION_GRACE_MS);
+      timer.unref?.();
+      cancel = () => {
+        // No-op once the sweep has started; the promise then resolves when
+        // the sweep finishes, so shutdown still waits for the store lock.
+        if (!expirationCancels.has(key)) return;
+        clearTimeout(timer);
+        expirationCancels.delete(key);
+        resolve();
+      };
+    });
+    expirationCancels.set(key, cancel!);
+    expirationPromises.set(key, expiration);
     return store;
   }
 
@@ -249,16 +270,6 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
           () => activeSessionHashes(),
         ).catch(() => undefined);
         expirationPromises.set(`git:${backend.repository.commonDir}`, expiration);
-      }
-
-      const expirationKey =
-        backend.kind === "blob"
-          ? `blob:${blobStoreRootDirectory()}`
-          : backend.kind === "git"
-            ? `git:${backend.repository.commonDir}`
-            : undefined;
-      if (expirationKey) {
-        await expirationPromises.get(expirationKey);
       }
 
       const store =
@@ -600,8 +611,14 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     navigations.clear();
     initializations.clear();
     pending.clear();
-    explicitActiveHashes.clear();
     shutdownPromise = (async () => {
+      // Let an in-flight expiry finish (it holds the store lock) and cancel one
+      // that never started, then stop protecting sessions so shutdown GC can
+      // reclaim their data.
+      for (const cancel of expirationCancels.values()) cancel();
+      expirationCancels.clear();
+      await Promise.allSettled([...expirationPromises.values()]);
+      explicitActiveHashes.clear();
       await disposeDetached(detachedNavigations, detachedPending, false);
       await Promise.allSettled([...activeOperations]);
       await drainState();

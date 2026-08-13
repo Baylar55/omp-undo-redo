@@ -647,6 +647,53 @@ describe("non-Git blob store", () => {
     await store.shutdown();
   });
 
+  it("keeps the incremental store-size estimate exact across captures, GC, and eviction", async () => {
+    const workspace = await temporaryDirectory("omp-blob-measure-exact-workspace-");
+    const storage = await temporaryDirectory("omp-blob-measure-exact-storage-");
+    const store = new BlobStore(storage);
+
+    const onDiskBytes = async (): Promise<number> => {
+      let total = 0;
+      const scanDir = async (directory: string): Promise<void> => {
+        const children = await readdir(directory, { withFileTypes: true }).catch(() => []);
+        for (const child of children) {
+          const fullPath = join(directory, child.name);
+          if (child.isDirectory()) await scanDir(fullPath);
+          else total += (await stat(fullPath)).size;
+        }
+      };
+      await scanDir(join(storage, "blobs"));
+      await scanDir(join(storage, "trees"));
+      return total;
+    };
+
+    const checkpoint = randomUUID();
+    await writeFile(join(workspace, "kept.txt"), "kept content");
+    const kept = await store.captureSnapshot(workspace, sessionHash("kept"), checkpoint, "before");
+    if ("reason" in kept) throw new Error("snapshot failed");
+    await store.retainCheckpointForResume(sessionHash("kept"), checkpoint);
+
+    await writeFile(join(workspace, "orphan.txt"), "orphan content");
+    const orphanCheckpoint = randomUUID();
+    const orphan = await store.captureSnapshot(
+      workspace,
+      sessionHash("orphan"),
+      orphanCheckpoint,
+      "before",
+    );
+    if ("reason" in orphan) throw new Error("snapshot failed");
+    await store.releaseCheckpointRefs(sessionHash("orphan"), [orphanCheckpoint]);
+
+    expect(await store.measureStoreBytes()).toBe(await onDiskBytes());
+
+    await store.garbageCollect();
+    expect(await store.treeExists(kept.treeId)).toBe(true);
+    expect(await store.treeExists(orphan.treeId)).toBe(false);
+    expect(await store.measureStoreBytes()).toBe(await onDiskBytes());
+
+    await store.shutdown();
+  });
+
   it("releases all session refs", async () => {
     const workspace = await temporaryDirectory("omp-blob-release-workspace-");
     const storage = await temporaryDirectory("omp-blob-release-storage-");

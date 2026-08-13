@@ -473,6 +473,61 @@ describe("BlobStore expiration and storage cap", () => {
     await store.shutdown();
   });
 
+  it("skips the tree/blob sweep when nothing expired and sweeps on the next real removal", async () => {
+    const workspace = await temporaryDirectory("blob-exp-gate-ws-");
+    const storage = await temporaryDirectory("blob-exp-gate-store-");
+    const store = new BlobStore(storage);
+
+    const sessionId = "gate-session";
+    const hash = sessionHash(sessionId);
+    const checkpointId = randomUUID();
+    await writeFile(join(workspace, "f.txt"), "gate content");
+    const snap = await store.captureSnapshot(workspace, hash, checkpointId, "before");
+    if ("reason" in snap) throw new Error("snapshot failed");
+    await store.retainCheckpointForResume(hash, checkpointId);
+
+    const hStore = new BlobHistoryStore(sessionId, workspace, store);
+    await hStore.save({
+      checkpoints: [
+        {
+          kind: "blob",
+          workspaceRoot: workspace,
+          sessionHash: hash,
+          checkpointId,
+          beforeTreeId: snap.treeId,
+          afterTreeId: snap.treeId,
+          parentLeafId: "p",
+          leafId: "r",
+        },
+      ],
+      currentIndex: 0,
+    });
+
+    // Orphan a second capture by releasing its refs.
+    const orphanCheckpoint = randomUUID();
+    await writeFile(join(workspace, "orphan.txt"), "orphan");
+    const orphan = await store.captureSnapshot(workspace, hash, orphanCheckpoint, "before");
+    if ("reason" in orphan) throw new Error("snapshot failed");
+    await store.releaseCheckpointRefs(hash, [orphanCheckpoint]);
+    expect(await store.treeExists(orphan.treeId)).toBe(true);
+
+    // Nothing is expired (fresh history), so the O(store) sweep must be skipped.
+    await store.expireAndCollect(30, 0, new Set());
+    expect(await store.treeExists(orphan.treeId)).toBe(true);
+
+    // Aging the session makes expireAndCollect remove it; the sweep then
+    // reclaims the orphan that the no-op run left behind.
+    const hFile = join(storage, "history", `${hash}.json`);
+    const json = JSON.parse(await readFile(hFile, "utf8"));
+    json.lastAccessedAt = new Date(Date.now() - 50 * 24 * 60 * 60 * 1000).toISOString();
+    await writeFile(hFile, JSON.stringify(json));
+
+    await store.expireAndCollect(30, 0, new Set());
+    expect(await store.treeExists(orphan.treeId)).toBe(false);
+
+    await store.shutdown();
+  });
+
   it("uses dynamic activeSessionHashes getter to re-check candidate sessions at deletion time", async () => {
     const workspace = await temporaryDirectory("blob-exp-getter-ws-");
     const storage = await temporaryDirectory("blob-exp-getter-store-");

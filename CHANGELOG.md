@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.3.2] - 2026-08-13
+
+### Performance
+
+- Defer the store-wide expiration and garbage-collection sweep to a background run shortly after extension startup so session initialization and the first undo/redo no longer block on a scan of the entire shared store.
+- Skip the O(store) tree-manifest and blob sweep when nothing was actually expired or evicted; stale active-ref cleanup for crashed owners still runs on every pass.
+- Track blob store size incrementally (exact bytes for writes, deletion-adjusted after GC) so storage-cap eviction checks are O(1) instead of re-walking every blob and tree file per evicted session.
+
 ## [1.3.1] - 2026-08-13
 
 ### Performance
