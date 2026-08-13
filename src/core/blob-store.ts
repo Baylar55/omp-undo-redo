@@ -175,6 +175,16 @@ export class BlobStore {
   private leasePublished = false;
   private readonly workspaceCaches = new Map<string, WorkspaceCache>();
   private storageRoot: Promise<string> | null = null;
+  /** Exact on-disk bytes of blobs/ and trees/ at the last full scan (under the
+   *  store lock), or null when no scan has happened in this process. All blob
+   *  and tree mutations run under the store lock, so this stays exact as long
+   *  as every mutation is also reflected in pendingWriteSizes/pendingBytes.
+   *  Cross-process files written between this process's scan and a later GC
+   *  are not in either account, so their deletion drifts the estimate low by
+   *  at most one file's bytes — a bounded, self-healing approximation. */
+  private storeBytesAtLastScan: number | null = null;
+  private pendingBytes = 0;
+  private readonly pendingWriteSizes = new Map<string, number>();
 
   constructor(
     readonly rootDirectory: string,
@@ -307,6 +317,9 @@ export class BlobStore {
     });
   }
 
+  /** Writes a content-addressed blob if it does not already exist.
+   *  Must be called under withStoreLock — the size-tracking skip on
+   *  existence is mandatory to avoid double-counting in measureStoreBytes. */
   private async writeBlob(hash: string, content: Buffer): Promise<void> {
     const path = this.blobPath(hash);
     if (await exists(path)) return;
@@ -326,6 +339,34 @@ export class BlobStore {
       }
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
+    }
+    this.trackStoreWrite(hash, content.length);
+  }
+
+  private trackStoreWrite(key: string, size: number): void {
+    const previous = this.pendingWriteSizes.get(key);
+    if (previous !== undefined) {
+      this.pendingBytes -= previous;
+    }
+    this.pendingWriteSizes.set(key, size);
+    this.pendingBytes += size;
+  }
+
+  /** Removes one file's bytes from the in-process store-size estimate. The key
+   *  distinguishes pending (written since the last scan) from scanned entries,
+   *  so the estimate stays exact without ever rescanning the store. */
+  private async untrackStoreFile(path: string, key: string): Promise<void> {
+    const pendingSize = this.pendingWriteSizes.get(key);
+    if (pendingSize !== undefined) {
+      this.pendingWriteSizes.delete(key);
+      this.pendingBytes -= pendingSize;
+      return;
+    }
+    if (this.storeBytesAtLastScan === null) return;
+    try {
+      this.storeBytesAtLastScan -= Math.min((await stat(path)).size, this.storeBytesAtLastScan);
+    } catch {
+      // The file is already gone; nothing to account for.
     }
   }
 
@@ -665,7 +706,9 @@ export class BlobStore {
           // present above and GC shares this lock, so no exists() check or rewrite
           // is needed.
           if (!(await exists(treePath))) {
-            await this.atomicWrite(treePath, this.manifestFileContent(manifest, content));
+            const manifestContent = this.manifestFileContent(manifest, content);
+            await this.atomicWrite(treePath, manifestContent);
+            this.trackStoreWrite(treeId, Buffer.byteLength(manifestContent));
           }
         }
         await this.atomicWrite(
@@ -1254,12 +1297,17 @@ export class BlobStore {
 
   async collectGarbage(): Promise<void> {
     await this.withStoreLock(async () => {
-      await this.collectGarbageUnlocked();
+      await this.collectGarbageUnlocked(true);
     });
   }
 
-  private async collectGarbageUnlocked(): Promise<void> {
+  private async collectGarbageUnlocked(sweep: boolean): Promise<void> {
     await this.cleanupStaleActiveRefs();
+    // The refs scan, manifest loads and blob/tree walks are O(entire store).
+    // Sweep only when session data was actually removed; stale-active-ref
+    // cleanup above still covers crashed owners. Orphans left by a crash
+    // mid-capture are reaped on the next real removal or by shutdown GC.
+    if (!sweep) return;
     const referencedTrees = new Set<string>();
     const scanRefs = async (directory: string): Promise<void> => {
       let children;
@@ -1287,8 +1335,11 @@ export class BlobStore {
       for (const child of await readdir(join(this.rootDirectory, "trees"))) {
         if (!child.endsWith(".json")) continue;
         const treeId = child.slice(0, -5);
-        if (!referencedTrees.has(treeId))
-          await rm(join(this.rootDirectory, "trees", child), { force: true });
+        if (!referencedTrees.has(treeId)) {
+          const path = join(this.rootDirectory, "trees", child);
+          await this.untrackStoreFile(path, treeId);
+          await rm(path, { force: true });
+        }
       }
     } catch {
       // Nothing to collect.
@@ -1298,7 +1349,11 @@ export class BlobStore {
         const directory = join(this.rootDirectory, "blobs", prefix);
         for (const child of await readdir(directory)) {
           const hash = `${prefix}${child}`;
-          if (!referencedBlobs.has(hash)) await rm(join(directory, child), { force: true });
+          if (!referencedBlobs.has(hash)) {
+            const path = join(directory, child);
+            await this.untrackStoreFile(path, hash);
+            await rm(path, { force: true });
+          }
         }
       }
     } catch {
@@ -1341,6 +1396,17 @@ export class BlobStore {
   }
 
   async measureStoreBytes(): Promise<number> {
+    if (this.storeBytesAtLastScan !== null) {
+      return this.storeBytesAtLastScan + this.pendingBytes;
+    }
+    const totalBytes = await this.scanStoreBytes();
+    this.storeBytesAtLastScan = totalBytes;
+    this.pendingBytes = 0;
+    this.pendingWriteSizes.clear();
+    return totalBytes;
+  }
+
+  private async scanStoreBytes(): Promise<number> {
     let totalBytes = 0;
     const scanDir = async (directory: string): Promise<void> => {
       let children;
@@ -1450,6 +1516,7 @@ export class BlobStore {
       };
 
       // Phase 1: Age-based expiration
+      let removedSomething = false;
       if (retentionDays > 0) {
         const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
         const files = await getHistoryFiles();
@@ -1460,6 +1527,7 @@ export class BlobStore {
             if (getActive().has(item.sessionHash)) continue;
             const refsDeleted = await removeSessionRefsInternal(item.sessionHash);
             if (!refsDeleted) continue;
+            removedSomething = true;
 
             const tombstoneFile = join(historyDir, `${item.sessionHash}.expired.json`);
             const tombstoneData = {
@@ -1490,11 +1558,13 @@ export class BlobStore {
 
           for (const item of items) {
             if (getActive().has(item.sessionHash)) continue;
-            currentBytes = await this.measureStoreBytes();
+            // After the first call above (which scans once), measureStoreBytes
+            // is O(1), so the per-iteration check no longer rescans the store.
             if (currentBytes <= maxStoreBytes) break;
 
             const refsDeleted = await removeSessionRefsInternal(item.sessionHash);
             if (!refsDeleted) continue;
+            removedSomething = true;
 
             const tombstoneFile = join(historyDir, `${item.sessionHash}.expired.json`);
             const tombstoneData = {
@@ -1507,13 +1577,15 @@ export class BlobStore {
               () => undefined,
             );
             await rm(item.filePath, { force: true }).catch(() => undefined);
-            await this.collectGarbageUnlocked();
+            await this.collectGarbageUnlocked(true);
+            currentBytes = await this.measureStoreBytes();
           }
         }
       }
 
-      // Always perform garbage collection and stale active-ref cleanup
-      await this.collectGarbageUnlocked();
+      // Garbage collection after removals, and stale active-ref cleanup always.
+      // The O(store) tree/blob sweep is skipped when nothing was removed.
+      await this.collectGarbageUnlocked(removedSomething);
     });
   }
 
