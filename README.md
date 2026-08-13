@@ -187,6 +187,7 @@ Install dependencies with npm, then use the scripts in `package.json`:
 - `npm test` runs the deterministic test suite.
 - `npm run lint` and `npm run format:check` check style.
 - `npm run verify` runs the repository verification sequence.
+- `npm run bench:walk` benchmarks non-Git blob-store captures (cold, warm cache-hit, and incremental) on a synthetic workspace under the OS temp directory.
 
 The implementation uses only public OMP extension APIs. Keep changes focused, preserve the package manifest, and do not commit generated `dist/` output unless a release process explicitly requires it.
 
