@@ -192,6 +192,34 @@ describe("non-Git blob store", () => {
     await store.shutdown();
   });
 
+  it("defers the GC sweep while a capture marker is fresh and proceeds once it is stale", async () => {
+    const workspace = await temporaryDirectory("omp-blob-gc-marker-workspace-");
+    const storage = await temporaryDirectory("omp-blob-gc-marker-storage-");
+    const store = new BlobStore(storage);
+    const session = sessionHash("gc-marker");
+    const checkpoint = randomUUID();
+    await writeFile(join(workspace, "file.txt"), "content");
+    const snapshot = await store.captureSnapshot(workspace, session, checkpoint, "before");
+    if ("reason" in snapshot) throw new Error("snapshot failed");
+    await store.releaseCheckpointRefs(session, [checkpoint]);
+
+    // A capture in another process is mid-walk: its marker beats are fresh.
+    const locksDir = join(storage, "locks");
+    const markerPath = join(locksDir, "capture-foreign-process.marker");
+    await mkdir(locksDir, { recursive: true });
+    await writeFile(markerPath, "{}");
+    await store.collectGarbage();
+    expect(await store.treeExists(snapshot.treeId)).toBe(true);
+
+    // The foreign capture stops beating; the marker goes stale and is reaped.
+    const staleTime = new Date(Date.now() - 60_000);
+    await utimes(markerPath, staleTime, staleTime);
+    await store.collectGarbage();
+    expect(await store.treeExists(snapshot.treeId)).toBe(false);
+    await expect(stat(markerPath)).rejects.toThrow();
+    await store.shutdown();
+  });
+
   it("detects same-size changes even when mtime is restored", async () => {
     const workspace = await temporaryDirectory("omp-blob-stat-workspace-");
     const storage = await temporaryDirectory("omp-blob-stat-storage-");
