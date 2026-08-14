@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -657,6 +657,22 @@ describe("resumed session history", () => {
       ompUndoRedo(secondApi as never);
       const secondCtx = context(cwd, sessionId2);
       await secondApi.emit("session_start", secondCtx);
+
+      // The expiration sweep runs in the background; wait until it has
+      // written the tombstone for session 1 before resuming it.
+      const { tombstonePath } = await import("../src/core/history-store.js");
+      const expirationDeadline = Date.now() + 10_000;
+      for (;;) {
+        try {
+          await access(tombstonePath(repo, sessionId1));
+          break;
+        } catch {
+          if (Date.now() > expirationDeadline) {
+            throw new Error("session 1 history was not expired within the deadline");
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
 
       // 4. Resume session 1 (now expired)
       const resumeCtx = context(cwd, sessionId1);
