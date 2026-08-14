@@ -10,6 +10,7 @@ import {
   rename,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
@@ -79,6 +80,14 @@ const MAX_CACHED_FILES = 100_000;
 const RACILY_CLEAN_MS = 4_000;
 const DEFAULT_WALK_CONCURRENCY = 16;
 const MAX_WALK_CONCURRENCY = 64;
+/** Captures walk their workspace outside the store lock and write blobs that
+ *  no ref references until the walk's publish step. A concurrent GC must not
+ *  sweep those blobs, so each capture keeps a marker file alive with a
+ *  heartbeat and GC defers its sweep while any marker is fresh. Marker
+ *  creation is serialized under the store lock, closing the
+ *  check-vs-start race. */
+const CAPTURE_MARKER_BEAT_MS = 5_000;
+const CAPTURE_MARKER_STALE_MS = 30_000;
 
 export function blobStoreRootDirectory(): string {
   if (process.env.OMP_UNDO_REDO_BLOB_DIR) return resolve(process.env.OMP_UNDO_REDO_BLOB_DIR);
@@ -175,13 +184,14 @@ export class BlobStore {
   private leasePublished = false;
   private readonly workspaceCaches = new Map<string, WorkspaceCache>();
   private storageRoot: Promise<string> | null = null;
-  /** Exact on-disk bytes of blobs/ and trees/ at the last full scan (under the
-   *  store lock), or null when no scan has happened in this process. All blob
-   *  and tree mutations run under the store lock, so this stays exact as long
-   *  as every mutation is also reflected in pendingWriteSizes/pendingBytes.
-   *  Cross-process files written between this process's scan and a later GC
-   *  are not in either account, so their deletion drifts the estimate low by
-   *  at most one file's bytes — a bounded, self-healing approximation. */
+  /** Exact on-disk bytes of blobs/ and trees/ at the last full scan, or null
+   *  when no scan has happened in this process. Tree manifests are written
+   *  under the store lock, but blobs may be written by a concurrent workspace
+   *  walk outside it; a blob the scan misses (written after its directory was
+   *  read) is cleared with the rest of the pending account, a bounded,
+   *  self-healing underestimate. Cross-process files written between this
+   *  process's scan and a later GC are not in either account, so their
+   *  deletion drifts the estimate low by at most one file's bytes. */
   private storeBytesAtLastScan: number | null = null;
   private pendingBytes = 0;
   private readonly pendingWriteSizes = new Map<string, number>();
@@ -318,8 +328,12 @@ export class BlobStore {
   }
 
   /** Writes a content-addressed blob if it does not already exist.
-   *  Must be called under withStoreLock — the size-tracking skip on
-   *  existence is mandatory to avoid double-counting in measureStoreBytes. */
+   *  Called during workspace walks, outside the store lock: content addressing
+   *  makes the write idempotent (same content, same path), and GC defers its
+   *  sweep while any capture marker is fresh, so an in-flight capture's blobs
+   *  are never swept before its ref is published. The existence-skip is still
+   *  load-bearing for size accounting — it must match measureStoreBytes'
+   *  per-hash tracking or pending bytes would double-count. */
   private async writeBlob(hash: string, content: Buffer): Promise<void> {
     const path = this.blobPath(hash);
     if (await exists(path)) return;
@@ -662,6 +676,22 @@ export class BlobStore {
       .sort();
   }
 
+  /** Serializes workspace-mutating phases (capture walks and applies) both
+   *  within this process (promise chain) and across processes (filesystem
+   *  lock). Scoped to one workspace, so a slow capture in one workspace never
+   *  blocks another workspace — the store lock is reserved for ref/manifest
+   *  publication and GC, which the whole store must agree on. */
+  private async withWorkspaceMutex<T>(root: string, operation: () => Promise<T>): Promise<T> {
+    return this.withWorkspaceLock(root, async () => {
+      const release = await this.acquireFilesystemLock(`workspace:${root}`);
+      try {
+        return await operation();
+      } finally {
+        await release();
+      }
+    });
+  }
+
   async captureSnapshot(
     workspaceRoot: string,
     sessionHash: string,
@@ -677,19 +707,50 @@ export class BlobStore {
       return { reason: "workspace_unresolvable" };
     }
     try {
-      return await this.withStoreLock(async () => {
-        if (!(await this.recoverWorkspace(canonicalRoot))) {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const outcome = await this.captureOnce(canonicalRoot, sessionHash, checkpointId, phase);
+        if (outcome !== "retry") return outcome;
+      }
+      return { reason: "blob_capture_failed" };
+    } catch {
+      return { reason: "blob_capture_failed" };
+    }
+  }
+
+  /** One capture attempt. Runs the workspace walk under the per-workspace
+   *  mutex — reads and content-addressed blob writes are safe outside the
+   *  store lock — and only publishes the manifest and ref under the store
+   *  lock, the critical section GC's sweep is atomic with. Returns "retry"
+   *  when a concurrent GC removed the cached tree (and with it the blobs its
+   *  cached fingerprints reference) while the walk was in flight; the caller
+   *  retries once with the cache invalidated. */
+  private async captureOnce(
+    workspaceRoot: string,
+    sessionHash: string,
+    checkpointId: string,
+    phase: SnapshotPhase,
+  ): Promise<TreeManifest | { reason: "blob_capture_failed" } | "retry"> {
+    return this.withWorkspaceMutex(workspaceRoot, async () => {
+      // Register as in-flight before any blob write so a concurrent GC in
+      // another process defers its sweep (creation is store-locked, which is
+      // what makes GC's fresh-marker check authoritative).
+      const endCapture = await this.withStoreLock(() => this.beginCaptureMarker());
+      try {
+        if (!(await this.recoverWorkspace(workspaceRoot))) {
           return { reason: "blob_capture_failed" } as const;
         }
         await this.publishLease();
-        const cache = this.workspaceCaches.get(canonicalRoot);
-        // GC shares this lock and clears these entries, so a present tree has retained its blobs.
+        const cache = this.workspaceCaches.get(workspaceRoot);
+        // The cached tree's presence witnesses that its blobs are still
+        // retained: GC removes a tree before its blobs, and never concurrently
+        // with the store-locked publish below. The check is repeated inside
+        // that locked section, where it is authoritative.
         const cachedFiles =
           cache && (await exists(this.treePath(cache.treeId))) ? cache.files : undefined;
-        if (cache && !cachedFiles) this.workspaceCaches.delete(canonicalRoot);
+        if (cache && !cachedFiles) this.workspaceCaches.delete(workspaceRoot);
         const captureTime = this.clock().getTime();
         const guardTime = cache?.captureTime ?? captureTime;
-        const walked = await this.walkWorkspace(canonicalRoot, cachedFiles, guardTime);
+        const walked = await this.walkWorkspace(workspaceRoot, cachedFiles, guardTime);
         // Sort the walked arrays once, explicitly, so the on-disk manifest is sorted
         // and canonicalManifest stays a pure serializer (no redundant second sort).
         sortCanonical(walked.entries, walked.skippedPaths);
@@ -700,27 +761,36 @@ export class BlobStore {
           entries: walked.entries,
           skippedPaths: walked.skippedPaths,
         };
-        const treePath = this.treePath(treeId);
-        if (!(cache && cachedFiles && cache.treeId === treeId)) {
-          // When the treeId matches the validated cache, the tree file was verified
-          // present above and GC shares this lock, so no exists() check or rewrite
-          // is needed.
-          if (!(await exists(treePath))) {
-            const manifestContent = this.manifestFileContent(manifest, content);
-            await this.atomicWrite(treePath, manifestContent);
-            this.trackStoreWrite(treeId, Buffer.byteLength(manifestContent));
+        return await this.withStoreLock(async () => {
+          if (cache && cachedFiles && !(await exists(this.treePath(cache.treeId)))) {
+            // GC ran while the walk was in flight and swept the cached tree.
+            // Its blobs may be gone too, so the cached entries this walk reused
+            // cannot back a valid manifest; retry with the cache invalidated.
+            this.workspaceCaches.delete(workspaceRoot);
+            return "retry" as const;
           }
-        }
-        await this.atomicWrite(
-          this.refPath("active", sessionHash, checkpointId, phase),
-          JSON.stringify({ treeId, ownerId: this.ownerId }),
-        );
-        this.cacheWorkspace(canonicalRoot, treeId, walked.files, captureTime);
-        return manifest;
-      });
-    } catch {
-      return { reason: "blob_capture_failed" };
-    }
+          const treePath = this.treePath(treeId);
+          if (!(cache && cachedFiles && cache.treeId === treeId)) {
+            // When the treeId matches the validated cache, the tree file was
+            // verified present above and GC shares this lock, so no exists()
+            // check or rewrite is needed.
+            if (!(await exists(treePath))) {
+              const manifestContent = this.manifestFileContent(manifest, content);
+              await this.atomicWrite(treePath, manifestContent);
+              this.trackStoreWrite(treeId, Buffer.byteLength(manifestContent));
+            }
+          }
+          await this.atomicWrite(
+            this.refPath("active", sessionHash, checkpointId, phase),
+            JSON.stringify({ treeId, ownerId: this.ownerId }),
+          );
+          this.cacheWorkspace(workspaceRoot, treeId, walked.files, captureTime);
+          return manifest;
+        });
+      } finally {
+        await endCapture();
+      }
+    });
   }
 
   private async loadManifest(treeId: string): Promise<TreeManifest | null> {
@@ -903,147 +973,144 @@ export class BlobStore {
       return { status: "failed" };
     }
     try {
-      return await this.withStoreLock(() =>
-        this.withWorkspaceLock(root, async () => {
-          if (!(await this.recoverWorkspace(root))) return { status: "failed" };
-          const source = await this.loadManifest(sourceTreeId);
-          const target = await this.loadManifest(targetTreeId);
-          if (!source || !target) return { status: "failed" };
-          const sourceMap = new Map(source.entries.map((entry) => [entry.path, entry]));
-          const targetMap = new Map(target.entries.map((entry) => [entry.path, entry]));
-          const mutations = this.changedPaths(
-            sourceMap,
-            targetMap,
-            source.skippedPaths,
-            target.skippedPaths,
+      return await this.withWorkspaceMutex(root, async () => {
+        if (!(await this.recoverWorkspace(root))) return { status: "failed" };
+        const source = await this.loadManifest(sourceTreeId);
+        const target = await this.loadManifest(targetTreeId);
+        if (!source || !target) return { status: "failed" };
+        const sourceMap = new Map(source.entries.map((entry) => [entry.path, entry]));
+        const targetMap = new Map(target.entries.map((entry) => [entry.path, entry]));
+        const mutations = this.changedPaths(
+          sourceMap,
+          targetMap,
+          source.skippedPaths,
+          target.skippedPaths,
+        );
+        // Only changed entries can be read while applying or rolling back. Checking every
+        // manifest entry makes a small undo/redo perform two full-tree stat passes.
+        const requiredBlobHashes = new Set<string>();
+        for (const path of mutations) {
+          const sourceEntry = sourceMap.get(path);
+          const targetEntry = targetMap.get(path);
+          if (sourceEntry) requiredBlobHashes.add(sourceEntry.blobHash);
+          if (targetEntry) requiredBlobHashes.add(targetEntry.blobHash);
+        }
+        for (const blobHash of requiredBlobHashes) {
+          if (!(await this.blobExists(blobHash))) return { status: "failed" };
+        }
+
+        for (const path of mutations) {
+          if (!this.validPath(path)) return { status: "conflict" };
+          if (!(await this.safeParent(root, join(root, ...path.split("/"))))) {
+            const parent = dirname(path);
+            const sourceParent = sourceMap.get(parent);
+            const targetParent = targetMap.get(parent);
+            if (!sourceParent || targetParent) return { status: "conflict" };
+          }
+          const left = sourceMap.get(path);
+          const right = targetMap.get(path);
+          const state = await this.pathState(root, path);
+          if (!left) {
+            if (state === "missing") continue;
+            if (
+              state === "directory" &&
+              right &&
+              (await this.directoryMatchesEntries(root, path, sourceMap))
+            ) {
+              continue;
+            }
+            if (state !== "file") return { status: "conflict" };
+            const current = await this.currentFile(root, path);
+            if (!current || current.hash !== right?.blobHash) {
+              return { status: "conflict" };
+            }
+          } else if (!right) {
+            if (
+              state === "directory" &&
+              (await this.directoryMatchesEntries(root, path, targetMap))
+            ) {
+              continue;
+            }
+            const current = await this.currentFile(root, path);
+            if (!current || current.hash !== left.blobHash || current.mode !== left.mode) {
+              return { status: "conflict" };
+            }
+          } else {
+            const current = await this.currentFile(root, path);
+            if (!current || current.hash !== left.blobHash || current.mode !== left.mode) {
+              return { status: "conflict" };
+            }
+          }
+        }
+
+        this.workspaceCaches.delete(root);
+        const journalPath = join(this.rootDirectory, "journals", `${randomUUID()}.json`);
+        try {
+          await this.atomicWrite(
+            journalPath,
+            JSON.stringify({
+              workspaceRoot: root,
+              sourceTreeId,
+              targetTreeId,
+              createdAt: this.clock().toISOString(),
+              paths: mutations,
+            }),
           );
-          // Only changed entries can be read while applying or rolling back. Checking every
-          // manifest entry makes a small undo/redo perform two full-tree stat passes.
-          const requiredBlobHashes = new Set<string>();
-          for (const path of mutations) {
-            const sourceEntry = sourceMap.get(path);
-            const targetEntry = targetMap.get(path);
-            if (sourceEntry) requiredBlobHashes.add(sourceEntry.blobHash);
-            if (targetEntry) requiredBlobHashes.add(targetEntry.blobHash);
+          const removals = mutations
+            .filter(
+              (path) =>
+                sourceMap.has(path) &&
+                (!targetMap.has(path) ||
+                  sourceMap.get(path)?.mode !== targetMap.get(path)?.mode ||
+                  sourceMap.get(path)?.blobHash !== targetMap.get(path)?.blobHash),
+            )
+            .sort((left, right) => depth(right) - depth(left));
+          for (const path of removals) {
+            const fullPath = join(root, ...path.split("/"));
+            if ((await this.pathState(root, path)) === "file") await rm(fullPath, { force: true });
           }
-          for (const blobHash of requiredBlobHashes) {
-            if (!(await this.blobExists(blobHash))) return { status: "failed" };
-          }
-
-          for (const path of mutations) {
-            if (!this.validPath(path)) return { status: "conflict" };
-            if (!(await this.safeParent(root, join(root, ...path.split("/"))))) {
-              const parent = dirname(path);
-              const sourceParent = sourceMap.get(parent);
-              const targetParent = targetMap.get(parent);
-              if (!sourceParent || targetParent) return { status: "conflict" };
+          const writes = mutations
+            .filter((path) => targetMap.has(path))
+            .sort((left, right) => depth(left) - depth(right));
+          for (const path of writes) {
+            const entry = targetMap.get(path)!;
+            const fullPath = join(root, ...path.split("/"));
+            if (!(await this.safeParent(root, fullPath))) throw new Error("unsafe parent");
+            if ((await this.pathState(root, path)) === "directory") {
+              if ((await readdir(fullPath)).length > 0) throw new Error("directory obstruction");
+              await rm(fullPath, { recursive: true });
             }
-            const left = sourceMap.get(path);
-            const right = targetMap.get(path);
-            const state = await this.pathState(root, path);
-            if (!left) {
-              if (state === "missing") continue;
-              if (
-                state === "directory" &&
-                right &&
-                (await this.directoryMatchesEntries(root, path, sourceMap))
-              ) {
-                continue;
-              }
-              if (state !== "file") return { status: "conflict" };
-              const current = await this.currentFile(root, path);
-              if (!current || current.hash !== right?.blobHash) {
-                return { status: "conflict" };
-              }
-            } else if (!right) {
-              if (
-                state === "directory" &&
-                (await this.directoryMatchesEntries(root, path, targetMap))
-              ) {
-                continue;
-              }
-              const current = await this.currentFile(root, path);
-              if (!current || current.hash !== left.blobHash || current.mode !== left.mode) {
-                return { status: "conflict" };
-              }
-            } else {
-              const current = await this.currentFile(root, path);
-              if (!current || current.hash !== left.blobHash || current.mode !== left.mode) {
-                return { status: "conflict" };
-              }
+            await mkdir(dirname(fullPath), { recursive: true, mode: 0o700 });
+            const blob = await readFile(this.blobPath(entry.blobHash));
+            const temporary = join(dirname(fullPath), `.${randomUUID()}.tmp`);
+            try {
+              await writeFile(temporary, blob, { mode: entry.mode || 0o600 });
+              await rename(temporary, fullPath);
+              await chmodSafe(fullPath, entry.mode);
+            } finally {
+              await rm(temporary, { force: true }).catch(() => undefined);
             }
           }
-
-          this.workspaceCaches.delete(root);
-          const journalPath = join(this.rootDirectory, "journals", `${randomUUID()}.json`);
-          try {
-            await this.atomicWrite(
-              journalPath,
-              JSON.stringify({
-                workspaceRoot: root,
-                sourceTreeId,
-                targetTreeId,
-                createdAt: this.clock().toISOString(),
-                paths: mutations,
-              }),
+          await this.cleanupEmptyDirectories(root, sourceMap, targetMap, mutations);
+          await rm(journalPath, { force: true });
+          return {
+            status: "applied",
+            partial: source.skippedPaths.length > 0 || target.skippedPaths.length > 0,
+          };
+        } catch {
+          const rolledBack = await this.rollbackSnapshot(root, sourceMap, targetMap, mutations);
+          if (rolledBack) {
+            await rm(journalPath, { force: true }).catch(() => undefined);
+          } else {
+            const failedDirectory = join(this.rootDirectory, "journals", "failed");
+            await mkdir(failedDirectory, { recursive: true, mode: 0o700 }).catch(() => undefined);
+            await rename(journalPath, join(failedDirectory, basename(journalPath))).catch(
+              () => undefined,
             );
-            const removals = mutations
-              .filter(
-                (path) =>
-                  sourceMap.has(path) &&
-                  (!targetMap.has(path) ||
-                    sourceMap.get(path)?.mode !== targetMap.get(path)?.mode ||
-                    sourceMap.get(path)?.blobHash !== targetMap.get(path)?.blobHash),
-              )
-              .sort((left, right) => depth(right) - depth(left));
-            for (const path of removals) {
-              const fullPath = join(root, ...path.split("/"));
-              if ((await this.pathState(root, path)) === "file")
-                await rm(fullPath, { force: true });
-            }
-            const writes = mutations
-              .filter((path) => targetMap.has(path))
-              .sort((left, right) => depth(left) - depth(right));
-            for (const path of writes) {
-              const entry = targetMap.get(path)!;
-              const fullPath = join(root, ...path.split("/"));
-              if (!(await this.safeParent(root, fullPath))) throw new Error("unsafe parent");
-              if ((await this.pathState(root, path)) === "directory") {
-                if ((await readdir(fullPath)).length > 0) throw new Error("directory obstruction");
-                await rm(fullPath, { recursive: true });
-              }
-              await mkdir(dirname(fullPath), { recursive: true, mode: 0o700 });
-              const blob = await readFile(this.blobPath(entry.blobHash));
-              const temporary = join(dirname(fullPath), `.${randomUUID()}.tmp`);
-              try {
-                await writeFile(temporary, blob, { mode: entry.mode || 0o600 });
-                await rename(temporary, fullPath);
-                await chmodSafe(fullPath, entry.mode);
-              } finally {
-                await rm(temporary, { force: true }).catch(() => undefined);
-              }
-            }
-            await this.cleanupEmptyDirectories(root, sourceMap, targetMap, mutations);
-            await rm(journalPath, { force: true });
-            return {
-              status: "applied",
-              partial: source.skippedPaths.length > 0 || target.skippedPaths.length > 0,
-            };
-          } catch {
-            const rolledBack = await this.rollbackSnapshot(root, sourceMap, targetMap, mutations);
-            if (rolledBack) {
-              await rm(journalPath, { force: true }).catch(() => undefined);
-            } else {
-              const failedDirectory = join(this.rootDirectory, "journals", "failed");
-              await mkdir(failedDirectory, { recursive: true, mode: 0o700 }).catch(() => undefined);
-              await rename(journalPath, join(failedDirectory, basename(journalPath))).catch(
-                () => undefined,
-              );
-            }
-            return { status: "failed" };
           }
-        }),
-      );
+          return { status: "failed" };
+        }
+      });
     } catch {
       return { status: "failed" };
     }
@@ -1301,13 +1368,19 @@ export class BlobStore {
     });
   }
 
-  private async collectGarbageUnlocked(sweep: boolean): Promise<void> {
+  private async collectGarbageUnlocked(sweep: boolean): Promise<boolean> {
     await this.cleanupStaleActiveRefs();
     // The refs scan, manifest loads and blob/tree walks are O(entire store).
     // Sweep only when session data was actually removed; stale-active-ref
     // cleanup above still covers crashed owners. Orphans left by a crash
     // mid-capture are reaped on the next real removal or by shutdown GC.
-    if (!sweep) return;
+    if (!sweep) return false;
+    // A capture in another process may be mid-walk, writing blobs that no ref
+    // references yet. Sweeping now could orphan a ref the capture publishes
+    // moments later, so defer the whole sweep; the next removal-triggered GC
+    // reclaims the data. Marker creation is store-locked, so no capture can
+    // slip into the window between this check and the end of the sweep.
+    if (await this.captureInFlight()) return false;
     const referencedTrees = new Set<string>();
     const scanRefs = async (directory: string): Promise<void> => {
       let children;
@@ -1360,6 +1433,69 @@ export class BlobStore {
       // Nothing to collect.
     }
     this.workspaceCaches.clear();
+    return true;
+  }
+
+  /** Registers this capture as in-flight so a concurrent GC defers its sweep.
+   *  The marker lives in locks/, where every process sharing the store can see
+   *  it, and is kept fresh with a heartbeat until the capture finishes (the
+   *  caller must invoke the returned stop function, including on failure). */
+  private async beginCaptureMarker(): Promise<() => Promise<void>> {
+    const path = join(
+      this.rootDirectory,
+      "locks",
+      `capture-${this.ownerId}-${randomUUID()}.marker`,
+    );
+    await this.atomicWrite(
+      path,
+      JSON.stringify({
+        ownerId: this.ownerId,
+        pid: process.pid,
+        startedAt: this.clock().toISOString(),
+      }),
+    );
+    const beat = async (): Promise<void> => {
+      try {
+        const now = new Date();
+        await utimes(path, now, now);
+      } catch {
+        // Marker already removed or the store is unavailable; the staleness
+        // window covers the gap.
+      }
+    };
+    const interval = setInterval(() => void beat(), CAPTURE_MARKER_BEAT_MS);
+    interval.unref();
+    return async () => {
+      clearInterval(interval);
+      await rm(path, { force: true }).catch(() => undefined);
+    };
+  }
+
+  /** True while any capture marker is fresh. Reaps markers that stopped
+   *  beating (crashed captures) so a stale marker never defers the sweep
+   *  forever. Must be called under the store lock. */
+  private async captureInFlight(): Promise<boolean> {
+    try {
+      const entries = await readdir(join(this.rootDirectory, "locks"));
+      let inFlight = false;
+      for (const name of entries) {
+        if (!name.endsWith(".marker")) continue;
+        const path = join(this.rootDirectory, "locks", name);
+        try {
+          const metadata = await stat(path);
+          if (Date.now() - metadata.mtimeMs < CAPTURE_MARKER_STALE_MS) {
+            inFlight = true;
+          } else {
+            await rm(path, { force: true });
+          }
+        } catch {
+          // Vanished between readdir and stat.
+        }
+      }
+      return inFlight;
+    } catch {
+      return false;
+    }
   }
 
   async garbageCollect(): Promise<void> {
@@ -1419,7 +1555,7 @@ export class BlobStore {
         const fullPath = join(directory, child.name);
         if (child.isDirectory()) {
           await scanDir(fullPath);
-        } else if (child.isFile()) {
+        } else if (child.isFile() && !child.name.startsWith(".")) {
           try {
             const metadata = await stat(fullPath);
             totalBytes += metadata.size;
@@ -1577,7 +1713,10 @@ export class BlobStore {
               () => undefined,
             );
             await rm(item.filePath, { force: true }).catch(() => undefined);
-            await this.collectGarbageUnlocked(true);
+            // If a concurrent capture deferred the sweep, eviction reclaimed no
+            // bytes — continuing would destroy further sessions for nothing, so
+            // stop and let the next removal-triggered GC finish the reclamation.
+            if (!(await this.collectGarbageUnlocked(true))) break;
             currentBytes = await this.measureStoreBytes();
           }
         }

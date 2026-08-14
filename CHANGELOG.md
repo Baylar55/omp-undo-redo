@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.3.3] - 2026-08-14
+
+### Performance
+
+- Scope non-Git snapshot captures and applies to a per-workspace filesystem lock instead of the single global store lock, so a slow capture in one workspace, session, or process no longer blocks snapshots, applies, or garbage collection in another.
+- Hold the store lock only around tree-manifest and ref publication; workspace walks (reads, content-addressed blob writes, and journal recovery) run outside it. GC defers its sweep while any capture is in flight — tracked by heartbeat markers in the shared store — so blobs a walk just wrote are never collected before the ref that references them is published, and captures still reclaim unreferenced data immediately when no capture is running.
+
 ## [1.3.2] - 2026-08-13
 
 ### Performance
