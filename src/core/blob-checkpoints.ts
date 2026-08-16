@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import type { BlobApplyResult, BlobStore } from "./blob-store.js";
+import type { BlobApplyResult, BlobStore } from "./blob-store/index.js";
 import type {
   BlobCheckpoint,
   FileCheckpointUnavailableReason,

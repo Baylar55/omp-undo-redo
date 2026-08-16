@@ -9,7 +9,7 @@ import {
   releaseBlobCheckpoint,
   retainBlobCheckpointForResume,
 } from "../src/core/blob-checkpoints.js";
-import { BlobStore } from "../src/core/blob-store.js";
+import { BlobStore } from "../src/core/blob-store/index.js";
 
 const temporaryDirectories: string[] = [];
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");

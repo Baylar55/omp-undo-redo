@@ -16,7 +16,7 @@ import {
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { BlobStore } from "../src/core/blob-store.js";
+import { BlobStore } from "../src/core/blob-store/index.js";
 
 const temporaryDirectories: string[] = [];
 

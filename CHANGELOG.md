@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.4.0] - 2026-08-17
+
+### Changed
+
+- Internal refactor: split the 1756-line `BlobStore` class into a facade plus single-concern modules under `src/core/blob-store/` (locking, liveness/leases, workspace walking, apply/rollback, refs, manifest codec, size accounting, garbage collection). No behavior change; the public API surface is unchanged.
+- Note for deep importers: the module previously at `src/core/blob-store.ts` (built to `dist/core/blob-store.js`) now lives at `src/core/blob-store/index.ts` (built to `dist/core/blob-store/index.js`). Imports from the package root are unaffected.
+- Declare the public entry points explicitly with a `package.json` `exports` map (the package root and `./package.json`). Deep imports into `dist/` were never documented; they now fail with Node's standard `ERR_PACKAGE_PATH_NOT_EXPORTED` instead of silently depending on internal file layout.
+
 ## [1.3.3] - 2026-08-14
 
 ### Performance

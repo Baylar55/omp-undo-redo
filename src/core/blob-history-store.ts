@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { blobStoreRootDirectory } from "./blob-store.js";
-import type { BlobStore } from "./blob-store.js";
+import { blobStoreRootDirectory } from "./blob-store/index.js";
+import type { BlobStore } from "./blob-store/index.js";
 import { checkpointNamespace } from "./checkpoints.js";
 import { effectiveLeaf, entryExists, expectedLeaf } from "./session-tree-utils.js";
 import type {

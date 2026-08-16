@@ -12,7 +12,7 @@ import type {
   TurnCheckpoint,
 } from "./types.js";
 import { applyCheckpoint, releaseCheckpoints, type CheckpointApplyResult } from "./checkpoints.js";
-import type { BlobApplyResult, BlobStore } from "./blob-store.js";
+import type { BlobApplyResult, BlobStore } from "./blob-store/index.js";
 
 export type NavigationOutcome = NavigationResult;
 

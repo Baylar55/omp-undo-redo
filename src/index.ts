@@ -9,7 +9,7 @@ import {
   resolveRuntimeScope,
 } from "./core/checkpoint-owners.js";
 import { createGitRunner } from "./core/git-runner.js";
-import { BlobStore, blobStoreRootDirectory } from "./core/blob-store.js";
+import { BlobStore, blobStoreRootDirectory } from "./core/blob-store/index.js";
 import {
   finishAfterTurnBlob,
   prepareBeforeTurnBlob,
