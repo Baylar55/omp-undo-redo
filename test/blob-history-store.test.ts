@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BlobHistoryStore } from "../src/core/blob-history-store.js";
-import { BlobStore } from "../src/core/blob-store.js";
+import { BlobStore } from "../src/core/blob-store/index.js";
 import { checkpointNamespace } from "../src/core/checkpoints.js";
 import type { BlobCheckpoint, SessionEntryLike, SessionReader } from "../src/core/types.js";
 

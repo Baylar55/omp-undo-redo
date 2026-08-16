@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
-import { BlobStore } from "../dist/core/blob-store.js";
+import { BlobStore } from "../dist/core/blob-store/index.js";
 
 const [fileCountRaw, directoryCountRaw, concurrencyRaw] = process.argv.slice(2);
 const fileCount = Number.parseInt(fileCountRaw ?? "20000", 10);
