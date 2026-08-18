@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import type { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -11,10 +10,6 @@ import { historyDirectory } from "../src/core/history-store.js";
 import type { BlobStore } from "../src/core/blob-store/index.js";
 import type { GitRunner } from "../src/core/types.js";
 import { resolveBackend } from "../src/index.js";
-
-function sha256Hex(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
 
 function blobStoreStub() {
   const calls: string[] = [];
@@ -43,7 +38,7 @@ describe("private per-workspace git repositories", () => {
       if (!repository) return;
 
       const canonical = await realpath(cwd);
-      const expected = join(storeRoot, "repos", `${sha256Hex(canonical)}.git`);
+      const expected = privateRepositoryPath(storeRoot, cwd);
       expect(resolve(repository.gitDir)).toBe(resolve(expected));
       expect(repository.worktree).toBe(canonical);
       expect(repository.commonDir).toBe(repository.gitDir);

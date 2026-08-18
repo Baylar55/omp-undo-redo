@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import type { SessionEntryLike } from "./core/types.js";
 import { runRedo } from "./commands/redo.js";
 import { runUndo } from "./commands/undo.js";
@@ -8,7 +9,8 @@ import {
   resolvePersistentHostId,
   resolveRuntimeScope,
 } from "./core/checkpoint-owners.js";
-import { createGitRunner } from "./core/git-runner.js";
+import { createEnvGitRunner, createGitRunner } from "./core/git-runner.js";
+import { ensurePrivateGitRepository } from "./core/private-repo.js";
 import { BlobStore, blobStoreRootDirectory } from "./core/blob-store/index.js";
 import {
   finishAfterTurnBlob,
@@ -40,6 +42,7 @@ import {
 import type {
   ActionId,
   GitRepository,
+  GitRunner,
   NavigationState,
   PendingTurnCheckpoint,
   SessionOnlyCheckpoint,
@@ -81,10 +84,18 @@ function readRetentionConfig(): { retentionDays: number; maxStoreBytes: number }
   };
 }
 
-type FileBackend =
+export type FileBackend =
   | { kind: "git"; repository: GitRepository; git: ReturnType<typeof createGitRunner> }
   | { kind: "blob"; store: BlobStore; workspaceRoot: string }
   | { kind: "session"; reason: "git_unavailable" | "not_repository" | "repository_unresolvable" };
+
+/** Per-controller private-repo state: a ready entry carries the repository and
+ *  the env runner (GIT_DIR fixed), with `ready` resolving true once init
+ *  completes; a `failure` entry records a failed init so blob fallback is
+ *  reused without retrying. Keyed by canonical cwd (private) or commonDir
+ *  (git mode). */
+export type PrivateRepoEntry =
+  { repository?: GitRepository; git?: GitRunner; ready: Promise<boolean> } | { failure: true };
 
 type HistoryWriter = { save(state: NavigationState): Promise<void> };
 
@@ -104,16 +115,88 @@ async function hasGitMarkerInAncestors(cwd: string): Promise<boolean> {
   }
 }
 
-async function resolveBackend(
+function startPrivateRepo(git: GitRunner, canonical: string): PrivateRepoEntry {
+  const storeRoot = blobStoreRootDirectory();
+  const entry: PrivateRepoEntry = {
+    repository: undefined,
+    git: undefined,
+    ready: Promise.resolve(false),
+  };
+  entry.ready = (async (): Promise<boolean> => {
+    try {
+      const repository = await ensurePrivateGitRepository(git, canonical, storeRoot);
+      if (!repository) return false;
+      entry.repository = repository;
+      entry.git = createEnvGitRunner(canonical, { GIT_DIR: repository.gitDir });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  return entry;
+}
+
+async function resolvePrivateGit(
+  cwd: string,
+  git: GitRunner,
+  privateRepositories: Map<string, PrivateRepoEntry>,
+): Promise<{ repository: GitRepository; git: GitRunner } | null> {
+  const { realpath } = await import("node:fs/promises");
+  let canonical: string;
+  try {
+    canonical = await realpath(cwd);
+  } catch {
+    canonical = resolve(cwd);
+  }
+  const existing = privateRepositories.get(canonical);
+  if (existing) {
+    if ("failure" in existing) return null;
+    const ok = await existing.ready;
+    return ok && existing.repository && existing.git
+      ? { repository: existing.repository, git: existing.git }
+      : null;
+  }
+  const entry = startPrivateRepo(git, canonical);
+  privateRepositories.set(canonical, entry);
+  if ("failure" in entry) return null;
+  const ok = await entry.ready;
+  if (!ok || !entry.repository || !entry.git) {
+    privateRepositories.set(canonical, { failure: true });
+    return null;
+  }
+  return { repository: entry.repository, git: entry.git };
+}
+
+export async function resolveBackend(
   cwd: string,
   blobStoreFor: (workspaceRoot: string) => BlobStore,
+  privateGitEnabled = process.env.OMP_UNDO_REDO_PRIVATE_GIT !== "0",
+  privateRepositories: Map<string, PrivateRepoEntry> = new Map(),
 ): Promise<FileBackend> {
   const git = createGitRunner(cwd);
   const resolved = await resolveRepository(git);
-  if ("repository" in resolved) return { kind: "git", repository: resolved.repository, git };
+  if ("repository" in resolved) {
+    const repository = resolved.repository;
+    const existing = privateRepositories.get(repository.commonDir);
+    if (existing && "git" in existing && existing.git) {
+      return { kind: "git", repository, git: existing.git };
+    }
+    privateRepositories.set(repository.commonDir, {
+      repository,
+      git,
+      ready: Promise.resolve(true),
+    });
+    return { kind: "git", repository, git };
+  }
   const marker = await hasGitMarkerInAncestors(cwd);
   if (resolved.reason !== "not_repository" && !(resolved.reason === "git_unavailable" && !marker)) {
     return { kind: "session", reason: resolved.reason };
+  }
+  if (resolved.reason === "not_repository" && privateGitEnabled) {
+    const privateBackend = await resolvePrivateGit(cwd, git, privateRepositories);
+    if (privateBackend) {
+      return { kind: "git", repository: privateBackend.repository, git: privateBackend.git };
+    }
   }
   try {
     const { realpath } = await import("node:fs/promises");
@@ -130,6 +213,7 @@ function createNavigation(
   store: HistoryWriter | undefined,
   runtimeStore: RuntimeActionStateStore,
   backend?: FileBackend,
+  gitForRepository?: (repository: GitRepository) => GitRunner,
 ): SessionNavigation {
   const manager = ctx.sessionManager;
   const blobDependencies =
@@ -145,8 +229,8 @@ function createNavigation(
       getBranch: (fromId) => manager.getBranch(fromId),
       getEntry: (id) => manager.getEntry(id),
     },
-    createGitRunner(ctx.cwd),
-    (repository) => createGitRunner(repository.worktree),
+    backend?.kind === "git" ? backend.git : createGitRunner(ctx.cwd),
+    gitForRepository ?? ((repository) => createGitRunner(repository.worktree)),
     async (state) => {
       const activeSessionLeaf = manager.getLeafId();
       await Promise.allSettled([
@@ -161,6 +245,14 @@ function createNavigation(
 
 export default function ompUndoRedo(pi: ExtensionAPI): void {
   const retentionConfig = readRetentionConfig();
+  const privateGitEnabled = process.env.OMP_UNDO_REDO_PRIVATE_GIT !== "0";
+  const privateRepositories = new Map<string, PrivateRepoEntry>();
+  function gitRunnerFor(repository: GitRepository): GitRunner {
+    const entry =
+      privateRepositories.get(repository.commonDir) ?? privateRepositories.get(repository.worktree);
+    if (entry && "git" in entry && entry.git) return entry.git;
+    return createGitRunner(repository.worktree);
+  }
   const ownerRegistry = new CheckpointOwnerRegistry({
     resolveHostIdentity: resolvePersistentHostId,
     resolveRuntimeScope,
@@ -255,7 +347,12 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       const previous = navigations.get(sessionId);
       navigations.delete(sessionId);
       if (previous) await previous.suspend();
-      const backend = await resolveBackend(ctx.cwd, (workspaceRoot) => blobStoreFor(workspaceRoot));
+      const backend = await resolveBackend(
+        ctx.cwd,
+        (workspaceRoot) => blobStoreFor(workspaceRoot),
+        privateGitEnabled,
+        privateRepositories,
+      );
       backends.set(sessionId, backend);
 
       if (
@@ -278,7 +375,14 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
           : backend.kind === "blob"
             ? new BlobHistoryStore(sessionId, backend.workspaceRoot, backend.store)
             : undefined;
-      const navigation = createNavigation(ctx, sessionId, store, runtimeStore, backend);
+      const navigation = createNavigation(
+        ctx,
+        sessionId,
+        store,
+        runtimeStore,
+        backend,
+        gitRunnerFor,
+      );
       const loadResult = store ? await store.load(ctx.sessionManager) : null;
       let restored: NavigationState | null = null;
       if (loadResult?.status === "loaded") {
@@ -357,10 +461,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
 
   async function releasePending(pendingCheckpoint: PendingTurnCheckpoint): Promise<void> {
     if (pendingCheckpoint.kind === "git") {
-      await releasePendingCheckpoint(
-        createGitRunner(pendingCheckpoint.repository.worktree),
-        pendingCheckpoint,
-      );
+      await releasePendingCheckpoint(gitRunnerFor(pendingCheckpoint.repository), pendingCheckpoint);
       return;
     }
     if (pendingCheckpoint.kind === "blob") {
@@ -473,7 +574,12 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
 
       const backend =
         backends.get(sessionId) ??
-        (await resolveBackend(typed.cwd, (workspaceRoot) => blobStoreFor(workspaceRoot)));
+        (await resolveBackend(
+          typed.cwd,
+          (workspaceRoot) => blobStoreFor(workspaceRoot),
+          privateGitEnabled,
+          privateRepositories,
+        ));
       backends.set(sessionId, backend);
       const prepared =
         backend.kind === "git"
@@ -522,27 +628,24 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
         };
       } else if (before.kind === "git") {
         const result = await finishAfterTurn(
-          createGitRunner(before.repository.worktree),
+          gitRunnerFor(before.repository),
           before,
           before.parentLeafId,
           typed.sessionManager.getLeafId(),
         );
         if (result.status === "git") {
           if (closing) {
-            await releaseCheckpoint(
-              createGitRunner(result.checkpoint.repository.worktree),
-              result.checkpoint,
-            );
+            await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
             return;
           }
           const retained = await retainCheckpointForResume(
-            createGitRunner(result.checkpoint.repository.worktree),
+            gitRunnerFor(result.checkpoint.repository),
             sessionId,
             result.checkpoint,
           );
           const nav =
             (await ensureNavigation(typed)) ??
-            createNavigation(typed, sessionId, undefined, runtimeStore);
+            createNavigation(typed, sessionId, undefined, runtimeStore, undefined, gitRunnerFor);
           navigations.set(sessionId, nav);
           await nav.recordTurnEnd(retained);
           return;
@@ -572,7 +675,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
           if (retained) {
             const nav =
               (await ensureNavigation(typed)) ??
-              createNavigation(typed, sessionId, undefined, runtimeStore, backend);
+              createNavigation(typed, sessionId, undefined, runtimeStore, backend, gitRunnerFor);
             navigations.set(sessionId, nav);
             await nav.recordTurnEnd(retained);
             return;
@@ -595,7 +698,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       }
       const nav =
         (await ensureNavigation(typed)) ??
-        createNavigation(typed, sessionId, undefined, runtimeStore);
+        createNavigation(typed, sessionId, undefined, runtimeStore, undefined, gitRunnerFor);
       navigations.set(sessionId, nav);
       await nav.recordTurnEnd(completed);
     }),
