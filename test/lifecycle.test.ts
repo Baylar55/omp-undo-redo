@@ -562,6 +562,118 @@ describe("resumed session history", () => {
     }
   });
 
+  it("restores multi-turn undo and redo checkpoints across runtime restarts when undone turns exist", async () => {
+    const cwd = await makeRepository();
+    const sessionId = "resumed-multi-turn-session";
+    const p1: TestEntry = {
+      id: "p1",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const r1: TestEntry = {
+      id: "r1",
+      parentId: p1.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    const p2: TestEntry = {
+      id: "p2",
+      parentId: r1.id,
+      type: "message",
+      message: { role: "user" },
+    };
+    const r2: TestEntry = {
+      id: "r2",
+      parentId: p2.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    try {
+      const firstApi = new FakeExtensionApi();
+      ompUndoRedo(firstApi as never);
+      const first = context(cwd, sessionId);
+      first.leaf = p1.id;
+      first.branch = [p1];
+      first.entries = [p1];
+      await firstApi.emit("session_start", first);
+
+      // Turn 1
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "turn1\n");
+      first.leaf = r1.id;
+      first.branch = [p1, r1];
+      first.entries = [p1, r1];
+      await firstApi.emit("agent_end", first);
+
+      // Turn 2
+      first.leaf = p2.id;
+      first.branch = [p1, r1, p2];
+      first.entries = [p1, r1, p2];
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "turn2\n");
+      first.leaf = r2.id;
+      first.branch = [p1, r1, p2, r2];
+      first.entries = [p1, r1, p2, r2];
+      await firstApi.emit("agent_end", first);
+
+      // Undo turn 2 before shutdown
+      first.navigateTree = async (targetId) => {
+        first.leaf = targetId;
+        first.branch = targetId === p2.id ? [p1, r1, p2] : [p1];
+        return { cancelled: false };
+      };
+      await firstApi.runCommand("undo", first);
+      expect(first.leaf).toBe(p2.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn1\n");
+      await firstApi.emit("session_shutdown", first);
+
+      // Resume in a fresh extension process at leaf p2
+      const secondApi = new FakeExtensionApi();
+      ompUndoRedo(secondApi as never);
+      const second = context(cwd, sessionId);
+      second.leaf = p2.id;
+      second.branch = [p1, r1, p2];
+      second.entries = [p1, r1, p2, r2];
+      second.navigateTree = async (targetId) => {
+        second.leaf = targetId;
+        if (targetId === r2.id) second.branch = [p1, r1, p2, r2];
+        else if (targetId === p2.id) second.branch = [p1, r1, p2];
+        else if (targetId === p1.id) second.branch = [p1];
+        return { cancelled: false };
+      };
+      await secondApi.emit("session_start", second);
+
+      // Redo turn 2
+      await secondApi.runCommand("redo", second);
+      expect(second.leaf).toBe(r2.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn2\n");
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored.",
+      );
+
+      // Undo turn 2 again
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(p2.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn1\n");
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored.",
+      );
+
+      // Undo turn 1
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(p1.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored.",
+      );
+
+      await secondApi.emit("session_shutdown", second);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("reconstructs conversation-only undo when no durable file history exists", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-resumed-session-only-"));
     const prompt: TestEntry = {

@@ -2,6 +2,17 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.4.1] - 2026-08-18
+
+### Fixed
+
+- Restore the undo/redo cursor on resume when the session was left at an undone turn or at a tree position browsed away from the cursor. Previously, resuming such a session silently discarded the whole durable file history and fell back to conversation-only undo. Completed Git and non-Git checkpoints plus the undo/redo cursor now survive a normal terminal restart in every multi-turn case, matching the README guarantee.
+- Treat the persisted history state as authoritative when all of its checkpoints still exist in the session tree, instead of re-deriving the cursor from the current tree leaf. Browsing the tree does not move the undo/redo cursor or the file state, so a leaf-based cursor guess conflicted with the workspace snapshot state.
+
+### Changed
+
+- Remove the now-unused leaf-matching load scan and the dead `expectedLeaf`/`matchesEffectiveLeaf` helpers from the history stores.
+
 ## [1.4.0] - 2026-08-17
 
 ### Changed

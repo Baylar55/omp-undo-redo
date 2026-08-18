@@ -13,18 +13,8 @@ import type {
   SessionReader,
   TurnCheckpoint,
 } from "./types.js";
-import {
-  effectiveLeaf,
-  entryExists,
-  expectedLeaf,
-  isSessionExitEntry,
-} from "./session-tree-utils.js";
-export {
-  effectiveLeaf,
-  entryExists,
-  expectedLeaf,
-  isSessionExitEntry,
-} from "./session-tree-utils.js";
+import { effectiveLeaf, entryExists, isSessionExitEntry } from "./session-tree-utils.js";
+export { effectiveLeaf, entryExists, isSessionExitEntry } from "./session-tree-utils.js";
 
 const HISTORY_SCHEMA_CURRENT = 2;
 const ACCEPTED_SCHEMAS = new Set([1, 2]);
@@ -382,13 +372,15 @@ export class SessionHistoryStore {
           (checkpoint) =>
             !entryExists(reader, checkpoint.parentLeafId) ||
             !entryExists(reader, checkpoint.leafId),
-        ) ||
-        expectedLeaf(state) !== effectiveLeaf(reader)
+        )
       )
         return { status: "unavailable" };
 
-      await this.save(state).catch(() => undefined);
+      if (checkpoints.length === 0 && effectiveLeaf(reader) !== null) {
+        return { status: "unavailable" };
+      }
 
+      await this.save(state).catch(() => undefined);
       return { status: "loaded", state };
     } catch {
       return { status: "unavailable" };

@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { blobStoreRootDirectory } from "./blob-store/index.js";
 import type { BlobStore } from "./blob-store/index.js";
 import { checkpointNamespace } from "./checkpoints.js";
-import { effectiveLeaf, entryExists, expectedLeaf } from "./session-tree-utils.js";
+import { effectiveLeaf, entryExists } from "./session-tree-utils.js";
 import type {
   BlobCheckpoint,
   ExpirationTombstone,
@@ -231,13 +231,15 @@ export class BlobHistoryStore {
           (checkpoint) =>
             !entryExists(reader, checkpoint.parentLeafId) ||
             !entryExists(reader, checkpoint.leafId),
-        ) ||
-        expectedLeaf(state) !== effectiveLeaf(reader)
+        )
       )
         return { status: "unavailable" };
 
-      await this.save(state).catch(() => undefined);
+      if (checkpoints.length === 0 && effectiveLeaf(reader) !== null) {
+        return { status: "unavailable" };
+      }
 
+      await this.save(state).catch(() => undefined);
       return { status: "loaded", state };
     } catch {
       return { status: "unavailable" };
