@@ -1,4 +1,4 @@
-import type { NavigationState, SessionEntryLike, SessionReader } from "./types.js";
+import type { SessionEntryLike, SessionReader } from "./types.js";
 
 export function entryExists(reader: SessionReader, id: string | null): boolean {
   return id === null || reader.getEntry(id) !== undefined;
@@ -18,11 +18,4 @@ export function effectiveLeaf(reader: SessionReader): string | null {
     leafId = entry?.parentId ?? null;
   }
   return leafId;
-}
-
-export function expectedLeaf(state: NavigationState): string | null {
-  if (state.checkpoints.length === 0) return null;
-  return state.currentIndex >= 0
-    ? state.checkpoints[state.currentIndex].leafId
-    : state.checkpoints[0].parentLeafId;
 }

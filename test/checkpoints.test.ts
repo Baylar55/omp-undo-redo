@@ -1123,4 +1123,99 @@ describe("history-safe Git checkpoints", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("loads multi-turn Git session history when active leaf is at undone prompt boundary", async () => {
+    const { cwd, git } = await makeRepo();
+    const repository = {
+      worktree: cwd,
+      gitDir: join(cwd, ".git"),
+      commonDir: join(cwd, ".git"),
+    };
+    const sessionId = "chk-multi-undo-session";
+    const sessionHash = checkpointNamespace(sessionId);
+
+    const p1: SessionEntryLike = {
+      id: "p1",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const r1: SessionEntryLike = {
+      id: "r1",
+      parentId: "p1",
+      type: "message",
+      message: { role: "assistant" },
+    };
+    const p2: SessionEntryLike = {
+      id: "p2",
+      parentId: "r1",
+      type: "message",
+      message: { role: "user" },
+    };
+    const r2: SessionEntryLike = {
+      id: "r2",
+      parentId: "p2",
+      type: "message",
+      message: { role: "assistant" },
+    };
+
+    try {
+      await initializeBranch(git, cwd);
+      const { SessionHistoryStore } = await import("../src/core/history-store.js");
+      const store = new SessionHistoryStore(sessionId, repository, git);
+
+      // Create valid refs for two checkpoints
+      const head = (await git(["rev-parse", "HEAD"])).stdout.trim();
+      const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+      await git(["update-ref", `${refPrefix}c1/before`, head]);
+      await git(["update-ref", `${refPrefix}c1/after`, head]);
+      await git(["update-ref", `${refPrefix}c2/before`, head]);
+      await git(["update-ref", `${refPrefix}c2/after`, head]);
+
+      const c1: TurnCheckpoint = {
+        kind: "git",
+        repository,
+        beforeRef: `${refPrefix}c1/before`,
+        beforeHash: head,
+        afterRef: `${refPrefix}c1/after`,
+        afterHash: head,
+        parentLeafId: "p1",
+        leafId: "r1",
+      };
+      const c2: TurnCheckpoint = {
+        kind: "git",
+        repository,
+        beforeRef: `${refPrefix}c2/before`,
+        beforeHash: head,
+        afterRef: `${refPrefix}c2/after`,
+        afterHash: head,
+        parentLeafId: "p2",
+        leafId: "r2",
+      };
+
+      // State saved after undoing Turn 2 (currentIndex = 0, sitting at p2)
+      await store.save({
+        checkpoints: [c1, c2],
+        currentIndex: 0,
+      });
+
+      // Reader is sitting at p2 (undone prompt)
+      const multiReader: SessionReader = {
+        getLeafId: () => "p2",
+        getBranch: () => [p1, r1, p2],
+        getEntry: (id) => [p1, r1, p2, r2].find((e) => e.id === id),
+      };
+
+      const loaded = await store.load(multiReader);
+      expect(loaded).toEqual({
+        status: "loaded",
+        state: {
+          checkpoints: [c1, c2],
+          currentIndex: 0,
+        },
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
