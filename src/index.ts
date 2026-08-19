@@ -328,10 +328,16 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const turnStartLeafBySession = new Map<string, string | null>();
 
   /** True when `gitDir` belongs to one of our private per-workspace repos.
-   *  Guards gc/prune triggers so they can never touch a user's own repo. */
-  function isPrivateRepository(gitDir: string): boolean {
+   *  Guards gc/prune triggers so they can never touch a user's own repo.
+   *  The incoming gitDir is realpath-canonicalized before comparing so a
+   *  checkpoint recorded with a long-form path still matches a repository
+   *  whose gitDir was built from a short-form (8.3) store root or cwd —
+   *  otherwise the string compare silently fails and the gc counter never
+   *  increments (repo growth stays unbounded on such machines). */
+  async function isPrivateRepository(gitDir: string): Promise<boolean> {
+    const canonicalGitDir = await canonicalCwd(gitDir);
     for (const entry of privateRepositories.values()) {
-      if (!("failure" in entry) && entry.repository?.gitDir === gitDir) return true;
+      if (!("failure" in entry) && entry.repository?.gitDir === canonicalGitDir) return true;
     }
     return false;
   }
@@ -362,7 +368,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  on shutdown so vanished workspaces cannot leave their snapshot repos
    *  (and the file contents inside them) behind forever. */
   async function evictStalePrivateRepos(): Promise<void> {
-    const reposDir = join(blobStoreRootDirectory(), "repos");
+    const reposDir = join(await canonicalCwd(blobStoreRootDirectory()), "repos");
     let entries: string[];
     try {
       entries = await readdir(reposDir);
@@ -632,7 +638,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           if (
             checkpoint.kind === "git" &&
             checkpoint.repository.gitDir &&
-            isPrivateRepository(checkpoint.repository.gitDir)
+            (await isPrivateRepository(checkpoint.repository.gitDir))
           ) {
             const gitDir = checkpoint.repository.gitDir;
             const count = (capturesSinceGcByGitDir.get(gitDir) ?? 0) + 1;

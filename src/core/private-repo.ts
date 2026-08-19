@@ -46,9 +46,15 @@ async function canonicalCwd(cwd: string): Promise<string> {
   }
 }
 
-/** The private git dir for a workspace: `<storeRoot>/repos/<sha256(cwd)>.git`. */
+/** The private git dir for a workspace: `<storeRoot>/repos/<sha256(cwd)>.git`.
+ *  Both inputs are canonicalized here (realpath) so the result is one
+ *  deterministic long-form path regardless of how the caller spelled either
+ *  argument. Without this, a store root or cwd spelled in 8.3 short form
+ *  (e.g. `C:\Users\BAYLAR~1.SAD\...`) would yield a gitDir string that
+ *  differs from the realpath-canonicalized form recorded on checkpoints,
+ *  so `isPrivateRepository` string comparisons would silently fail. */
 export function privateRepositoryPath(storeRoot: string, cwd: string): string {
-  return join(storeRoot, "repos", `${sha256Hex(canonicalCwdSync(cwd))}.git`);
+  return join(canonicalCwdSync(storeRoot), "repos", `${sha256Hex(canonicalCwdSync(cwd))}.git`);
 }
 
 async function repoExists(gitDir: string): Promise<boolean> {

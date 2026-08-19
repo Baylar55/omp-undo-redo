@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import type { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -261,6 +262,71 @@ describe("private per-workspace git repositories", () => {
       }
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it("canonicalizes the store root so junction/8.3 alias spellings yield one gitDir", async () => {
+    // Regression for the owner-review finding: on machines whose TEMP/user dir
+    // is spelled in 8.3 short form (e.g. C:\Users\BAYLAR~1.SAD\...), the
+    // checkpoint records the realpath-canonicalized gitDir while the map entry
+    // was built from the raw store root — a string mismatch that made
+    // isPrivateRepository return false and the gc counter never increment
+    // (21 turns, 42 adds, 0 gcs). privateRepositoryPath must canonicalize
+    // BOTH inputs so every pipeline yields the same long-form path.
+    // The mixed-form probe here is a directory JUNCTION: realpath expands a
+    // junction to its target string while path.join does not — the exact
+    // 8.3-short-form shape (realpath expands, raw join keeps), reproducible
+    // on any machine without needing 8.3 short names to be enabled.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-canon-cwd-"));
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-canon-store-"));
+    const alias = join(tmpdir(), `omp-canon-alias-${process.pid}-${Date.now()}`);
+    let aliasCreated = false;
+    try {
+      try {
+        execFileSync("cmd", ["/c", "mklink", "/J", alias, storeRoot], { stdio: "ignore" });
+        aliasCreated = true;
+      } catch {
+        // Junction creation failed (filesystem without junction support):
+        // the 8.3 leg below still runs when short names are available.
+      }
+      // 8.3 short form of the same store root (%~fsI, unquoted set — a
+      // quoted set makes cmd emit a broken `F:\"C:\...` token). When
+      // short-name generation is disabled on the volume this equals the long
+      // form and the leg is a no-op; the junction leg above always forces a
+      // mixed form. The cwd needs no aliased form: it was already realpath-
+      // canonicalized on the sha side before this fix, so only the store
+      // root carries the mismatch (the owner's exact scenario).
+      let shortStoreRoot = storeRoot;
+      try {
+        shortStoreRoot = execFileSync(
+          "cmd",
+          ["/c", `for %I in (${storeRoot}) do @echo %~fsI`],
+          { encoding: "utf8" },
+        ).trim();
+      } catch {
+        // cmd unavailable or %~fsI failed: fall through to the other variants.
+      }
+      const canonical = privateRepositoryPath(storeRoot, cwd);
+      const storeForms = [
+        ...(aliasCreated ? [alias] : []),
+        ...(shortStoreRoot !== storeRoot ? [shortStoreRoot] : []),
+      ];
+      for (const storeForm of storeForms) {
+        expect(privateRepositoryPath(storeForm, cwd)).toBe(canonical);
+      }
+      // End-to-end: the repository actually created from the RAW store root
+      // and cwd must land at the canonical path, and that path must be its
+      // own realpath form — the exact comparison the checkpoint side makes.
+      const repository = await ensurePrivateGitRepository(
+        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        cwd,
+        storeRoot,
+      );
+      expect(repository?.gitDir).toBe(canonical);
+      if (repository) expect(await realpath(repository.gitDir)).toBe(repository.gitDir);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+      if (aliasCreated) await rm(alias, { recursive: true, force: true });
     }
   });
 });
