@@ -140,7 +140,7 @@ Cleanup runs automatically in the background shortly after extension startup and
 
 In Git workspaces, expiration removes the session's history refs under `refs/omp-undo-redo/history/<sessionHash>/` and its history file. The referenced commit objects become unreachable and are reclaimed later by the repository's normal `git gc`; `.git` size does not shrink immediately. No storage cap applies to Git object storage.
 
-In non-Git workspaces, the Private-Git mode expires the session's refs and history file inside the private repository (the referenced objects are reclaimed by that repository's normal `git gc`); the non-Git blob store fallback expires the session's refs and history file, then garbage-collects orphaned blobs and tree manifests from `~/.omp/omp-undo-redo/`. When the storage cap is set, the oldest inactive sessions are evicted iteratively until the store is back under the cap.
+In non-Git workspaces, the Private-Git mode expires the session's refs and history file inside the private repository; a background `git gc --prune=now` runs after every 20 captured snapshots (and on shutdown, when captures are due) so the unreferenced objects are reclaimed promptly instead of accumulating, and stale private repositories are evicted when their workspace disappears. The non-Git blob store fallback expires the session's refs and history file, then garbage-collects orphaned blobs and tree manifests from `~/.omp/omp-undo-redo/`. When the storage cap is set, the oldest inactive sessions are evicted iteratively until the store is back under the cap.
 
 ## Limitations
 

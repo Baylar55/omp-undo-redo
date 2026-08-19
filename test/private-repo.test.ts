@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEnvGitRunner, createGitRunner } from "../src/core/git-runner.js";
+import { createEnvGitRunner } from "../src/core/git-runner.js";
 import { ensurePrivateGitRepository, privateRepositoryPath } from "../src/core/private-repo.js";
 import { createSnapshotCommit } from "../src/core/checkpoints.js";
 import { historyDirectory } from "../src/core/history-store.js";
@@ -32,8 +32,11 @@ describe("private per-workspace git repositories", () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-repo-"));
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
     try {
-      const git = createGitRunner(cwd);
-      const repository = await ensurePrivateGitRepository(git, cwd, storeRoot);
+      const repository = await ensurePrivateGitRepository(
+        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        cwd,
+        storeRoot,
+      );
       expect(repository).not.toBeNull();
       if (!repository) return;
 
@@ -62,7 +65,11 @@ describe("private per-workspace git repositories", () => {
         expect(result.stdout.trim()).toBe(value);
       }
 
-      const second = await ensurePrivateGitRepository(git, cwd, storeRoot);
+      const second = await ensurePrivateGitRepository(
+        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        cwd,
+        storeRoot,
+      );
       expect(second).not.toBeNull();
       expect(second!.gitDir).toBe(repository.gitDir);
       for (const [key, value] of configs) {
@@ -83,7 +90,7 @@ describe("private per-workspace git repositories", () => {
       vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", storeRoot);
       vi.stubEnv("OMP_UNDO_REDO_PRIVATE_GIT", "1");
       const { blobStoreFor } = blobStoreStub();
-      const backend = await resolveBackend(cwd, blobStoreFor);
+      const backend = await resolveBackend(cwd, blobStoreFor, true);
       expect(backend.kind).toBe("git");
       if (backend.kind !== "git") return;
       const canonical = await realpath(cwd);
@@ -108,7 +115,7 @@ describe("private per-workspace git repositories", () => {
       vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", storeRoot);
       vi.stubEnv("OMP_UNDO_REDO_PRIVATE_GIT", "0");
       const { blobStoreFor, calls } = blobStoreStub();
-      const backend = await resolveBackend(cwd, blobStoreFor);
+      const backend = await resolveBackend(cwd, blobStoreFor, false);
       expect(backend.kind).toBe("blob");
       if (backend.kind !== "blob") return;
       const canonical = await realpath(cwd);
@@ -129,7 +136,7 @@ describe("private per-workspace git repositories", () => {
       vi.stubEnv("OMP_UNDO_REDO_PRIVATE_GIT", "1");
       await writeFile(join(storeRoot, "repos"), "not a directory");
       const { blobStoreFor, calls } = blobStoreStub();
-      const backend = await resolveBackend(cwd, blobStoreFor);
+      const backend = await resolveBackend(cwd, blobStoreFor, true);
       expect(backend.kind).toBe("blob");
       if (backend.kind !== "blob") return;
       const canonical = await realpath(cwd);
@@ -146,8 +153,11 @@ describe("private per-workspace git repositories", () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-env-"));
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
     try {
-      const git = createGitRunner(cwd);
-      const repository = await ensurePrivateGitRepository(git, cwd, storeRoot);
+      const repository = await ensurePrivateGitRepository(
+        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        cwd,
+        storeRoot,
+      );
       expect(repository).not.toBeNull();
       if (!repository) return;
 
@@ -191,8 +201,11 @@ describe("private per-workspace git repositories", () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-ignore-"));
     try {
       const storeRoot = join(cwd, ".omp");
-      const git = createGitRunner(cwd);
-      const repository = await ensurePrivateGitRepository(git, cwd, storeRoot);
+      const repository = await ensurePrivateGitRepository(
+        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        cwd,
+        storeRoot,
+      );
       expect(repository).not.toBeNull();
       if (!repository) return;
 
@@ -212,6 +225,40 @@ describe("private per-workspace git repositories", () => {
       expect(tree.stdout).toContain("tracked.txt");
       expect(tree.stdout).not.toContain(".omp");
       expect(tree.stdout).not.toContain("node_modules");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("seeds the built-in blob ignores into the private repo exclude", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-private-exclude-"));
+    try {
+      const storeRoot = join(cwd, ".omp");
+      const repository = await ensurePrivateGitRepository(
+        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        cwd,
+        storeRoot,
+      );
+      expect(repository).not.toBeNull();
+      if (!repository) return;
+      const exclude = await readFile(join(repository.gitDir, "info", "exclude"), "utf8");
+      const entries = new Set(exclude.split(/\r?\n/));
+      // The store root is inside the worktree, so its relative entry is seeded…
+      expect(entries.has(".omp/")).toBe(true);
+      // …and so are the same built-in ignores the blob store applies.
+      for (const ignored of [
+        ".git",
+        "node_modules",
+        "dist",
+        "coverage",
+        ".omp",
+        ".next",
+        "build",
+        "out",
+        "target",
+      ]) {
+        expect(entries.has(ignored)).toBe(true);
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

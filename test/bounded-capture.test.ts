@@ -157,6 +157,60 @@ function slowAddRunnerFactory(delayMs: number): {
   return { runner, waitForAdds };
 }
 
+/** Like `slowAddRunnerFactory`, but also slows the snapshot's post-add chain
+ *  (`write-tree`/`commit-tree`/`update-ref`), so a capture stays in flight well
+ *  past any handler deadline even after `waitForAdds(1)` has confirmed the
+ *  before-snapshot content. Makes the deferred-finalize race deterministic. */
+function raceRunnerFactory(delayMs: number): {
+  runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]>;
+  waitForAdds: (n: number, timeoutMs?: number) => Promise<void>;
+} {
+  let count = 0;
+  const listeners = new Set<() => void>();
+  const waitForAdds = (n: number, timeoutMs = 8000): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const check = () => {
+        if (count >= n) {
+          cleanup();
+          resolve();
+        }
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`timed out waiting for ${n} git adds (saw ${count})`));
+      }, timeoutMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        listeners.delete(check);
+      };
+      listeners.add(check);
+      check();
+    });
+  const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (
+    cwd: string,
+    env?: Record<string, string>,
+  ): GitRunner => {
+    const inner = env ? createEnvGitRunner(cwd, env) : createGitRunner(cwd);
+    const slow: GitRunner = async (args, options) => {
+      if (args.includes("add")) {
+        const result = await inner(args, options);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        count += 1;
+        listeners.forEach((listener) => listener());
+        return result;
+      }
+      if (["write-tree", "commit-tree", "update-ref", "rev-parse"].includes(args[0] ?? "")) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        return inner(args, options);
+      }
+      return inner(args, options);
+    };
+    slow.cwd = cwd;
+    return slow;
+  };
+  return { runner, waitForAdds };
+}
+
 describe("bounded capture lifecycle", () => {
   it("returns from before_agent_start before a slow file capture finishes", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-bounded-"));
@@ -177,13 +231,20 @@ describe("bounded capture lifecycle", () => {
 
   it("finalizes a turn whose before-capture overruns the handler deadline", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-bounded-"));
-    const { runner, waitForAdds } = slowAddRunnerFactory(500);
+    const { runner, waitForAdds } = raceRunnerFactory(500);
     try {
       const pi = new FakeExtensionApi();
       ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
       const ctx = context(cwd, "bounded-session");
       await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
       await pi.emit("before_agent_start", ctx);
+      // waitForAdds(1) confirms the before-snapshot captured the pre-turn
+      // state (the add's inner already ran), so the turn's change lands
+      // deterministically AFTER the snapshot regardless of load. The slowed
+      // post-add chain keeps the capture in flight past the 200 ms handler
+      // deadline, so the finalize defers.
+      await waitForAdds(1);
       await writeFile(join(cwd, "tracked.txt"), "changed\n");
       ctx.leaf = "turn";
       await pi.emit("agent_end", ctx);
@@ -201,10 +262,61 @@ describe("bounded capture lifecycle", () => {
         }
         break;
       }
-      await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
       expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
     } finally {
       await waitForAdds(2).catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await rmRetry(cwd);
+    }
+  });
+
+  it("keeps a deferred finalize bound to its turn when a later turn starts before it settles", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-race-"));
+    const { runner, waitForAdds } = raceRunnerFactory(500);
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
+      const ctx = context(cwd, "race-session");
+      await pi.emit("session_start", ctx);
+      // Turn N: pre-turn state "base". The before-capture's add runs
+      // immediately; waitForAdds(1) confirms the snapshot content before the
+      // turn changes the file. The slowed post-add chain keeps the capture in
+      // flight well past the 200 ms handler deadline, so N's finalize defers.
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      ctx.leaf = "leafN";
+      await pi.emit("before_agent_start", ctx);
+      await waitForAdds(1);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await pi.emit("agent_end", ctx);
+      // Turn N+1 starts while N's capture is still settling. The in-flight
+      // guard must skip a new capture so a slow workspace never stacks
+      // overlapping `git add` runs.
+      ctx.leaf = "leafN1";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed-again\n");
+      await pi.emit("agent_end", ctx);
+      await waitForAdds(2);
+      // Only N's before + after adds exist — N+1's guarded turn added none.
+      await expect(waitForAdds(3, 200)).rejects.toThrow("timed out");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        await pi.runCommand("undo", ctx);
+        const message = ctx.ui.notifications.at(-1)?.message ?? "";
+        if (message.includes("Nothing to undo") || message.includes("still being captured")) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          continue;
+        }
+        break;
+      }
+      // The undo must restore N's pre-turn state — not N+1's "changed-again".
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+    } finally {
+      await waitForAdds(3).catch(() => undefined);
       await new Promise((resolve) => setTimeout(resolve, 100));
       await rmRetry(cwd);
     }

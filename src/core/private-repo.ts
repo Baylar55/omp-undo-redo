@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { createEnvGitRunner } from "./git-runner.js";
+import { DEFAULT_BLOB_IGNORES } from "./blob-store/types.js";
 import type { GitRepository, GitRunner } from "./types.js";
 
 /** Per-workspace private repositories: a non-git workspace is snapshotted
@@ -60,13 +60,16 @@ async function repoExists(gitDir: string): Promise<boolean> {
   }
 }
 
+export { canonicalCwd };
+
 /** Appends `<relative-storeRoot>/` to the private repo's info/exclude so a
  *  snapshot never captures the omp state root (which contains the private
- *  repo itself). Skipped when the store root is not inside the worktree. */
+ *  repo itself), plus the same built-in ignore list the blob store uses
+ *  (`node_modules`, `dist`, `.omp`, …) so private-git snapshots do not grow
+ *  unbounded on churning dependency/build/state directories. The store-root
+ *  entry is skipped when it is not inside the worktree; the built-in ignores
+ *  are always seeded. */
 async function ensureExclude(gitDir: string, worktree: string, storeRoot: string): Promise<void> {
-  const rel = relative(worktree, storeRoot);
-  if (!rel || rel === "." || rel.startsWith("..") || isAbsolute(rel)) return;
-  const entry = `${rel.replace(/\\/g, "/")}/`;
   const excludePath = join(gitDir, "info", "exclude");
   let content = "";
   try {
@@ -74,25 +77,35 @@ async function ensureExclude(gitDir: string, worktree: string, storeRoot: string
   } catch {
     content = "";
   }
-  if (content.split(/\r?\n/).includes(entry)) return;
+  const entries = new Set(
+    content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#")),
+  );
+  const rel = relative(worktree, storeRoot);
+  if (rel && rel !== "." && !rel.startsWith("..") && !isAbsolute(rel)) {
+    entries.add(`${rel.replace(/\\/g, "/")}/`);
+  }
+  for (const ignored of DEFAULT_BLOB_IGNORES) entries.add(ignored);
   const updated =
     content.length > 0 && !content.endsWith("\n")
-      ? `${content}\n${entry}\n`
-      : `${content}${entry}\n`;
+      ? `${content}\n${[...entries].join("\n")}\n`
+      : `${content}${[...entries].join("\n")}\n`;
   await writeFile(excludePath, updated, "utf8");
 }
 
 /** Ensures a private git repository exists for `cwd` under `storeRoot`.
  *  Idempotent: an existing repo (HEAD present) skips init/config but still
- *  gets the exclude entry. Returns null when init/config fails. */
+ *  gets the exclude entries. Returns null when init/config fails. */
 export async function ensurePrivateGitRepository(
-  git: GitRunner,
+  gitRunnerFactory: (cwd: string, env?: Record<string, string>) => GitRunner,
   cwd: string,
   storeRoot: string,
 ): Promise<GitRepository | null> {
   const worktree = await canonicalCwd(cwd);
   const gitDir = privateRepositoryPath(storeRoot, worktree);
-  const envGit = createEnvGitRunner(worktree, { GIT_DIR: gitDir });
+  const envGit = gitRunnerFactory(worktree, { GIT_DIR: gitDir });
   try {
     await mkdir(dirname(gitDir), { recursive: true });
     if (!(await repoExists(gitDir))) {
