@@ -32,7 +32,7 @@ function sha256Hex(value: string): string {
 
 function canonicalCwdSync(cwd: string): string {
   try {
-    return realpathSync(cwd);
+    return realpathSync.native(cwd);
   } catch {
     return resolve(cwd);
   }

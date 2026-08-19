@@ -297,11 +297,9 @@ describe("private per-workspace git repositories", () => {
       // root carries the mismatch (the owner's exact scenario).
       let shortStoreRoot = storeRoot;
       try {
-        shortStoreRoot = execFileSync(
-          "cmd",
-          ["/c", `for %I in (${storeRoot}) do @echo %~fsI`],
-          { encoding: "utf8" },
-        ).trim();
+        shortStoreRoot = execFileSync("cmd", ["/c", `for %I in (${storeRoot}) do @echo %~fsI`], {
+          encoding: "utf8",
+        }).trim();
       } catch {
         // cmd unavailable or %~fsI failed: fall through to the other variants.
       }
