@@ -17,6 +17,41 @@ export interface GitRunnerDependencies {
   terminationGraceMs?: number;
 }
 
+async function runExec(
+  cwd: string,
+  args: string[],
+  options: NonNullable<Parameters<GitRunner>[1]> | undefined,
+  env: Record<string, string | undefined>,
+): Promise<ChildResult> {
+  try {
+    const result = await execFileAsync("git", args, {
+      cwd,
+      env: { ...process.env, ...env },
+      windowsHide: true,
+      timeout: options?.timeoutMs,
+    });
+    return { stdout: result.stdout, stderr: result.stderr, code: 0 };
+  } catch (error) {
+    const failure = error as {
+      stdout?: string;
+      stderr?: string;
+      code?: number;
+      killed?: boolean;
+    };
+    const timedOut = options?.timeoutMs !== undefined && failure.killed === true;
+    return {
+      stdout: failure.stdout ?? "",
+      stderr: failure.stderr ?? "",
+      code: typeof failure.code === "number" ? failure.code : 1,
+      ...(timedOut
+        ? { error: "timeout" as const }
+        : typeof failure.code === "number"
+          ? {}
+          : { error: "unavailable" as const }),
+    };
+  }
+}
+
 function runStdinCommand(
   cwd: string,
   args: string[],
@@ -102,34 +137,30 @@ function runStdinCommand(
 export function createGitRunner(cwd: string, dependencies: GitRunnerDependencies = {}): GitRunner {
   const runner: GitRunner = async (args, options) => {
     if (options?.stdin !== undefined) return runStdinCommand(cwd, args, options, dependencies);
-    try {
-      const result = await execFileAsync("git", args, {
-        cwd,
-        env: { ...process.env, ...options?.env },
-        windowsHide: true,
-        timeout: options?.timeoutMs,
-      });
-      return { stdout: result.stdout, stderr: result.stderr, code: 0 };
-    } catch (error) {
-      const failure = error as {
-        stdout?: string;
-        stderr?: string;
-        code?: number;
-        killed?: boolean;
-      };
-      const timedOut = options?.timeoutMs !== undefined && failure.killed === true;
-      return {
-        stdout: failure.stdout ?? "",
-        stderr: failure.stderr ?? "",
-        code: typeof failure.code === "number" ? failure.code : 1,
-        ...(timedOut
-          ? { error: "timeout" as const }
-          : typeof failure.code === "number"
-            ? {}
-            : { error: "unavailable" as const }),
-      };
-    }
+    return runExec(cwd, args, options, options?.env ?? {});
   };
   runner.cwd = cwd;
+  return runner;
+}
+
+/** A git runner whose every invocation merges `env` after `process.env` (and
+ *  before per-invocation options.env), so the fixed env overrides the process
+ *  environment. Used for private per-workspace repositories where GIT_DIR must
+ *  be present on every command. The runner exposes `env` so callers can detect
+ *  which fixed variables it carries. */
+export function createEnvGitRunner(
+  cwd: string,
+  env: Record<string, string>,
+  dependencies: GitRunnerDependencies = {},
+): GitRunner {
+  const runner: GitRunner = async (args, options) => {
+    const mergedEnv = { ...env, ...options?.env };
+    if (options?.stdin !== undefined) {
+      return runStdinCommand(cwd, args, { ...options, env: mergedEnv }, dependencies);
+    }
+    return runExec(cwd, args, options, mergedEnv);
+  };
+  runner.cwd = cwd;
+  runner.env = env;
   return runner;
 }

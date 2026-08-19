@@ -1,5 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SessionEntryLike } from "./core/types.js";
 import { runRedo } from "./commands/redo.js";
 import { runUndo } from "./commands/undo.js";
@@ -8,7 +11,8 @@ import {
   resolvePersistentHostId,
   resolveRuntimeScope,
 } from "./core/checkpoint-owners.js";
-import { createGitRunner } from "./core/git-runner.js";
+import { createEnvGitRunner, createGitRunner } from "./core/git-runner.js";
+import { canonicalCwd, ensurePrivateGitRepository } from "./core/private-repo.js";
 import { BlobStore, blobStoreRootDirectory } from "./core/blob-store/index.js";
 import {
   finishAfterTurnBlob,
@@ -40,6 +44,7 @@ import {
 import type {
   ActionId,
   GitRepository,
+  GitRunner,
   NavigationState,
   PendingTurnCheckpoint,
   SessionOnlyCheckpoint,
@@ -81,10 +86,55 @@ function readRetentionConfig(): { retentionDays: number; maxStoreBytes: number }
   };
 }
 
-type FileBackend =
+export type FileBackend =
   | { kind: "git"; repository: GitRepository; git: ReturnType<typeof createGitRunner> }
   | { kind: "blob"; store: BlobStore; workspaceRoot: string }
   | { kind: "session"; reason: "git_unavailable" | "not_repository" | "repository_unresolvable" };
+
+export type OmpUndoRedoDependencies = {
+  /** Overrides how git runners are created, letting hosts and tests inject
+   *  behavior (e.g. slowing captures to exercise the bounded handler path).
+   *  Receives the canonical worktree and an optional fixed env (used for
+   *  private per-workspace repositories). */
+  gitRunnerFactory?: (cwd: string, env?: Record<string, string>) => GitRunner;
+  /** How long the before_agent_start / agent_end / undo / redo handlers wait
+   *  for an in-flight checkpoint capture before returning without it. The
+   *  capture keeps running and the turn is finalized when it settles. */
+  captureDeadlineMs?: number;
+};
+
+export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
+
+function defaultGitRunnerFactory(cwd: string, env?: Record<string, string>): GitRunner {
+  return env ? createEnvGitRunner(cwd, env) : createGitRunner(cwd);
+}
+
+async function awaitWithDeadline<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<{ value: T | undefined; timedOut: boolean }> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<{ timedOut: true; value: undefined }>((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true, value: undefined }), Math.max(1, ms));
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ timedOut: false as const, value })),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Per-controller private-repo state: a ready entry carries the repository and
+ *  the env runner (GIT_DIR fixed), with `ready` resolving true once init
+ *  completes; a `failure` entry records a failed init so blob fallback is
+ *  reused without retrying. Keyed by canonical cwd (private) or commonDir
+ *  (git mode). */
+export type PrivateRepoEntry =
+  { repository?: GitRepository; git?: GitRunner; ready: Promise<boolean> } | { failure: true };
 
 type HistoryWriter = { save(state: NavigationState): Promise<void> };
 
@@ -104,16 +154,96 @@ async function hasGitMarkerInAncestors(cwd: string): Promise<boolean> {
   }
 }
 
-async function resolveBackend(
+function startPrivateRepo(
+  canonical: string,
+  gitRunnerFactory: (
+    cwd: string,
+    env?: Record<string, string>,
+  ) => GitRunner = defaultGitRunnerFactory,
+): PrivateRepoEntry {
+  const storeRoot = blobStoreRootDirectory();
+  const entry: PrivateRepoEntry = {
+    repository: undefined,
+    git: undefined,
+    ready: Promise.resolve(false),
+  };
+  entry.ready = (async (): Promise<boolean> => {
+    try {
+      const repository = await ensurePrivateGitRepository(gitRunnerFactory, canonical, storeRoot);
+      if (!repository) return false;
+      entry.repository = repository;
+      entry.git = gitRunnerFactory(canonical, { GIT_DIR: repository.gitDir });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  return entry;
+}
+
+async function resolvePrivateGit(
+  cwd: string,
+  git: GitRunner,
+  privateRepositories: Map<string, PrivateRepoEntry>,
+  gitRunnerFactory: (
+    cwd: string,
+    env?: Record<string, string>,
+  ) => GitRunner = defaultGitRunnerFactory,
+): Promise<{ repository: GitRepository; git: GitRunner } | null> {
+  const canonical = await canonicalCwd(cwd);
+  const existing = privateRepositories.get(canonical);
+  if (existing) {
+    if ("failure" in existing) return null;
+    const ok = await existing.ready;
+    return ok && existing.repository && existing.git
+      ? { repository: existing.repository, git: existing.git }
+      : null;
+  }
+  const entry = startPrivateRepo(canonical, gitRunnerFactory);
+  privateRepositories.set(canonical, entry);
+  if ("failure" in entry) return null;
+  const ok = await entry.ready;
+  if (!ok || !entry.repository || !entry.git) {
+    privateRepositories.set(canonical, { failure: true });
+    return null;
+  }
+  return { repository: entry.repository, git: entry.git };
+}
+
+export async function resolveBackend(
   cwd: string,
   blobStoreFor: (workspaceRoot: string) => BlobStore,
+  privateGitEnabled: boolean,
+  privateRepositories: Map<string, PrivateRepoEntry> = new Map(),
+  gitRunnerFactory: (
+    cwd: string,
+    env?: Record<string, string>,
+  ) => GitRunner = defaultGitRunnerFactory,
 ): Promise<FileBackend> {
-  const git = createGitRunner(cwd);
+  const git = gitRunnerFactory(cwd);
   const resolved = await resolveRepository(git);
-  if ("repository" in resolved) return { kind: "git", repository: resolved.repository, git };
+  if ("repository" in resolved) {
+    const repository = resolved.repository;
+    const existing = privateRepositories.get(repository.commonDir);
+    if (existing && "git" in existing && existing.git) {
+      return { kind: "git", repository, git: existing.git };
+    }
+    privateRepositories.set(repository.commonDir, {
+      repository,
+      git,
+      ready: Promise.resolve(true),
+    });
+    return { kind: "git", repository, git };
+  }
   const marker = await hasGitMarkerInAncestors(cwd);
   if (resolved.reason !== "not_repository" && !(resolved.reason === "git_unavailable" && !marker)) {
     return { kind: "session", reason: resolved.reason };
+  }
+  if (resolved.reason === "not_repository" && privateGitEnabled) {
+    const privateBackend = await resolvePrivateGit(cwd, git, privateRepositories, gitRunnerFactory);
+    if (privateBackend) {
+      return { kind: "git", repository: privateBackend.repository, git: privateBackend.git };
+    }
   }
   try {
     const { realpath } = await import("node:fs/promises");
@@ -130,6 +260,11 @@ function createNavigation(
   store: HistoryWriter | undefined,
   runtimeStore: RuntimeActionStateStore,
   backend?: FileBackend,
+  gitForRepository?: (repository: GitRepository) => GitRunner,
+  gitRunnerFactory: (
+    cwd: string,
+    env?: Record<string, string>,
+  ) => GitRunner = defaultGitRunnerFactory,
 ): SessionNavigation {
   const manager = ctx.sessionManager;
   const blobDependencies =
@@ -145,8 +280,8 @@ function createNavigation(
       getBranch: (fromId) => manager.getBranch(fromId),
       getEntry: (id) => manager.getEntry(id),
     },
-    createGitRunner(ctx.cwd),
-    (repository) => createGitRunner(repository.worktree),
+    backend?.kind === "git" ? backend.git : gitRunnerFactory(ctx.cwd),
+    gitForRepository ?? ((repository) => gitRunnerFactory(repository.worktree)),
     async (state) => {
       const activeSessionLeaf = manager.getLeafId();
       await Promise.allSettled([
@@ -159,8 +294,18 @@ function createNavigation(
   );
 }
 
-export default function ompUndoRedo(pi: ExtensionAPI): void {
+export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependencies = {}): void {
   const retentionConfig = readRetentionConfig();
+  const privateGitEnabled = process.env.OMP_UNDO_REDO_PRIVATE_GIT !== "0";
+  const privateRepositories = new Map<string, PrivateRepoEntry>();
+  const gitRunnerFactory = deps.gitRunnerFactory ?? defaultGitRunnerFactory;
+  const captureDeadlineMs = deps.captureDeadlineMs ?? DEFAULT_CAPTURE_DEADLINE_MS;
+  function gitRunnerFor(repository: GitRepository): GitRunner {
+    const entry =
+      privateRepositories.get(repository.commonDir) ?? privateRepositories.get(repository.worktree);
+    if (entry && "git" in entry && entry.git) return entry.git;
+    return gitRunnerFactory(repository.worktree);
+  }
   const ownerRegistry = new CheckpointOwnerRegistry({
     resolveHostIdentity: resolvePersistentHostId,
     resolveRuntimeScope,
@@ -171,6 +316,96 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   const backends = new Map<string, FileBackend>();
   const blobStores = new Map<string, BlobStore>();
   const pending = new Map<string, PendingTurnCheckpoint>();
+  type PendingCapture = {
+    complete: Promise<void>;
+    checkpoint: PendingTurnCheckpoint | null;
+    failed: boolean;
+  };
+  /** Leaf the current turn started from, per session. Used to bind a
+   *  checkpoint to the turn that captured it: a deferred finalize whose
+   *  checkpoint predates the current turn is released, never recorded with
+   *  the wrong leaf. */
+  const turnStartLeafBySession = new Map<string, string | null>();
+
+  /** True when `gitDir` belongs to one of our private per-workspace repos.
+   *  Guards gc/prune triggers so they can never touch a user's own repo.
+   *  The incoming gitDir is realpath-canonicalized before comparing so a
+   *  checkpoint recorded with a long-form path still matches a repository
+   *  whose gitDir was built from a short-form (8.3) store root or cwd —
+   *  otherwise the string compare silently fails and the gc counter never
+   *  increments (repo growth stays unbounded on such machines). */
+  async function isPrivateRepository(gitDir: string): Promise<boolean> {
+    const canonicalGitDir = await canonicalCwd(gitDir);
+    for (const entry of privateRepositories.values()) {
+      if (!("failure" in entry) && entry.repository?.gitDir === canonicalGitDir) return true;
+    }
+    return false;
+  }
+
+  // Private-repo housekeeping: captures between gc runs (per repo) and the
+  // threshold that triggers a background `git gc`.
+  const PRIVATE_GC_AFTER_CAPTURES = 20;
+  const capturesSinceGcByGitDir = new Map<string, number>();
+
+  /** Best-effort `git gc` over a private repo. Runs outside the handler
+   *  deadline accounting (never awaited by a handler) so a slow gc can never
+   *  hit the host's timeout. `--prune=now` drops unreferenced objects
+   *  immediately: expiring sessions would otherwise leave recoverable file
+   *  content behind indefinitely. */
+  async function schedulePrivateGc(gitDir: string): Promise<void> {
+    try {
+      // Run from a neutral cwd so a slow gc never holds a handle on either the
+      // user's workspace or the snapshot repo itself (Windows keeps a child's
+      // cwd handle until it exits, which would race teardown rms and the
+      // eviction sweep). GIT_DIR is set, so the repo operations work anywhere.
+      await gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir })(["gc", "--prune=now"]);
+    } catch {
+      // Best-effort: a failed gc leaves more work for the next trigger.
+    }
+  }
+
+  /** Removes private repos whose workspace no longer exists. Runs at boot and
+   *  on shutdown so vanished workspaces cannot leave their snapshot repos
+   *  (and the file contents inside them) behind forever. */
+  async function evictStalePrivateRepos(): Promise<void> {
+    const reposDir = join(await canonicalCwd(blobStoreRootDirectory()), "repos");
+    let entries: string[];
+    try {
+      entries = await readdir(reposDir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".git")) continue;
+      const gitDir = join(reposDir, entry);
+      try {
+        const config = await readFile(join(gitDir, "config"), "utf8");
+        const worktreeMatch = /^\s*worktree\s*=\s*(.+)$/m.exec(config);
+        if (!worktreeMatch) continue;
+        const worktree = worktreeMatch[1].trim();
+        try {
+          await stat(worktree);
+        } catch {
+          // Workspace vanished: drop the repo. A gc or other git child may
+          // still hold the dir handle on Windows; retry briefly so a single
+          // transient EBUSY does not strand the repo until the next sweep.
+          for (let attempt = 0; attempt < 5; attempt += 1) {
+            try {
+              await rm(gitDir, { recursive: true, force: true });
+              break;
+            } catch {
+              if (attempt === 4) throw new Error(`could not evict ${gitDir}`);
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            }
+          }
+        }
+      } catch {
+        // Unreadable repo: leave it for a later sweep.
+      }
+    }
+  }
+
+  const pendingCaptures = new Map<string, PendingCapture>();
   const initializations = new Map<string, Promise<SessionNavigation>>();
   const activeOperations = new Set<Promise<void>>();
   let closing = false;
@@ -255,7 +490,13 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       const previous = navigations.get(sessionId);
       navigations.delete(sessionId);
       if (previous) await previous.suspend();
-      const backend = await resolveBackend(ctx.cwd, (workspaceRoot) => blobStoreFor(workspaceRoot));
+      const backend = await resolveBackend(
+        ctx.cwd,
+        (workspaceRoot) => blobStoreFor(workspaceRoot),
+        privateGitEnabled,
+        privateRepositories,
+        gitRunnerFactory,
+      );
       backends.set(sessionId, backend);
 
       if (
@@ -278,7 +519,14 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
           : backend.kind === "blob"
             ? new BlobHistoryStore(sessionId, backend.workspaceRoot, backend.store)
             : undefined;
-      const navigation = createNavigation(ctx, sessionId, store, runtimeStore, backend);
+      const navigation = createNavigation(
+        ctx,
+        sessionId,
+        store,
+        runtimeStore,
+        backend,
+        gitRunnerFor,
+      );
       const loadResult = store ? await store.load(ctx.sessionManager) : null;
       let restored: NavigationState | null = null;
       if (loadResult?.status === "loaded") {
@@ -357,10 +605,7 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
 
   async function releasePending(pendingCheckpoint: PendingTurnCheckpoint): Promise<void> {
     if (pendingCheckpoint.kind === "git") {
-      await releasePendingCheckpoint(
-        createGitRunner(pendingCheckpoint.repository.worktree),
-        pendingCheckpoint,
-      );
+      await releasePendingCheckpoint(gitRunnerFor(pendingCheckpoint.repository), pendingCheckpoint);
       return;
     }
     if (pendingCheckpoint.kind === "blob") {
@@ -368,6 +613,61 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
         blobStores.get(blobStoreRootDirectory()) ?? new BlobStore(blobStoreRootDirectory());
       await releaseBlobPendingCheckpoint(store, pendingCheckpoint);
     }
+  }
+
+  function beginCapture(
+    sessionId: string,
+    task: () => Promise<PendingTurnCheckpoint>,
+  ): PendingCapture {
+    const capture: PendingCapture = {
+      complete: Promise.resolve(),
+      checkpoint: null,
+      failed: false,
+    };
+    const { promise: complete, resolve } = promiseWithResolvers<void>();
+    capture.complete = complete;
+    void track(async () => {
+      try {
+        const checkpoint = await task();
+        if (closing || pendingCaptures.get(sessionId) !== capture) {
+          await releasePending(checkpoint);
+          capture.failed = true;
+        } else {
+          capture.checkpoint = checkpoint;
+          pending.set(sessionId, checkpoint);
+          if (
+            checkpoint.kind === "git" &&
+            checkpoint.repository.gitDir &&
+            (await isPrivateRepository(checkpoint.repository.gitDir))
+          ) {
+            const gitDir = checkpoint.repository.gitDir;
+            const count = (capturesSinceGcByGitDir.get(gitDir) ?? 0) + 1;
+            if (count >= PRIVATE_GC_AFTER_CAPTURES) {
+              capturesSinceGcByGitDir.delete(gitDir);
+              // The current capture's git work is done (this runs after its
+              // snapshot); only defer when another session's capture is still
+              // mid-flight — a concurrent `git gc --prune=now` could prune an
+              // unreferenced-but-pending object it just wrote. The counter
+              // reset below prevents gc runs from stacking.
+              if (pendingCaptures.size <= 1) {
+                void track(() => schedulePrivateGc(gitDir));
+              } else {
+                capturesSinceGcByGitDir.set(gitDir, PRIVATE_GC_AFTER_CAPTURES - 1);
+              }
+            } else {
+              capturesSinceGcByGitDir.set(gitDir, count);
+            }
+          }
+        }
+      } catch {
+        capture.failed = true;
+      } finally {
+        resolve();
+        if (pendingCaptures.get(sessionId) === capture) pendingCaptures.delete(sessionId);
+      }
+    });
+    pendingCaptures.set(sessionId, capture);
+    return capture;
   }
 
   async function disposeDetached(
@@ -405,6 +705,10 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       const previousPending = pending.get(sessionId);
       pending.delete(sessionId);
       if (previousPending) await releasePending(previousPending);
+      turnStartLeafBySession.delete(sessionId);
+      // An in-flight capture for this session no longer belongs to a live turn:
+      // it self-releases on completion via the identity check in beginCapture.
+      pendingCaptures.delete(sessionId);
       if (closing) return;
       await initializeNavigation(typed, true);
     }),
@@ -471,133 +775,208 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       pending.delete(sessionId);
       if (oldPending) await releasePending(oldPending);
 
+      // Record the leaf this turn starts from, then bound concurrent captures:
+      // a turn that starts while the previous turn's capture is still in flight
+      // gets no new capture (its undo boundary is session-only) instead of
+      // stacking overlapping `git add` runs over the same workspace.
+      turnStartLeafBySession.set(sessionId, typed.sessionManager.getLeafId());
+      if (pendingCaptures.has(sessionId)) return;
+
       const backend =
         backends.get(sessionId) ??
-        (await resolveBackend(typed.cwd, (workspaceRoot) => blobStoreFor(workspaceRoot)));
+        (await resolveBackend(
+          typed.cwd,
+          (workspaceRoot) => blobStoreFor(workspaceRoot),
+          privateGitEnabled,
+          privateRepositories,
+          gitRunnerFactory,
+        ));
       backends.set(sessionId, backend);
-      const prepared =
-        backend.kind === "git"
-          ? await prepareBeforeTurn(backend.git, sessionId, ownerRegistry)
-          : backend.kind === "blob"
-            ? await prepareBeforeTurnBlob(
-                backend.store,
-                backend.workspaceRoot,
-                checkpointNamespace(sessionId),
-              )
-            : { status: "session_only" as const, reason: backend.reason };
       const parentLeafId = typed.sessionManager.getLeafId();
-      const checkpoint: PendingTurnCheckpoint =
-        prepared.status === "git"
-          ? { ...prepared.checkpoint, parentLeafId }
-          : prepared.status === "blob"
+      const capture = beginCapture(sessionId, async () => {
+        const prepared =
+          backend.kind === "git"
+            ? await prepareBeforeTurn(backend.git, sessionId, ownerRegistry)
+            : backend.kind === "blob"
+              ? await prepareBeforeTurnBlob(
+                  backend.store,
+                  backend.workspaceRoot,
+                  checkpointNamespace(sessionId),
+                )
+              : { status: "session_only" as const, reason: backend.reason };
+        const checkpoint: PendingTurnCheckpoint =
+          prepared.status === "git"
             ? { ...prepared.checkpoint, parentLeafId }
-            : { kind: "session", reason: prepared.reason, parentLeafId };
-      if (closing) {
-        await releasePending(checkpoint);
-        return;
-      }
-      pending.set(sessionId, checkpoint);
+            : prepared.status === "blob"
+              ? { ...prepared.checkpoint, parentLeafId }
+              : { kind: "session", reason: prepared.reason, parentLeafId };
+        return checkpoint;
+      });
+      const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
+      if (outcome.timedOut) return;
+
+      const settled = pending.get(sessionId);
+      if (!settled) return;
     }),
   );
+
+  async function finalizeTurn(
+    typed: AnyContext,
+    capture: PendingCapture,
+    leafId: string | null,
+    turnStartLeaf: string | null,
+  ): Promise<void> {
+    const sessionId = typed.sessionManager.getSessionId();
+    const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
+    if (outcome.timedOut) {
+      // The capture overran the handler deadline. Keep this turn's finalize
+      // identity-bound — same capture, same leaf, same turn-start leaf, same
+      // context — so when it settles it finalizes its own checkpoint instead
+      // of a later turn's.
+      void capture.complete.then(() => {
+        void finalizeTurn(typed, capture, leafId, turnStartLeaf);
+      });
+      return;
+    }
+    const before = capture.checkpoint;
+    if (!before) return;
+    // Consume the checkpoint: exactly one finalize (this turn's) may record it.
+    capture.checkpoint = null;
+    // The checkpoint must belong to the turn that is finalizing: its pre-turn
+    // leaf must be the turn-start leaf captured when this finalize was first
+    // invoked. If a later turn's finalize reaches it first, releasing the
+    // stale checkpoint is safer than recording it with the wrong leaf (which
+    // would make an undo restore the wrong pre-turn state).
+    if (before.parentLeafId !== turnStartLeaf) {
+      pending.delete(sessionId);
+      await releasePending(before);
+      return;
+    }
+    pending.delete(sessionId);
+    if (closing) {
+      await releasePending(before);
+      return;
+    }
+
+    let completed: SessionOnlyCheckpoint | undefined;
+    if (before.kind === "session") {
+      completed = {
+        kind: "session",
+        reason: before.reason,
+        parentLeafId: before.parentLeafId,
+        leafId: leafId,
+      };
+    } else if (before.kind === "git") {
+      const result = await finishAfterTurn(
+        gitRunnerFor(before.repository),
+        before,
+        before.parentLeafId,
+        leafId,
+      );
+      if (result.status === "git") {
+        if (closing) {
+          await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
+          return;
+        }
+        const retained = await retainCheckpointForResume(
+          gitRunnerFor(result.checkpoint.repository),
+          sessionId,
+          result.checkpoint,
+        );
+        const nav =
+          (await ensureNavigation(typed)) ??
+          createNavigation(
+            typed,
+            sessionId,
+            undefined,
+            runtimeStore,
+            undefined,
+            gitRunnerFor,
+            gitRunnerFactory,
+          );
+        navigations.set(sessionId, nav);
+        await nav.recordTurnEnd(retained);
+        return;
+      }
+      completed = {
+        kind: "session",
+        reason: result.reason,
+        parentLeafId: before.parentLeafId,
+        leafId: leafId,
+      };
+    } else {
+      const backend = backends.get(sessionId);
+      const store =
+        backend?.kind === "blob" ? backend.store : new BlobStore(blobStoreRootDirectory());
+      const result = await finishAfterTurnBlob(store, before, before.parentLeafId, leafId);
+      if (result.status === "blob") {
+        if (closing) {
+          await releaseBlobCheckpoint(store, result.checkpoint);
+          return;
+        }
+        const retained = await retainBlobCheckpointForResume(store, sessionId, result.checkpoint);
+        if (retained) {
+          const nav =
+            (await ensureNavigation(typed)) ??
+            createNavigation(
+              typed,
+              sessionId,
+              undefined,
+              runtimeStore,
+              backend,
+              gitRunnerFor,
+              gitRunnerFactory,
+            );
+          navigations.set(sessionId, nav);
+          await nav.recordTurnEnd(retained);
+          return;
+        }
+        await releaseBlobCheckpoint(store, result.checkpoint);
+        completed = {
+          kind: "session",
+          reason: "after_blob_failed",
+          parentLeafId: before.parentLeafId,
+          leafId: leafId,
+        };
+      } else {
+        completed = {
+          kind: "session",
+          reason: result.reason,
+          parentLeafId: before.parentLeafId,
+          leafId: leafId,
+        };
+      }
+    }
+    const nav =
+      (await ensureNavigation(typed)) ??
+      createNavigation(
+        typed,
+        sessionId,
+        undefined,
+        runtimeStore,
+        undefined,
+        gitRunnerFor,
+        gitRunnerFactory,
+      );
+    navigations.set(sessionId, nav);
+    await nav.recordTurnEnd(completed);
+  }
 
   pi.on("agent_end", (_event, ctx) =>
     track(async () => {
       const typed = ctx as unknown as AnyContext;
       const sessionId = typed.sessionManager.getSessionId();
-      const before = pending.get(sessionId);
-      if (!before) return;
-      pending.delete(sessionId);
-      if (closing) {
-        await releasePending(before);
-        return;
-      }
-
-      let completed: SessionOnlyCheckpoint | undefined;
-      if (before.kind === "session") {
-        completed = {
-          kind: "session",
-          reason: before.reason,
-          parentLeafId: before.parentLeafId,
-          leafId: typed.sessionManager.getLeafId(),
-        };
-      } else if (before.kind === "git") {
-        const result = await finishAfterTurn(
-          createGitRunner(before.repository.worktree),
-          before,
-          before.parentLeafId,
-          typed.sessionManager.getLeafId(),
-        );
-        if (result.status === "git") {
-          if (closing) {
-            await releaseCheckpoint(
-              createGitRunner(result.checkpoint.repository.worktree),
-              result.checkpoint,
-            );
-            return;
-          }
-          const retained = await retainCheckpointForResume(
-            createGitRunner(result.checkpoint.repository.worktree),
-            sessionId,
-            result.checkpoint,
-          );
-          const nav =
-            (await ensureNavigation(typed)) ??
-            createNavigation(typed, sessionId, undefined, runtimeStore);
-          navigations.set(sessionId, nav);
-          await nav.recordTurnEnd(retained);
-          return;
-        }
-        completed = {
-          kind: "session",
-          reason: result.reason,
-          parentLeafId: before.parentLeafId,
-          leafId: typed.sessionManager.getLeafId(),
-        };
-      } else {
-        const backend = backends.get(sessionId);
-        const store =
-          backend?.kind === "blob" ? backend.store : new BlobStore(blobStoreRootDirectory());
-        const result = await finishAfterTurnBlob(
-          store,
-          before,
-          before.parentLeafId,
-          typed.sessionManager.getLeafId(),
-        );
-        if (result.status === "blob") {
-          if (closing) {
-            await releaseBlobCheckpoint(store, result.checkpoint);
-            return;
-          }
-          const retained = await retainBlobCheckpointForResume(store, sessionId, result.checkpoint);
-          if (retained) {
-            const nav =
-              (await ensureNavigation(typed)) ??
-              createNavigation(typed, sessionId, undefined, runtimeStore, backend);
-            navigations.set(sessionId, nav);
-            await nav.recordTurnEnd(retained);
-            return;
-          }
-          await releaseBlobCheckpoint(store, result.checkpoint);
-          completed = {
-            kind: "session",
-            reason: "after_blob_failed",
-            parentLeafId: before.parentLeafId,
-            leafId: typed.sessionManager.getLeafId(),
-          };
-        } else {
-          completed = {
-            kind: "session",
-            reason: result.reason,
-            parentLeafId: before.parentLeafId,
-            leafId: typed.sessionManager.getLeafId(),
-          };
-        }
-      }
-      const nav =
-        (await ensureNavigation(typed)) ??
-        createNavigation(typed, sessionId, undefined, runtimeStore);
-      navigations.set(sessionId, nav);
-      await nav.recordTurnEnd(completed);
+      const capture = pendingCaptures.get(sessionId);
+      // A capture that already settled leaves no entry (its finally deletes
+      // it), but its checkpoint stays in the pending map — finalize from that.
+      const settled = capture ? null : (pending.get(sessionId) ?? null);
+      if (!capture && !settled) return;
+      await finalizeTurn(
+        typed,
+        capture ?? { complete: Promise.resolve(), checkpoint: settled, failed: false },
+        typed.sessionManager.getLeafId(),
+        turnStartLeafBySession.get(sessionId) ?? null,
+      );
     }),
   );
 
@@ -620,9 +999,26 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
       await Promise.allSettled([...expirationPromises.values()]);
       explicitActiveHashes.clear();
       await disposeDetached(detachedNavigations, detachedPending, false);
-      await Promise.allSettled([...activeOperations]);
+      // Bounded: an overrunning capture must not delay shutdown indefinitely.
+      // Any capture still running now self-releases on completion (closing is
+      // set), and its temporary index is reclaimed by git or the OS.
+      await awaitWithDeadline(Promise.allSettled([...activeOperations]), 5_000);
       await drainState();
       await ownerRegistry.shutdown();
+      // Private-repo housekeeping on the way out: gc repos that crossed the
+      // capture threshold and evict repos whose workspaces vanished. Both run
+      // fire-and-forget (the process may exit before they finish; the counter
+      // trigger covers the in-process case).
+      void Promise.allSettled(
+        [...privateRepositories.values()].map(async (entry) => {
+          if ("failure" in entry || !entry.repository || !entry.git) return;
+          if (capturesSinceGcByGitDir.has(entry.repository.gitDir)) {
+            capturesSinceGcByGitDir.delete(entry.repository.gitDir);
+            await schedulePrivateGc(entry.repository.gitDir);
+          }
+        }),
+      );
+      void evictStalePrivateRepos().catch(() => undefined);
       await Promise.allSettled(
         [...blobStores.values()].map(async (store) => {
           await store.garbageCollect().catch(() => undefined);
@@ -637,6 +1033,18 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   const undoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
     const typed = ctx as unknown as AnyContext;
+    const sessionId = typed.sessionManager.getSessionId();
+    const capture = pendingCaptures.get(sessionId);
+    if (capture) {
+      const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
+      if (outcome.timedOut) {
+        ctx.ui.notify(
+          "Cannot undo while the file checkpoint is still being captured; try again shortly.",
+          "warning",
+        );
+        return;
+      }
+    }
     const nav = await ensureNavigation(typed);
     if (!nav) {
       ctx.ui.notify("Undo is unavailable while the session is closing.", "warning");
@@ -657,6 +1065,18 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
   const redoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
     const typed = ctx as unknown as AnyContext;
+    const sessionId = typed.sessionManager.getSessionId();
+    const capture = pendingCaptures.get(sessionId);
+    if (capture) {
+      const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
+      if (outcome.timedOut) {
+        ctx.ui.notify(
+          "Cannot redo while the file checkpoint is still being captured; try again shortly.",
+          "warning",
+        );
+        return;
+      }
+    }
     const nav = await ensureNavigation(typed);
     if (!nav) {
       ctx.ui.notify("Redo is unavailable while the session is closing.", "warning");
@@ -682,4 +1102,8 @@ export default function ompUndoRedo(pi: ExtensionAPI): void {
     description: "Restore the most recently undone turn",
     handler: redoHandler,
   });
+
+  // Boot-time private-repo sweep: drop snapshot repos whose workspaces have
+  // vanished (fire-and-forget; failures are ignored).
+  void evictStalePrivateRepos().catch(() => undefined);
 }

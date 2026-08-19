@@ -160,10 +160,11 @@ async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined):
   }
 }
 
-async function createSnapshotCommit(
+export async function createSnapshotCommit(
   git: GitRunner,
   message: string,
   retainIndex = false,
+  worktree?: string,
 ): Promise<SnapshotResult> {
   let tempDirectory: string | null = null;
   try {
@@ -173,7 +174,12 @@ async function createSnapshotCommit(
     const seeded = await seedSnapshotIndex(git, env);
     if (seeded.status === "invalid_head") return { reason: "invalid_head" };
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
-    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env });
+    const addEnv: Record<string, string> = { ...env };
+    if (git.env?.GIT_DIR) {
+      const addWorktree = git.cwd ?? worktree;
+      if (addWorktree) addEnv.GIT_WORK_TREE = addWorktree;
+    }
+    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
     if (added.code !== 0) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     if (tree.code !== 0) return { reason: "snapshot_failed" };
@@ -204,6 +210,7 @@ async function createSnapshotCommitFromLease(
   git: GitRunner,
   lease: SnapshotIndexLease,
   message: string,
+  worktree?: string,
 ): Promise<SnapshotResult> {
   const currentHead = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
   if (currentHead.code !== 0 || currentHead.stdout.trim() !== lease.headTree) {
@@ -247,7 +254,12 @@ async function createSnapshotCommitFromLease(
       if (reset.code !== 0) return { reason: "snapshot_failed" };
     }
 
-    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env });
+    const addEnv: Record<string, string> = { ...env };
+    if (git.env?.GIT_DIR) {
+      const addWorktree = git.cwd ?? worktree;
+      if (addWorktree) addEnv.GIT_WORK_TREE = addWorktree;
+    }
+    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
     if (added.code !== 0) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     const treeHash = tree.stdout.trim();

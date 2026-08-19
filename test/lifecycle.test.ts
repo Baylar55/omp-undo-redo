@@ -11,6 +11,22 @@ import ompUndoRedo from "../src/index.js";
 const execFileAsync = promisify(execFile);
 type Handler = (...args: unknown[]) => unknown;
 
+async function rmRetry(path: string): Promise<void> {
+  // Windows keeps a directory handle until the last git child whose cwd it
+  // was exits, so a teardown rm can race a slow capture/sweep. Retry longer
+  // than the bounded-capture suite's rmRetry (200 ms waits) — lifecycle tests
+  // tear down whole workspaces whose captures may still be settling.
+  for (let i = 0; i < 10; i++) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if (i === 9) throw err;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+  }
+}
+
 type TestEntry = {
   id: string;
   parentId: string | null;
@@ -171,7 +187,7 @@ describe("session-only lifecycle fallback", () => {
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -195,7 +211,7 @@ describe("session-only lifecycle fallback", () => {
         "Redid last turn: session moved forward and file snapshot restored.",
       );
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -225,7 +241,7 @@ describe("session-only lifecycle fallback", () => {
       );
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -279,7 +295,7 @@ describe("session-only lifecycle fallback", () => {
       await pi.runCommand("redo", ctx);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("D\n");
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 });
@@ -305,7 +321,7 @@ describe("runtime action-state lifecycle", () => {
       expect(published.activeSessionLeaf).toBe("turn");
       expect(published.actionResult).toBeUndefined();
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -337,7 +353,7 @@ describe("runtime action-state lifecycle", () => {
       await pi.emit("session_start", ctx);
       expect((await runtimeState(sessionId)).actionResult).toBeUndefined();
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -377,7 +393,7 @@ describe("runtime action-state lifecycle", () => {
       const afterBusy = await runtimeState(busyId);
       expect(afterBusy.actionResult).toMatchObject({ id: "undo", applied: false });
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -403,7 +419,7 @@ describe("runtime action-state lifecycle", () => {
       ]);
       expect(published.activeSessionLeaf).toBe("unrelated");
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 });
@@ -428,7 +444,7 @@ describe("navigation invalidation lifecycle", () => {
       expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
       expect(await privateRefs(cwd)).toEqual([]);
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -447,7 +463,7 @@ describe("navigation invalidation lifecycle", () => {
 
         expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
       } finally {
-        await rm(cwd, { recursive: true, force: true });
+        await rmRetry(cwd);
       }
     }
   });
@@ -466,7 +482,7 @@ describe("navigation invalidation lifecycle", () => {
         "Redid last turn: session moved forward and file snapshot restored.",
       );
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 });
@@ -558,7 +574,7 @@ describe("resumed session history", () => {
       );
       await thirdApi.emit("session_shutdown", third);
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -670,7 +686,7 @@ describe("resumed session history", () => {
 
       await secondApi.emit("session_shutdown", second);
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -710,7 +726,7 @@ describe("resumed session history", () => {
       );
       await pi.emit("session_shutdown", ctx);
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -822,7 +838,7 @@ describe("resumed session history", () => {
         delete process.env.OMP_UNDO_REDO_RETENTION_DAYS;
       }
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 });
@@ -849,7 +865,7 @@ describe("extension lifecycle cleanup", () => {
         await git(cwd, ["rev-parse", "HEAD"]),
       );
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -866,7 +882,7 @@ describe("extension lifecycle cleanup", () => {
       await pi.emit("session_shutdown", ctx);
       expect(await privateRefs(cwd)).toEqual([]);
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -894,10 +910,7 @@ describe("extension lifecycle cleanup", () => {
       expect(await privateRefs(first)).toHaveLength(2);
       expect(await privateRefs(second)).toHaveLength(2);
     } finally {
-      await Promise.all([
-        rm(first, { recursive: true, force: true }),
-        rm(second, { recursive: true, force: true }),
-      ]);
+      await Promise.all([rmRetry(first), rmRetry(second)]);
     }
   });
 });
