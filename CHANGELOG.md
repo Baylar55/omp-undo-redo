@@ -2,6 +2,16 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Added
+
+- Snapshot non-Git workspaces through a private per-workspace Git repository (opencode parity): the repository lives under the store root, snapshots use the same alternate-index machinery as regular Git mode, and the private repo is excluded from its own snapshots. Set `OMP_UNDO_REDO_PRIVATE_GIT=0` to force the previous blob-store behavior for non-Git workspaces.
+
+### Fixed
+
+- Bound checkpoint capture: `before_agent_start`, `agent_end`, and the undo/redo commands now wait at most ~3 s for an in-flight capture and finalize an overrunning capture in the background, so extension handlers can never hit the host's 30 s handler timeout on huge non-Git workspaces (previously the whole workspace walk ran inside the handler).
+
 ## [1.4.1] - 2026-08-18
 
 ### Fixed
