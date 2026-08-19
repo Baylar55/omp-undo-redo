@@ -354,6 +354,12 @@ describe("bounded capture lifecycle", () => {
       await writeFile(join(cwd, "tracked.txt"), "changed\n");
       ctx.leaf = "turn";
       await pi.emit("agent_end", ctx);
+      // The after-capture's git add is the slow phase (delay + git add);
+      // once it is in, the remaining write-tree/commit-tree/update-ref chain
+      // is fast, so the undo's own bounded wait (200ms) will find the
+      // capture complete and take the synchronous path. Waiting on the add
+      // count (not wall-clock) makes this deterministic under parallel load.
+      await waitForAdds(2);
       ctx.navigateTree = async (targetId) => {
         ctx.leaf = targetId;
         return { cancelled: false };
@@ -364,7 +370,7 @@ describe("bounded capture lifecycle", () => {
       await pi.runCommand("redo", ctx);
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 });

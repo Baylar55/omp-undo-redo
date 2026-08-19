@@ -160,19 +160,23 @@ describe("private-repo housekeeping", () => {
 
   it("evicts private repos whose workspace no longer exists", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-"));
-    const reposDir = join(testStoreRoot, "repos");
+    // Hermetic store for this test: the shared module-level store is also
+    // used by the gc-trigger test (same file), whose leftover repo and
+    // in-flight background gc would otherwise race this test's assertions
+    // (the boot sweep evicts it fire-and-forget, and an rm-while-gc-child-
+    // exits EBUSY retry can outlast the poll on Windows). A per-test store
+    // means the only repo ever present here is this test's own.
+    const store = join(tmpdir(), `omp-undo-redo-evict-store-${process.pid}-${Date.now()}`);
+    const previousStore = process.env.OMP_UNDO_REDO_BLOB_DIR;
+    process.env.OMP_UNDO_REDO_BLOB_DIR = store;
+    const reposDir = join(store, "repos");
     try {
       const pi = new FakeExtensionApi();
       ompUndoRedo(pi as never, {});
       const ctx = context(cwd, "evict-session");
       await runTurns(pi, ctx, 1, "tracked.txt");
-      // The gc-trigger test (same file, shared store) left a repo behind;
-      // this instance's boot sweep evicts it fire-and-forget, so settle on
-      // exactly our own repo before asserting.
-      for (let attempt = 0; attempt < 50; attempt += 1) {
-        if ((await readdir(reposDir)).length === 1) break;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
+      // runTurns' agent_end awaits finalize, so the private repo exists
+      // deterministically the moment the turn completes.
       expect(await readdir(reposDir)).toHaveLength(1);
       // The workspace disappears; the shutdown sweep evicts its repo.
       await rmRetry(cwd);
@@ -183,8 +187,10 @@ describe("private-repo housekeeping", () => {
       }
       expect(await readdir(reposDir)).toHaveLength(0);
     } finally {
+      if (previousStore === undefined) delete process.env.OMP_UNDO_REDO_BLOB_DIR;
+      else process.env.OMP_UNDO_REDO_BLOB_DIR = previousStore;
       await rmRetry(cwd);
-      await rm(testStoreRoot, { recursive: true, force: true }).catch(() => undefined);
+      await rm(store, { recursive: true, force: true }).catch(() => undefined);
     }
   });
 });
