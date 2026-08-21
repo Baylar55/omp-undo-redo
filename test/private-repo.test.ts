@@ -96,7 +96,8 @@ describe("private per-workspace git repositories", () => {
       if (backend.kind !== "git") return;
       const canonical = await realpath(cwd);
       expect(backend.repository.worktree).toBe(canonical);
-      expect(backend.repository.gitDir.startsWith(join(storeRoot, "repos"))).toBe(true);
+      const canonicalStoreRoot = await realpath(storeRoot);
+      expect(backend.repository.gitDir.startsWith(join(canonicalStoreRoot, "repos"))).toBe(true);
       expect(backend.repository.gitDir).not.toBe(join(canonical, ".git"));
       expect(backend.repository.commonDir).toBe(backend.repository.gitDir);
       expect(historyDirectory(backend.repository)).toBe(

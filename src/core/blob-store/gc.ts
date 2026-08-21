@@ -6,6 +6,7 @@ import { readRefFile, type RefRegistry } from "./refs.js";
 import type { StoreLiveness } from "./liveness.js";
 import type { StoreAccountant } from "./accounting.js";
 import type { TreeManifest } from "./types.js";
+import { pruneExpiredTombstones } from "../prune-tombstones.js";
 
 /** Garbage collection and retention policy: reference counting over refs/
  *  and manifests, age- and size-based session expiration, and stale-active-
@@ -44,6 +45,9 @@ export class StoreJanitor {
     await this.refs.cleanupStaleActiveRefs((ownerId) =>
       this.liveness.ownerIsProvablyStale(ownerId),
     );
+    // L2: leases/*.json were previously never reaped — cleanupStaleActiveRefs only touches refs/active.
+    // Reap stale lease files themselves AFTER refs cleanup to avoid racing the probe (lease must still exist for the check).
+    await this.liveness.reapStaleLeases().catch(() => undefined);
     // The refs scan, manifest loads and blob/tree walks are O(entire store).
     // Sweep only when session data was actually removed; stale-active-ref
     // cleanup above still covers crashed owners. Orphans left by a crash
@@ -224,6 +228,8 @@ export class StoreJanitor {
         }
       }
     }
+
+    await pruneExpiredTombstones(historyDir, retentionDays, getActive, isHash);
 
     // Garbage collection after removals, and stale active-ref cleanup always.
     // The O(store) tree/blob sweep is skipped when nothing was removed.

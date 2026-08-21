@@ -338,7 +338,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   async function isPrivateRepository(gitDir: string): Promise<boolean> {
     const canonicalGitDir = await canonicalCwd(gitDir);
     for (const entry of privateRepositories.values()) {
-      if (!("failure" in entry) && entry.repository?.gitDir === canonicalGitDir) return true;
+      if ("failure" in entry) continue;
+      if (!entry.repository?.gitDir) continue;
+      const canonicalEntry = await canonicalCwd(entry.repository.gitDir);
+      if (canonicalEntry === canonicalGitDir) return true;
     }
     return false;
   }
@@ -363,6 +366,40 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     } catch {
       // Best-effort: a failed gc leaves more work for the next trigger.
     }
+  }
+
+  /** One-time removal of legacy git-indexes directory from pre-v1.5.1 store layout */
+  async function cleanLegacyGitIndexes(): Promise<void> {
+    const legacy = join(await canonicalCwd(blobStoreRootDirectory()), "git-indexes");
+    await rm(legacy, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  /** Removes orphaned %TEMP%/omp-undo-redo-index-* dirs older than 24h.
+   *  Persistent alternates (SnapshotIndexLease) keep mtime fresh while in use;
+   *  only abandoned crash orphans age >24h. */
+  async function sweepOrphanTempIndexes(): Promise<void> {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    let entries: string[];
+    try {
+      entries = await readdir(tmpdir());
+    } catch {
+      return;
+    }
+    const candidates = entries.filter(
+      (e) => e.startsWith("omp-undo-redo-index-") || e.startsWith("omp-undo-redo-patch-"),
+    );
+    await Promise.all(
+      candidates.map(async (name) => {
+        const path = join(tmpdir(), name);
+        try {
+          const st = await stat(path);
+          if (!st.isDirectory() || st.mtimeMs >= cutoff) return;
+          await rm(path, { recursive: true, force: true });
+        } catch {
+          // Ignore
+        }
+      }),
+    );
   }
 
   /** Removes private repos whose workspace no longer exists. Runs at boot and
@@ -1105,7 +1142,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     handler: redoHandler,
   });
 
-  // Boot-time private-repo sweep: drop snapshot repos whose workspaces have
-  // vanished (fire-and-forget; failures are ignored).
+  // Boot-time housekeeping (all fire-and-forget, unref'd — 0ms handler latency)
   void evictStalePrivateRepos().catch(() => undefined);
+  void cleanLegacyGitIndexes().catch(() => undefined);
+  {
+    const t = setTimeout(() => void sweepOrphanTempIndexes().catch(() => undefined), 2_000);
+    t.unref?.();
+  }
 }

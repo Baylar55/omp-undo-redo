@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { DEFAULT_BLOB_IGNORES } from "./blob-store/types.js";
 import type { GitRepository, GitRunner } from "./types.js";
 
@@ -34,7 +34,23 @@ function canonicalCwdSync(cwd: string): string {
   try {
     return realpathSync.native(cwd);
   } catch {
-    return resolve(cwd);
+    // The path may not exist yet (e.g., a fresh store root like
+    // `C:\Users\BAYLAR~1.SAD\Temp\new-store` where only the parent exists).
+    // Fall back to canonicalizing the nearest existing ancestor and re-appending
+    // the remainder, so a short-form parent still yields a long-form result.
+    let current = resolve(cwd);
+    const suffix: string[] = [];
+    while (true) {
+      try {
+        const canonical = realpathSync.native(current);
+        return suffix.length ? join(canonical, ...suffix.reverse()) : canonical;
+      } catch {
+        const parent = dirname(current);
+        if (parent === current) return resolve(cwd);
+        suffix.push(basename(current));
+        current = parent;
+      }
+    }
   }
 }
 
@@ -42,7 +58,19 @@ async function canonicalCwd(cwd: string): Promise<string> {
   try {
     return await realpath(cwd);
   } catch {
-    return resolve(cwd);
+    let current = resolve(cwd);
+    const suffix: string[] = [];
+    while (true) {
+      try {
+        const canonical = await realpath(current);
+        return suffix.length ? join(canonical, ...suffix.reverse()) : canonical;
+      } catch {
+        const parent = dirname(current);
+        if (parent === current) return resolve(cwd);
+        suffix.push(basename(current));
+        current = parent;
+      }
+    }
   }
 }
 
@@ -89,7 +117,9 @@ async function ensureExclude(gitDir: string, worktree: string, storeRoot: string
       .map((line) => line.trim())
       .filter((line) => line.length > 0 && !line.startsWith("#")),
   );
-  const rel = relative(worktree, storeRoot);
+  const canonicalStoreRoot = await canonicalCwd(storeRoot);
+  const canonicalWorktree = await canonicalCwd(worktree);
+  const rel = relative(canonicalWorktree, canonicalStoreRoot);
   if (rel && rel !== "." && !rel.startsWith("..") && !isAbsolute(rel)) {
     entries.add(`${rel.replace(/\\/g, "/")}/`);
   }

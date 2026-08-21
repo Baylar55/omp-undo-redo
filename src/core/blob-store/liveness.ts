@@ -2,6 +2,7 @@ import { readdir, readFile, rm, stat, utimes } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
+import type { Dirent } from "node:fs";
 import { atomicWrite } from "./fs.js";
 
 /** Captures walk their workspace outside the store lock and write blobs that
@@ -113,6 +114,77 @@ export class StoreLiveness {
       clearInterval(interval);
       await rm(path, { force: true }).catch(() => undefined);
     };
+  }
+
+  async reapStaleLeases(): Promise<void> {
+    const leasesDir = join(this.rootDirectory, "leases");
+    let entries: Dirent[];
+    try {
+      entries = await readdir(leasesDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const candidates = entries.filter((e) => e.isFile() && e.name.endsWith(".json"));
+    const concurrency = 16;
+    let idx = 0;
+    const worker = async (): Promise<void> => {
+      while (idx < candidates.length) {
+        const entry = candidates[idx++];
+        const ownerId = entry.name.slice(0, -5);
+        // Never delete own lease while we own active refs — shutdown path handles it
+        if (ownerId === this.ownerId) continue;
+        if (await this.ownerIsProvablyStale(ownerId)) {
+          await rm(join(leasesDir, entry.name), { force: true }).catch(() => undefined);
+        } else {
+          // Fallback age guard for leases whose pid is recycled but hostname matches
+          // and kill returns EPERM/0 — treat >24h as stale (PID recycling hazard)
+          try {
+            const st = await stat(join(leasesDir, entry.name));
+            if (Date.now() - st.mtimeMs >= 24 * 60 * 60 * 1000) {
+              const content = await readFile(join(leasesDir, entry.name), "utf8").catch(() => "");
+              let parsed: {
+                startedAt?: string;
+                ownerId?: unknown;
+                pid?: unknown;
+                hostname?: unknown;
+              };
+              try {
+                parsed = JSON.parse(content) as {
+                  startedAt?: string;
+                  ownerId?: unknown;
+                  pid?: unknown;
+                  hostname?: unknown;
+                };
+              } catch {
+                continue;
+              }
+              // Re-probe startedAt vs mtime for extra safety
+              if (parsed.startedAt) {
+                const startedMs = Date.parse(parsed.startedAt);
+                if (!Number.isNaN(startedMs) && Date.now() - startedMs < 24 * 60 * 60 * 1000)
+                  continue;
+              }
+              if (parsed.hostname === hostname() && typeof parsed.pid === "number") {
+                try {
+                  process.kill(parsed.pid, 0);
+                  continue;
+                } catch (e) {
+                  if ((e as NodeJS.ErrnoException).code !== "ESRCH") continue;
+                }
+              } else {
+                continue;
+              }
+              await rm(join(leasesDir, entry.name), { force: true }).catch(() => undefined);
+            }
+          } catch {
+            // Ignore stat/read errors
+          }
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, candidates.length) }, () => worker()),
+    );
   }
 
   /** True while any capture marker is fresh. Reaps markers that stopped

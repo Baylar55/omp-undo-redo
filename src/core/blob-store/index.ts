@@ -116,6 +116,11 @@ export class BlobStore {
       accountant: this.accountant,
       invalidateAllCaches: () => this.workspaceCaches.clear(),
     });
+    // Background stale lease sweep for crash-leaked leases — deferred so first capture still wins lock
+    const leaseTimer = setTimeout(() => {
+      void this.liveness.reapStaleLeases().catch(() => undefined);
+    }, 2_000);
+    leaseTimer.unref?.();
   }
 
   private blobPath(hash: string): string {

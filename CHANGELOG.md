@@ -2,6 +2,19 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.5.2] - 2026-08-21
+
+### Fixed
+
+- **Store leak remediation (6 channels):** background `reapStaleRuntimes` for `~/.omp/omp-undo-redo/runtime/<pid>/` with `hostname` guard + `kill(pid,0)` + 24h `mtime` fallback against PID recycling (`src/core/runtime-action-state-store.ts:14,122,139-235`), `reapStaleLeases` for `~/.omp/omp-undo-redo/leases/*.json` after active-ref sweep (`src/core/blob-store/liveness.ts:118-183`, `src/core/blob-store/gc.ts:43-49`, `src/core/blob-store/index.ts:118`), `*.expired.json` tombstone pruning at `retentionDays*2` (shared `src/core/prune-tombstones.ts:6`, `src/core/history-store.ts:4,318`, `src/core/blob-store/gc.ts:164`), `host-id.*.tmp` cleanup on `resolvePersistentHostId` (`src/core/checkpoint-owners.ts:183`), one-time `~/.omp/omp-undo-redo/git-indexes/` removal and `%TEMP%/omp-undo-redo-index|patch-*` orphan sweep >24h preserving warm `SnapshotIndexLease` (`src/index.ts:373-397`). All sweeps deferred `setTimeout(2000).unref()` — zero handler latency.
+- **Short-form (8.3) path canonicalization:** `canonicalCwdSync`/`canonicalCwd` now walk to nearest existing ancestor when `realpath` fails (`src/core/private-repo.ts:34-74`), and `ensureExclude` canonicalizes both `storeRoot` and `worktree` before `relative()` (`src/core/private-repo.ts:117-120`) — fixes mismatched `privateRepositoryPath` and `isPrivateRepository` string compares on Windows 8.3 store roots.
+- **Flaky-test hardening:** `bounded-capture` now waits for `write-tree`/`commit-tree` chain and retries `undo` on `still being captured` (`test/bounded-capture.test.ts:360`), `private-gc` window 50→80 polls + 60s timeout (`test/private-gc.test.ts:149`), `private-repo` asserts against canonical store root (`test/private-repo.test.ts:99`), `runtime-action-state-store` expects `hostname` in `RuntimeMarker` (`test/runtime-action-state-store.test.ts:76`), and `blob-store` stale-ref test preserves lease-file lifetime ordering.
+
+### Changed
+
+- `RuntimeMarker` now includes `hostname` (`src/core/runtime-action-state-store.ts:14-21`) — cross-host `/runtime` shares no longer risk remote PID reaping.
+- Deduplicate `*.expired.json` pruning into `src/core/prune-tombstones.ts` and single-parse lease JSON in `reapStaleLeases` (`src/core/blob-store/liveness.ts:143-166`).
+
 ## [1.5.1] - 2026-08-21
 
 ### Performance
