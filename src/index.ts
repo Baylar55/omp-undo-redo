@@ -31,6 +31,7 @@ import { checkpointNamespace } from "./core/checkpoints.js";
 import {
   finishAfterTurn,
   prepareBeforeTurn,
+  releaseAllPersistentSnapshotIndices,
   releaseCheckpoint,
   releasePendingCheckpoint,
   resolveRepository,
@@ -1003,6 +1004,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // Any capture still running now self-releases on completion (closing is
       // set), and its temporary index is reclaimed by git or the OS.
       await awaitWithDeadline(Promise.allSettled([...activeOperations]), 5_000);
+      await releaseAllPersistentSnapshotIndices();
       await drainState();
       await ownerRegistry.shutdown();
       // Private-repo housekeeping on the way out: gc repos that crossed the

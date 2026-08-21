@@ -2,6 +2,16 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.5.1] - 2026-08-21
+
+### Performance
+
+- Persist the Git alternate index across turns instead of deleting it after each `after` snapshot (`src/core/checkpoints.ts:21-37,172-183,448-540`, `src/index.ts:34,1007`). The first turn seeds the index with a full `git add -A` to populate the stat cache; all later `before`/`after` snapshots reuse the warm index and skip re-hashing unchanged tracked and previously-added untracked files via git's stat-dance. `HEAD^{tree}` changes, `.gitignore` updates (normalization via `diff-index --diff-filter=ADT` + `reset`), and aborted-turn cleanup correctly invalidate the cached index and fall back to a fresh seed.
+
+### Fixed
+
+- Avoid a full cold re-hash on every `before` turn for Git workspaces with large untracked trees: cross-turn persistence eliminates the per-turn `read-tree HEAD^{tree}` + cold `add -A` that previously made each turn pay full-index cost twice.
+
 ## [1.5.0] - 2026-08-19
 
 ### Added
