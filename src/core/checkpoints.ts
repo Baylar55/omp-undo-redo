@@ -18,6 +18,25 @@ const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-
 const REF_ROOT = "refs/omp-undo-redo";
 const WORKTREE_PATHSPEC = ":(top)";
 
+// Alternate index reused across turns so each turn is not a full `git add -A`
+// re-hash of the whole worktree. The first turn seeds it (a full `add -A` that
+// records a valid stat cache); every later turn's before/after snapshot reuses
+// it, so unchanged files are skipped via git's stat-dance instead of being
+// re-read. Keyed by repository + session so concurrent sessions/repos stay
+// isolated. The lease is dropped (and reseeded) whenever HEAD^{tree} changes,
+// and evicted whenever its directory is released.
+const persistentSnapshotIndices = new Map<string, SnapshotIndexLease>();
+
+function persistentIndexKey(repository: GitRepository, sessionId: string): string {
+  return `${repository.commonDir}\u0000${checkpointNamespace(sessionId)}`;
+}
+
+export async function releaseAllPersistentSnapshotIndices(): Promise<void> {
+  const leases = [...persistentSnapshotIndices.values()];
+  persistentSnapshotIndices.clear();
+  await Promise.all(leases.map((lease) => releaseSnapshotIndexLease(lease)));
+}
+
 export function checkpointNamespace(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex");
 }
@@ -152,6 +171,9 @@ async function createCommitForTree(
 
 async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined): Promise<boolean> {
   if (!lease) return true;
+  for (const [key, value] of persistentSnapshotIndices) {
+    if (value === lease) persistentSnapshotIndices.delete(key);
+  }
   try {
     await rm(lease.directory, { recursive: true, force: true });
     return true;
@@ -435,7 +457,28 @@ export async function prepareBeforeTurn(
     ? await ownerRegistry.ensureInitialized(resolved.repository, git)
     : "legacy";
   const checkpointId = randomUUID();
-  const snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn", true);
+  const indexKey = persistentIndexKey(resolved.repository, sessionId);
+  const priorLease = persistentSnapshotIndices.get(indexKey);
+  let snapshot: SnapshotResult;
+  let lease: SnapshotIndexLease | undefined;
+  if (priorLease) {
+    const reused = await createSnapshotCommitFromLease(
+      git,
+      priorLease,
+      "omp-undo-redo: before turn",
+    );
+    if ("hash" in reused) {
+      snapshot = reused;
+      lease = priorLease;
+    } else {
+      await releaseSnapshotIndexLease(priorLease);
+      snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn", true);
+      if ("hash" in snapshot) lease = snapshot.snapshotIndexLease;
+    }
+  } else {
+    snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn", true);
+    if ("hash" in snapshot) lease = snapshot.snapshotIndexLease;
+  }
   if (!("hash" in snapshot)) {
     return {
       status: "session_only",
@@ -452,12 +495,13 @@ export async function prepareBeforeTurn(
       snapshot.hash,
     ]))
   ) {
-    await releaseSnapshotIndexLease(snapshot.snapshotIndexLease);
+    await releaseSnapshotIndexLease(lease);
     return {
       status: "session_only",
       reason: "before_ref_failed",
     };
   }
+  if (lease) persistentSnapshotIndices.set(indexKey, lease);
   return {
     status: "git",
     checkpoint: {
@@ -466,7 +510,7 @@ export async function prepareBeforeTurn(
       beforeHash: snapshot.hash,
       beforeRef,
       checkpointId,
-      ...(snapshot.snapshotIndexLease ? { snapshotIndexLease: snapshot.snapshotIndexLease } : {}),
+      ...(lease ? { snapshotIndexLease: lease } : {}),
       parentLeafId: null,
     },
   };
@@ -483,18 +527,17 @@ export async function finishAfterTurn(
 ): Promise<FinishAfterTurnResult> {
   let snapshot: SnapshotResult;
   if (before.snapshotIndexLease) {
-    try {
-      snapshot = await createSnapshotCommitFromLease(
-        git,
-        before.snapshotIndexLease,
-        "omp-undo-redo: after turn",
-      );
-    } finally {
-      await releaseSnapshotIndexLease(before.snapshotIndexLease);
-    }
+    const lease = before.snapshotIndexLease;
+    snapshot = await createSnapshotCommitFromLease(git, lease, "omp-undo-redo: after turn");
     if (!("hash" in snapshot)) {
+      // HEAD moved (or another failure occurred) since the turn began: the
+      // retained alternate index is stale, so drop it and fall back to a fresh
+      // snapshot. The next turn will reseed the persistent index from HEAD.
+      await releaseSnapshotIndexLease(lease);
       snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
     }
+    // On success the lease index now reflects the after-state and stays in the
+    // persistent cache for the next turn's before snapshot.
   } else {
     snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
   }

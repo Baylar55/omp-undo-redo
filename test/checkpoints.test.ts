@@ -22,6 +22,7 @@ import {
   checkpointNamespace,
   finishAfterTurn,
   prepareBeforeTurn,
+  releaseAllPersistentSnapshotIndices,
   releaseCheckpoint,
   previousCheckpoint,
   releaseRefs,
@@ -429,7 +430,9 @@ describe("history-safe Git checkpoints", () => {
       const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
 
       expect(commands.some((args) => args[0] === "diff-index")).toBe(true);
-      await expect(stat(leaseDirectory)).rejects.toThrow();
+      // With cross-turn index reuse the lease is retained after the after-snapshot
+      // (not deleted) so the next turn can reuse it for a cheap before snapshot.
+      await expect(stat(leaseDirectory)).resolves.toBeDefined();
       const fresh = pendingCheckpoint(await prepareBeforeTurn(baseGit, "fresh-ground-truth"));
       expect(await text(baseGit, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
         await text(baseGit, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
@@ -445,6 +448,8 @@ describe("history-safe Git checkpoints", () => {
       await releasePendingCheckpoint(baseGit, fresh);
       if (freshLeaseDirectory) await expect(stat(freshLeaseDirectory)).rejects.toThrow();
       await releaseCheckpoint(baseGit, after);
+      // Clean up the persisted lease from this test's session.
+      await releaseAllPersistentSnapshotIndices();
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -471,6 +476,54 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(baseGit, after);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses the persisted alternate index across consecutive turns to avoid a full re-hash", async () => {
+    const { cwd, git: baseGit } = await makeRepo();
+    const sessionId = "cross-turn-reuse";
+    try {
+      await initializeBranch(baseGit, cwd);
+      await writeFile(join(cwd, "tracked.txt"), "initial\n");
+      await baseGit(["add", "tracked.txt"]);
+      await baseGit(["commit", "-qm", "initial"]);
+
+      // First turn: seeds the persistent index (full add -A) and retains it.
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(baseGit, sessionId));
+      const after1 = completedCheckpoint(await finishAfterTurn(baseGit, before1, null, null));
+      const leaseDirectory1 = before1.snapshotIndexLease?.directory;
+      expect(leaseDirectory1).toBeDefined();
+      if (!leaseDirectory1) return;
+      await expect(stat(leaseDirectory1)).resolves.toBeDefined();
+
+      // Second turn, same session, no file changes: the before snapshot must
+      // reuse the same index (no fresh read-tree seeding) and reflect the
+      // unchanged worktree, so its tree equals the previous after tree.
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(baseGit, sessionId));
+      expect(before2.snapshotIndexLease?.directory).toBe(leaseDirectory1);
+      // Commit hashes embed the message + timestamp, so compare the captured
+      // trees: with an unchanged worktree the reused index must reproduce the
+      // previous turn's after-tree exactly.
+      const tree = (hash: string) => text(baseGit, ["rev-parse", `${hash}^{tree}`]);
+      expect(await tree(before2.beforeHash)).toBe(await tree(after1.afterHash));
+      const after2 = completedCheckpoint(await finishAfterTurn(baseGit, before2, null, null));
+      expect(await tree(after2.afterHash)).toBe(await tree(after1.afterHash));
+
+      // A change made between turns is still captured on the next before pass.
+      await writeFile(join(cwd, "tracked.txt"), "mutated between turns\n");
+      const before3 = pendingCheckpoint(await prepareBeforeTurn(baseGit, sessionId));
+      expect(before3.snapshotIndexLease?.directory).toBe(leaseDirectory1);
+      const after3 = completedCheckpoint(await finishAfterTurn(baseGit, before3, null, null));
+      expect(await text(baseGit, ["show", `${after3.afterHash}:tracked.txt`])).toBe(
+        "mutated between turns",
+      );
+
+      await releaseCheckpoint(baseGit, after1);
+      await releaseCheckpoint(baseGit, after2);
+      await releaseCheckpoint(baseGit, after3);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releaseAllPersistentSnapshotIndices();
     }
   });
 

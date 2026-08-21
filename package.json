@@ -1,6 +1,6 @@
 {
   "name": "@baylarsadigov/omp-undo-redo",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Undo and redo session navigation for Pi and Oh My Pi",
   "license": "MIT",
   "keywords": [
