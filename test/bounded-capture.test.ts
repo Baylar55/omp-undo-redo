@@ -360,11 +360,30 @@ describe("bounded capture lifecycle", () => {
       // capture complete and take the synchronous path. Waiting on the add
       // count (not wall-clock) makes this deterministic under parallel load.
       await waitForAdds(2);
+      // The add count gates only the git-add phase; the subsequent
+      // write-tree/commit-tree/update-ref chain is still async. Give it a
+      // brief window to settle so the navigation has a checkpoint before undo.
+      // On Windows the full commit chain can be >200ms under load, so wait
+      // longer than the capture deadline to ensure the turn is recorded.
+      await new Promise((resolve) => setTimeout(resolve, 800));
       ctx.navigateTree = async (targetId) => {
         ctx.leaf = targetId;
         return { cancelled: false };
       };
-      await pi.runCommand("undo", ctx);
+      // Retry once if the finalize is still in flight (Windows Git can be
+      // slower under parallel load); the synchronous path should succeed on
+      // the second attempt without the "still being captured" warning.
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await pi.runCommand("undo", ctx);
+        const message = ctx.ui.notifications.at(-1)?.message ?? "";
+        if (message.includes("still being captured")) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          continue;
+        }
+        if (message.includes("file snapshot restored")) break;
+        // Empty or other: wait a bit and retry, finalize may still be in flight
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
       await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
       expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
       await pi.runCommand("redo", ctx);

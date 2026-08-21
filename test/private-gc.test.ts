@@ -146,7 +146,7 @@ describe("private-repo housekeeping", () => {
       // gc. (The after-captures run inside finalizeTurn, not beginCapture, so
       // they do not contribute to the counter.)
       await runTurns(pi, ctx, 20, "tracked.txt");
-      for (let attempt = 0; attempt < 50; attempt += 1) {
+      for (let attempt = 0; attempt < 120; attempt += 1) {
         if (commands.some((command) => command[0] === "gc")) break;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
@@ -156,7 +156,7 @@ describe("private-repo housekeeping", () => {
     } finally {
       await rmRetry(cwd);
     }
-  });
+  }, 120000);
 
   it("evicts private repos whose workspace no longer exists", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-"));

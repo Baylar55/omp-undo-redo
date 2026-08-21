@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { checkpointNamespace } from "./checkpoints.js";
+import { pruneExpiredTombstones } from "./prune-tombstones.js";
 import type {
   ExpirationTombstone,
   FileCheckpointUnavailableReason,
@@ -314,6 +315,8 @@ export async function expireGitSessionHistories(
 
     await rm(filePath, { force: true }).catch(() => undefined);
   }
+
+  await pruneExpiredTombstones(dir, retentionDays, getActive, (v) => HASH.test(v));
 }
 
 export class SessionHistoryStore {

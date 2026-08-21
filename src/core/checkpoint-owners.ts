@@ -177,6 +177,21 @@ export async function resolvePersistentHostId(
   options: HostIdentityOptions = {},
 ): Promise<HostIdentity> {
   const path = hostIdentityPath(options);
+  // A2: reap leaked host-id.*.tmp files from prior crashed attempts (fire-and-forget, <1ms)
+  try {
+    const hostDir = dirname(path);
+    const hostEntries = await readdir(hostDir, { withFileTypes: true }).catch(() => null);
+    if (hostEntries) {
+      const tmpPattern = /^host-id\.[0-9a-f-]{36}\.tmp$/;
+      await Promise.all(
+        hostEntries
+          .filter((e) => e.isFile() && tmpPattern.test(e.name))
+          .map((e) => rm(join(hostDir, e.name), { force: true }).catch(() => undefined)),
+      );
+    }
+  } catch {
+    // Best-effort cleanup
+  }
   const existing = await readValidUuid(path);
   if (existing === "unreadable") return { id: null, persistent: false };
   if (existing) return { id: existing, persistent: true };

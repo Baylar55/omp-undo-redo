@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import type { Dirent } from "node:fs";
 import { checkpointNamespace } from "./checkpoints.js";
 import type { ActionInvocationResult, NavigationState, RuntimeActionState } from "./types.js";
 
@@ -16,6 +17,7 @@ type RuntimeMarker = {
   protocol: typeof RUNTIME_PROTOCOL;
   runtimeId: string;
   pid: number;
+  hostname: string;
   startedAt: string;
 };
 
@@ -125,12 +127,114 @@ export class RuntimeActionStateStore {
         protocol: RUNTIME_PROTOCOL,
         runtimeId: this.runtimeId,
         pid: this.pid,
+        hostname: hostname(),
         startedAt: this.clock().toISOString(),
       };
       await this.writeJsonAtomic(join(this.runtimeDirectory, "runtime.json"), marker);
+      this.scheduleStaleRuntimeSweep();
     } catch {
       // Runtime state is observational. Keep extension operations independent.
     }
+  }
+
+  private scheduleStaleRuntimeSweep(): void {
+    const timer = setTimeout(() => {
+      void this.reapStaleRuntimes().catch(() => undefined);
+    }, 2_000);
+    timer.unref?.();
+  }
+
+  private async reapStaleRuntimes(): Promise<void> {
+    if (!this.active) return;
+    const STALE_RUNTIME_MS = 24 * 60 * 60 * 1_000;
+    const localHostname = hostname();
+    let entries: Dirent[];
+    try {
+      entries = await readdir(this.rootDirectory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const candidates = entries.filter((e) => e.isDirectory() && /^\d+$/.test(e.name));
+    // Batch with limited concurrency to avoid EMFILE on extreme leak (100+ dirs)
+    const concurrency = 16;
+    let index = 0;
+    const worker = async (): Promise<void> => {
+      while (index < candidates.length) {
+        const entry = candidates[index++];
+        const pid = Number(entry.name);
+        if (pid === this.pid) continue;
+        const dir = join(this.rootDirectory, entry.name);
+        const markerPath = join(dir, "runtime.json");
+        let shouldRemove = false;
+        let markerHostname: string | null = null;
+        let markerPid: number | null = null;
+        let markerStartedAt: string | null = null;
+        try {
+          const content = await readFile(markerPath, "utf8");
+          const parsed = JSON.parse(content) as Partial<RuntimeMarker>;
+          if (typeof parsed.hostname === "string") markerHostname = parsed.hostname;
+          if (typeof parsed.pid === "number") markerPid = parsed.pid;
+          if (typeof parsed.startedAt === "string") markerStartedAt = parsed.startedAt;
+        } catch {
+          // Missing/unreadable marker — fall back to directory mtime check below
+        }
+        // Cross-host guard: never delete remote host's directory even if pid appears dead locally
+        if (markerHostname && markerHostname !== localHostname) continue;
+        if (markerPid !== null) {
+          try {
+            process.kill(markerPid, 0);
+            // Process alive — keep unless marker is ancient (PID recycling guard)
+            if (markerStartedAt) {
+              const startedMs = Date.parse(markerStartedAt);
+              if (!Number.isNaN(startedMs) && Date.now() - startedMs < STALE_RUNTIME_MS) {
+                continue;
+              }
+            }
+            // Also check directory mtime as secondary guard
+            try {
+              const st = await stat(dir);
+              if (Date.now() - st.mtimeMs < STALE_RUNTIME_MS) continue;
+            } catch {
+              continue;
+            }
+            shouldRemove = true;
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ESRCH") shouldRemove = true;
+            else if (code === "EPERM") {
+              // Process exists but no permission — treat as alive unless ancient
+              if (markerStartedAt) {
+                const startedMs = Date.parse(markerStartedAt);
+                if (!Number.isNaN(startedMs) && Date.now() - startedMs < STALE_RUNTIME_MS) continue;
+              }
+              try {
+                const st = await stat(dir);
+                if (Date.now() - st.mtimeMs < STALE_RUNTIME_MS) continue;
+              } catch {
+                continue;
+              }
+              shouldRemove = true;
+            } else {
+              continue;
+            }
+          }
+        } else {
+          // No valid marker — use directory mtime only
+          try {
+            const st = await stat(dir);
+            if (Date.now() - st.mtimeMs >= STALE_RUNTIME_MS) shouldRemove = true;
+          } catch {
+            continue;
+          }
+        }
+        if (shouldRemove) {
+          await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, candidates.length) }, () => worker()),
+    );
   }
 
   private async writeJsonAtomic(path: string, value: unknown): Promise<void> {
