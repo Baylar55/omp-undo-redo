@@ -852,6 +852,16 @@ describe("resumed session history", () => {
       const content = JSON.parse(await readFile(hPath, "utf8"));
       content.lastAccessedAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
       await writeFile(hPath, JSON.stringify(content));
+      // The turn saves left a fresh cross-process heartbeat marker; drop it
+      // so no live owner is implied and the dormant session is sweepable.
+      const { activeHeartbeatPath } = await import("../src/core/history-liveness.js");
+      await rm(
+        activeHeartbeatPath(
+          join(repo.commonDir, "omp-undo-redo", "history"),
+          checkpointNamespace(sessionId1),
+        ),
+        { force: true },
+      );
 
       // 3. Start session 2 to trigger background expiration of dormant session 1
       const secondApi = new FakeExtensionApi();

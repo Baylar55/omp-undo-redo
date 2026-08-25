@@ -2,6 +2,14 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.5.4] - 2026-08-25
+
+### Fixed
+
+- **Cross-process expiration no longer destroys live session history (per-process active-set blindness):** retention sweeps filtered candidates only against the local process's in-memory active set, so a sweeper in one process could delete git refs / blob refs and tombstone a session that another process (same repo `commonDir` or shared blob store) was actively resuming. A resume racing the ref deletion then re-persisted the degraded state, durably converting file-restorable checkpoints into navigation-only rows. Fixes: history stores never persist runtime-downgraded checkpoints — `load()` rewrites the stored document with the original coordinates and a fresh timestamp only (`src/core/history-store.ts`, `src/core/blob-history-store.ts`); every load/save touches a cross-process heartbeat marker (`<historyDir>/.active.<sessionHash>`, TTL 24h) that both sweepers honor alongside the local active set, with a pre-deletion re-check (`src/core/history-liveness.ts`, `src/core/history-store.ts`, `src/core/blob-store/gc.ts`, `src/core/prune-tombstones.ts`); a 10-minute unref'd interval re-asserts liveness for all locally tracked sessions so idle-but-open sessions stay protected (`src/index.ts`).
+- Tombstones are now authoritative until superseded: a live owner's `save()` clears its own expiration marker so post-expiry sessions recover undo capability on their next turn instead of reporting "expired" until tombstone pruning; sweeps remove any history JSON that coexists with a standing tombstone (residue from a concurrent load rewriting the file mid-sweep), keeping the marker authoritative without resurrecting data.
+- Storage-cap eviction keeps its hard oldest-first guarantee: liveness is enforced purely by heartbeat markers (a live session in any process is never evicted), while unprotected stale sessions remain ordinary candidates — the cap is met as before instead of being soft-floored.
+
 ## [1.5.3] - 2026-08-25
 
 ### Fixed

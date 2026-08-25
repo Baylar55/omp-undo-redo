@@ -1,11 +1,12 @@
 import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { atomicWrite, isHash } from "./fs.js";
+import { atomicWrite, exists, isHash } from "./fs.js";
 import { readTreeManifest } from "./manifest.js";
 import { readRefFile, type RefRegistry } from "./refs.js";
 import type { StoreLiveness } from "./liveness.js";
 import type { StoreAccountant } from "./accounting.js";
 import type { TreeManifest } from "./types.js";
+import { pruneStaleHeartbeats, sessionHeartbeatIsFresh } from "../history-liveness.js";
 import { pruneExpiredTombstones } from "../prune-tombstones.js";
 
 /** Garbage collection and retention policy: reference counting over refs/
@@ -136,12 +137,32 @@ export class StoreJanitor {
       }
     };
 
+    // Residue cleanup: a history JSON that coexists with its tombstone can
+    // only be an artifact of a concurrent load rewriting the file mid-sweep.
+    // The marker stays authoritative until a live owner saves anew — which
+    // clears it — so the JSON must go regardless of its timestamp. Runs
+    // unconditionally so cap-only configurations still reclaim residue.
+    for (const file of await getHistoryFiles()) {
+      const sessionHash = file.slice(0, -5);
+      if (!isHash(sessionHash)) continue;
+      const tombstoneFile = join(historyDir, `${sessionHash}.expired.json`);
+      if (!(await exists(tombstoneFile))) continue;
+      const filePath = join(historyDir, file);
+      // Re-check immediately before the rm to stay out of a save()'s
+      // clear-and-rewrite path for a session that just came back to life.
+      if (!(await exists(tombstoneFile))) continue;
+      await rm(filePath, { force: true }).catch(() => undefined);
+    }
+
     const parseSessionTimestamp = async (
       file: string,
     ): Promise<{ sessionHash: string; timestamp: number; filePath: string } | null> => {
       const sessionHash = file.slice(0, -5);
       if (!isHash(sessionHash)) return null;
       if (getActive().has(sessionHash)) return null;
+      // Cross-process liveness: another process may hold this session open
+      // without this process knowing. A fresh heartbeat protects it here.
+      if (await sessionHeartbeatIsFresh(historyDir, sessionHash)) return null;
       const filePath = join(historyDir, file);
       try {
         const content = await readFile(filePath, "utf8");
@@ -229,7 +250,10 @@ export class StoreJanitor {
       }
     }
 
-    await pruneExpiredTombstones(historyDir, retentionDays, getActive, isHash);
+    await pruneExpiredTombstones(historyDir, retentionDays, getActive, isHash, (hash) =>
+      sessionHeartbeatIsFresh(historyDir, hash),
+    );
+    await pruneStaleHeartbeats(historyDir);
 
     // Garbage collection after removals, and stale active-ref cleanup always.
     // The O(store) tree/blob sweep is skipped when nothing was removed.

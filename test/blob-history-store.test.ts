@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -202,6 +202,118 @@ describe("blob history store", () => {
         currentIndex: 0,
       },
     });
+    await store.shutdown();
+  });
+
+  it("does not persist downgraded checkpoints to disk on load", async () => {
+    const workspace = await temporaryDirectory("omp-blob-nopersist-ws-");
+    const storage = await temporaryDirectory("omp-blob-nopersist-store-");
+    const sessionId = "blob-nopersist-session";
+    const sessionHash = checkpointNamespace(sessionId);
+    const checkpointId = randomUUID();
+    const store = new BlobStore(storage);
+    await writeFile(join(workspace, "file.txt"), "before");
+    const before = await store.captureSnapshot(workspace, sessionHash, checkpointId, "before");
+    await writeFile(join(workspace, "file.txt"), "after");
+    const after = await store.captureSnapshot(workspace, sessionHash, checkpointId, "after");
+    if ("reason" in before || "reason" in after) throw new Error("snapshot failed");
+    await store.retainCheckpointForResume(sessionHash, checkpointId);
+    const checkpoint: BlobCheckpoint = {
+      kind: "blob",
+      workspaceRoot: await realpath(workspace),
+      sessionHash,
+      checkpointId,
+      beforeTreeId: before.treeId,
+      afterTreeId: after.treeId,
+      parentLeafId: "prompt",
+      leafId: "response",
+    };
+    const history = new BlobHistoryStore(sessionId, workspace, store);
+    await history.save({ checkpoints: [checkpoint], currentIndex: 0 });
+
+    // The save left a cross-process heartbeat marker for this session.
+    const markerPath = join(storage, "history", `.active.${sessionHash}`);
+    expect((await stat(markerPath)).isFile()).toBe(true);
+
+    await rm(join(storage, "trees", `${before.treeId}.json`), { force: true });
+    await expect(history.load(reader())).resolves.toEqual({
+      status: "loaded",
+      state: {
+        checkpoints: [
+          {
+            kind: "session",
+            reason: "resumed_checkpoint_unavailable",
+            parentLeafId: "prompt",
+            leafId: "response",
+          },
+        ],
+        currentIndex: 0,
+      },
+    });
+
+    // The runtime downgrade must stay in memory only: the stored document
+    // keeps the original blob coordinates (plus a refreshed timestamp), so a
+    // concurrent expiration can never turn a transient race into permanent
+    // data loss.
+    const raw = JSON.parse(await readFile(join(storage, "history", `${sessionHash}.json`), "utf8"));
+    expect(raw.schemaVersion).toBe(2);
+    expect(typeof raw.lastAccessedAt).toBe("string");
+    expect(raw.checkpoints).toEqual([checkpoint]);
+
+    await store.shutdown();
+  });
+
+  it("clears a superseded tombstone when the session saves again", async () => {
+    const workspace = await temporaryDirectory("omp-blob-revive-ws-");
+    const storage = await temporaryDirectory("omp-blob-revive-store-");
+    const sessionId = "blob-revived-session";
+    const sessionHash = checkpointNamespace(sessionId);
+    const store = new BlobStore(storage);
+
+    const historyDir = join(storage, "history");
+    await mkdir(historyDir, { recursive: true });
+    const tombstoneFile = join(historyDir, `${sessionHash}.expired.json`);
+    await writeFile(
+      tombstoneFile,
+      JSON.stringify({
+        expired: true,
+        sessionHash,
+        expiredAt: new Date().toISOString(),
+        reason: "storage_cap",
+      }),
+    );
+
+    const history = new BlobHistoryStore(sessionId, workspace, store);
+    // A live owner saving new history supersedes the earlier expiration.
+    await history.save({
+      checkpoints: [
+        {
+          kind: "session",
+          reason: "resumed_checkpoint_unavailable",
+          parentLeafId: null,
+          leafId: null,
+        },
+      ],
+      currentIndex: 0,
+    });
+    await expect(stat(tombstoneFile)).rejects.toThrow();
+
+    // The next resume loads the new history instead of reporting expired.
+    await expect(history.load(reader())).resolves.toEqual({
+      status: "loaded",
+      state: {
+        checkpoints: [
+          {
+            kind: "session",
+            reason: "resumed_checkpoint_unavailable",
+            parentLeafId: null,
+            leafId: null,
+          },
+        ],
+        currentIndex: 0,
+      },
+    });
+
     await store.shutdown();
   });
 
