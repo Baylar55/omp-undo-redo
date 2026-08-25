@@ -39,9 +39,11 @@ import {
 } from "./core/checkpoints.js";
 import {
   expireGitSessionHistories,
+  historyDirectory,
   reconstructSessionHistory,
   SessionHistoryStore,
 } from "./core/history-store.js";
+import { touchSessionHeartbeat } from "./core/history-liveness.js";
 import type {
   ActionId,
   GitRepository,
@@ -475,6 +477,34 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     }
     return hashes;
   }
+
+  // Cross-process liveness beats: load/save touch .active markers, but a
+  // session left open and idle would otherwise go stale past the heartbeat
+  // TTL while its owner process is still running. A slow unref'd interval
+  // re-asserts liveness for exactly the locally active sessions (the same
+  // set the sweeps already treat as protected), so foreign sweepers never
+  // see a live session as expired. Deliberately not `backends`: that map
+  // retains every session ever initialized here, and beating abandoned ones
+  // would shield them from retention for the process's lifetime.
+  const HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
+  const heartbeatTimer = setInterval(() => {
+    const tracked = new Set<string>([
+      ...navigations.keys(),
+      ...initializations.keys(),
+      ...pending.keys(),
+    ]);
+    for (const sessionId of tracked) {
+      const backend = backends.get(sessionId);
+      if (!backend || backend.kind === "session") continue;
+      const sessionHash = checkpointNamespace(sessionId);
+      if (backend.kind === "git") {
+        void touchSessionHeartbeat(historyDirectory(backend.repository), sessionHash);
+      } else {
+        void touchSessionHeartbeat(join(backend.store.rootDirectory, "history"), sessionHash);
+      }
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+  heartbeatTimer.unref();
 
   function blobStoreFor(_workspaceRoot: string): BlobStore {
     const root = blobStoreRootDirectory();
@@ -1076,6 +1106,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // Let an in-flight expiry finish (it holds the store lock) and cancel one
       // that never started, then stop protecting sessions so shutdown GC can
       // reclaim their data.
+      clearInterval(heartbeatTimer);
       for (const cancel of expirationCancels.values()) cancel();
       expirationCancels.clear();
       await Promise.allSettled([...expirationPromises.values()]);

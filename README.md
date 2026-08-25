@@ -132,11 +132,13 @@ To disable either behavior, set its value to `0`; setting both to `0` disables a
 | `2`              | `0`              | Age expiration (2 days); no storage cap enforcement                                                       |
 | `0`              | `0`              | No automatic cleanup (indefinite retention)                                                               |
 
-> **Note:** `OMP_UNDO_REDO_RETENTION_DAYS=0` disables age-based expiration but does **not** guarantee indefinite history retention when a storage cap is active (`MAX_STORE_MB > 0`). The cap can still evict the oldest inactive session histories to free up storage space. Active sessions are never evicted by age or storage cap.
+> **Note:** `OMP_UNDO_REDO_RETENTION_DAYS=0` disables age-based expiration but does **not** guarantee indefinite history retention when a storage cap is active (`MAX_STORE_MB > 0`). The cap can still evict the oldest inactive session histories to free up storage space. Active sessions are never evicted by age or storage cap, in any process sharing the store.
 
 ### Expiration behavior
 
 Cleanup runs automatically in the background shortly after extension startup and never blocks session initialization or the first undo/redo; sessions currently in use are never expired or evicted. Successful cleanup is silent. When a dormant session's file history is expired, resuming that session shows a warning: session navigation still works, but file changes from the expired turns cannot be restored, and `/undo`/`/redo` degrade to session-only navigation.
+
+"In use" is enforced across processes: every history load/save touches a liveness marker (`.active.<sessionHash>`, fresh for 24 hours) in the shared history directory, a background interval re-asserts it for all locally active sessions every 10 minutes, and retention sweeps skip any session with a fresh marker — including sweeps started by another process sharing the same repository or store. Once an expired session records a new turn, its saved history supersedes the expiration marker, so undo capability resumes for the new turns instead of every later resume reporting "expired".
 
 In Git workspaces, expiration removes the session's history refs under `refs/omp-undo-redo/history/<sessionHash>/` and its history file. The referenced commit objects become unreachable and are reclaimed later by the repository's normal `git gc`; `.git` size does not shrink immediately. No storage cap applies to Git object storage.
 

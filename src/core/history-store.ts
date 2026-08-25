@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { checkpointNamespace } from "./checkpoints.js";
+import {
+  pruneStaleHeartbeats,
+  sessionHeartbeatIsFresh,
+  touchSessionHeartbeat,
+} from "./history-liveness.js";
 import { pruneExpiredTombstones } from "./prune-tombstones.js";
 import type {
   ExpirationTombstone,
@@ -251,9 +256,31 @@ export async function expireGitSessionHistories(
     if (!file.endsWith(".json") || file.endsWith(".expired.json") || file.startsWith(".")) continue;
     const sessionHash = file.slice(0, -5);
     if (!HASH.test(sessionHash)) continue;
-    if (getActive().has(sessionHash)) continue;
-
     const filePath = join(dir, file);
+
+    // A tombstoned history JSON is residue from a concurrent load rewriting
+    // the file mid-sweep (or a load racing the rm). The marker stays
+    // authoritative until a live owner saves anew — which clears it — so the
+    // JSON must go regardless of its timestamp. Re-checked immediately before
+    // the rm to stay out of a save()'s clear-and-rewrite path.
+    const existingTombstone = tombstonePath(repository, sessionHash);
+    let tombstoned = false;
+    try {
+      await stat(existingTombstone);
+      tombstoned = true;
+    } catch {
+      // No marker: normal candidate path.
+    }
+    if (tombstoned) {
+      await rm(filePath, { force: true }).catch(() => undefined);
+      continue;
+    }
+
+    if (getActive().has(sessionHash)) continue;
+    // Cross-process liveness: another process may hold this session open
+    // without this process knowing. A fresh heartbeat protects it here.
+    if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
+
     let lastAccessedAtMs: number;
     try {
       const content = await readFile(filePath, "utf8");
@@ -275,6 +302,9 @@ export async function expireGitSessionHistories(
 
     // Re-check active set right before deletion to prevent racing concurrent session startup
     if (getActive().has(sessionHash)) continue;
+    // And re-check the cross-process heartbeat, which a concurrent resume in
+    // another process may have touched while the timestamp was being read.
+    if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
 
     const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
     const refsMap = await existingRefs(git, refPrefix);
@@ -316,7 +346,14 @@ export async function expireGitSessionHistories(
     await rm(filePath, { force: true }).catch(() => undefined);
   }
 
-  await pruneExpiredTombstones(dir, retentionDays, getActive, (v) => HASH.test(v));
+  await pruneExpiredTombstones(
+    dir,
+    retentionDays,
+    getActive,
+    (v) => HASH.test(v),
+    (hash) => sessionHeartbeatIsFresh(dir, hash),
+  );
+  await pruneStaleHeartbeats(dir);
 }
 
 export class SessionHistoryStore {
@@ -328,6 +365,7 @@ export class SessionHistoryStore {
 
   async load(reader: SessionReader): Promise<HistoryLoadResult> {
     const sessionHash = checkpointNamespace(this.sessionId);
+    const dir = historyDirectory(this.repository);
     const tombstoneFile = tombstonePath(this.repository, this.sessionId);
     const tombstone = await readTombstone(tombstoneFile, sessionHash);
     if (tombstone) {
@@ -339,16 +377,15 @@ export class SessionHistoryStore {
       .then(() => true)
       .catch(() => false);
     if (!present) return { status: "unavailable", reason: "missing" };
+    await touchSessionHeartbeat(dir, sessionHash);
     try {
       const metadata = await stat(path);
       if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) {
         return { status: "unavailable", reason: "unusable" };
       }
-      const parsed = parseHistory(
-        JSON.parse(await readFile(path, "utf8")) as unknown,
-        this.sessionId,
-        this.repository,
-      );
+      const value = JSON.parse(await readFile(path, "utf8")) as unknown;
+      const candidate = value as Record<string, unknown>;
+      const parsed = parseHistory(value, this.sessionId, this.repository);
       if (!parsed) return { status: "unavailable", reason: "unusable" };
       const refPrefix = `refs/omp-undo-redo/history/${parsed.sessionHash}/`;
       const refs = await existingRefs(this.git, refPrefix);
@@ -389,10 +426,46 @@ export class SessionHistoryStore {
         return { status: "unavailable", reason: "unusable" };
       }
 
-      await this.save(state).catch(() => undefined);
+      // Refresh lastAccessedAt without persisting the runtime-mapped
+      // checkpoints: a concurrent expiration that deleted refs mid-load would
+      // otherwise be written back as permanent session-only rows, destroying
+      // recoverable git coordinates. The mapping is re-derived on every load.
+      await this.refreshStoredTimestamp(candidate).catch(() => undefined);
       return { status: "loaded", state };
     } catch {
       return { status: "unavailable", reason: "unusable" };
+    }
+  }
+
+  /** Rewrites the stored document with the original (unmapped) checkpoints
+   *  and a fresh lastAccessedAt, preserving schema migration. Skips the write
+   *  when a tombstone appeared mid-load so a completed expiration is never
+   *  resurrected. */
+  private async refreshStoredTimestamp(candidate: Record<string, unknown>): Promise<void> {
+    const tombstoneFile = tombstonePath(this.repository, this.sessionId);
+    const claimed = await stat(tombstoneFile)
+      .then(() => true)
+      .catch(() => false);
+    if (claimed) return;
+    const directory = historyDirectory(this.repository);
+    const stored: StoredHistory = {
+      schemaVersion: HISTORY_SCHEMA_CURRENT,
+      sessionHash: checkpointNamespace(this.sessionId),
+      repository: this.repository,
+      checkpoints: candidate.checkpoints as TurnCheckpoint[],
+      currentIndex: candidate.currentIndex as number,
+      lastAccessedAt: new Date().toISOString(),
+    };
+    const temporary = join(
+      directory,
+      `.${checkpointNamespace(this.sessionId)}.${randomUUID()}.tmp`,
+    );
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(temporary, JSON.stringify(stored), { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, historyPath(this.repository, this.sessionId));
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
     }
   }
 
@@ -439,5 +512,13 @@ export class SessionHistoryStore {
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }
+    // A live owner saving new history supersedes any earlier expiration
+    // marker, so clear it — otherwise every future resume would discard the
+    // freshly saved checkpoints until the marker aged out of the tombstone
+    // prune window.
+    await rm(tombstonePath(this.repository, this.sessionId), { force: true }).catch(
+      () => undefined,
+    );
+    await touchSessionHeartbeat(directory, sessionHash);
   }
 }

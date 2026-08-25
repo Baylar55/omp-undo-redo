@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { blobStoreRootDirectory } from "./blob-store/index.js";
 import type { BlobStore } from "./blob-store/index.js";
 import { checkpointNamespace } from "./checkpoints.js";
+import { touchSessionHeartbeat } from "./history-liveness.js";
 import { effectiveLeaf, entryExists } from "./session-tree-utils.js";
 import type {
   BlobCheckpoint,
@@ -154,6 +155,7 @@ export class BlobHistoryStore {
       .then(() => true)
       .catch(() => false);
     if (!present) return { status: "unavailable", reason: "missing" };
+    await touchSessionHeartbeat(dirname(this.path), this.sessionHash);
     const workspace = await this.canonicalWorkspace();
     if (!workspace) return { status: "unavailable", reason: "unusable" };
     try {
@@ -246,10 +248,43 @@ export class BlobHistoryStore {
         return { status: "unavailable", reason: "unusable" };
       }
 
-      await this.save(state).catch(() => undefined);
+      // Refresh lastAccessedAt without persisting the runtime-mapped
+      // checkpoints: a concurrent expiration that released refs or removed
+      // trees mid-load would otherwise be written back as permanent
+      // session-only rows, destroying recoverable tree coordinates. The
+      // mapping is re-derived on every load.
+      await this.refreshStoredTimestamp(candidate).catch(() => undefined);
       return { status: "loaded", state };
     } catch {
       return { status: "unavailable", reason: "unusable" };
+    }
+  }
+
+  /** Rewrites the stored document with the original (unmapped) checkpoints
+   *  and a fresh lastAccessedAt, preserving schema migration. Skips the write
+   *  when a tombstone appeared mid-load so a completed expiration is never
+   *  resurrected. */
+  private async refreshStoredTimestamp(candidate: Record<string, unknown>): Promise<void> {
+    const claimed = await stat(blobTombstonePath(this.sessionId, this.store.rootDirectory))
+      .then(() => true)
+      .catch(() => false);
+    if (claimed) return;
+    const directory = dirname(this.path);
+    const stored: StoredHistory = {
+      schemaVersion: HISTORY_SCHEMA_CURRENT,
+      sessionHash: this.sessionHash,
+      workspaceRoot: candidate.workspaceRoot as string,
+      checkpoints: candidate.checkpoints as TurnCheckpoint[],
+      currentIndex: candidate.currentIndex as number,
+      lastAccessedAt: new Date().toISOString(),
+    };
+    const temporary = join(directory, `.${this.sessionHash}.${randomUUID()}.tmp`);
+    try {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await writeFile(temporary, JSON.stringify(stored), { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, this.path);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined);
     }
   }
 
@@ -292,5 +327,13 @@ export class BlobHistoryStore {
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
     }
+    // A live owner saving new history supersedes any earlier expiration
+    // marker, so clear it — otherwise every future resume would discard the
+    // freshly saved checkpoints until the marker aged out of the tombstone
+    // prune window.
+    await rm(blobTombstonePath(this.sessionId, this.store.rootDirectory), {
+      force: true,
+    }).catch(() => undefined);
+    await touchSessionHeartbeat(directory, this.sessionHash);
   }
 }

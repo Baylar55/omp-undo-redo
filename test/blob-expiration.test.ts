@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -65,6 +65,8 @@ describe("BlobStore expiration and storage cap", () => {
     const content = JSON.parse(await readFile(historyFilePath, "utf8"));
     content.lastAccessedAt = oldDate;
     await writeFile(historyFilePath, JSON.stringify(content));
+    // Drop the heartbeat the save left behind: no owner process remains.
+    await rm(join(storage, "history", `.active.${hash}`), { force: true });
 
     // Run expireAndCollect with 30 days retention
     await store.expireAndCollect(30, 0, new Set());
@@ -130,6 +132,8 @@ describe("BlobStore expiration and storage cap", () => {
       const json = JSON.parse(await readFile(hFile, "utf8"));
       json.lastAccessedAt = dateStr;
       await writeFile(hFile, JSON.stringify(json));
+      // Drop the heartbeat the save left behind: no owner process remains.
+      await rm(join(storage, "history", `.active.${h}`), { force: true });
     };
 
     await setupSession(s1, h1, "content session 1 ".repeat(100), 10);
@@ -278,6 +282,8 @@ describe("BlobStore expiration and storage cap", () => {
     const json1 = JSON.parse(await readFile(hFile1, "utf8"));
     json1.lastAccessedAt = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
     await writeFile(hFile1, JSON.stringify(json1));
+    // Drop the heartbeat the save left behind: no owner process remains.
+    await rm(join(storage, "history", `.active.${h1}`), { force: true });
 
     const totalBytes = await store.measureStoreBytes();
     // Set cap bytes slightly below totalBytes so evicting s1's manifest gets store under cap without evicting s2
@@ -337,6 +343,8 @@ describe("BlobStore expiration and storage cap", () => {
       const json = JSON.parse(await readFile(hFile, "utf8"));
       json.lastAccessedAt = dateStr;
       await writeFile(hFile, JSON.stringify(json));
+      // Drop the heartbeat the save left behind: no owner process remains.
+      await rm(join(storage, "history", `.active.${h}`), { force: true });
     };
 
     // s1 is 40 days old (expires by age 30)
@@ -461,6 +469,8 @@ describe("BlobStore expiration and storage cap", () => {
     delete json.lastAccessedAt;
     json.schemaVersion = 1;
     await writeFile(hFile, JSON.stringify(json));
+    // Drop the heartbeat the save left behind: no owner process remains.
+    await rm(join(storage, "history", `.active.${hash}`), { force: true });
 
     const fortyDaysAgoSec = (Date.now() - 40 * 24 * 60 * 60 * 1000) / 1000;
     const { utimes } = await import("node:fs/promises");
@@ -521,6 +531,8 @@ describe("BlobStore expiration and storage cap", () => {
     const json = JSON.parse(await readFile(hFile, "utf8"));
     json.lastAccessedAt = new Date(Date.now() - 50 * 24 * 60 * 60 * 1000).toISOString();
     await writeFile(hFile, JSON.stringify(json));
+    // Drop the heartbeat the save left behind: no owner process remains.
+    await rm(join(storage, "history", `.active.${hash}`), { force: true });
 
     await store.expireAndCollect(30, 0, new Set());
     expect(await store.treeExists(orphan.treeId)).toBe(false);
@@ -576,6 +588,182 @@ describe("BlobStore expiration and storage cap", () => {
     await store.expireAndCollect(30, 0, activeGetter);
 
     expect((await stat(hFile)).isFile()).toBe(true);
+
+    await store.shutdown();
+  });
+
+  it("preserves sessions with a fresh cross-process heartbeat during age expiration", async () => {
+    const workspace = await temporaryDirectory("blob-exp-beat-ws-");
+    const storage = await temporaryDirectory("blob-exp-beat-store-");
+    const store = new BlobStore(storage);
+
+    const sessionId = "heartbeat-session";
+    const hash = sessionHash(sessionId);
+    const checkpointId = randomUUID();
+
+    await writeFile(join(workspace, "f.txt"), "heartbeat content");
+    const snap = await store.captureSnapshot(workspace, hash, checkpointId, "before");
+    if ("reason" in snap) throw new Error("snapshot failed");
+    await store.retainCheckpointForResume(hash, checkpointId);
+
+    const hStore = new BlobHistoryStore(sessionId, workspace, store);
+    await hStore.save({
+      checkpoints: [
+        {
+          kind: "blob",
+          workspaceRoot: workspace,
+          sessionHash: hash,
+          checkpointId,
+          beforeTreeId: snap.treeId,
+          afterTreeId: snap.treeId,
+          parentLeafId: "p",
+          leafId: "r",
+        },
+      ],
+      currentIndex: 0,
+    });
+
+    // Age only the recorded timestamp. A foreign process keeps touching the
+    // heartbeat marker, so a sweeper that cannot see it must still treat
+    // the session as live.
+    const hFile = join(storage, "history", `${hash}.json`);
+    const json = JSON.parse(await readFile(hFile, "utf8"));
+    json.lastAccessedAt = new Date(Date.now() - 50 * 24 * 60 * 60 * 1000).toISOString();
+    await writeFile(hFile, JSON.stringify(json));
+
+    await store.expireAndCollect(30, 0, new Set());
+
+    expect((await stat(hFile)).isFile()).toBe(true);
+    await expect(stat(blobTombstonePath(sessionId, storage))).rejects.toThrow();
+
+    // Once the owner stops beating past the TTL, the same sweep expires the
+    // session and prunes the stale marker.
+    const markerPath = join(storage, "history", `.active.${hash}`);
+    const stale = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+    await utimes(markerPath, stale, stale);
+
+    await store.expireAndCollect(30, 0, new Set());
+
+    await expect(stat(hFile)).rejects.toThrow();
+    const tombstone = JSON.parse(await readFile(blobTombstonePath(sessionId, storage), "utf8"));
+    expect(tombstone.reason).toBe("age");
+    await expect(stat(markerPath)).rejects.toThrow();
+
+    await store.shutdown();
+  });
+
+  it("keeps the storage cap hard while heartbeat-protected sessions survive eviction", async () => {
+    const workspace = await temporaryDirectory("blob-exp-capbeat-ws-");
+    const storage = await temporaryDirectory("blob-exp-capbeat-store-");
+    const store = new BlobStore(storage);
+
+    const evictable = "capbeat-old";
+    const protectedSession = "capbeat-live";
+    const evictableHash = sessionHash(evictable);
+    const protectedHash = sessionHash(protectedSession);
+
+    const setupSession = async (
+      sId: string,
+      h: string,
+      content: string,
+      keepHeartbeat: boolean,
+    ) => {
+      const chk = randomUUID();
+      await writeFile(join(workspace, `${sId}.txt`), content);
+      const before = await store.captureSnapshot(workspace, h, chk, "before");
+      if ("reason" in before) throw new Error("snapshot failed");
+      await store.retainCheckpointForResume(h, chk);
+      const hStore = new BlobHistoryStore(sId, workspace, store);
+      await hStore.save({
+        checkpoints: [
+          {
+            kind: "blob",
+            workspaceRoot: workspace,
+            sessionHash: h,
+            checkpointId: chk,
+            beforeTreeId: before.treeId,
+            afterTreeId: before.treeId,
+            parentLeafId: "p",
+            leafId: "r",
+          },
+        ],
+        currentIndex: 0,
+      });
+      if (!keepHeartbeat) {
+        // Unprotected: aged timestamp and no liveness marker, so a foreign
+        // sweeper sees it as an ordinary inactive candidate.
+        const hFile = join(storage, "history", `${h}.json`);
+        const json = JSON.parse(await readFile(hFile, "utf8"));
+        json.lastAccessedAt = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+        await writeFile(hFile, JSON.stringify(json));
+        await rm(join(storage, "history", `.active.${h}`), { force: true });
+      }
+    };
+
+    await setupSession(evictable, evictableHash, "old session payload ".repeat(200), false);
+    const bytesAfterOld = await store.measureStoreBytes();
+    await setupSession(protectedSession, protectedHash, "protected payload ".repeat(20), true);
+
+    // Cap sits below the total, but above what remains after the unprotected
+    // oldest session is evicted.
+    const totalBytes = await store.measureStoreBytes();
+    const capBytes = totalBytes - Math.floor((totalBytes - bytesAfterOld) / 2) - 1;
+
+    await store.expireAndCollect(0, capBytes, new Set());
+
+    const oldFile = join(storage, "history", `${evictableHash}.json`);
+    await expect(stat(oldFile)).rejects.toThrow();
+    const tombstone = JSON.parse(await readFile(blobTombstonePath(evictable, storage), "utf8"));
+    expect(tombstone.reason).toBe("storage_cap");
+
+    // The heartbeat-protected session survives: its marker proves a live
+    // owner in some process, even though it is the newest history present.
+    const liveFile = join(storage, "history", `${protectedHash}.json`);
+    expect((await stat(liveFile)).isFile()).toBe(true);
+
+    await store.shutdown();
+  });
+
+  it("removes a history JSON that coexists with its tombstone (residue cleanup)", async () => {
+    const workspace = await temporaryDirectory("blob-exp-residue-ws-");
+    const storage = await temporaryDirectory("blob-exp-residue-store-");
+    const store = new BlobStore(storage);
+
+    const sessionId = "residue-session";
+    const hash = sessionHash(sessionId);
+
+    const historyDir = join(storage, "history");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(historyDir, { recursive: true });
+
+    // A concurrent load rewrote the file after the sweep completed: fresh
+    // timestamp, no owner. The tombstone must stay authoritative.
+    const hFile = join(historyDir, `${hash}.json`);
+    await writeFile(
+      hFile,
+      JSON.stringify({
+        schemaVersion: 2,
+        sessionHash: hash,
+        workspaceRoot: workspace,
+        checkpoints: [],
+        currentIndex: -1,
+        lastAccessedAt: new Date().toISOString(),
+      }),
+    );
+    await writeFile(
+      join(historyDir, `${hash}.expired.json`),
+      JSON.stringify({
+        expired: true,
+        sessionHash: hash,
+        expiredAt: new Date().toISOString(),
+        reason: "age",
+      }),
+    );
+
+    await store.expireAndCollect(30, 0, new Set());
+
+    await expect(stat(hFile)).rejects.toThrow();
+    expect((await stat(join(historyDir, `${hash}.expired.json`))).isFile()).toBe(true);
 
     await store.shutdown();
   });
