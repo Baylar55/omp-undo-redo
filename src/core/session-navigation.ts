@@ -104,6 +104,9 @@ export class SessionNavigation {
     if (port.navigateTree) this.navigateTree = port.navigateTree.bind(port);
   }
 
+  /** Teardown-only: runs outside the navigation chain. Callers guarantee no
+   *  concurrent undo/redo/turn finalization touches this instance yet
+   *  (initializeNavigation owns the object until it publishes it). */
   restoreState(state: NavigationState): void {
     this.checkpoints = [...state.checkpoints];
     this.currentIndex = state.currentIndex;
@@ -151,16 +154,23 @@ export class SessionNavigation {
     oldLeafId: string | null,
     newLeafId: string | null,
   ): Promise<void> {
+    // Must run before any queueing: the host awaits this handler inside its
+    // navigateTree call, so an undo/redo's own navigation has to be recognized
+    // synchronously or it would deadlock against itself on navigationTail.
     const expected = this.expectedTreeNavigation;
     if (expected && expected.oldLeafId === oldLeafId && expected.newLeafId === newLeafId) {
       this.expectedTreeNavigation = null;
       return;
     }
     if (oldLeafId === newLeafId) return;
-    await this.invalidateRedo();
+    await this.serializeNavigation(() => this.performInvalidateRedo());
   }
 
   async invalidateRedo(): Promise<void> {
+    await this.serializeNavigation(() => this.performInvalidateRedo());
+  }
+
+  private async performInvalidateRedo(): Promise<void> {
     const discarded = this.checkpoints.splice(this.currentIndex + 1);
     await this.persistState();
     await this.releaseFileCheckpoints(discarded);
@@ -190,6 +200,10 @@ export class SessionNavigation {
   }
 
   async recordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
+    await this.serializeNavigation(() => this.performRecordTurnEnd(checkpoint));
+  }
+
+  private async performRecordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
     const discarded = this.checkpoints.splice(
       this.currentIndex + 1,
       this.checkpoints.length - this.currentIndex - 1,
@@ -201,6 +215,8 @@ export class SessionNavigation {
     await this.releaseFileCheckpoints([...discarded, ...converted]);
   }
 
+  /** Teardown-only: runs outside the navigation chain (session_shutdown /
+   *  session_start replacement paths, which exclude concurrent navigation). */
   async dispose(release = true): Promise<void> {
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
@@ -210,6 +226,7 @@ export class SessionNavigation {
     await this.releaseFileCheckpoints(checkpoints);
   }
 
+  /** Teardown-only: runs outside the navigation chain (suspend/resume path). */
   async suspend(): Promise<void> {
     const checkpoints = this.checkpoints;
     this.checkpoints = [];

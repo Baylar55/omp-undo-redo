@@ -730,6 +730,79 @@ describe("resumed session history", () => {
     }
   });
 
+  it("notifies the user when durable history exists but cannot be loaded", async () => {
+    const cwd = await makeRepository();
+    const sessionId = "corrupt-history-session";
+    const prompt: TestEntry = {
+      id: "prompt",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: TestEntry = {
+      id: "response",
+      parentId: prompt.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    try {
+      const firstApi = new FakeExtensionApi();
+      ompUndoRedo(firstApi as never);
+      const first = context(cwd, sessionId);
+      first.leaf = prompt.id;
+      first.branch = [prompt];
+      first.entries = [prompt];
+      await firstApi.emit("session_start", first);
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      first.leaf = response.id;
+      first.branch = [prompt, response];
+      first.entries = [prompt, response];
+      await firstApi.emit("agent_end", first);
+      await firstApi.emit("session_shutdown", first);
+
+      // Corrupt the durable history file so the next resume hits the
+      // unavailable path (distinct from the expired tombstone path).
+      const { historyPath } = await import("../src/core/history-store.js");
+      const repo = {
+        worktree: cwd,
+        gitDir: join(cwd, ".git"),
+        commonDir: join(cwd, ".git"),
+      };
+      await writeFile(historyPath(repo, sessionId), "{corrupted history");
+
+      const secondApi = new FakeExtensionApi();
+      ompUndoRedo(secondApi as never);
+      const second = context(cwd, sessionId);
+      second.leaf = response.id;
+      second.branch = [prompt, response];
+      second.entries = [prompt, response];
+      await secondApi.emit("session_start", second);
+
+      expect(
+        second.ui.notifications.some((n) =>
+          n.message.includes("Undo/redo file history for this session could not be loaded."),
+        ),
+      ).toBe(true);
+
+      // Undo still works in session-only mode after the warning.
+      second.navigateTree = async (targetId) => {
+        second.leaf = targetId;
+        second.branch = [prompt];
+        return { cancelled: false };
+      };
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(prompt.id);
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the resumed turn has no usable file checkpoint.",
+      );
+
+      await secondApi.emit("session_shutdown", second);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
   it("handles session history expiration on session_start and notifies user", async () => {
     const cwd = await makeRepository();
     const sessionId1 = "expired-lifecycle-session-1";

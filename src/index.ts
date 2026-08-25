@@ -444,6 +444,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   }
 
   const pendingCaptures = new Map<string, PendingCapture>();
+  const pendingFinalizations = new Map<string, Promise<void>>();
   const initializations = new Map<string, Promise<SessionNavigation>>();
   const activeOperations = new Set<Promise<void>>();
   let closing = false;
@@ -583,6 +584,14 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
               "warning",
             );
           }
+        }
+      } else if (loadResult?.status === "unavailable" && loadResult.reason === "unusable") {
+        restored = null;
+        if (ctx.ui?.notify) {
+          ctx.ui.notify(
+            "Undo/redo file history for this session could not be loaded.\nSession navigation still works, but earlier file changes cannot be restored.",
+            "warning",
+          );
         }
       } else {
         restored = null;
@@ -858,6 +867,51 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     }),
   );
 
+  function beginFinalizeTurn(
+    typed: AnyContext,
+    capture: PendingCapture,
+    leafId: string | null,
+    turnStartLeaf: string | null,
+  ): Promise<void> {
+    const sessionId = typed.sessionManager.getSessionId();
+    let handlerRelease!: () => void;
+    const handlerDone = new Promise<void>((resolve) => {
+      handlerRelease = resolve;
+    });
+    const work = (async () => {
+      try {
+        const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
+        if (outcome.timedOut) {
+          // The capture overran the handler deadline. Keep this turn's
+          // finalize identity-bound — same capture, same leaf, same turn-start
+          // leaf, same context — so when it settles it finalizes its own
+          // checkpoint instead of a later turn's.
+          handlerRelease();
+          await capture.complete;
+          await finalizeTurn(typed, capture, leafId, turnStartLeaf);
+          return;
+        }
+        await finalizeTurn(typed, capture, leafId, turnStartLeaf);
+      } finally {
+        handlerRelease();
+      }
+    })();
+    // Undo/redo wait on this; it stays registered across a deferred
+    // continuation so the commands cannot slip in before the turn is recorded.
+    const tracked = work.then(
+      () => undefined,
+      // Best-effort diagnostics only: the tracked promise must stay
+      // never-rejecting for awaiting undo/redo handlers.
+      // eslint-disable-next-line no-console
+      (error) => console.error("[omp-undo-redo] finalize failed", error),
+    );
+    pendingFinalizations.set(sessionId, tracked);
+    void tracked.then(() => {
+      if (pendingFinalizations.get(sessionId) === tracked) pendingFinalizations.delete(sessionId);
+    });
+    return handlerDone;
+  }
+
   async function finalizeTurn(
     typed: AnyContext,
     capture: PendingCapture,
@@ -865,17 +919,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     turnStartLeaf: string | null,
   ): Promise<void> {
     const sessionId = typed.sessionManager.getSessionId();
-    const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
-    if (outcome.timedOut) {
-      // The capture overran the handler deadline. Keep this turn's finalize
-      // identity-bound — same capture, same leaf, same turn-start leaf, same
-      // context — so when it settles it finalizes its own checkpoint instead
-      // of a later turn's.
-      void capture.complete.then(() => {
-        void finalizeTurn(typed, capture, leafId, turnStartLeaf);
-      });
-      return;
-    }
+    await capture.complete;
     const before = capture.checkpoint;
     if (!before) return;
     // Consume the checkpoint: exactly one finalize (this turn's) may record it.
@@ -1009,7 +1053,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // it), but its checkpoint stays in the pending map — finalize from that.
       const settled = capture ? null : (pending.get(sessionId) ?? null);
       if (!capture && !settled) return;
-      await finalizeTurn(
+      await beginFinalizeTurn(
         typed,
         capture ?? { complete: Promise.resolve(), checkpoint: settled, failed: false },
         typed.sessionManager.getLeafId(),
@@ -1084,6 +1128,17 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         return;
       }
     }
+    const pendingFinalize = pendingFinalizations.get(sessionId);
+    if (pendingFinalize) {
+      const outcome = await awaitWithDeadline(pendingFinalize, captureDeadlineMs);
+      if (outcome.timedOut) {
+        ctx.ui.notify(
+          "Cannot undo while the last turn is still being finalized; try again shortly.",
+          "warning",
+        );
+        return;
+      }
+    }
     const nav = await ensureNavigation(typed);
     if (!nav) {
       ctx.ui.notify("Undo is unavailable while the session is closing.", "warning");
@@ -1111,6 +1166,17 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (outcome.timedOut) {
         ctx.ui.notify(
           "Cannot redo while the file checkpoint is still being captured; try again shortly.",
+          "warning",
+        );
+        return;
+      }
+    }
+    const pendingFinalize = pendingFinalizations.get(sessionId);
+    if (pendingFinalize) {
+      const outcome = await awaitWithDeadline(pendingFinalize, captureDeadlineMs);
+      if (outcome.timedOut) {
+        ctx.ui.notify(
+          "Cannot redo while the last turn is still being finalized; try again shortly.",
           "warning",
         );
         return;
