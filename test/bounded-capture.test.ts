@@ -256,7 +256,11 @@ describe("bounded capture lifecycle", () => {
       for (let attempt = 0; attempt < 20; attempt += 1) {
         await pi.runCommand("undo", ctx);
         const message = ctx.ui.notifications.at(-1)?.message ?? "";
-        if (message.includes("Nothing to undo") || message.includes("still being captured")) {
+        if (
+          message.includes("Nothing to undo") ||
+          message.includes("still being captured") ||
+          message.includes("still being finalized")
+        ) {
           await new Promise((resolve) => setTimeout(resolve, 100));
           continue;
         }
@@ -306,7 +310,11 @@ describe("bounded capture lifecycle", () => {
       for (let attempt = 0; attempt < 40; attempt += 1) {
         await pi.runCommand("undo", ctx);
         const message = ctx.ui.notifications.at(-1)?.message ?? "";
-        if (message.includes("Nothing to undo") || message.includes("still being captured")) {
+        if (
+          message.includes("Nothing to undo") ||
+          message.includes("still being captured") ||
+          message.includes("still being finalized")
+        ) {
           await new Promise((resolve) => setTimeout(resolve, 100));
           continue;
         }
@@ -389,6 +397,73 @@ describe("bounded capture lifecycle", () => {
       await pi.runCommand("redo", ctx);
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
     } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("waits for an in-flight finalize instead of undoing an empty history", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-finalize-"));
+    let releaseUpdateRef: (() => void) | undefined;
+    const updateRefGate = new Promise<void>((resolve) => {
+      releaseUpdateRef = resolve;
+    });
+    let updateRefCount = 0;
+    let finalizeAtGate = false;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createEnvGitRunner(workCwd, env) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        if (args[0] === "update-ref") {
+          updateRefCount += 1;
+          // The second update-ref belongs to the turn's after-snapshot: park
+          // finalizeTurn there so recordTurnEnd has not run yet.
+          if (updateRefCount >= 2) {
+            finalizeAtGate = true;
+            await updateRefGate;
+          }
+        }
+        return inner(args, options);
+      };
+      gated.cwd = workCwd;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 5_000 });
+      const ctx = context(cwd, "finalize-window-session");
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await pi.emit("before_agent_start", ctx);
+      for (let attempt = 0; attempt < 200 && updateRefCount < 1; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(updateRefCount).toBeGreaterThanOrEqual(1);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      const agentEndSettled = pi.emit("agent_end", ctx);
+      for (let attempt = 0; attempt < 200 && !finalizeAtGate; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(finalizeAtGate).toBe(true);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      let undoSettled = false;
+      const undoRun = pi.runCommand("undo", ctx).then(() => {
+        undoSettled = true;
+      });
+      // The undo must be blocked by the in-flight finalize, not run early.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(undoSettled).toBe(false);
+
+      releaseUpdateRef!();
+      await undoRun;
+      await agentEndSettled;
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+    } finally {
+      releaseUpdateRef?.();
       await rmRetry(cwd);
     }
   });

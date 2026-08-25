@@ -150,13 +150,19 @@ export class BlobHistoryStore {
       return { status: "expired", reason: tombstone.reason };
     }
 
+    const present = await stat(this.path)
+      .then(() => true)
+      .catch(() => false);
+    if (!present) return { status: "unavailable", reason: "missing" };
     const workspace = await this.canonicalWorkspace();
-    if (!workspace) return { status: "unavailable" };
+    if (!workspace) return { status: "unavailable", reason: "unusable" };
     try {
       const metadata = await stat(this.path);
-      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) return { status: "unavailable" };
+      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) {
+        return { status: "unavailable", reason: "unusable" };
+      }
       const value = JSON.parse(await readFile(this.path, "utf8")) as unknown;
-      if (!value || typeof value !== "object") return { status: "unavailable" };
+      if (!value || typeof value !== "object") return { status: "unavailable", reason: "unusable" };
       const candidate = value as Record<string, unknown>;
       if (
         typeof candidate.schemaVersion !== "number" ||
@@ -166,11 +172,11 @@ export class BlobHistoryStore {
         !Array.isArray(candidate.checkpoints) ||
         !Number.isInteger(candidate.currentIndex)
       )
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "unusable" };
       if (
         !candidate.checkpoints.every((checkpoint) => isSession(checkpoint) || isBlob(checkpoint))
       ) {
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "unusable" };
       }
       const checkpoints: TurnCheckpoint[] = [];
       const usableTrees = new Map<string, boolean>();
@@ -224,7 +230,8 @@ export class BlobHistoryStore {
         );
       }
       const currentIndex = candidate.currentIndex as number;
-      if (currentIndex < -1 || currentIndex >= checkpoints.length) return { status: "unavailable" };
+      if (currentIndex < -1 || currentIndex >= checkpoints.length)
+        return { status: "unavailable", reason: "unusable" };
       const state = { checkpoints, currentIndex };
       if (
         checkpoints.some(
@@ -233,16 +240,16 @@ export class BlobHistoryStore {
             !entryExists(reader, checkpoint.leafId),
         )
       )
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "unusable" };
 
       if (checkpoints.length === 0 && effectiveLeaf(reader) !== null) {
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "unusable" };
       }
 
       await this.save(state).catch(() => undefined);
       return { status: "loaded", state };
     } catch {
-      return { status: "unavailable" };
+      return { status: "unavailable", reason: "unusable" };
     }
   }
 

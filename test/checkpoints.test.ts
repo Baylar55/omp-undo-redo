@@ -1083,6 +1083,43 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("distinguishes missing from unusable history in SessionHistoryStore.load", async () => {
+    const { cwd, git } = await makeRepo();
+    const repository = {
+      worktree: cwd,
+      gitDir: join(cwd, ".git"),
+      commonDir: join(cwd, ".git"),
+    };
+    const sessionId = "chk-missing-vs-unusable";
+    const prompt: SessionEntryLike = {
+      id: "p1",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    try {
+      await initializeBranch(git, cwd);
+      const { SessionHistoryStore, historyPath } = await import("../src/core/history-store.js");
+      const store = new SessionHistoryStore(sessionId, repository, git);
+      const r = reader([prompt], "p1");
+
+      await expect(store.load(r)).resolves.toEqual({
+        status: "unavailable",
+        reason: "missing",
+      });
+
+      const hPath = historyPath(repository, sessionId);
+      await mkdir(join(repository.commonDir, "omp-undo-redo", "history"), { recursive: true });
+      await writeFile(hPath, "{corrupted history");
+      await expect(store.load(r)).resolves.toEqual({
+        status: "unavailable",
+        reason: "unusable",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("handles HistoryLoadResult, tombstone detection, and schema v1 to v2 upgrade in SessionHistoryStore", async () => {
     const { cwd, git } = await makeRepo();
     const repository = {
@@ -1111,8 +1148,11 @@ describe("history-safe Git checkpoints", () => {
       const store = new SessionHistoryStore(sessionId, repository, git);
       const r = reader([prompt, response], "r1");
 
-      // 1. Load empty -> returns status: "unavailable"
-      await expect(store.load(r)).resolves.toEqual({ status: "unavailable" });
+      // 1. Load empty -> returns status: "unavailable" with reason: "missing"
+      await expect(store.load(r)).resolves.toEqual({
+        status: "unavailable",
+        reason: "missing",
+      });
 
       // 2. Write schema v1 file without lastAccessedAt
       const hPath = historyPath(repository, sessionId);

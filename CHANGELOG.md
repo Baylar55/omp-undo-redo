@@ -2,6 +2,23 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.5.3] - 2026-08-25
+
+### Fixed
+
+- Serialize turn finalization against undo/redo: `recordTurnEnd` and redo invalidation now run through the same navigation chain as `undo()`/`redo()` (`src/core/session-navigation.ts`), so a turn recorded while an undo was still applying its patch can no longer leave a persisted cursor claiming the wrong checkpoint state — previously the durable history survived with a cursor that pointed past the actual worktree position, and the next redo applied the wrong delta.
+- `/undo` and `/redo` now bounded-wait (same `captureDeadlineMs` budget as the capture guard) for an in-flight turn finalization before navigating (`src/index.ts`), including the deferred finalize of an overrunning capture; previously a fast command could run against an empty or stale history while the last turn's checkpoint was still being written, reporting "Nothing to undo" for the turn the user meant to revert.
+- Recognize undo/redo's own session-tree navigation synchronously before queuing invalidation (`src/core/session-navigation.ts`), so the host's awaited `session_tree` dispatch cannot queue an invalidation behind the very navigation that triggered it.
+
+### Changed
+
+- History stores now distinguish a never-recorded session (`missing`) from existing-but-unloadable metadata (`unusable`) in `HistoryLoadResult` (`src/core/types.ts`, `src/core/history-store.ts`, `src/core/blob-history-store.ts`). Resuming over corrupt durable history warns once and continues session-only; fresh sessions stay silent.
+- Diagnostics: a failed turn finalization is logged to stderr instead of vanishing silently.
+
+### Documentation
+
+- README/SECURITY accuracy pass: rollback scope limited to workspace files (not shell/network/editor effects), per-mode symlink behavior (blob-store fallback skips them, Private-Git restores them), blob-mode walker does not parse workspace `.gitignore`, plaintext retention of sensitive files and the 4 MiB per-path ceiling, journal-quarantine semantics (`journals/failed/`, partial restore possible, mutation refused), host-ID sharing consequence for live remote sessions, 64 KiB runtime state-write cap, concurrency claims scoped to a single agent process. `SECURITY.md` added to the published tarball (`package.json`).
+
 ## [1.5.2] - 2026-08-21
 
 ### Fixed
@@ -92,7 +109,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - Add snapshot history retention: dormant session histories untouched for longer than `OMP_UNDO_REDO_RETENTION_DAYS` (default `2`) are expired automatically at startup, so Git refs, blob objects, and history files no longer grow without bound. Expired sessions resume with a warning and session-only undo/redo.
 - Add a storage cap for the non-Git blob store via `OMP_UNDO_REDO_MAX_STORE_MB` (default `1024`, i.e., 1 GiB): when the store exceeds the cap, the oldest inactive session histories are evicted iteratively until it drops back below.
 - Track history access with `lastAccessedAt` (history schema v2, backward compatible with v1) and write expiration tombstones so expired history is reported distinctly from missing or corrupt history.
-- Verify candidate sessions against a live active-session set during expiration so sessions that start concurrently are never expired by their own startup.
+- Verify candidate sessions against a live active-session set during expiration so sessions that start concurrently within the same agent process are never expired by their own startup.
 
 ### Changed
 

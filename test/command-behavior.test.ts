@@ -1,5 +1,5 @@
 import { SessionNavigation } from "../src/core/session-navigation.js";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   GitCheckpoint,
   GitRepository,
@@ -214,6 +214,45 @@ describe("session navigation", () => {
     navigation.recordTurnEnd(checkpoint("u1", "a1"));
     expect((await navigation.undo()).status).toBe("git_failed");
   });
+  it("serializes turn finalization against an in-flight undo", async () => {
+    const session = port();
+    let releaseApply: (() => void) | undefined;
+    const applyGate = new Promise<void>((resolve) => {
+      releaseApply = resolve;
+    });
+    let applyCalls = 0;
+    const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, {
+      git: async () => {
+        applyCalls++;
+        await applyGate;
+        return "applied";
+      },
+    });
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
+
+    const pendingUndo = navigation.undo();
+    await vi.waitFor(() => expect(applyCalls).toBe(1));
+
+    // Turn finalization lands while the undo is still applying its patch:
+    // the cursor must not move until the undo completes and decrements it.
+    const pendingFinalize = navigation.recordTurnEnd(checkpoint("a2", "a3"));
+    expect(navigation.snapshot()).toEqual({
+      checkpoints: [checkpoint("u1", "a1"), checkpoint("u2", "a2")],
+      currentIndex: 1,
+    });
+
+    releaseApply!();
+    await Promise.all([pendingUndo, pendingFinalize]);
+
+    // FIFO order: the undo finishes first (cursor 0), then the new turn
+    // discards the undone checkpoint and appends itself.
+    const finalState = navigation.snapshot();
+    expect(finalState.checkpoints.map((entry) => entry.leafId)).toEqual(["a1", "a3"]);
+    expect(finalState.currentIndex).toBe(1);
+    expect((await navigation.redo()).status).toBe("empty");
+  });
+
   it("supports repeated session-only undo and redo", async () => {
     const session = port();
     const navigation = makeNavigation(session);

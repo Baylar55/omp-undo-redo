@@ -335,18 +335,24 @@ export class SessionHistoryStore {
     }
 
     const path = historyPath(this.repository, this.sessionId);
+    const present = await stat(path)
+      .then(() => true)
+      .catch(() => false);
+    if (!present) return { status: "unavailable", reason: "missing" };
     try {
       const metadata = await stat(path);
-      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) return { status: "unavailable" };
+      if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) {
+        return { status: "unavailable", reason: "unusable" };
+      }
       const parsed = parseHistory(
         JSON.parse(await readFile(path, "utf8")) as unknown,
         this.sessionId,
         this.repository,
       );
-      if (!parsed) return { status: "unavailable" };
+      if (!parsed) return { status: "unavailable", reason: "unusable" };
       const refPrefix = `refs/omp-undo-redo/history/${parsed.sessionHash}/`;
       const refs = await existingRefs(this.git, refPrefix);
-      if (refs === null) return { status: "unavailable" };
+      if (refs === null) return { status: "unavailable", reason: "unusable" };
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
         if (checkpoint.kind === "session") return checkpoint;
         if (checkpoint.kind !== "git")
@@ -377,16 +383,16 @@ export class SessionHistoryStore {
             !entryExists(reader, checkpoint.leafId),
         )
       )
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "unusable" };
 
       if (checkpoints.length === 0 && effectiveLeaf(reader) !== null) {
-        return { status: "unavailable" };
+        return { status: "unavailable", reason: "unusable" };
       }
 
       await this.save(state).catch(() => undefined);
       return { status: "loaded", state };
     } catch {
-      return { status: "unavailable" };
+      return { status: "unavailable", reason: "unusable" };
     }
   }
 

@@ -14,4 +14,4 @@ Maintainers will acknowledge reports when practical, investigate, and coordinate
 
 ## Scope
 
-The extension navigates OMP's in-memory session tree. It does not promise to roll back files, shell commands, network requests, or other external effects. Reports about those limitations are not security vulnerabilities, but may be filed as normal issues when they describe a reproducible defect.
+The extension navigates OMP's in-memory session tree and restores worktree file contents between recorded checkpoints. It does not promise to roll back shell commands, network requests, editor state, or other external effects. Reports about those limitations are not security vulnerabilities, but may be filed as normal issues when they describe a reproducible defect.

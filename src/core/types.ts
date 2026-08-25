@@ -173,7 +173,7 @@ export interface ExpirationTombstone {
 export type HistoryLoadResult =
   | { status: "loaded"; state: NavigationState }
   | { status: "expired"; reason: "age" | "storage_cap" }
-  | { status: "unavailable" };
+  | { status: "unavailable"; reason?: "missing" | "unusable" };
 
 export type PendingTurnCheckpoint =
   PendingGitCheckpoint | PendingBlobCheckpoint | PendingSessionCheckpoint;

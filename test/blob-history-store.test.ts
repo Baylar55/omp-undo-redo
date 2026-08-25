@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BlobHistoryStore } from "../src/core/blob-history-store.js";
 import { BlobStore } from "../src/core/blob-store/index.js";
@@ -47,6 +47,32 @@ afterEach(async () => {
 });
 
 describe("blob history store", () => {
+  it("distinguishes missing from unusable history files on load", async () => {
+    const workspace = await temporaryDirectory("omp-blob-history-workspace-");
+    const storage = await temporaryDirectory("omp-blob-history-storage-");
+    const sessionId = "blob-missing-vs-unusable";
+    const store = new BlobStore(storage);
+    const history = new BlobHistoryStore(sessionId, workspace, store);
+
+    await expect(history.load(reader())).resolves.toEqual({
+      status: "unavailable",
+      reason: "missing",
+    });
+
+    const historyPath = join(
+      store.rootDirectory,
+      "history",
+      `${checkpointNamespace(sessionId)}.json`,
+    );
+    await mkdir(dirname(historyPath), { recursive: true });
+    await writeFile(historyPath, "{corrupted history");
+    await expect(history.load(reader())).resolves.toEqual({
+      status: "unavailable",
+      reason: "unusable",
+    });
+    await store.shutdown();
+  });
+
   it("round-trips retained checkpoints across store instances", async () => {
     const workspace = await temporaryDirectory("omp-blob-history-workspace-");
     const storage = await temporaryDirectory("omp-blob-history-storage-");
