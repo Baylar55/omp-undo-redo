@@ -2,6 +2,13 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.5.5] - 2026-08-26
+
+### Changed
+
+- **Private-repo eviction is now multi-gated and recoverable.** A vanished workspace alone no longer destroys a snapshot repository at the next sweep: eviction requires the workspace `stat` to fail with ENOENT/ENOTDIR twice (200ms apart, so a single mount/AV/lock hiccup cannot trigger it), the repo to be idle ≥24h, no captures/finalizations/operations in flight, and no live `git gc` (`gc.pid`). Qualifying repos are renamed to `<hash>.git.evicted-<ts>` and their bytes removed only after 7 days, so a false positive stays recoverable — previously a single failed `stat` of any error kind irreversibly `rm -rf`'d the repo and every snapshot in it.
+- Shutdown private-GCs now sequence strictly after the eviction sweep finishes instead of racing it (a concurrent `gc --prune=now` both held handles through the rename and bumped mtimes past the idle gate); they skip repos eviction renamed away. Housekeeping remains off the shutdown latency path.
+
 ## [1.5.4] - 2026-08-25
 
 ### Fixed

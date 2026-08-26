@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import { readFile, readdir, rm, stat } from "node:fs/promises";
+import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionEntryLike } from "./core/types.js";
@@ -404,9 +404,79 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     );
   }
 
+  // Core turn-state, declared ahead of the eviction helpers below that read
+  // them (evictStalePrivateRepos' in-flight guard).
+  const pendingCaptures = new Map<string, PendingCapture>();
+  const pendingFinalizations = new Map<string, Promise<void>>();
+  const activeOperations = new Set<Promise<void>>();
+
+  /** How long a snapshot repo must sit untouched before its workspace's
+   *  disappearance counts as abandonment rather than a transient mount or
+   *  lock hiccup (offline SMB/NFS volume, AV scan, temporarily renamed dir). */
+  const EVICTION_IDLE_CUTOFF_MS = 24 * 60 * 60 * 1000;
+  /** Evicted repos are renamed aside as recoverable trash and kept this long
+   *  before any bytes are removed. */
+  const EVICTION_TRASH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+  /** Delay riding out short flaps: between the two workspace stats, and
+   *  between retries when a git child still holds a directory handle on
+   *  Windows. */
+  const EVICTION_RETRY_DELAY_MS = 200;
+
+  async function removeDirWithRetry(path: string): Promise<boolean> {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await rm(path, { recursive: true, force: true });
+        return true;
+      } catch {
+        if (attempt === 4) return false;
+        await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
+      }
+    }
+    return false;
+  }
+
+  /** Newest mtime across `dir` and its direct children. Git writes land in
+   *  descendants (logs, packs, COMMIT_EDITMSG), not necessarily the root, so
+   *  the root mtime alone under-reports recent activity. Returns null when
+   *  freshness cannot be determined; callers must then not evict. */
+  async function lastActivityMs(dir: string): Promise<number | null> {
+    let newest: number | null = null;
+    const consider = (ms: number): void => {
+      if (newest === null || ms > newest) newest = ms;
+    };
+    try {
+      consider((await stat(dir)).mtimeMs);
+    } catch {
+      return null;
+    }
+    let children: string[];
+    try {
+      children = await readdir(dir);
+    } catch {
+      return newest;
+    }
+    await Promise.all(
+      children.map(async (name) => {
+        try {
+          consider((await stat(join(dir, name))).mtimeMs);
+        } catch {
+          // Ignore
+        }
+      }),
+    );
+    return newest;
+  }
+
   /** Removes private repos whose workspace no longer exists. Runs at boot and
    *  on shutdown so vanished workspaces cannot leave their snapshot repos
-   *  (and the file contents inside them) behind forever. */
+   *  (and the file contents inside them) behind forever.
+   *
+   *  Deliberately conservative: eviction requires the workspace stat to fail
+   *  with ENOENT/ENOTDIR twice (re-checked after a delay, so a single mount
+   *  or AV hiccup cannot trigger it), the repo to be idle past
+   *  EVICTION_IDLE_CUTOFF_MS, nothing touching snapshot repos to be in
+   *  flight, and even then the repo is only renamed aside as `.evicted-<ts>`
+   *  trash for EVICTION_TRASH_RETENTION_MS instead of being deleted outright. */
   async function evictStalePrivateRepos(): Promise<void> {
     const reposDir = join(await canonicalCwd(blobStoreRootDirectory()), "repos");
     let entries: string[];
@@ -415,28 +485,72 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     } catch {
       return;
     }
+
+    // Defer when work touching snapshot repos is in flight (captures,
+    // finalizes, undo/redo): git children may still be writing into them.
+    // Whatever is left behind is revisited by the next boot or shutdown
+    // sweep. Registered-but-idle sessions are deliberately NOT a guard:
+    // the shutdown sweep exists to evict exactly those once drained.
+    if (pendingCaptures.size > 0 || pendingFinalizations.size > 0 || activeOperations.size > 0) {
+      return;
+    }
+
+    const now = Date.now();
     for (const entry of entries) {
+      const path = join(reposDir, entry);
+      const trashMatch = /\.evicted-(\d+)$/.exec(entry);
+      if (trashMatch) {
+        // Trash from an earlier sweep. Retention is stamped in the name
+        // because rename preserves mtime.
+        if (now - Number(trashMatch[1]) >= EVICTION_TRASH_RETENTION_MS) {
+          await removeDirWithRetry(path);
+        }
+        continue;
+      }
       if (!entry.endsWith(".git")) continue;
-      const gitDir = join(reposDir, entry);
       try {
-        const config = await readFile(join(gitDir, "config"), "utf8");
+        // A running `git gc` (ours or external) is actively rewriting this
+        // repo; touching it now would race the child. gc removes the pid
+        // file when it exits, so a lingering one means the child was killed
+        // hard — but only a RECENT pidfile is trusted as "live": one older
+        // than the idle cutoff is crash debris and must not block eviction
+        // forever. A real gc on these repos finishes well inside that
+        // window; a genuinely long child just fails the rename below and is
+        // retried by a later sweep.
+        try {
+          const gcPidStat = await stat(join(path, "gc.pid"));
+          if (now - gcPidStat.mtimeMs < EVICTION_IDLE_CUTOFF_MS) continue;
+        } catch {
+          // No pidfile.
+        }
+        const config = await readFile(join(path, "config"), "utf8");
         const worktreeMatch = /^\s*worktree\s*=\s*(.+)$/m.exec(config);
         if (!worktreeMatch) continue;
         const worktree = worktreeMatch[1].trim();
-        try {
-          await stat(worktree);
-        } catch {
-          // Workspace vanished: drop the repo. A gc or other git child may
-          // still hold the dir handle on Windows; retry briefly so a single
-          // transient EBUSY does not strand the repo until the next sweep.
-          for (let attempt = 0; attempt < 5; attempt += 1) {
-            try {
-              await rm(gitDir, { recursive: true, force: true });
-              break;
-            } catch {
-              if (attempt === 4) throw new Error(`could not evict ${gitDir}`);
-              await new Promise((resolve) => setTimeout(resolve, 200));
-            }
+        const vanished = async (): Promise<boolean> => {
+          try {
+            await stat(worktree);
+            return false;
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException | undefined)?.code;
+            // Anything else (EACCES, EBUSY, EIO, EMFILE...) means "cannot
+            // tell", which must never be read as "gone".
+            return code === "ENOENT" || code === "ENOTDIR";
+          }
+        };
+        if (!(await vanished())) continue;
+        await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
+        if (!(await vanished())) continue;
+        const lastActivity = await lastActivityMs(path);
+        if (lastActivity === null || now - lastActivity < EVICTION_IDLE_CUTOFF_MS) continue;
+        const trashPath = `${path}.evicted-${now}`;
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          try {
+            await rename(path, trashPath);
+            break;
+          } catch {
+            if (attempt === 4) break; // Stranded until a later sweep.
+            await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
           }
         }
       } catch {
@@ -445,10 +559,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     }
   }
 
-  const pendingCaptures = new Map<string, PendingCapture>();
-  const pendingFinalizations = new Map<string, Promise<void>>();
   const initializations = new Map<string, Promise<SessionNavigation>>();
-  const activeOperations = new Set<Promise<void>>();
   let closing = false;
   let shutdownPromise: Promise<void> | null = null;
   let pendingSwitchSourceSessionId: string | null = null;
@@ -1119,20 +1230,32 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       await releaseAllPersistentSnapshotIndices();
       await drainState();
       await ownerRegistry.shutdown();
-      // Private-repo housekeeping on the way out: gc repos that crossed the
-      // capture threshold and evict repos whose workspaces vanished. Both run
-      // fire-and-forget (the process may exit before they finish; the counter
-      // trigger covers the in-process case).
-      void Promise.allSettled(
-        [...privateRepositories.values()].map(async (entry) => {
-          if ("failure" in entry || !entry.repository || !entry.git) return;
-          if (capturesSinceGcByGitDir.has(entry.repository.gitDir)) {
-            capturesSinceGcByGitDir.delete(entry.repository.gitDir);
-            await schedulePrivateGc(entry.repository.gitDir);
-          }
-        }),
-      );
-      void evictStalePrivateRepos().catch(() => undefined);
+      // Private-repo housekeeping on the way out: evict repos whose
+      // workspaces vanished, then gc repos that crossed the capture
+      // threshold. Runs detached so an overrunning sweep cannot delay
+      // shutdown, but internally sequenced: a gc racing the sweep would
+      // both hold handles through the rename and bump mtimes past the idle
+      // cutoff, so every gc waits for eviction to finish first and skips
+      // repos it renamed away. Whatever is unfinished when the process
+      // exits is covered by the next boot sweep.
+      void evictStalePrivateRepos()
+        .catch(() => undefined)
+        .then(() =>
+          Promise.allSettled(
+            [...privateRepositories.values()].map(async (entry) => {
+              if ("failure" in entry || !entry.repository || !entry.git) return;
+              const gitDir = entry.repository.gitDir;
+              if (!capturesSinceGcByGitDir.has(gitDir)) return;
+              capturesSinceGcByGitDir.delete(gitDir);
+              try {
+                await stat(gitDir);
+              } catch {
+                return;
+              }
+              await schedulePrivateGc(gitDir);
+            }),
+          ),
+        );
       await Promise.allSettled(
         [...blobStores.values()].map(async (store) => {
           await store.garbageCollect().catch(() => undefined);
