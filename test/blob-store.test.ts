@@ -31,6 +31,20 @@ function sessionHash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function withResolvers<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories
@@ -770,8 +784,8 @@ describe("non-Git blob store", () => {
     const locks1 = new StoreLocks(storage, "owner-1");
     const locks2 = new StoreLocks(aliasedStorage, "owner-2");
 
-    const firstEntered = Promise.withResolvers<void>();
-    const releaseFirst = Promise.withResolvers<void>();
+    const firstEntered = withResolvers<void>();
+    const releaseFirst = withResolvers<void>();
 
     const op1 = locks1.withWorkspaceMutex(workspace, async () => {
       firstEntered.resolve();
@@ -934,8 +948,8 @@ describe("non-Git blob store", () => {
 
     const locks1 = new StoreLocks(storage, "owner-1");
 
-    const holder1Entered = Promise.withResolvers<void>();
-    const finishHolder1 = Promise.withResolvers<void>();
+    const holder1Entered = withResolvers<void>();
+    const finishHolder1 = withResolvers<void>();
 
     // Holder 1 acquires lock
     const op1 = locks1.withWorkspaceMutex(workspace, async () => {
