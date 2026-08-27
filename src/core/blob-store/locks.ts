@@ -1,8 +1,13 @@
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { sha256 } from "./fs.js";
+import { canonicalPath, canonicalPathSync, sha256 } from "./fs.js";
+
+const LOCK_HEARTBEAT_MS = 5_000;
+const LOCK_LOCAL_STALE_MS = 30_000;
+const LOCK_FOREIGN_STALE_MS = 24 * 60 * 60 * 1000;
 
 /** Mutual exclusion for the blob store. Two layers that must always be
  *  taken together:
@@ -20,7 +25,7 @@ export class StoreLocks {
   private readonly locks = new Map<string, Promise<void>>();
 
   constructor(rootDirectory: string, ownerId: string) {
-    this.rootDirectory = rootDirectory;
+    this.rootDirectory = canonicalPathSync(rootDirectory);
     this.ownerId = ownerId;
   }
 
@@ -32,17 +37,42 @@ export class StoreLocks {
       try {
         await mkdir(lockPath, { mode: 0o700 });
         try {
-          await writeFile(
-            join(lockPath, "owner.json"),
-            JSON.stringify({ pid: process.pid, hostname: hostname(), ownerId: this.ownerId }),
-            { mode: 0o600 },
-          );
+          const content = JSON.stringify({
+            pid: process.pid,
+            hostname: hostname(),
+            ownerId: this.ownerId,
+            startedAt: new Date().toISOString(),
+          });
+          const tmpPath = join(lockPath, `owner.${randomUUID()}.tmp`);
+          await writeFile(tmpPath, content, { mode: 0o600 });
+          await rename(tmpPath, join(lockPath, "owner.json"));
         } catch (error) {
           await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
           throw error;
         }
+        const beat = async (): Promise<void> => {
+          try {
+            const now = new Date();
+            await utimes(lockPath, now, now);
+          } catch {
+            // Lock released or unavailable
+          }
+        };
+        const interval = setInterval(() => void beat(), LOCK_HEARTBEAT_MS);
+        interval.unref();
+
         return async () => {
-          await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+          clearInterval(interval);
+          try {
+            const current = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as {
+              ownerId?: string;
+            };
+            if (current.ownerId === this.ownerId) {
+              await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+            }
+          } catch {
+            // Lock already reaped, removed, or unreadable — never delete another holder's lock
+          }
         };
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
@@ -51,24 +81,58 @@ export class StoreLocks {
           const owner = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as {
             pid?: number;
             hostname?: string;
+            ownerId?: string;
+            startedAt?: string;
           };
+          const metadata = await stat(lockPath);
           if (owner.hostname === hostname() && typeof owner.pid === "number") {
             try {
               process.kill(owner.pid, 0);
             } catch (probeError) {
               if ((probeError as NodeJS.ErrnoException).code === "ESRCH") {
-                await rm(lockPath, { recursive: true, force: true });
+                await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+                continue;
+              }
+            }
+            // Same host: heartbeat staleness catches recycled PIDs and hung processes safely
+            if (Date.now() - metadata.mtimeMs > LOCK_LOCAL_STALE_MS) {
+              await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+              continue;
+            }
+          } else {
+            // Foreign host / unprobeable: do not steal locks on short heartbeat (clock skew risk).
+            // Only reap after conservative 24h fallback window to prevent permanent lockout.
+            // Note: assumes foreign host wall-clock skew is within 24h.
+            if (Date.now() - metadata.mtimeMs > LOCK_FOREIGN_STALE_MS) {
+              let recent = false;
+              if (owner.startedAt) {
+                const startedMs = Date.parse(owner.startedAt);
+                if (!Number.isNaN(startedMs) && Date.now() - startedMs < LOCK_FOREIGN_STALE_MS) {
+                  recent = true;
+                }
+              }
+              if (!recent) {
+                await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
                 continue;
               }
             }
           }
         } catch {
-          // A process can crash between mkdir and owner publication. Reap only an old,
-          // ownerless lock; a live publisher gets a generous completion window.
+          // A process can crash between mkdir and owner publication (owner.json missing or partial),
+          // or owner.json exists but is unparseable / permission-denied.
           try {
             const metadata = await stat(lockPath);
-            if (Date.now() - metadata.mtimeMs > 30_000) {
-              await rm(lockPath, { recursive: true, force: true });
+            let timeoutThreshold = LOCK_LOCAL_STALE_MS;
+            try {
+              const raw = await readFile(join(lockPath, "owner.json"), "utf8");
+              if (raw.includes(`"hostname":"`) && !raw.includes(`"hostname":"${hostname()}"`)) {
+                timeoutThreshold = LOCK_FOREIGN_STALE_MS;
+              }
+            } catch {
+              // Missing or unreadable — treat as local crash
+            }
+            if (Date.now() - metadata.mtimeMs > timeoutThreshold) {
+              await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
               continue;
             }
           } catch {
@@ -117,8 +181,9 @@ export class StoreLocks {
    *  blocks another workspace — the store lock is reserved for ref/manifest
    *  publication and GC, which the whole store must agree on. */
   async withWorkspaceMutex<T>(root: string, operation: () => Promise<T>): Promise<T> {
-    return this.withWorkspaceLock(root, async () => {
-      const release = await this.acquireFilesystemLock(`workspace:${root}`);
+    const canonicalRoot = await canonicalPath(root);
+    return this.withWorkspaceLock(canonicalRoot, async () => {
+      const release = await this.acquireFilesystemLock(`workspace:${canonicalRoot}`);
       try {
         return await operation();
       } finally {

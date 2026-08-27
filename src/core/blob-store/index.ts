@@ -1,8 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { atomicWrite, blobPathFor, exists, isHash, safeId, sha256, treePathFor } from "./fs.js";
+import {
+  atomicWrite,
+  blobPathFor,
+  canonicalPath,
+  canonicalPathSync,
+  exists,
+  isHash,
+  safeId,
+  sha256,
+  treePathFor,
+} from "./fs.js";
 import {
   canonicalManifest,
   manifestFileContent,
@@ -33,12 +43,15 @@ export type { BlobApplyResult, SnapshotPhase, TreeEntry, TreeManifest } from "./
 export { DEFAULT_BLOB_IGNORES } from "./types.js";
 
 export function blobStoreRootDirectory(): string {
-  if (process.env.OMP_UNDO_REDO_BLOB_DIR) return resolve(process.env.OMP_UNDO_REDO_BLOB_DIR);
+  if (process.env.OMP_UNDO_REDO_BLOB_DIR) {
+    return canonicalPathSync(process.env.OMP_UNDO_REDO_BLOB_DIR);
+  }
   if (process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
     const runtime = resolve(process.env.OMP_UNDO_REDO_RUNTIME_DIR);
-    return basenameIsRuntime(runtime) ? dirname(runtime) : runtime;
+    const dir = basenameIsRuntime(runtime) ? dirname(runtime) : runtime;
+    return canonicalPathSync(dir);
   }
-  return resolve(join(homedir(), ".omp", "omp-undo-redo"));
+  return canonicalPathSync(join(homedir(), ".omp", "omp-undo-redo"));
 }
 
 /** The literal "/runtime" catches env-var paths written with forward slashes
@@ -86,7 +99,7 @@ export class BlobStore {
       walkConcurrency?: number;
     } = {},
   ) {
-    this.rootDirectory = resolve(rootDirectory);
+    this.rootDirectory = canonicalPathSync(rootDirectory);
     const clock = options.clock ?? (() => new Date());
     this.clock = clock;
     this.locks = new StoreLocks(this.rootDirectory, this.ownerId);
@@ -107,7 +120,8 @@ export class BlobStore {
     this.mutator = new WorkspaceMutator({
       storeRoot: this.rootDirectory,
       clock,
-      invalidateCache: (workspaceRoot) => this.workspaceCaches.delete(workspaceRoot),
+      invalidateCache: (workspaceRoot) =>
+        this.workspaceCaches.delete(canonicalPathSync(workspaceRoot)),
     });
     this.janitor = new StoreJanitor({
       rootDirectory: this.rootDirectory,
@@ -196,7 +210,7 @@ export class BlobStore {
     if (!isHash(sessionHash) || !safeId(checkpointId)) return { reason: "blob_capture_failed" };
     let canonicalRoot: string;
     try {
-      canonicalRoot = await realpath(workspaceRoot);
+      canonicalRoot = await canonicalPath(workspaceRoot);
       if (!(await lstat(canonicalRoot)).isDirectory()) return { reason: "workspace_unresolvable" };
     } catch {
       return { reason: "workspace_unresolvable" };
@@ -333,7 +347,7 @@ export class BlobStore {
   ): Promise<BlobApplyResult> {
     let root: string;
     try {
-      root = await realpath(workspaceRoot);
+      root = await canonicalPath(workspaceRoot);
     } catch {
       return { status: "failed" };
     }

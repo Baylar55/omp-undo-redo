@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import type { Dirent } from "node:fs";
-import { atomicWrite } from "./fs.js";
+import { atomicWrite, canonicalPathSync } from "./fs.js";
 
 /** Captures walk their workspace outside the store lock and write blobs that
  *  no ref references until the walk's publish step. A concurrent GC must not
@@ -16,8 +16,10 @@ const CAPTURE_MARKER_STALE_MS = 30_000;
 
 /** Cross-process liveness for the store: the lease that proves this owner is
  *  alive (used to reap a dead owner's active refs) and the capture markers
- *  that defer GC sweeps while captures are in flight. */
-
+ *  that defer GC sweeps while captures are in flight.
+ *
+ *  Note on foreign leases: leases from foreign hosts on shared filesystems
+ *  are conservatively reaped after 24h of inactivity (no snapshots/sweeps). */
 export class StoreLiveness {
   private readonly rootDirectory: string;
   private readonly ownerId: string;
@@ -25,7 +27,7 @@ export class StoreLiveness {
   private leasePublished = false;
 
   constructor(rootDirectory: string, ownerId: string, clock: () => Date) {
-    this.rootDirectory = rootDirectory;
+    this.rootDirectory = canonicalPathSync(rootDirectory);
     this.ownerId = ownerId;
     this.clock = clock;
   }
@@ -35,9 +37,14 @@ export class StoreLiveness {
   }
 
   async publishLease(): Promise<void> {
-    if (this.leasePublished) return;
+    const leasePath = join(this.rootDirectory, "leases", `${this.ownerId}.json`);
+    if (this.leasePublished) {
+      const now = new Date();
+      await utimes(leasePath, now, now).catch(() => undefined);
+      return;
+    }
     await atomicWrite(
-      join(this.rootDirectory, "leases", `${this.ownerId}.json`),
+      leasePath,
       JSON.stringify({
         ownerId: this.ownerId,
         pid: process.pid,
@@ -171,8 +178,6 @@ export class StoreLiveness {
                 } catch (e) {
                   if ((e as NodeJS.ErrnoException).code !== "ESRCH") continue;
                 }
-              } else {
-                continue;
               }
               await rm(join(leasesDir, entry.name), { force: true }).catch(() => undefined);
             }

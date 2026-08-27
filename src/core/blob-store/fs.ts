@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createReadStream, realpath as realpathCb, realpathSync } from "node:fs";
 import { chmod, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { promisify } from "node:util";
+
+const realpathNative = promisify(realpathCb.native);
 
 /** Filesystem, hashing, and path/id-guard primitives shared by the blob
  *  store's internal modules. Everything here is stateless. */
@@ -92,4 +95,44 @@ export function depth(value: string): number {
     if (value.charCodeAt(index) === 47) count++; // "/"
   }
   return count;
+}
+
+export function canonicalPathSync(path: string): string {
+  try {
+    return realpathSync.native(path);
+  } catch {
+    let current = resolve(path);
+    const suffix: string[] = [];
+    while (true) {
+      try {
+        const canonical = realpathSync.native(current);
+        return suffix.length ? join(canonical, ...suffix.reverse()) : canonical;
+      } catch {
+        const parent = dirname(current);
+        if (parent === current) return resolve(path);
+        suffix.push(basename(current));
+        current = parent;
+      }
+    }
+  }
+}
+
+export async function canonicalPath(path: string): Promise<string> {
+  try {
+    return await realpathNative(path);
+  } catch {
+    let current = resolve(path);
+    const suffix: string[] = [];
+    while (true) {
+      try {
+        const canonical = await realpathNative(current);
+        return suffix.length ? join(canonical, ...suffix.reverse()) : canonical;
+      } catch {
+        const parent = dirname(current);
+        if (parent === current) return resolve(path);
+        suffix.push(basename(current));
+        current = parent;
+      }
+    }
+  }
 }

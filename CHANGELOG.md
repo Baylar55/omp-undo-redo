@@ -2,6 +2,17 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.5.6] - 2026-08-27
+
+### Fixed
+
+- **Blob-store lock & lease protocol hardening (scope canonicalization & liveness heartbeats):**
+  - **Textual path aliasing / split-brain prevention:** `BlobStore`, `StoreLocks`, `StoreLiveness`, `captureSnapshot`, `applySnapshot`, and `invalidateCache` now canonicalize store and workspace roots via native `realpath` (`canonicalPath`/`canonicalPathSync` in `src/core/blob-store/fs.ts`), ensuring symlinks, Windows 8.3 short paths, casing differences, and relative path spellings hash to identical lock keys (`src/core/blob-store/locks.ts`, `src/core/blob-store/index.ts`, `src/core/blob-store/liveness.ts`).
+  - **Lock heartbeats & PID recycling protection:** lock holders write `{ pid, hostname, ownerId, startedAt }` atomically via temp file and maintain a 5s heartbeat (`utimes`). Same-host contenders reap dead processes instantly on `ESRCH` and reclaim hung/recycled PIDs when heartbeat is stale (>30s) (`src/core/blob-store/locks.ts`).
+  - **Cross-host split-brain protection:** foreign-host locks are never reaped on short heartbeats, preventing clock-skew lock theft on shared network mounts (NFS/SMB); an abandoned foreign lock is reclaimed only after a conservative 24h fallback window (`src/core/blob-store/locks.ts`).
+  - **Release-after-reap fencing:** lock release closure verifies `owner.json` still matches `ownerId` before deleting, ensuring a stalled holder that wakes up after being reaped never deletes a new holder's active lock (`src/core/blob-store/locks.ts`).
+  - **Lease liveness refresh:** repeat `publishLease()` calls refresh lease `mtime` via `utimes`, keeping long-running active sessions fresh (`src/core/blob-store/liveness.ts`).
+
 ## [1.5.5] - 2026-08-26
 
 ### Changed
