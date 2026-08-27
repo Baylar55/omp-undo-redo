@@ -17,7 +17,8 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { BlobStore } from "../src/core/blob-store/index.js";
-
+import { StoreLocks } from "../src/core/blob-store/locks.js";
+import { canonicalPath, sha256 } from "../src/core/blob-store/fs.js";
 const temporaryDirectories: string[] = [];
 
 async function temporaryDirectory(prefix: string): Promise<string> {
@@ -741,5 +742,236 @@ describe("non-Git blob store", () => {
     expect(released).toBe(true);
     expect(await store.hasHistoryRef(session, checkpoint, "before")).toBe(false);
     await store.shutdown();
+  });
+
+  it("canonicalizes store and workspace roots to avoid lock key split-brain on aliased paths", async () => {
+    const workspace = await temporaryDirectory("omp-blob-alias-workspace-");
+    const storage = await temporaryDirectory("omp-blob-alias-storage-");
+
+    // Construct true symlink aliases for workspace and storage
+    const symlinkParent = await temporaryDirectory("omp-blob-symlink-parent-");
+    const symlinkWorkspace = join(symlinkParent, "ws-link");
+    const symlinkStorage = join(symlinkParent, "store-link");
+
+    try {
+      await symlink(workspace, symlinkWorkspace, "junction");
+      await symlink(storage, symlinkStorage, "junction");
+    } catch {
+      // If symlink creation not permitted on environment, fallback to casing
+    }
+
+    const aliasedWorkspace = await stat(symlinkWorkspace)
+      .then(() => symlinkWorkspace)
+      .catch(() => workspace.toUpperCase());
+    const aliasedStorage = await stat(symlinkStorage)
+      .then(() => symlinkStorage)
+      .catch(() => storage.toUpperCase());
+
+    const locks1 = new StoreLocks(storage, "owner-1");
+    const locks2 = new StoreLocks(aliasedStorage, "owner-2");
+
+    const firstEntered = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+
+    const op1 = locks1.withWorkspaceMutex(workspace, async () => {
+      firstEntered.resolve();
+      await releaseFirst.promise;
+      return "first";
+    });
+
+    await firstEntered.promise;
+
+    // Start op2 while op1 holds the lock — op2 should block on the mutex
+    let op2Started = false;
+    const op2 = locks2.withWorkspaceMutex(aliasedWorkspace, async () => {
+      op2Started = true;
+      return "second";
+    });
+
+    // Give microtasks a turn to ensure op2 tried to acquire
+    await Promise.resolve();
+    expect(op2Started).toBe(false);
+
+    // Release first lock
+    releaseFirst.resolve();
+
+    const [res1, res2] = await Promise.all([op1, op2]);
+    expect(res1).toBe("first");
+    expect(res2).toBe("second");
+  });
+  it("reaps same-host locks with dead heartbeats (recycled PID protection)", async () => {
+    const workspace = await temporaryDirectory("omp-blob-stale-local-workspace-");
+    const storage = await temporaryDirectory("omp-blob-stale-local-storage-");
+    const canonicalWorkspace = await canonicalPath(workspace);
+    const lockKey = sha256(`workspace:${canonicalWorkspace}`);
+    const lockPath = join(storage, "locks", `${lockKey}.lock`);
+
+    await mkdir(lockPath, { recursive: true });
+    // Point to current pid (which is alive) but with a dead heartbeat (>30s)
+    await writeFile(
+      join(lockPath, "owner.json"),
+      JSON.stringify({
+        hostname: hostname(),
+        pid: process.pid,
+        ownerId: "stale-same-host-owner",
+        startedAt: new Date(Date.now() - 40_000).toISOString(),
+      }),
+    );
+
+    const oldTime = new Date(Date.now() - 40_000);
+    await utimes(lockPath, oldTime, oldTime);
+
+    const locks = new StoreLocks(storage, "local-owner");
+    const result = await locks.withWorkspaceMutex(workspace, async () => "acquired");
+    expect(result).toBe("acquired");
+  });
+
+  it("reaps abandoned foreign-host locks after 24h fallback window", async () => {
+    const workspace = await temporaryDirectory("omp-blob-stale-foreign-workspace-");
+    const storage = await temporaryDirectory("omp-blob-stale-foreign-storage-");
+    const canonicalWorkspace = await canonicalPath(workspace);
+    const lockKey = sha256(`workspace:${canonicalWorkspace}`);
+    const lockPath = join(storage, "locks", `${lockKey}.lock`);
+
+    await mkdir(lockPath, { recursive: true });
+    const dayAndHalfAgo = Date.now() - 36 * 60 * 60 * 1000;
+    await writeFile(
+      join(lockPath, "owner.json"),
+      JSON.stringify({
+        hostname: "dead-foreign-host",
+        pid: 999999,
+        ownerId: "dead-foreign-owner",
+        startedAt: new Date(dayAndHalfAgo).toISOString(),
+      }),
+    );
+
+    const oldTime = new Date(dayAndHalfAgo);
+    await utimes(lockPath, oldTime, oldTime);
+
+    const locks = new StoreLocks(storage, "local-owner");
+    const result = await locks.withWorkspaceMutex(workspace, async () => "acquired");
+    expect(result).toBe("acquired");
+  });
+
+  it("does not steal fresh foreign-host locks and rejects on timeout", async () => {
+    const workspace = await temporaryDirectory("omp-blob-fresh-foreign-workspace-");
+    const storage = await temporaryDirectory("omp-blob-fresh-foreign-storage-");
+    const canonicalWorkspace = await canonicalPath(workspace);
+    const lockKey = sha256(`workspace:${canonicalWorkspace}`);
+    const lockPath = join(storage, "locks", `${lockKey}.lock`);
+
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(
+      join(lockPath, "owner.json"),
+      JSON.stringify({
+        hostname: "active-foreign-host",
+        pid: 999999,
+        ownerId: "active-foreign-owner",
+        startedAt: new Date().toISOString(),
+      }),
+    );
+
+    const locks = new StoreLocks(storage, "local-contender");
+    await expect(
+      locks.withWorkspaceMutex(workspace, async () => "should-not-acquire"),
+    ).rejects.toThrow("blob store lock timeout");
+  }, 15_000);
+
+  it("writes startedAt and heartbeats active locks", async () => {
+    const workspace = await temporaryDirectory("omp-blob-heartbeat-workspace-");
+    const storage = await temporaryDirectory("omp-blob-heartbeat-storage-");
+    const canonicalWorkspace = await canonicalPath(workspace);
+    const lockKey = sha256(`workspace:${canonicalWorkspace}`);
+    const lockPath = join(storage, "locks", `${lockKey}.lock`);
+
+    const locks = new StoreLocks(storage, "active-owner");
+    await locks.withWorkspaceMutex(workspace, async () => {
+      const content = await readFile(join(lockPath, "owner.json"), "utf8");
+      const owner = JSON.parse(content) as { startedAt?: string; pid?: number };
+      expect(typeof owner.startedAt).toBe("string");
+      expect(Number.isNaN(Date.parse(owner.startedAt!))).toBe(false);
+      expect(owner.pid).toBe(process.pid);
+    });
+  });
+
+  it("reaps foreign leases older than 24h during stale lease sweep", async () => {
+    const storage = await temporaryDirectory("omp-blob-foreign-lease-storage-");
+    const store = new BlobStore(storage);
+    const leasesDir = join(storage, "leases");
+    await mkdir(leasesDir, { recursive: true });
+
+    const foreignOwner = randomUUID();
+    const dayAndHalfAgo = Date.now() - 36 * 60 * 60 * 1000;
+    const leasePath = join(leasesDir, `${foreignOwner}.json`);
+    await writeFile(
+      leasePath,
+      JSON.stringify({
+        ownerId: foreignOwner,
+        pid: 999999,
+        hostname: "dead-foreign-host",
+        startedAt: new Date(dayAndHalfAgo).toISOString(),
+      }),
+    );
+
+    const oldTime = new Date(dayAndHalfAgo);
+    await utimes(leasePath, oldTime, oldTime);
+
+    await store.garbageCollect();
+    expect(
+      await stat(leasePath)
+        .then(() => true)
+        .catch(() => false),
+    ).toBe(false);
+    await store.shutdown();
+  });
+
+  it("fences lock release so a stalled holder never deletes a new holder's lock", async () => {
+    const workspace = await temporaryDirectory("omp-blob-fencing-workspace-");
+    const storage = await temporaryDirectory("omp-blob-fencing-storage-");
+    const canonicalWorkspace = await canonicalPath(workspace);
+    const lockKey = sha256(`workspace:${canonicalWorkspace}`);
+    const lockPath = join(storage, "locks", `${lockKey}.lock`);
+
+    const locks1 = new StoreLocks(storage, "owner-1");
+
+    const holder1Entered = Promise.withResolvers<void>();
+    const finishHolder1 = Promise.withResolvers<void>();
+
+    // Holder 1 acquires lock
+    const op1 = locks1.withWorkspaceMutex(workspace, async () => {
+      holder1Entered.resolve();
+      await finishHolder1.promise;
+    });
+
+    await holder1Entered.promise;
+
+    // Simulate lock being reaped / overwritten by Holder 2
+    await writeFile(
+      join(lockPath, "owner.json"),
+      JSON.stringify({
+        hostname: hostname(),
+        pid: process.pid,
+        ownerId: "owner-2",
+        startedAt: new Date().toISOString(),
+      }),
+    );
+
+    // Holder 1 finishes and releases
+    finishHolder1.resolve();
+    await op1;
+
+    // Holder 2's lock must still exist on disk!
+    expect(
+      await stat(lockPath)
+        .then(() => true)
+        .catch(() => false),
+    ).toBe(true);
+    const content = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as {
+      ownerId?: string;
+    };
+    expect(content.ownerId).toBe("owner-2");
+
+    // Cleanup
+    await rm(lockPath, { recursive: true, force: true });
   });
 });
