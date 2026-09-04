@@ -44,15 +44,10 @@ export async function runRedo(
   const outcome: NavigationResult = await navigation.redo();
   switch (outcome.status) {
     case "moved": {
-      let message: string;
-      if (outcome.files === "unavailable") {
-        message = `Redid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`;
-      } else if (outcome.files === "partially_restored") {
-        message =
-          "Redid last turn: tracked files restored, but some paths were not included (unsupported type or size limit).";
-      } else {
-        message = "Redid last turn: session moved forward and file snapshot restored.";
-      }
+      const message =
+        outcome.files === "unavailable"
+          ? `Redid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`
+          : "Redid last turn: session moved forward and file snapshot restored.";
       ctx.ui.notify(message, "info");
       break;
     }

@@ -230,8 +230,22 @@ describe("private per-workspace git repositories", () => {
       const entries = new Set(exclude.split(/\r?\n/));
       // The store root is inside the worktree, so its relative entry is seeded…
       expect(entries.has(".omp/")).toBe(true);
-      // …and so are the same built-in ignores the blob store applies.
-      for (const ignored of DEFAULT_EXCLUDES) {
+      const expectedExcludes = [
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        ".history",
+        "dist",
+        "coverage",
+        ".omp",
+        ".next",
+        "build",
+        "out",
+        "target",
+      ];
+      expect([...DEFAULT_EXCLUDES]).toEqual(expectedExcludes);
+      for (const ignored of expectedExcludes) {
         expect(entries.has(ignored)).toBe(true);
       }
     } finally {

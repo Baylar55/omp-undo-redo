@@ -32,7 +32,7 @@ export type TreeNavigationResult = {
 };
 
 export type NavigationResult =
-  | { status: "moved"; files: "restored" | "partially_restored" }
+  | { status: "moved"; files: "restored" }
   | {
       status: "moved";
       files: "unavailable";

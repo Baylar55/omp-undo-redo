@@ -117,6 +117,7 @@ $env:OMP_UNDO_REDO_STORE_DIR = "$HOME\.omp\omp-undo-redo"
 
 ```powershell
 setx OMP_UNDO_REDO_RETENTION_DAYS 7
+setx OMP_UNDO_REDO_STORE_DIR %USERPROFILE%\.omp\omp-undo-redo
 ```
 
 To disable automatic cleanup, set `OMP_UNDO_REDO_RETENTION_DAYS=0` (indefinite retention).

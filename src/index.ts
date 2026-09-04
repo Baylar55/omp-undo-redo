@@ -37,7 +37,6 @@ import {
 import { touchSessionHeartbeat } from "./core/history-liveness.js";
 import type {
   ActionId,
-  FileCheckpointUnavailableReason,
   GitRepository,
   GitRunner,
   NavigationState,
@@ -79,9 +78,12 @@ function readRetentionConfig(): { retentionDays: number } {
   };
 }
 
+export type SessionOnlyReason =
+  "git_unavailable" | "repository_unresolvable" | "private_repository_unavailable";
+
 export type FileBackend =
   | { kind: "git"; repository: GitRepository; git: GitRunner }
-  | { kind: "session"; reason: FileCheckpointUnavailableReason };
+  | { kind: "session"; reason: SessionOnlyReason };
 
 export type OmpUndoRedoDependencies = {
   /** Overrides how git runners are created, letting hosts and tests inject
@@ -556,7 +558,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   }, HEARTBEAT_INTERVAL_MS);
   heartbeatTimer.unref();
 
-  const NOTIFICATION_MESSAGES: Record<string, string> = {
+  const NOTIFICATION_MESSAGES: Record<SessionOnlyReason, string> = {
     git_unavailable:
       "Git is not available.\nSession navigation still works, but file changes cannot be restored.",
     private_repository_unavailable:
@@ -565,20 +567,17 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       "The Git repository could not be resolved.\nSession navigation still works, but file changes cannot be restored.",
   };
 
-  const notifiedReasonsBySession = new Map<string, Set<string>>();
-  function notifySessionOnly(ctx: AnyContext, sessionId: string, reason: string): void {
+  const notifiedReasonsBySession = new Map<string, Set<SessionOnlyReason>>();
+  function notifySessionOnly(ctx: AnyContext, sessionId: string, reason: SessionOnlyReason): void {
     if (!ctx.ui?.notify) return;
     let set = notifiedReasonsBySession.get(sessionId);
     if (!set) {
-      set = new Set<string>();
+      set = new Set<SessionOnlyReason>();
       notifiedReasonsBySession.set(sessionId, set);
     }
     if (set.has(reason)) return;
     set.add(reason);
-    const message = NOTIFICATION_MESSAGES[reason];
-    if (message) {
-      ctx.ui.notify(message, "warning");
-    }
+    ctx.ui.notify(NOTIFICATION_MESSAGES[reason], "warning");
   }
 
   async function initializeNavigation(

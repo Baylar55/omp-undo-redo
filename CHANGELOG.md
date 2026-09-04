@@ -15,6 +15,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - **Breaking: Removed 16 MiB per-file capture limit.** Git captures all non-ignored files without a size cap.
 - **Renamed `OMP_UNDO_REDO_BLOB_DIR` to `OMP_UNDO_REDO_STORE_DIR`.** The old environment variable name remains supported indefinitely as a fallback alias.
 - **Persisted history schema:** The `private_repository_unavailable` reason in persisted history JSON degrades older extension versions to session-only navigation.
+- **Legacy disk storage:** Existing `<storeRoot>/blobs`, `trees`, `leases`, `journals`, and `history` directories from pre-1.6 blob-mode sessions are inert and can be safely deleted manually to reclaim disk space.
 
 ### Removed
 

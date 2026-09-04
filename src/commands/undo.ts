@@ -44,15 +44,10 @@ export async function runUndo(
   const outcome: NavigationResult = await navigation.undo();
   switch (outcome.status) {
     case "moved": {
-      let message: string;
-      if (outcome.files === "unavailable") {
-        message = `Undid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`;
-      } else if (outcome.files === "partially_restored") {
-        message =
-          "Undid last turn: tracked files restored, but some paths were not included (unsupported type or size limit).";
-      } else {
-        message = "Undid last turn: session moved back and file snapshot restored.";
-      }
+      const message =
+        outcome.files === "unavailable"
+          ? `Undid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`
+          : "Undid last turn: session moved back and file snapshot restored.";
       ctx.ui.notify(message, "info");
       break;
     }

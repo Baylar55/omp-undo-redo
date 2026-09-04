@@ -214,13 +214,13 @@ export class SessionNavigation {
   private async applyFileCheckpoint(
     checkpoint: GitCheckpoint,
     source: "before" | "after",
-  ): Promise<{ status: "applied"; partial: boolean } | { status: "conflict" | "failed" }> {
+  ): Promise<{ status: "applied" } | { status: "conflict" | "failed" }> {
     const result = await this.applier.git(
       checkpoint,
       source === "before" ? checkpoint.afterHash : checkpoint.beforeHash,
       source === "before" ? checkpoint.beforeHash : checkpoint.afterHash,
     );
-    return result === "applied" ? { status: "applied", partial: false } : { status: result };
+    return result === "applied" ? { status: "applied" } : { status: result };
   }
 
   undo(): Promise<NavigationResult> {
@@ -251,7 +251,7 @@ export class SessionNavigation {
     }
     this.currentIndex--;
     await this.persistState();
-    return { status: "moved", files: applied.partial ? "partially_restored" : "restored" };
+    return { status: "moved", files: "restored" };
   }
 
   redo(): Promise<NavigationResult> {
@@ -282,6 +282,6 @@ export class SessionNavigation {
     }
     this.currentIndex++;
     await this.persistState();
-    return { status: "moved", files: applied.partial ? "partially_restored" : "restored" };
+    return { status: "moved", files: "restored" };
   }
 }
