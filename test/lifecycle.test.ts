@@ -996,4 +996,58 @@ describe("extension lifecycle cleanup", () => {
       await Promise.all([rmRetry(first), rmRetry(second)]);
     }
   });
+
+  it("degrades to session-only navigation when git is unavailable", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      const gitUnavailableRunner: GitRunner = Object.assign(
+        async () => ({
+          stdout: "",
+          stderr: "git: command not found",
+          code: 1,
+          error: "unavailable" as const,
+        }),
+        { cwd },
+      );
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: () => gitUnavailableRunner,
+      });
+      const ctx = context(cwd, "git-unavailable-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.emit("session_start", ctx);
+      expect(ctx.ui.notifications).toContainEqual({
+        message:
+          "Git is not available.\nSession navigation still works, but file changes cannot be restored.",
+        level: "warning",
+      });
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed-without-git\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      const warnings = ctx.ui.notifications.filter((n) => n.level === "warning");
+      expect(warnings).toHaveLength(1);
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed-without-git\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because Git was unavailable when the checkpoint was created.",
+      );
+
+      await pi.runCommand("redo", ctx);
+      expect(ctx.leaf).toBe("turn-1");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid the session turn, but files were not restored because Git was unavailable when the checkpoint was created.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
 });

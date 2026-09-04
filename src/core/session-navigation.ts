@@ -1,5 +1,4 @@
 import type {
-  BlobCheckpoint,
   GitCheckpoint,
   GitRepository,
   GitRunner,
@@ -12,7 +11,6 @@ import type {
   TurnCheckpoint,
 } from "./types.js";
 import { applyCheckpoint, releaseCheckpoints, type CheckpointApplyResult } from "./checkpoints.js";
-import type { BlobApplyResult, BlobStore } from "./blob-store/index.js";
 
 export type NavigationOutcome = NavigationResult;
 
@@ -27,43 +25,10 @@ export interface CheckpointApplier {
     sourceHash: string,
     targetHash: string,
   ): Promise<CheckpointApplyResult>;
-  blob(
-    checkpoint: BlobCheckpoint,
-    sourceTreeId: string,
-    targetTreeId: string,
-  ): Promise<BlobApplyResult>;
 }
 
 export interface CheckpointReleaser {
   git(checkpoints: readonly GitCheckpoint[]): Promise<boolean>;
-  blob(checkpoints: readonly BlobCheckpoint[]): Promise<boolean>;
-  blobShouldReleaseOnSuspend(checkpoint: BlobCheckpoint): Promise<boolean>;
-}
-
-export function blobNavigationApplier(store: BlobStore): Pick<CheckpointApplier, "blob"> {
-  return {
-    blob: (checkpoint, sourceTreeId, targetTreeId) =>
-      store.applySnapshot(
-        checkpoint.workspaceRoot,
-        checkpoint.sessionHash,
-        sourceTreeId,
-        targetTreeId,
-      ),
-  };
-}
-
-export function blobNavigationReleaser(
-  store: BlobStore,
-): Pick<CheckpointReleaser, "blob" | "blobShouldReleaseOnSuspend"> {
-  return {
-    blob: (checkpoints) =>
-      store.releaseCheckpointRefs(
-        checkpoints[0]?.sessionHash ?? "",
-        checkpoints.map((checkpoint) => checkpoint.checkpointId),
-      ),
-    blobShouldReleaseOnSuspend: async (checkpoint) =>
-      store.hasActiveRefs(checkpoint.sessionHash, checkpoint.checkpointId),
-  };
 }
 
 export class SessionNavigation {
@@ -92,13 +57,10 @@ export class SessionNavigation {
     this.applier = {
       git: (checkpoint, sourceHash, targetHash) =>
         applyCheckpoint(this.gitForRepository(checkpoint.repository), sourceHash, targetHash),
-      blob: async () => ({ status: "failed" }),
       ...applier,
     };
     this.releaser = {
       git: (checkpoints) => releaseCheckpoints(this.gitForRepository, checkpoints),
-      blob: async () => true,
-      blobShouldReleaseOnSuspend: async () => true,
       ...releaser,
     };
     if (port.navigateTree) this.navigateTree = port.navigateTree.bind(port);
@@ -176,8 +138,8 @@ export class SessionNavigation {
     await this.releaseFileCheckpoints(discarded);
   }
 
-  private convertEarlierFileCheckpoints(): Array<GitCheckpoint | BlobCheckpoint> {
-    const converted: Array<GitCheckpoint | BlobCheckpoint> = [];
+  private convertEarlierFileCheckpoints(): GitCheckpoint[] {
+    const converted: GitCheckpoint[] = [];
     for (let index = 0; index < this.checkpoints.length; index++) {
       const entry = this.checkpoints[index];
       if (entry.kind === "session") continue;
@@ -193,10 +155,9 @@ export class SessionNavigation {
   }
 
   private async releaseFileCheckpoints(entries: readonly TurnCheckpoint[]): Promise<void> {
-    await Promise.allSettled([
-      this.releaser.git(entries.filter((entry): entry is GitCheckpoint => entry.kind === "git")),
-      this.releaser.blob(entries.filter((entry): entry is BlobCheckpoint => entry.kind === "blob")),
-    ]);
+    await this.releaser.git(
+      entries.filter((entry): entry is GitCheckpoint => entry.kind === "git"),
+    );
   }
 
   async recordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
@@ -231,24 +192,13 @@ export class SessionNavigation {
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
     this.currentIndex = -1;
-    const blobs = checkpoints.filter(
-      (checkpoint): checkpoint is BlobCheckpoint => checkpoint.kind === "blob",
-    );
-    const releasableBlobs: BlobCheckpoint[] = [];
-    for (const checkpoint of blobs) {
-      if (await this.releaser.blobShouldReleaseOnSuspend(checkpoint))
-        releasableBlobs.push(checkpoint);
-    }
-    await Promise.allSettled([
-      this.releaser.git(
-        checkpoints.filter(
-          (checkpoint): checkpoint is GitCheckpoint =>
-            checkpoint.kind === "git" &&
-            !checkpoint.beforeRef.startsWith("refs/omp-undo-redo/history/"),
-        ),
+    await this.releaser.git(
+      checkpoints.filter(
+        (checkpoint): checkpoint is GitCheckpoint =>
+          checkpoint.kind === "git" &&
+          !checkpoint.beforeRef.startsWith("refs/omp-undo-redo/history/"),
       ),
-      this.releaser.blob(releasableBlobs),
-    ]);
+    );
   }
 
   private async navigateSession(targetId: string | null): Promise<boolean> {
@@ -262,17 +212,9 @@ export class SessionNavigation {
   }
 
   private async applyFileCheckpoint(
-    checkpoint: GitCheckpoint | BlobCheckpoint,
+    checkpoint: GitCheckpoint,
     source: "before" | "after",
   ): Promise<{ status: "applied"; partial: boolean } | { status: "conflict" | "failed" }> {
-    if (checkpoint.kind === "blob") {
-      const result = await this.applier.blob(
-        checkpoint,
-        source === "before" ? checkpoint.afterTreeId : checkpoint.beforeTreeId,
-        source === "before" ? checkpoint.beforeTreeId : checkpoint.afterTreeId,
-      );
-      return result;
-    }
     const result = await this.applier.git(
       checkpoint,
       source === "before" ? checkpoint.afterHash : checkpoint.beforeHash,
@@ -298,7 +240,7 @@ export class SessionNavigation {
     const applied = await this.applyFileCheckpoint(checkpoint, "before");
     if (applied.status !== "applied") {
       return {
-        status: checkpoint.kind === "blob" ? "blob_failed" : "git_failed",
+        status: "git_failed",
         failure: applied.status === "conflict" ? "conflict" : "failed",
       };
     }
@@ -329,7 +271,7 @@ export class SessionNavigation {
     const applied = await this.applyFileCheckpoint(checkpoint, "after");
     if (applied.status !== "applied") {
       return {
-        status: checkpoint.kind === "blob" ? "blob_failed" : "git_failed",
+        status: "git_failed",
         failure: applied.status === "conflict" ? "conflict" : "failed",
       };
     }

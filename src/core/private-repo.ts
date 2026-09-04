@@ -127,7 +127,7 @@ export { canonicalCwd };
 
 /** Appends `<relative-storeRoot>/` to the private repo's info/exclude so a
  *  snapshot never captures the omp state root (which contains the private
- *  repo itself), plus the same built-in ignore list the blob store uses
+ *  repo itself), plus the built-in default ignore list
  *  (`node_modules`, `dist`, `.omp`, …) so private-git snapshots do not grow
  *  unbounded on churning dependency/build/state directories. The store-root
  *  entry is skipped when it is not inside the worktree; the built-in ignores

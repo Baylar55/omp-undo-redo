@@ -9,7 +9,7 @@ import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
 type Handler = (...args: unknown[]) => unknown;
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-test-store-${process.pid}`);
-process.env.OMP_UNDO_REDO_BLOB_DIR = testStoreRoot;
+process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
 
 afterAll(async () => {
   await rm(testStoreRoot, { recursive: true, force: true });

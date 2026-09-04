@@ -9,7 +9,7 @@ import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
 type Handler = (...args: unknown[]) => unknown;
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-gc-store-${process.pid}`);
-process.env.OMP_UNDO_REDO_BLOB_DIR = testStoreRoot;
+process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
 
 afterAll(async () => {
   await rm(testStoreRoot, { recursive: true, force: true });
@@ -34,13 +34,13 @@ async function withHermeticStore(run: (reposDir: string) => Promise<void>): Prom
     tmpdir(),
     `omp-undo-redo-store-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   );
-  const previousStore = process.env.OMP_UNDO_REDO_BLOB_DIR;
-  process.env.OMP_UNDO_REDO_BLOB_DIR = store;
+  const previousStore = process.env.OMP_UNDO_REDO_STORE_DIR;
+  process.env.OMP_UNDO_REDO_STORE_DIR = store;
   try {
     await run(join(store, "repos"));
   } finally {
-    if (previousStore === undefined) delete process.env.OMP_UNDO_REDO_BLOB_DIR;
-    else process.env.OMP_UNDO_REDO_BLOB_DIR = previousStore;
+    if (previousStore === undefined) delete process.env.OMP_UNDO_REDO_STORE_DIR;
+    else process.env.OMP_UNDO_REDO_STORE_DIR = previousStore;
     await rm(store, { recursive: true, force: true }).catch(() => undefined);
   }
 }

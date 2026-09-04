@@ -2,6 +2,24 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.6.0] - 2026-09-04
+
+### Changed
+
+- **Breaking: Consolidated to Git-only snapshot engine.** The custom JavaScript BlobStore and all associated code have been retired. All workspaces now run on native Git snapshotting:
+  - Git workspaces snapshot into custom refs (`refs/omp-undo-redo/history/`) inside the existing repository without touching `HEAD` or index.
+  - Non-Git workspaces unconditionally use Private-Git under `<storeRoot>/repos/<sha256(cwd)>.git` with the workspace as worktree and built-in ignore seeding.
+- **Breaking: Removed `OMP_UNDO_REDO_PRIVATE_GIT`.** Non-Git workspaces always use Private-Git. Setting `OMP_UNDO_REDO_PRIVATE_GIT=0` no longer activates a fallback blob store.
+- **Breaking: Removed `OMP_UNDO_REDO_MAX_STORE_MB`.** Retention-by-age (`OMP_UNDO_REDO_RETENTION_DAYS`, default 2 days) is now the sole storage limit; there is no byte cap.
+- **Breaking: Missing Git binary degrades to session-only navigation.** Environments without a `git` executable no longer restore files; `/undo` and `/redo` navigate the agent session context only, with one clear warning notification per session.
+- **Breaking: Removed 16 MiB per-file capture limit.** Git captures all non-ignored files without a size cap.
+- **Renamed `OMP_UNDO_REDO_BLOB_DIR` to `OMP_UNDO_REDO_STORE_DIR`.** The old environment variable name remains supported indefinitely as a fallback alias.
+- **Persisted history schema:** The `private_repository_unavailable` reason in persisted history JSON degrades older extension versions to session-only navigation.
+
+### Removed
+
+- Deleted custom JavaScript BlobStore implementation (`src/core/blob-store/`, `src/core/blob-checkpoints.ts`, `src/core/blob-history-store.ts`, benchmark scripts, and associated tests — ~5,270 LOC removed).
+
 ## [1.5.6] - 2026-08-27
 
 ### Fixed
