@@ -12,7 +12,7 @@ import {
   resolveRuntimeScope,
 } from "./core/checkpoint-owners.js";
 import { createEnvGitRunner, createGitRunner } from "./core/git-runner.js";
-import { canonicalCwd, ensurePrivateGitRepository } from "./core/private-repo.js";
+import { canonicalCwd, ensurePrivateGitRepository, storeRootDirectory } from "./core/private-repo.js";
 import { BlobStore, blobStoreRootDirectory } from "./core/blob-store/index.js";
 import {
   finishAfterTurnBlob,
@@ -164,7 +164,7 @@ function startPrivateRepo(
     env?: Record<string, string>,
   ) => GitRunner = defaultGitRunnerFactory,
 ): PrivateRepoEntry {
-  const storeRoot = blobStoreRootDirectory();
+  const storeRoot = storeRootDirectory();
   const entry: PrivateRepoEntry = {
     repository: undefined,
     git: undefined,
@@ -372,7 +372,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
   /** One-time removal of legacy git-indexes directory from pre-v1.5.1 store layout */
   async function cleanLegacyGitIndexes(): Promise<void> {
-    const legacy = join(await canonicalCwd(blobStoreRootDirectory()), "git-indexes");
+    const legacy = join(await canonicalCwd(storeRootDirectory()), "git-indexes");
     await rm(legacy, { recursive: true, force: true }).catch(() => undefined);
   }
 
@@ -478,7 +478,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  flight, and even then the repo is only renamed aside as `.evicted-<ts>`
    *  trash for EVICTION_TRASH_RETENTION_MS instead of being deleted outright. */
   async function evictStalePrivateRepos(): Promise<void> {
-    const reposDir = join(await canonicalCwd(blobStoreRootDirectory()), "repos");
+    const reposDir = join(await canonicalCwd(storeRootDirectory()), "repos");
     let entries: string[];
     try {
       entries = await readdir(reposDir);

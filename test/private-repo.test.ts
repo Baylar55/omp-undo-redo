@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEnvGitRunner } from "../src/core/git-runner.js";
-import { ensurePrivateGitRepository, privateRepositoryPath } from "../src/core/private-repo.js";
+import {
+  ensurePrivateGitRepository,
+  privateRepositoryPath,
+  storeRootDirectory,
+} from "../src/core/private-repo.js";
 import { createSnapshotCommit } from "../src/core/checkpoints.js";
 import { historyDirectory } from "../src/core/history-store.js";
 import type { BlobStore } from "../src/core/blob-store/index.js";
@@ -326,6 +330,30 @@ describe("private per-workspace git repositories", () => {
       await rm(cwd, { recursive: true, force: true });
       await rm(storeRoot, { recursive: true, force: true });
       if (aliasCreated) await rm(alias, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves storeRootDirectory via OMP_UNDO_REDO_STORE_DIR and legacy OMP_UNDO_REDO_BLOB_DIR", async () => {
+    const dirStore = await mkdtemp(join(tmpdir(), "omp-store-dir-"));
+    const dirBlob = await mkdtemp(join(tmpdir(), "omp-blob-dir-"));
+    try {
+      const canonicalStore = await realpath(dirStore);
+      const canonicalBlob = await realpath(dirBlob);
+
+      delete process.env.OMP_UNDO_REDO_BLOB_DIR;
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", dirStore);
+      expect(storeRootDirectory()).toBe(canonicalStore);
+
+      delete process.env.OMP_UNDO_REDO_STORE_DIR;
+      vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", dirBlob);
+      expect(storeRootDirectory()).toBe(canonicalBlob);
+
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", dirStore);
+      vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", dirBlob);
+      expect(storeRootDirectory()).toBe(canonicalStore);
+    } finally {
+      await rm(dirStore, { recursive: true, force: true });
+      await rm(dirBlob, { recursive: true, force: true });
     }
   });
 });
