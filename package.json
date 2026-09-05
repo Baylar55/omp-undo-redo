@@ -74,7 +74,7 @@
     }
   },
   "devDependencies": {
-    "@oh-my-pi/pi-coding-agent": "18.0.4",
+    "@oh-my-pi/pi-coding-agent": "18.1.2",
     "@types/node": "^26.4.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
