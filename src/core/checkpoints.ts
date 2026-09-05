@@ -397,25 +397,8 @@ export async function releaseCheckpoints(
   );
 }
 
-export async function releaseCheckpoint(
-  git: GitRunner,
-  checkpoint: GitCheckpoint,
-): Promise<boolean> {
-  return releaseRefs(
-    () => git,
-    [
-      {
-        repository: checkpoint.repository,
-        ref: checkpoint.beforeRef,
-        expectedHash: checkpoint.beforeHash,
-      },
-      {
-        repository: checkpoint.repository,
-        ref: checkpoint.afterRef,
-        expectedHash: checkpoint.afterHash,
-      },
-    ],
-  );
+export function releaseCheckpoint(git: GitRunner, checkpoint: GitCheckpoint): Promise<boolean> {
+  return releaseCheckpoints(() => git, [checkpoint]);
 }
 
 export async function releasePendingCheckpoint(
