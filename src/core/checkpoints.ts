@@ -11,7 +11,6 @@ import type {
   OwnershipMode,
   PendingGitCheckpoint,
   SnapshotIndexLease,
-  SessionReader,
 } from "./types.js";
 
 const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-redo@local"];
@@ -630,16 +629,4 @@ export async function applyCheckpoint(
       await rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
   }
-}
-
-export function previousCheckpoint(ctx: SessionReader): string | null {
-  const leafId = ctx.getLeafId();
-  if (!leafId) return null;
-  const entries = ctx.getBranch(leafId);
-  const currentIndex = entries.findIndex((e) => e.id === leafId);
-  for (let i = currentIndex - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entry.type === "message" && entry.message?.role === "user") return entry.id;
-  }
-  return null;
 }

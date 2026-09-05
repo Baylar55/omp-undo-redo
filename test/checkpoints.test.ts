@@ -24,7 +24,6 @@ import {
   prepareBeforeTurn,
   releaseAllPersistentSnapshotIndices,
   releaseCheckpoint,
-  previousCheckpoint,
   releaseRefs,
   releasePendingCheckpoint,
 } from "../src/core/checkpoints.js";
@@ -55,13 +54,6 @@ function reader(entries: SessionEntryLike[], leafId: string | null): SessionRead
     },
   };
 }
-
-const entries: SessionEntryLike[] = [
-  { id: "u1", parentId: null, type: "message", message: { role: "user" } },
-  { id: "a1", parentId: "u1", type: "message", message: { role: "assistant" } },
-  { id: "u2", parentId: "a1", type: "message", message: { role: "user" } },
-  { id: "a2", parentId: "u2", type: "message", message: { role: "assistant" } },
-];
 
 function gitRunner(cwd: string): GitRunner {
   const runner: GitRunner = async (args, options) => {
@@ -187,17 +179,6 @@ function checkpointWithRepository(
     leafId: null,
   };
 }
-
-describe("previousCheckpoint", () => {
-  it("selects the first prompt boundary so the first interaction is undoable", () => {
-    expect(previousCheckpoint(reader(entries.slice(0, 2), "a1"))).toBe("u1");
-    expect(previousCheckpoint(reader(entries.slice(0, 1), "u1"))).toBeNull();
-  });
-
-  it("selects the latest prompt boundary", () => {
-    expect(previousCheckpoint(reader(entries, "a2"))).toBe("u2");
-  });
-});
 
 describe("checkpoint namespaces", () => {
   it("hashes session IDs and keeps refs in the private namespace", () => {
