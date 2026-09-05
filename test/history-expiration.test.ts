@@ -580,4 +580,24 @@ describe("expireGitSessionHistories", () => {
       },
     });
   });
+
+  it("prunes tombstones older than 2x retentionDays", async () => {
+    const gitDir = await temporaryDirectory("git-prune-tombstone-");
+    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const historyDir = join(gitDir, "omp-undo-redo", "history");
+    await mkdir(historyDir, { recursive: true });
+
+    const sessionId = "old-tombstone";
+    const hash = sessionHash(sessionId);
+    const tombFile = join(historyDir, `${hash}.expired.json`);
+    const expiredAt = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
+    await writeFile(
+      tombFile,
+      JSON.stringify({ expired: true, sessionHash: hash, expiredAt, reason: "age" }),
+    );
+
+    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+    await expireGitSessionHistories(repository, dummyGit, 2, () => new Set());
+    await expect(stat(tombFile)).rejects.toThrow();
+  });
 });

@@ -5,24 +5,16 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEnvGitRunner } from "../src/core/git-runner.js";
-import { ensurePrivateGitRepository, privateRepositoryPath } from "../src/core/private-repo.js";
+import {
+  DEFAULT_EXCLUDES,
+  ensurePrivateGitRepository,
+  privateRepositoryPath,
+  storeRootDirectory,
+} from "../src/core/private-repo.js";
 import { createSnapshotCommit } from "../src/core/checkpoints.js";
 import { historyDirectory } from "../src/core/history-store.js";
-import type { BlobStore } from "../src/core/blob-store/index.js";
 import type { GitRunner } from "../src/core/types.js";
 import { resolveBackend } from "../src/index.js";
-
-function blobStoreStub() {
-  const calls: string[] = [];
-  const store = { rootDirectory: "stub" } as unknown as BlobStore;
-  return {
-    calls,
-    blobStoreFor: (workspaceRoot: string) => {
-      calls.push(workspaceRoot);
-      return store;
-    },
-  };
-}
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -88,10 +80,8 @@ describe("private per-workspace git repositories", () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-backend-"));
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
     try {
-      vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", storeRoot);
-      vi.stubEnv("OMP_UNDO_REDO_PRIVATE_GIT", "1");
-      const { blobStoreFor } = blobStoreStub();
-      const backend = await resolveBackend(cwd, blobStoreFor, true);
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      const backend = await resolveBackend(cwd);
       expect(backend.kind).toBe("git");
       if (backend.kind !== "git") return;
       const canonical = await realpath(cwd);
@@ -110,19 +100,16 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
-  it("falls back to blob when private git is disabled", async () => {
+  it("uses private git unconditionally for non-git cwd", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-disabled-"));
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
     try {
-      vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", storeRoot);
-      vi.stubEnv("OMP_UNDO_REDO_PRIVATE_GIT", "0");
-      const { blobStoreFor, calls } = blobStoreStub();
-      const backend = await resolveBackend(cwd, blobStoreFor, false);
-      expect(backend.kind).toBe("blob");
-      if (backend.kind !== "blob") return;
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      const backend = await resolveBackend(cwd);
+      expect(backend.kind).toBe("git");
+      if (backend.kind !== "git") return;
       const canonical = await realpath(cwd);
-      expect(backend.workspaceRoot).toBe(canonical);
-      expect(calls).toContain(canonical);
+      expect(backend.repository.worktree).toBe(canonical);
     } finally {
       vi.unstubAllEnvs();
       await rm(cwd, { recursive: true, force: true });
@@ -130,20 +117,16 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
-  it("falls back to blob when private repo init fails", async () => {
+  it("falls back to session when private repo init fails", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-fail-"));
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
     try {
-      vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", storeRoot);
-      vi.stubEnv("OMP_UNDO_REDO_PRIVATE_GIT", "1");
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
       await writeFile(join(storeRoot, "repos"), "not a directory");
-      const { blobStoreFor, calls } = blobStoreStub();
-      const backend = await resolveBackend(cwd, blobStoreFor, true);
-      expect(backend.kind).toBe("blob");
-      if (backend.kind !== "blob") return;
-      const canonical = await realpath(cwd);
-      expect(backend.workspaceRoot).toBe(canonical);
-      expect(calls).toContain(canonical);
+      const backend = await resolveBackend(cwd);
+      expect(backend.kind).toBe("session");
+      if (backend.kind !== "session") return;
+      expect(backend.reason).toBe("private_repository_unavailable");
     } finally {
       vi.unstubAllEnvs();
       await rm(cwd, { recursive: true, force: true });
@@ -232,7 +215,7 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
-  it("seeds the built-in blob ignores into the private repo exclude", async () => {
+  it("seeds the built-in excludes into the private repo exclude", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-exclude-"));
     try {
       const storeRoot = join(cwd, ".omp");
@@ -247,10 +230,12 @@ describe("private per-workspace git repositories", () => {
       const entries = new Set(exclude.split(/\r?\n/));
       // The store root is inside the worktree, so its relative entry is seeded…
       expect(entries.has(".omp/")).toBe(true);
-      // …and so are the same built-in ignores the blob store applies.
-      for (const ignored of [
+      const expectedExcludes = [
         ".git",
+        ".hg",
+        ".svn",
         "node_modules",
+        ".history",
         "dist",
         "coverage",
         ".omp",
@@ -258,7 +243,9 @@ describe("private per-workspace git repositories", () => {
         "build",
         "out",
         "target",
-      ]) {
+      ];
+      expect([...DEFAULT_EXCLUDES]).toEqual(expectedExcludes);
+      for (const ignored of expectedExcludes) {
         expect(entries.has(ignored)).toBe(true);
       }
     } finally {
@@ -326,6 +313,30 @@ describe("private per-workspace git repositories", () => {
       await rm(cwd, { recursive: true, force: true });
       await rm(storeRoot, { recursive: true, force: true });
       if (aliasCreated) await rm(alias, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves storeRootDirectory via OMP_UNDO_REDO_STORE_DIR and legacy OMP_UNDO_REDO_BLOB_DIR", async () => {
+    const dirStore = await mkdtemp(join(tmpdir(), "omp-store-dir-"));
+    const dirBlob = await mkdtemp(join(tmpdir(), "omp-blob-dir-"));
+    try {
+      const canonicalStore = await realpath(dirStore);
+      const canonicalBlob = await realpath(dirBlob);
+
+      delete process.env.OMP_UNDO_REDO_BLOB_DIR;
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", dirStore);
+      expect(storeRootDirectory()).toBe(canonicalStore);
+
+      delete process.env.OMP_UNDO_REDO_STORE_DIR;
+      vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", dirBlob);
+      expect(storeRootDirectory()).toBe(canonicalBlob);
+
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", dirStore);
+      vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", dirBlob);
+      expect(storeRootDirectory()).toBe(canonicalStore);
+    } finally {
+      await rm(dirStore, { recursive: true, force: true });
+      await rm(dirBlob, { recursive: true, force: true });
     }
   });
 });

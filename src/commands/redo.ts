@@ -22,11 +22,8 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "the resumed turn has no usable file checkpoint.";
     case "workspace_unresolvable":
       return "the working directory could not be resolved.";
-    case "before_blob_failed":
-    case "after_blob_failed":
-      return "the file snapshot could not be created.";
-    case "blob_apply_failed":
-      return "the file snapshot could not be restored.";
+    case "private_repository_unavailable":
+      return "the private snapshot repository could not be initialized.";
     case "history_expired":
       return "undo/redo file history for this session expired due to inactivity.";
     default:
@@ -47,15 +44,10 @@ export async function runRedo(
   const outcome: NavigationResult = await navigation.redo();
   switch (outcome.status) {
     case "moved": {
-      let message: string;
-      if (outcome.files === "unavailable") {
-        message = `Redid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`;
-      } else if (outcome.files === "partially_restored") {
-        message =
-          "Redid last turn: tracked files restored, but some paths were not included (unsupported type or size limit).";
-      } else {
-        message = "Redid last turn: session moved forward and file snapshot restored.";
-      }
+      const message =
+        outcome.files === "unavailable"
+          ? `Redid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`
+          : "Redid last turn: session moved forward and file snapshot restored.";
       ctx.ui.notify(message, "info");
       break;
     }
@@ -76,14 +68,6 @@ export async function runRedo(
         outcome.failure === "conflict"
           ? "Worktree changed; nothing was redone."
           : "Could not restore the Git checkpoint.",
-        "warning",
-      );
-      break;
-    case "blob_failed":
-      ctx.ui.notify(
-        outcome.failure === "conflict"
-          ? "Worktree changed; nothing was redone."
-          : "Could not restore the file snapshot.",
         "warning",
       );
       break;

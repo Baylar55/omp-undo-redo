@@ -82,7 +82,7 @@ The extension exposes exactly these commands:
 Commands take no arguments. They navigate OMP's session tree through the official extension API and do not create a new model turn.
 Both commands wait for the current agent turn to become idle; if OMP remains busy, the command leaves the session unchanged and shows a warning.
 
-Every completed turn remains navigable, including conversation-only turns and turns that change only ignored files. In Git projects, `/undo` and `/redo` restore worktree snapshots without rewriting the Git index. In non-Git workspaces, the built-in snapshot store restores regular files, binary content, and executable modes. Unsupported symlinks and files above the 16 MiB limit are reported as partial restoration. This symlink behavior applies to the non-Git blob store fallback; Private-Git mode snapshots symlinks through Git itself and restores them like any other path. Skipped paths and their overlapping parent or descendant paths remain untouched during partial restoration. Such a session-only checkpoint is a file-history continuity barrier: older file checkpoints are discarded because applying them across an unknown file delta would be unsafe.
+Every completed turn remains navigable, including conversation-only turns and turns that change only ignored files. In Git projects and non-Git workspaces alike, `/undo` and `/redo` restore worktree snapshots through Git without rewriting the Git index. Files matched by the repository's `.gitignore` — or by the built-in ignore list, which Private-Git mode seeds into its private repository — are outside these checkpoints: changes to them survive undo/redo untouched.
 
 Completed Git or non-Git checkpoints and the undo/redo cursor survive a normal terminal restart. Resuming the same session in the same worktree restores both `/undo` and `/redo` history, unless the session's file history was removed by the retention policy (see [Configuration](#configuration)). If durable file metadata is missing or unusable, the extension reconstructs completed turns from the active session branch and offers session-only undo with an explicit warning. A changed worktree must still pass the normal conflict check; resuming never bypasses file-safety checks.
 
@@ -90,11 +90,10 @@ While the extension process is running, it publishes normalized Undo/Redo action
 
 ## Configuration
 
-The extension supports optional environment variables to configure snapshot history retention and storage limits:
+The extension supports optional environment variables to configure snapshot history retention and storage locations:
 
-- `OMP_UNDO_REDO_RETENTION_DAYS` — Inactivity retention threshold in days (default: `2`). Dormant session history untouched for longer than this limit is deleted on extension startup. The clock counts from the session's last access; resuming or using a session refreshes it. Set to `0` to disable age-based expiration.
-- `OMP_UNDO_REDO_MAX_STORE_MB` — Maximum storage cap for the non-Git blob store in MiB (default: `1024`, i.e., 1 GiB). If store size exceeds this limit, the oldest inactive session histories are evicted iteratively until total size drops below the cap. Set to `0` to disable storage cap enforcement. Applies to the non-Git blob store only.
-- `OMP_UNDO_REDO_PRIVATE_GIT` — Snapshot non-Git workspaces through a private per-workspace Git repository (default: `1`). Set to `0` to keep using the non-Git blob store for workspaces without a Git repository.
+- `OMP_UNDO_REDO_RETENTION_DAYS` — Inactivity retention threshold in days (default: `2`). Dormant session history untouched for longer than this limit is deleted on extension startup. The clock counts from the session's last access; resuming or using a session refreshes it. Set to `0` to disable age-based expiration (indefinite retention). Retention-by-age is the sole storage limit; there is no byte cap.
+- `OMP_UNDO_REDO_STORE_DIR` — Root directory for state, private Git repositories, and session history (default: `~/.omp/omp-undo-redo`). Legacy `OMP_UNDO_REDO_BLOB_DIR` is retained as a permanent alias.
 
 ### Setting the variables
 
@@ -104,35 +103,24 @@ Set these in your Pi/OMP process environment. The extension reads them **once, w
 
 ```sh
 export OMP_UNDO_REDO_RETENTION_DAYS=7
-export OMP_UNDO_REDO_MAX_STORE_MB=2048
+export OMP_UNDO_REDO_STORE_DIR=~/.omp/omp-undo-redo
 ```
 
 **Windows PowerShell** — for the current session:
 
 ```powershell
 $env:OMP_UNDO_REDO_RETENTION_DAYS = "7"
-$env:OMP_UNDO_REDO_MAX_STORE_MB = "2048"
+$env:OMP_UNDO_REDO_STORE_DIR = "$HOME\.omp\omp-undo-redo"
 ```
 
 **Windows (persistent)** — use `setx`, then open a new terminal:
 
 ```powershell
 setx OMP_UNDO_REDO_RETENTION_DAYS 7
-setx OMP_UNDO_REDO_MAX_STORE_MB 2048
+setx OMP_UNDO_REDO_STORE_DIR "$HOME\.omp\omp-undo-redo"
 ```
 
-To disable either behavior, set its value to `0`; setting both to `0` disables automatic cleanup entirely (indefinite retention).
-
-### Setting interaction rules
-
-| `RETENTION_DAYS` | `MAX_STORE_MB`   | Behavior                                                                                                  |
-| ---------------- | ---------------- | --------------------------------------------------------------------------------------------------------- |
-| `2` (default)    | `1024` (default) | Age expiration (2 days) + blob storage cap enforcement (1 GiB)                                            |
-| `0`              | `1024`           | No age expiration; storage cap can still evict oldest inactive sessions if total blob store exceeds 1 GiB |
-| `2`              | `0`              | Age expiration (2 days); no storage cap enforcement                                                       |
-| `0`              | `0`              | No automatic cleanup (indefinite retention)                                                               |
-
-> **Note:** `OMP_UNDO_REDO_RETENTION_DAYS=0` disables age-based expiration but does **not** guarantee indefinite history retention when a storage cap is active (`MAX_STORE_MB > 0`). The cap can still evict the oldest inactive session histories to free up storage space. Active sessions are never evicted by age or storage cap, in any process sharing the store.
+To disable automatic cleanup, set `OMP_UNDO_REDO_RETENTION_DAYS=0` (indefinite retention).
 
 ### Expiration behavior
 
@@ -142,11 +130,17 @@ Cleanup runs automatically in the background shortly after extension startup and
 
 In Git workspaces, expiration removes the session's history refs under `refs/omp-undo-redo/history/<sessionHash>/` and its history file. The referenced commit objects become unreachable and are reclaimed later by the repository's normal `git gc`; `.git` size does not shrink immediately. No storage cap applies to Git object storage.
 
-In non-Git workspaces, the Private-Git mode expires the session's refs and history file inside the private repository; a background `git gc --prune=now` runs after every 20 captured snapshots (and on shutdown, when captures are due) so the unreferenced objects are reclaimed promptly instead of accumulating. Stale private repositories whose workspace has disappeared are evicted conservatively: the workspace must read as missing on two checks moments apart, the repository must be idle for at least 24 hours, and no capture, finalization, or `git gc` may be in flight. Eviction renames the repository to `<hash>.git.evicted-<timestamp>` and removes its contents only after 7 days, so a transient mount, lock, or permission hiccup can never cost undo history. The non-Git blob store fallback expires the session's refs and history file, then garbage-collects orphaned blobs and tree manifests from `~/.omp/omp-undo-redo/`. When the storage cap is set, the oldest inactive sessions are evicted iteratively until the store is back under the cap. Expired `*.expired.json` tombstones are pruned after twice the retention period (default 4 days) in both stores so the history directory does not grow without bound.
+In non-Git workspaces, Private-Git mode expires the session's refs and history file inside the private repository; a background `git gc --prune=now` runs after every 20 captured snapshots (and on shutdown, when captures are due) so the unreferenced objects are reclaimed promptly instead of accumulating. Stale private repositories whose workspace has disappeared are evicted conservatively: the workspace must read as missing on two checks moments apart, the repository must be idle for at least 24 hours, and no capture, finalization, or `git gc` may be in flight. Eviction renames the repository to `<hash>.git.evicted-<timestamp>` and removes its contents only after 7 days, so a transient mount, lock, or permission hiccup can never cost undo history. Expired `*.expired.json` tombstones are pruned after twice the retention period (default 4 days) so the history directory does not grow without bound.
 
 ## Limitations
 
-Undo/redo has four modes. **Git mode** creates private snapshots through an alternate index and `git commit-tree`, then retains refs under `refs/omp-undo-redo/history/`; it never rewrites `HEAD`, branch refs, or the real index. **Private-Git mode** (the default for non-Git workspaces) gives workspaces without a repository the same guarantee: the extension lazily creates a private repository under `~/.omp/omp-undo-redo/repos/` (override the store root with `OMP_UNDO_REDO_BLOB_DIR`), with the workspace as its worktree, and snapshots through the same alternate-index machinery. The private repository is configured like the one OpenCode keeps per project (`core.autocrlf false`, `core.longpaths true`, `feature.manyFiles true`) and is excluded from its own snapshots. **Non-Git blob mode** stores immutable content-addressed blobs and tree manifests under `~/.omp/omp-undo-redo/` and keeps per-session refs and history metadata there; it is the fallback when Git is unavailable or `OMP_UNDO_REDO_PRIVATE_GIT=0`. **Session-only mode** navigates context without changing files when a checkpoint cannot be created or loaded. Git and Private-Git checkpoints cover tracked files and untracked non-ignored files across the complete repository worktree. Files matched by the repository's `.gitignore` — or by the built-in ignore list, which Private-Git mode seeds into its private repository — are outside these checkpoints: changes to them survive undo/redo untouched. Non-Git blob checkpoints cover regular files outside built-in ignored directories (`node_modules`, `dist`, `.git`, and similar). Symlinks, oversized files, empty directories, shell effects, network effects, and editor state are outside the non-Git blob checkpoint. The blob-mode walker matches only the built-in ignore names; a `.gitignore` inside a non-Git workspace is not parsed. If overlapping worktree changes prevent safe application, undo/redo fails instead of overwriting them. Graceful shutdown releases pending snapshots but retains completed resumable checkpoints. Non-Git blob checkpoints capture regular file contents verbatim, including non-gitignored sensitive files such as local `.env` files; they persist in plaintext under the store root until retention removes them. Durable history files larger than 4 MiB are treated as unusable. If an interrupted apply cannot be rolled back automatically, its journal is quarantined under the store's `journals/failed/` directory, the workspace may be left partially restored, and the extension refuses further mutation until manual inspection.
+Undo/redo operates in one of three modes:
+
+- **Git mode**: Git workspaces create private snapshots through an alternate index and `git commit-tree`, retaining refs under `refs/omp-undo-redo/history/`; `HEAD`, branch refs, and the real index are never touched.
+- **Private-Git mode**: Non-Git workspaces get an isolated private repository under `<storeRoot>/repos/<sha256(cwd)>.git` (defaults to `~/.omp/omp-undo-redo/repos/`, configurable via `OMP_UNDO_REDO_STORE_DIR` or legacy `OMP_UNDO_REDO_BLOB_DIR`), with the workspace as its worktree, and snapshots through the same alternate-index engine. The private repository is seeded with built-in ignores (`node_modules`, `dist`, `.omp`, etc.) so churn is bounded.
+- **Session-only fallback**: If no Git binary is available or private repository initialization fails, the extension navigates session context without restoring file changes, notifying the user once per session.
+
+Git and Private-Git checkpoints cover tracked files and untracked non-ignored files across the complete repository worktree. Files matched by the repository's `.gitignore` — or by the built-in ignore list, which Private-Git mode seeds into its private repository — are outside these checkpoints: changes to them survive undo/redo untouched.
 
 Checkpoint capture never blocks the agent: `before_agent_start`, `agent_end`, `/undo` and `/redo` wait at most a few seconds (default 3 s, configurable by hosts embedding the extension) for an in-flight capture; when a capture overruns that deadline it keeps running in the background and the turn's undo boundary is recorded as soon as it settles, so a very large or slow workspace cannot time out the extension handlers (OMP's 30 s handler cap). While a capture is still in flight, `/undo`/`/redo` tell you to try again shortly instead of acting on a half-recorded state.
 
@@ -192,7 +186,6 @@ Install dependencies with npm, then use the scripts in `package.json`:
 - `npm test` runs the deterministic test suite.
 - `npm run lint` and `npm run format:check` check style.
 - `npm run verify` runs the repository verification sequence.
-- `npm run bench:walk` benchmarks non-Git blob-store captures (cold, warm cache-hit, and incremental) on a synthetic workspace under the OS temp directory.
 
 The implementation uses only public OMP extension APIs. Keep changes focused, preserve the package manifest, and do not commit generated `dist/` output unless a release process explicitly requires it.
 

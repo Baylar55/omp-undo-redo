@@ -39,9 +39,7 @@ const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
   file_history_gap: true,
   resumed_checkpoint_unavailable: true,
   workspace_unresolvable: true,
-  before_blob_failed: true,
-  after_blob_failed: true,
-  blob_apply_failed: true,
+  private_repository_unavailable: true,
   history_expired: true,
 };
 
@@ -392,13 +390,6 @@ export class SessionHistoryStore {
       if (refs === null) return { status: "unavailable", reason: "unusable" };
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
         if (checkpoint.kind === "session") return checkpoint;
-        if (checkpoint.kind !== "git")
-          return {
-            kind: "session",
-            reason: "resumed_checkpoint_unavailable",
-            parentLeafId: checkpoint.parentLeafId,
-            leafId: checkpoint.leafId,
-          };
         if (
           refs.get(checkpoint.beforeRef) === checkpoint.beforeHash &&
           refs.get(checkpoint.afterRef) === checkpoint.afterHash &&

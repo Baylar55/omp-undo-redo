@@ -4,7 +4,6 @@ import { join } from "node:path";
 /**
  * Prunes *.expired.json tombstones older than retentionDays*2.
  * Keeps recent expiry signal (default 4 days) while bounding history readdir cost.
- * History and blob stores have different roots but identical tombstone shape.
  */
 export async function pruneExpiredTombstones(
   historyDir: string,

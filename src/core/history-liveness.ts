@@ -5,7 +5,7 @@ import { join } from "node:path";
  * Cross-process liveness for session history retention.
  *
  * History files live in directories shared by every process resolving the
- * same repository commonDir or blob store root, but each process's in-memory
+ * same repository commonDir, but each process's in-memory
  * active-session set only covers its own sessions. A retention sweep in
  * process A can therefore target a session that process B is actively
  * loading or saving. Every store touches a `.active.<sessionHash>` marker in

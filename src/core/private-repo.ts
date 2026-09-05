@@ -1,9 +1,24 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { DEFAULT_BLOB_IGNORES } from "./blob-store/types.js";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { GitRepository, GitRunner } from "./types.js";
+
+export const DEFAULT_EXCLUDES = [
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  ".history",
+  "dist",
+  "coverage",
+  ".omp",
+  ".next",
+  "build",
+  "out",
+  "target",
+] as const;
 
 /** Per-workspace private repositories: a non-git workspace is snapshotted
  *  through a private git repo stored under the omp state root, keyed by the
@@ -74,6 +89,20 @@ async function canonicalCwd(cwd: string): Promise<string> {
   }
 }
 
+function basenameIsRuntime(value: string): boolean {
+  return value.endsWith(`${sep}runtime`) || value.endsWith("/runtime");
+}
+
+export function storeRootDirectory(): string {
+  const explicit = process.env.OMP_UNDO_REDO_STORE_DIR ?? process.env.OMP_UNDO_REDO_BLOB_DIR;
+  if (explicit) return canonicalCwdSync(explicit);
+  if (process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
+    const runtime = resolve(process.env.OMP_UNDO_REDO_RUNTIME_DIR);
+    return canonicalCwdSync(basenameIsRuntime(runtime) ? dirname(runtime) : runtime);
+  }
+  return canonicalCwdSync(join(homedir(), ".omp", "omp-undo-redo"));
+}
+
 /** The private git dir for a workspace: `<storeRoot>/repos/<sha256(cwd)>.git`.
  *  Both inputs are canonicalized here (realpath) so the result is one
  *  deterministic long-form path regardless of how the caller spelled either
@@ -98,7 +127,7 @@ export { canonicalCwd };
 
 /** Appends `<relative-storeRoot>/` to the private repo's info/exclude so a
  *  snapshot never captures the omp state root (which contains the private
- *  repo itself), plus the same built-in ignore list the blob store uses
+ *  repo itself), plus the built-in default ignore list
  *  (`node_modules`, `dist`, `.omp`, …) so private-git snapshots do not grow
  *  unbounded on churning dependency/build/state directories. The store-root
  *  entry is skipped when it is not inside the worktree; the built-in ignores
@@ -123,7 +152,7 @@ async function ensureExclude(gitDir: string, worktree: string, storeRoot: string
   if (rel && rel !== "." && !rel.startsWith("..") && !isAbsolute(rel)) {
     entries.add(`${rel.replace(/\\/g, "/")}/`);
   }
-  for (const ignored of DEFAULT_BLOB_IGNORES) entries.add(ignored);
+  for (const ignored of DEFAULT_EXCLUDES) entries.add(ignored);
   const updated =
     content.length > 0 && !content.endsWith("\n")
       ? `${content}\n${[...entries].join("\n")}\n`

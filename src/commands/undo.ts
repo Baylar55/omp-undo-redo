@@ -22,11 +22,8 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "the resumed turn has no usable file checkpoint.";
     case "workspace_unresolvable":
       return "the working directory could not be resolved.";
-    case "before_blob_failed":
-    case "after_blob_failed":
-      return "the file snapshot could not be created.";
-    case "blob_apply_failed":
-      return "the file snapshot could not be restored.";
+    case "private_repository_unavailable":
+      return "the private snapshot repository could not be initialized.";
     case "history_expired":
       return "undo/redo file history for this session expired due to inactivity.";
     default:
@@ -47,15 +44,10 @@ export async function runUndo(
   const outcome: NavigationResult = await navigation.undo();
   switch (outcome.status) {
     case "moved": {
-      let message: string;
-      if (outcome.files === "unavailable") {
-        message = `Undid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`;
-      } else if (outcome.files === "partially_restored") {
-        message =
-          "Undid last turn: tracked files restored, but some paths were not included (unsupported type or size limit).";
-      } else {
-        message = "Undid last turn: session moved back and file snapshot restored.";
-      }
+      const message =
+        outcome.files === "unavailable"
+          ? `Undid the session turn, but files were not restored because ${unavailableMessage(outcome.reason)}`
+          : "Undid last turn: session moved back and file snapshot restored.";
       ctx.ui.notify(message, "info");
       break;
     }
@@ -76,14 +68,6 @@ export async function runUndo(
         outcome.failure === "conflict"
           ? "Worktree changed; nothing was undone."
           : "Could not restore the Git checkpoint.",
-        "warning",
-      );
-      break;
-    case "blob_failed":
-      ctx.ui.notify(
-        outcome.failure === "conflict"
-          ? "Worktree changed; nothing was undone."
-          : "Could not restore the file snapshot.",
         "warning",
       );
       break;
