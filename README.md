@@ -181,7 +181,7 @@ For example, if `f.txt` is committed as `base`, a turn changes it to `turn` and 
 
 Install dependencies with npm, then use the scripts in `package.json`:
 
-- `npm run build` replaces `dist/` rather than incrementally accumulating files, compiling `src/` to `dist/` and checking that the emitted file set matches `src/` exactly.
+- `npm run build` replaces `dist/` rather than incrementally accumulating files, compiling `src/` to `dist/`.
 - `npm run typecheck` checks TypeScript without emitting files.
 - `npm test` runs the deterministic test suite.
 - `npm run lint` and `npm run format:check` check style.
@@ -191,7 +191,7 @@ The implementation uses only public OMP extension APIs. Keep changes focused, pr
 
 ## Release
 
-A release consists of a reviewed change, a clean verification run (enforcing exact generated-output parity and running the compiled package-entry smoke check), an updated `CHANGELOG.md` entry, and a published npm package containing `index.js`, `dist/`, `README.md`, `LICENSE`, and `CHANGELOG.md`. The package manifest is the source of truth for the extension entry point and peer compatibility. Never place npm tokens, registry credentials, or other secrets in the repository or release logs.
+A release consists of a reviewed change, a clean verification run (running the compiled package-entry smoke check), an updated `CHANGELOG.md` entry, and a published npm package containing `index.js`, `dist/`, `README.md`, `LICENSE`, and `CHANGELOG.md`. The package manifest is the source of truth for the extension entry point and peer compatibility. Never place npm tokens, registry credentials, or other secrets in the repository or release logs.
 
 ## Security
 
