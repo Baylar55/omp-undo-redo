@@ -249,6 +249,66 @@ function createNavigation(
   );
 }
 
+const LEGACY_BLOB_DIRS = [
+  "blobs",
+  "trees",
+  "refs",
+  "locks",
+  "leases",
+  "journals",
+  "history",
+] as const;
+
+const LEGACY_BLOB_QUIET_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Delay riding out short flaps: between the two workspace stats,
+ *  between retries when removing legacy blob dirs or evicted repos, and
+ *  between retries when a git child still holds a directory handle on
+ *  Windows. */
+const EVICTION_RETRY_DELAY_MS = 200;
+
+async function removeDirWithRetry(path: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(path, { recursive: true, force: true });
+      return true;
+    } catch {
+      if (attempt === 4) return false;
+      const { promise, resolve } = promiseWithResolvers<void>();
+      setTimeout(resolve, EVICTION_RETRY_DELAY_MS);
+      await promise;
+    }
+  }
+  return false;
+}
+
+export async function purgeLegacyBlobStore(): Promise<void> {
+  const root = await canonicalCwd(storeRootDirectory());
+  const isDir = async (name: string): Promise<boolean> =>
+    stat(join(root, name))
+      .then((s) => s.isDirectory())
+      .catch(() => false);
+  if (!(await isDir("blobs"))) return;
+  if (!(await isDir("trees")) && !(await isDir("journals"))) return;
+
+  let newest = 0;
+  for (const name of LEGACY_BLOB_DIRS) {
+    const dir = join(root, name);
+    const metadata = await stat(dir).catch(() => undefined);
+    if (!metadata) continue;
+    newest = Math.max(newest, metadata.mtimeMs);
+    // Liveness lives in these three only; blobs/ and trees/ are never walked.
+    if (name !== "locks" && name !== "leases" && name !== "history") continue;
+    for (const entry of await readdir(dir).catch(() => [])) {
+      const child = await stat(join(dir, entry)).catch(() => undefined);
+      if (child) newest = Math.max(newest, child.mtimeMs);
+    }
+  }
+  if (Date.now() - newest < LEGACY_BLOB_QUIET_MS) return;
+
+  for (const name of LEGACY_BLOB_DIRS) await removeDirWithRetry(join(root, name));
+}
+
 export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependencies = {}): void {
   const retentionConfig = readRetentionConfig();
   const privateRepositories = new Map<string, PrivateRepoEntry>();
@@ -367,23 +427,6 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   /** Evicted repos are renamed aside as recoverable trash and kept this long
    *  before any bytes are removed. */
   const EVICTION_TRASH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
-  /** Delay riding out short flaps: between the two workspace stats, and
-   *  between retries when a git child still holds a directory handle on
-   *  Windows. */
-  const EVICTION_RETRY_DELAY_MS = 200;
-
-  async function removeDirWithRetry(path: string): Promise<boolean> {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await rm(path, { recursive: true, force: true });
-        return true;
-      } catch {
-        if (attempt === 4) return false;
-        await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
-      }
-    }
-    return false;
-  }
 
   /** Newest mtime across `dir` and its direct children. Git writes land in
    *  descendants (logs, packs, COMMIT_EDITMSG), not necessarily the root, so
@@ -1222,7 +1265,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   void evictStalePrivateRepos().catch(() => undefined);
   void cleanLegacyGitIndexes().catch(() => undefined);
   {
-    const t = setTimeout(() => void sweepOrphanTempIndexes().catch(() => undefined), 2_000);
+    const t = setTimeout(() => {
+      void sweepOrphanTempIndexes().catch(() => undefined);
+      void purgeLegacyBlobStore().catch(() => undefined);
+    }, 2_000);
     t.unref?.();
   }
 }

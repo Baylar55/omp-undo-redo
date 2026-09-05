@@ -2,7 +2,7 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
-## [1.6.0] - 2026-09-04
+## [1.6.0] - 2026-09-05
 
 ### Changed
 
@@ -14,8 +14,8 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - **Breaking: Missing Git binary degrades to session-only navigation.** Environments without a `git` executable no longer restore files; `/undo` and `/redo` navigate the agent session context only, with one clear warning notification per session.
 - **Breaking: Removed 16 MiB per-file capture limit.** Git captures all non-ignored files without a size cap.
 - **Renamed `OMP_UNDO_REDO_BLOB_DIR` to `OMP_UNDO_REDO_STORE_DIR`.** The old environment variable name remains supported indefinitely as a fallback alias.
-- **Persisted history schema:** The `private_repository_unavailable` reason in persisted history JSON degrades older extension versions to session-only navigation.
-- **Legacy disk storage:** Existing `<storeRoot>/blobs`, `trees`, `leases`, `journals`, and `history` directories from pre-1.6 blob-mode sessions are inert and can be safely deleted manually to reclaim disk space.
+- **Downgrade-safe:** History files written by 1.6.0 use the unchanged v2 schema and reason set; rolling back to 1.5.x reads them normally.
+- **Legacy disk storage auto-reclaimed:** Existing `<storeRoot>/blobs`, `trees`, `refs`, `locks`, `leases`, `journals`, and `history` directories from pre-1.6 blob-mode sessions are automatically removed once the store has been untouched for 7 days, reclaiming up to ~1 GiB of legacy disk space with no manual action required.
 
 ### Removed
 
