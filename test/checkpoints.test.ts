@@ -26,6 +26,7 @@ import {
   releaseCheckpoint,
   releaseRefs,
   releasePendingCheckpoint,
+  resolveRepository,
 } from "../src/core/checkpoints.js";
 import type {
   GitCheckpoint,
@@ -185,6 +186,30 @@ describe("checkpoint namespaces", () => {
     const namespace = checkpointNamespace("session/raw id");
     expect(namespace).toMatch(/^[0-9a-f]{64}$/);
     expect(namespace).not.toContain("session");
+  });
+});
+
+describe("repository resolution", () => {
+  it("resolves gitDir and commonDir identically from a subdirectory", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const nested = join(cwd, "pkg", "deep");
+      await mkdir(nested, { recursive: true });
+
+      const fromRoot = await resolveRepository(gitRunner(cwd));
+      const fromNested = await resolveRepository(gitRunner(nested));
+      expect("repository" in fromRoot).toBe(true);
+      expect("repository" in fromNested).toBe(true);
+      if (!("repository" in fromRoot) || !("repository" in fromNested)) return;
+
+      // git prints --git-dir/--git-common-dir relative to cwd; resolving them
+      // against the worktree root escaped the repository from a subdirectory.
+      expect(fromNested.repository).toEqual(fromRoot.repository);
+      expect(fromNested.repository.commonDir.startsWith(fromRoot.repository.worktree)).toBe(true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 });
 

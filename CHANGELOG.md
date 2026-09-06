@@ -2,6 +2,16 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Repository resolution from a subdirectory.** `git rev-parse --git-dir`/`--git-common-dir` print paths relative to the process working directory, but both were resolved against the worktree root. Starting the agent in a subdirectory of a Git repository therefore produced a `commonDir` outside the repository, sending `GIT_DIR`, session history (`<commonDir>/omp-undo-redo/history`), and checkpoint ownership records to a path that does not exist. Now resolved against the working directory, so all cwd positions agree.
+
+### Changed
+
+- Repository resolution issues one `git rev-parse` instead of three, removing two process spawns per turn.
+
 ## [1.6.0] - 2026-09-05
 
 ### Changed

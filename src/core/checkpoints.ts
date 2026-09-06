@@ -85,9 +85,16 @@ export type RepositoryResolution =
   | { reason: "git_unavailable" | "not_repository" | "repository_unresolvable" };
 
 export async function resolveRepository(git: GitRunner): Promise<RepositoryResolution> {
-  const worktreeResult = await invoke(git, ["rev-parse", "--show-toplevel"]);
-  if (worktreeResult.error === "unavailable") return { reason: "git_unavailable" };
-  const worktree = worktreeResult.code === 0 ? worktreeResult.stdout.trim() : "";
+  // One spawn: rev-parse prints each flag's answer on its own stdout line, in order.
+  const result = await invoke(git, [
+    "rev-parse",
+    "--show-toplevel",
+    "--git-dir",
+    "--git-common-dir",
+  ]);
+  if (result.error === "unavailable") return { reason: "git_unavailable" };
+  const lines = result.code === 0 ? result.stdout.trim().split("\n") : [];
+  const [worktree = "", gitDir = "", commonDir = ""] = lines.map((line) => line.trim());
   if (!worktree) {
     const cwd = git.cwd;
     if (!cwd) return { reason: "not_repository" };
@@ -107,22 +114,16 @@ export async function resolveRepository(git: GitRunner): Promise<RepositoryResol
       return { reason: "not_repository" };
     }
   }
-
-  const gitDirResult = await invoke(git, ["rev-parse", "--git-dir"]);
-  const commonDirResult = await invoke(git, ["rev-parse", "--git-common-dir"]);
-  if (gitDirResult.error === "unavailable" || commonDirResult.error === "unavailable") {
-    return { reason: "git_unavailable" };
-  }
-  const gitDir = gitDirResult.code === 0 ? gitDirResult.stdout.trim() : "";
-  const commonDir = commonDirResult.code === 0 ? commonDirResult.stdout.trim() : "";
   if (!gitDir || !commonDir) return { reason: "repository_unresolvable" };
 
-  const canonicalWorktree = await canonicalPath(worktree, worktree);
+  // git prints --git-dir/--git-common-dir relative to the process cwd, not to the
+  // worktree root; resolving them against the worktree escapes the repo from a subdir.
+  const base = git.cwd ?? worktree;
   return {
     repository: {
-      worktree: canonicalWorktree,
-      gitDir: await canonicalPath(gitDir, canonicalWorktree),
-      commonDir: await canonicalPath(commonDir, canonicalWorktree),
+      worktree: await canonicalPath(worktree, worktree),
+      gitDir: await canonicalPath(gitDir, base),
+      commonDir: await canonicalPath(commonDir, base),
     },
   };
 }
