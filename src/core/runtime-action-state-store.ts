@@ -95,10 +95,6 @@ export class RuntimeActionStateStore {
     this.sessionsDirectory = join(this.runtimeDirectory, "sessions");
   }
 
-  get isActive(): boolean {
-    return this.active;
-  }
-
   sessionPath(sessionId: string): string {
     return this.sessionHashPath(checkpointNamespace(sessionId));
   }
@@ -370,5 +366,3 @@ export class RuntimeActionStateStore {
     await this.shutdownPromise;
   }
 }
-
-export { MAX_STATE_BYTES };

@@ -12,8 +12,6 @@ import type {
 } from "./types.js";
 import { applyCheckpoint, releaseCheckpoints, type CheckpointApplyResult } from "./checkpoints.js";
 
-export type NavigationOutcome = NavigationResult;
-
 type ExpectedTreeNavigation = {
   oldLeafId: string | null;
   newLeafId: string | null;
