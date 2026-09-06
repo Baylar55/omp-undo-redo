@@ -127,8 +127,12 @@ async function awaitWithDeadline<T>(
  *  completes; a `failure` entry records a failed init so session fallback is
  *  reused without retrying. Keyed by canonical cwd (private) or commonDir
  *  (git mode). */
-export type PrivateRepoEntry =
-  { repository?: GitRepository; git?: GitRunner; ready: Promise<boolean> } | { failure: true };
+type ActivePrivateRepoEntry = {
+  repository?: GitRepository;
+  git?: GitRunner;
+  ready: Promise<boolean>;
+};
+export type PrivateRepoEntry = ActivePrivateRepoEntry | { failure: true };
 
 type HistoryWriter = { save(state: NavigationState): Promise<void> };
 
@@ -138,9 +142,9 @@ function startPrivateRepo(
     cwd: string,
     env?: Record<string, string>,
   ) => GitRunner = defaultGitRunnerFactory,
-): PrivateRepoEntry {
+): ActivePrivateRepoEntry {
   const storeRoot = storeRootDirectory();
-  const entry: PrivateRepoEntry = {
+  const entry: ActivePrivateRepoEntry = {
     repository: undefined,
     git: undefined,
     ready: Promise.resolve(false),
@@ -179,7 +183,6 @@ async function resolvePrivateGit(
   }
   const entry = startPrivateRepo(canonical, gitRunnerFactory);
   privateRepositories.set(canonical, entry);
-  if ("failure" in entry) return null;
   const ok = await entry.ready;
   if (!ok || !entry.repository || !entry.git) {
     privateRepositories.set(canonical, { failure: true });
