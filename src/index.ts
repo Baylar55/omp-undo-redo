@@ -1168,87 +1168,35 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return shutdownPromise;
   });
 
-  const undoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
+  const makeHandler = (id: ActionId) => async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
     const typed = ctx as unknown as AnyContext;
     const sessionId = typed.sessionManager.getSessionId();
-    const capture = pendingCaptures.get(sessionId);
-    if (capture) {
-      const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
+    const guards: [Promise<unknown> | undefined, string][] = [
+      [pendingCaptures.get(sessionId)?.complete, "the file checkpoint is still being captured"],
+      [pendingFinalizations.get(sessionId), "the last turn is still being finalized"],
+    ];
+    for (const [work, reason] of guards) {
+      if (!work) continue;
+      const outcome = await awaitWithDeadline(work, captureDeadlineMs);
       if (outcome.timedOut) {
-        ctx.ui.notify(
-          "Cannot undo while the file checkpoint is still being captured; try again shortly.",
-          "warning",
-        );
-        return;
-      }
-    }
-    const pendingFinalize = pendingFinalizations.get(sessionId);
-    if (pendingFinalize) {
-      const outcome = await awaitWithDeadline(pendingFinalize, captureDeadlineMs);
-      if (outcome.timedOut) {
-        ctx.ui.notify(
-          "Cannot undo while the last turn is still being finalized; try again shortly.",
-          "warning",
-        );
+        ctx.ui.notify(`Cannot ${id} while ${reason}; try again shortly.`, "warning");
         return;
       }
     }
     const nav = await ensureNavigation(typed);
     if (!nav) {
-      ctx.ui.notify("Undo is unavailable while the session is closing.", "warning");
+      const label = id === "undo" ? "Undo" : "Redo";
+      ctx.ui.notify(`${label} is unavailable while the session is closing.`, "warning");
       return;
     }
     nav.setNavigateTree(ctx.navigateTree);
-    const outcome = await runNavigation(nav, ctx, "undo");
+    const outcome = await runNavigation(nav, ctx, id);
     await publishActionResult(
       typed.sessionManager.getSessionId(),
       nav,
       typed,
-      "undo",
-      token,
-      outcome.status === "moved",
-    );
-  };
-
-  const redoHandler = async (_args: string, ctx: ExtensionCommandContext) => {
-    const token = randomUUID();
-    const typed = ctx as unknown as AnyContext;
-    const sessionId = typed.sessionManager.getSessionId();
-    const capture = pendingCaptures.get(sessionId);
-    if (capture) {
-      const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
-      if (outcome.timedOut) {
-        ctx.ui.notify(
-          "Cannot redo while the file checkpoint is still being captured; try again shortly.",
-          "warning",
-        );
-        return;
-      }
-    }
-    const pendingFinalize = pendingFinalizations.get(sessionId);
-    if (pendingFinalize) {
-      const outcome = await awaitWithDeadline(pendingFinalize, captureDeadlineMs);
-      if (outcome.timedOut) {
-        ctx.ui.notify(
-          "Cannot redo while the last turn is still being finalized; try again shortly.",
-          "warning",
-        );
-        return;
-      }
-    }
-    const nav = await ensureNavigation(typed);
-    if (!nav) {
-      ctx.ui.notify("Redo is unavailable while the session is closing.", "warning");
-      return;
-    }
-    nav.setNavigateTree(ctx.navigateTree);
-    const outcome = await runNavigation(nav, ctx, "redo");
-    await publishActionResult(
-      typed.sessionManager.getSessionId(),
-      nav,
-      typed,
-      "redo",
+      id,
       token,
       outcome.status === "moved",
     );
@@ -1256,11 +1204,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
   pi.registerCommand("undo", {
     description: "Revert file changes and session context for the last turn",
-    handler: undoHandler,
+    handler: makeHandler("undo"),
   });
   pi.registerCommand("redo", {
     description: "Restore the most recently undone turn",
-    handler: redoHandler,
+    handler: makeHandler("redo"),
   });
 
   // Boot-time housekeeping (all fire-and-forget, unref'd — 0ms handler latency)
