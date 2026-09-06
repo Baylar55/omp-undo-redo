@@ -4,8 +4,7 @@ import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionEntryLike } from "./core/types.js";
-import { runRedo } from "./commands/redo.js";
-import { runUndo } from "./commands/undo.js";
+import { runNavigation } from "./commands/navigate.js";
 import {
   CheckpointOwnerRegistry,
   resolvePersistentHostId,
@@ -1201,7 +1200,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       return;
     }
     nav.setNavigateTree(ctx.navigateTree);
-    const outcome = await runUndo(nav, ctx);
+    const outcome = await runNavigation(nav, ctx, "undo");
     await publishActionResult(
       typed.sessionManager.getSessionId(),
       nav,
@@ -1244,7 +1243,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       return;
     }
     nav.setNavigateTree(ctx.navigateTree);
-    const outcome = await runRedo(nav, ctx);
+    const outcome = await runNavigation(nav, ctx, "redo");
     await publishActionResult(
       typed.sessionManager.getSessionId(),
       nav,
