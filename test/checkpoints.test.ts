@@ -1214,10 +1214,7 @@ describe("history-safe Git checkpoints", () => {
         }),
       );
 
-      await expect(store.load(r)).resolves.toEqual({
-        status: "expired",
-        reason: "age",
-      });
+      await expect(store.load(r)).resolves.toEqual({ status: "expired" });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

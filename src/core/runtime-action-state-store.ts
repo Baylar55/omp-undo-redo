@@ -340,16 +340,6 @@ export class RuntimeActionStateStore {
     await this.enqueue(sessionHash, () => this.writeSession(sessionHash));
   }
 
-  async removeSession(sessionId: string): Promise<void> {
-    if (!this.active) return;
-    await this.initialize();
-    const sessionHash = checkpointNamespace(sessionId);
-    this.latest.delete(sessionHash);
-    await this.enqueue(sessionHash, async () => {
-      await rm(this.sessionHashPath(sessionHash), { force: true });
-    });
-  }
-
   async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.active = false;

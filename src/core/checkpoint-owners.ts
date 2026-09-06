@@ -177,21 +177,6 @@ export async function resolvePersistentHostId(
   options: HostIdentityOptions = {},
 ): Promise<HostIdentity> {
   const path = hostIdentityPath(options);
-  // A2: reap leaked host-id.*.tmp files from prior crashed attempts (fire-and-forget, <1ms)
-  try {
-    const hostDir = dirname(path);
-    const hostEntries = await readdir(hostDir, { withFileTypes: true }).catch(() => null);
-    if (hostEntries) {
-      const tmpPattern = /^host-id\.[0-9a-f-]{36}\.tmp$/;
-      await Promise.all(
-        hostEntries
-          .filter((e) => e.isFile() && tmpPattern.test(e.name))
-          .map((e) => rm(join(hostDir, e.name), { force: true }).catch(() => undefined)),
-      );
-    }
-  } catch {
-    // Best-effort cleanup
-  }
   const existing = await readValidUuid(path);
   if (existing === "unreadable") return { id: null, persistent: false };
   if (existing) return { id: existing, persistent: true };
@@ -292,20 +277,6 @@ function leaseContents(
     startedAt: now().toISOString(),
   });
 }
-async function removeCurrentOwnerTemporaryFiles(directory: string, ownerId: string): Promise<void> {
-  const pattern = new RegExp(`^\\.${ownerId}\\.[0-9a-f-]{36}\\.tmp$`);
-  let entries;
-  try {
-    entries = await readdir(directory, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  await Promise.all(
-    entries
-      .filter((entry) => entry.isFile() && pattern.test(entry.name))
-      .map((entry) => rm(join(directory, entry.name), { force: true }).catch(() => undefined)),
-  );
-}
 
 async function publishLease(
   repository: GitRepository,
@@ -320,7 +291,6 @@ async function publishLease(
   const temporary = join(directory, `.${ownerId}.${randomUUID()}.tmp`);
   try {
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await removeCurrentOwnerTemporaryFiles(directory, ownerId);
     if (
       !(await writeExclusive(
         temporary,
@@ -515,7 +485,7 @@ export class CheckpointOwnerRegistry {
     }
     const candidates: Array<{ ownerId: string }> = [];
     for (const entry of entries) {
-      if (!entry.isFile()) continue;
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       const filePath = join(leaseDirectory(repository), entry.name);
       const metadata = await stat(filePath).catch(() => null);
       if (!metadata || metadata.size > MAX_LEASE_BYTES) continue;

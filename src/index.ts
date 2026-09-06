@@ -284,6 +284,12 @@ async function removeDirWithRetry(path: string): Promise<boolean> {
   return false;
 }
 
+/** One-shot removal of the pre-v1.5.1 store layout, whose dirs hold user file
+ *  content and are never reclaimed by anything else. Kept while the pre-1.5.1
+ *  tail (v1.5.1 shipped 2026-08-21) can still upgrade straight to 1.6.x.
+ *  ponytail: delete this, LEGACY_BLOB_DIRS, LEGACY_BLOB_QUIET_MS,
+ *  cleanLegacyGitIndexes, their boot wiring, and test/legacy-blob-purge.test.ts
+ *  at v1.7.0. removeDirWithRetry/EVICTION_RETRY_DELAY_MS stay: eviction uses them. */
 export async function purgeLegacyBlobStore(): Promise<void> {
   const root = await canonicalCwd(storeRootDirectory());
   const isDir = async (name: string): Promise<boolean> =>
@@ -681,17 +687,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       } else if (loadResult?.status === "expired") {
         restored = null;
         if (ctx.ui?.notify) {
-          if (loadResult.reason === "age") {
-            ctx.ui.notify(
-              "Undo/redo file history for this session expired due to inactivity.\nSession navigation still works, but file changes cannot be restored.",
-              "warning",
-            );
-          } else if (loadResult.reason === "storage_cap") {
-            ctx.ui.notify(
-              "Undo/redo file history for this session was removed to free storage space.\nSession navigation still works, but file changes cannot be restored.",
-              "warning",
-            );
-          }
+          ctx.ui.notify(
+            "Undo/redo file history for this session expired due to inactivity.\nSession navigation still works, but file changes cannot be restored.",
+            "warning",
+          );
         }
       } else if (loadResult?.status === "unavailable" && loadResult.reason === "unusable") {
         restored = null;

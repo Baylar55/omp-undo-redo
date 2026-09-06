@@ -23,9 +23,7 @@ export type FileCheckpointUnavailableReason =
   | "after_ref_failed"
   | "file_history_gap"
   | "resumed_checkpoint_unavailable"
-  | "workspace_unresolvable"
-  | "private_repository_unavailable"
-  | "history_expired";
+  | "private_repository_unavailable";
 
 export type TreeNavigationResult = {
   cancelled: boolean;
@@ -144,12 +142,12 @@ export interface ExpirationTombstone {
   expired: true;
   sessionHash: string;
   expiredAt: string;
-  reason: "age" | "storage_cap";
+  reason: "age";
 }
 
 export type HistoryLoadResult =
   | { status: "loaded"; state: NavigationState }
-  | { status: "expired"; reason: "age" | "storage_cap" }
+  | { status: "expired" }
   | { status: "unavailable"; reason?: "missing" | "unusable" };
 
 export type PendingTurnCheckpoint = PendingGitCheckpoint | PendingSessionCheckpoint;

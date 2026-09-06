@@ -55,12 +55,8 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "a later turn had no file checkpoint, so this older file checkpoint was discarded.";
     case "resumed_checkpoint_unavailable":
       return "the resumed turn has no usable file checkpoint.";
-    case "workspace_unresolvable":
-      return "the working directory could not be resolved.";
     case "private_repository_unavailable":
       return "the private snapshot repository could not be initialized.";
-    case "history_expired":
-      return "undo/redo file history for this session expired due to inactivity.";
     default:
       return "the file checkpoint could not be created.";
   }

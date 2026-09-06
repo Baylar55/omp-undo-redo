@@ -272,39 +272,6 @@ describe("expireGitSessionHistories", () => {
     expect(metadata.isFile()).toBe(true);
   });
 
-  it("returns status expired when tombstone file exists for Git store load", async () => {
-    const gitDir = await temporaryDirectory("git-load-tombstone-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
-    const sessionId = "git-tombstone-session";
-    const hash = sessionHash(sessionId);
-
-    await mkdir(join(gitDir, "omp-undo-redo", "history"), { recursive: true });
-    await writeFile(
-      tombstonePath(repository, sessionId),
-      JSON.stringify({
-        expired: true,
-        sessionHash: hash,
-        expiredAt: new Date().toISOString(),
-        reason: "storage_cap",
-      }),
-    );
-
-    const { SessionHistoryStore } = await import("../src/core/history-store.js");
-    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
-    const store = new SessionHistoryStore(sessionId, repository, dummyGit);
-
-    const dummyReader = {
-      getLeafId: () => null,
-      getBranch: () => [],
-      getEntry: () => undefined,
-    };
-
-    await expect(store.load(dummyReader)).resolves.toEqual({
-      status: "expired",
-      reason: "storage_cap",
-    });
-  });
-
   it("preserves sessions with a fresh cross-process heartbeat marker", async () => {
     const gitDir = await temporaryDirectory("git-expire-heartbeat-");
     const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };

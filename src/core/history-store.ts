@@ -38,9 +38,7 @@ const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
   after_ref_failed: true,
   file_history_gap: true,
   resumed_checkpoint_unavailable: true,
-  workspace_unresolvable: true,
   private_repository_unavailable: true,
-  history_expired: true,
 };
 
 /** Write JSON so readers never see a partial document: temp file beside the
@@ -93,13 +91,13 @@ async function readTombstone(
       candidate.expired === true &&
       candidate.sessionHash === sessionHash &&
       typeof candidate.expiredAt === "string" &&
-      (candidate.reason === "age" || candidate.reason === "storage_cap")
+      candidate.reason === "age"
     ) {
       return {
         expired: true,
         sessionHash,
         expiredAt: candidate.expiredAt,
-        reason: candidate.reason,
+        reason: "age",
       };
     }
     return null;
@@ -372,7 +370,7 @@ export class SessionHistoryStore {
     const tombstoneFile = tombstonePath(this.repository, this.sessionId);
     const tombstone = await readTombstone(tombstoneFile, sessionHash);
     if (tombstone) {
-      return { status: "expired", reason: tombstone.reason };
+      return { status: "expired" };
     }
 
     const path = historyPath(this.repository, this.sessionId);

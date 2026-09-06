@@ -186,7 +186,6 @@ export async function createSnapshotCommit(
   git: GitRunner,
   message: string,
   retainIndex = false,
-  worktree?: string,
 ): Promise<SnapshotResult> {
   let tempDirectory: string | null = null;
   try {
@@ -197,10 +196,7 @@ export async function createSnapshotCommit(
     if (seeded.status === "invalid_head") return { reason: "invalid_head" };
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const addEnv: Record<string, string> = { ...env };
-    if (git.env?.GIT_DIR) {
-      const addWorktree = git.cwd ?? worktree;
-      if (addWorktree) addEnv.GIT_WORK_TREE = addWorktree;
-    }
+    if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
     const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
     if (added.code !== 0) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
@@ -232,7 +228,6 @@ async function createSnapshotCommitFromLease(
   git: GitRunner,
   lease: SnapshotIndexLease,
   message: string,
-  worktree?: string,
 ): Promise<SnapshotResult> {
   const currentHead = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
   if (currentHead.code !== 0 || currentHead.stdout.trim() !== lease.headTree) {
@@ -277,10 +272,7 @@ async function createSnapshotCommitFromLease(
     }
 
     const addEnv: Record<string, string> = { ...env };
-    if (git.env?.GIT_DIR) {
-      const addWorktree = git.cwd ?? worktree;
-      if (addWorktree) addEnv.GIT_WORK_TREE = addWorktree;
-    }
+    if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
     const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
     if (added.code !== 0) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
