@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { checkpointNamespace } from "./checkpoints.js";
 import {
   pruneStaleHeartbeats,
@@ -42,6 +42,19 @@ const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
   private_repository_unavailable: true,
   history_expired: true,
 };
+
+/** Write JSON so readers never see a partial document: temp file beside the
+ *  target, then rename over it. Throws on failure; the temp never leaks. */
+async function writeJsonAtomic(directory: string, path: string, value: unknown): Promise<void> {
+  const temporary = join(directory, `.${basename(path)}.${randomUUID()}.tmp`);
+  try {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await writeFile(temporary, JSON.stringify(value), { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
 
 type StoredHistory = {
   schemaVersion: number;
@@ -330,16 +343,8 @@ export async function expireGitSessionHistories(
       expiredAt: new Date().toISOString(),
       reason: "age",
     };
-    const temporary = join(dir, `.${sessionHash}.${randomUUID()}.tmp`);
-    try {
-      await mkdir(dir, { recursive: true, mode: 0o700 });
-      await writeFile(temporary, JSON.stringify(tombstoneData), { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, tombstoneFile);
-    } catch {
-      // tombstone write failure is non-fatal
-    } finally {
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
+    // tombstone write failure is non-fatal
+    await writeJsonAtomic(dir, tombstoneFile, tombstoneData).catch(() => undefined);
 
     await rm(filePath, { force: true }).catch(() => undefined);
   }
@@ -447,17 +452,7 @@ export class SessionHistoryStore {
       currentIndex: candidate.currentIndex as number,
       lastAccessedAt: new Date().toISOString(),
     };
-    const temporary = join(
-      directory,
-      `.${checkpointNamespace(this.sessionId)}.${randomUUID()}.tmp`,
-    );
-    try {
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await writeFile(temporary, JSON.stringify(stored), { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, historyPath(this.repository, this.sessionId));
-    } finally {
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
+    await writeJsonAtomic(directory, historyPath(this.repository, this.sessionId), stored);
   }
 
   async save(state: NavigationState): Promise<void> {
@@ -492,17 +487,7 @@ export class SessionHistoryStore {
       currentIndex: state.currentIndex,
       lastAccessedAt: new Date().toISOString(),
     };
-    const temporary = join(
-      directory,
-      `.${checkpointNamespace(this.sessionId)}.${randomUUID()}.tmp`,
-    );
-    try {
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await writeFile(temporary, JSON.stringify(stored), { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, path);
-    } finally {
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
+    await writeJsonAtomic(directory, path, stored);
     // A live owner saving new history supersedes any earlier expiration
     // marker, so clear it — otherwise every future resume would discard the
     // freshly saved checkpoints until the marker aged out of the tombstone
