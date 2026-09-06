@@ -6,14 +6,12 @@ if (typeof ompUndoRedo !== "function") {
 }
 
 const registeredCommands = new Map();
-const registeredEvents = new Map();
 
 const fakeApi = {
   on(event, handler) {
     if (typeof handler !== "function") {
       throw new Error(`Event handler for '${event}' is not a function.`);
     }
-    registeredEvents.set(event, (registeredEvents.get(event) || 0) + 1);
   },
   registerCommand(name, config) {
     if (registeredCommands.has(name)) {
