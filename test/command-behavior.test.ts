@@ -221,12 +221,10 @@ describe("session navigation", () => {
       releaseApply = resolve;
     });
     let applyCalls = 0;
-    const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, {
-      git: async () => {
-        applyCalls++;
-        await applyGate;
-        return "applied";
-      },
+    const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, async () => {
+      applyCalls++;
+      await applyGate;
+      return "applied";
     });
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));

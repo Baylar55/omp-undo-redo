@@ -10,7 +10,7 @@ import {
   resolvePersistentHostId,
   resolveRuntimeScope,
 } from "./core/checkpoint-owners.js";
-import { createEnvGitRunner, createGitRunner } from "./core/git-runner.js";
+import { createGitRunner } from "./core/git-runner.js";
 import {
   canonicalCwd,
   ensurePrivateGitRepository,
@@ -44,19 +44,6 @@ import type {
 } from "./core/types.js";
 import { RuntimeActionStateStore } from "./core/runtime-action-state-store.js";
 
-function promiseWithResolvers<T>(): {
-  promise: Promise<T>;
-  resolve: (value: T | PromiseLike<T>) => void;
-  reject: (reason?: unknown) => void;
-} {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
-}
 type AnyContext = {
   cwd: string;
   sessionManager: {
@@ -99,7 +86,7 @@ export type OmpUndoRedoDependencies = {
 export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
 
 function defaultGitRunnerFactory(cwd: string, env?: Record<string, string>): GitRunner {
-  return env ? createEnvGitRunner(cwd, env) : createGitRunner(cwd);
+  return createGitRunner(cwd, { env });
 }
 
 async function awaitWithDeadline<T>(
@@ -164,14 +151,13 @@ function startPrivateRepo(
 
 async function resolvePrivateGit(
   cwd: string,
-  git: GitRunner,
   privateRepositories: Map<string, PrivateRepoEntry>,
   gitRunnerFactory: (
     cwd: string,
     env?: Record<string, string>,
   ) => GitRunner = defaultGitRunnerFactory,
 ): Promise<{ repository: GitRepository; git: GitRunner } | null> {
-  const canonical = await canonicalCwd(cwd);
+  const canonical = canonicalCwd(cwd);
   const existing = privateRepositories.get(canonical);
   if (existing) {
     if ("failure" in existing) return null;
@@ -214,7 +200,7 @@ export async function resolveBackend(
     return { kind: "git", repository, git };
   }
   if (resolved.reason !== "not_repository") return { kind: "session", reason: resolved.reason };
-  const priv = await resolvePrivateGit(cwd, git, privateRepositories, gitRunnerFactory);
+  const priv = await resolvePrivateGit(cwd, privateRepositories, gitRunnerFactory);
   return priv
     ? { kind: "git", repository: priv.repository, git: priv.git }
     : { kind: "session", reason: "private_repository_unavailable" };
@@ -276,7 +262,7 @@ async function removeDirWithRetry(path: string): Promise<boolean> {
       return true;
     } catch {
       if (attempt === 4) return false;
-      const { promise, resolve } = promiseWithResolvers<void>();
+      const { promise, resolve } = Promise.withResolvers<void>();
       setTimeout(resolve, EVICTION_RETRY_DELAY_MS);
       await promise;
     }
@@ -291,7 +277,7 @@ async function removeDirWithRetry(path: string): Promise<boolean> {
  *  cleanLegacyGitIndexes, their boot wiring, and test/legacy-blob-purge.test.ts
  *  at v1.7.0. removeDirWithRetry/EVICTION_RETRY_DELAY_MS stay: eviction uses them. */
 export async function purgeLegacyBlobStore(): Promise<void> {
-  const root = await canonicalCwd(storeRootDirectory());
+  const root = canonicalCwd(storeRootDirectory());
   const isDir = async (name: string): Promise<boolean> =>
     stat(join(root, name))
       .then((s) => s.isDirectory())
@@ -340,7 +326,6 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   type PendingCapture = {
     complete: Promise<void>;
     checkpoint: PendingTurnCheckpoint | null;
-    failed: boolean;
   };
   /** Leaf the current turn started from, per session. Used to bind a
    *  checkpoint to the turn that captured it: a deferred finalize whose
@@ -355,12 +340,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  whose gitDir was built from a short-form (8.3) store root or cwd —
    *  otherwise the string compare silently fails and the gc counter never
    *  increments (repo growth stays unbounded on such machines). */
-  async function isPrivateRepository(gitDir: string): Promise<boolean> {
-    const canonicalGitDir = await canonicalCwd(gitDir);
+  function isPrivateRepository(gitDir: string): boolean {
+    const canonicalGitDir = canonicalCwd(gitDir);
     for (const entry of privateRepositories.values()) {
       if ("failure" in entry) continue;
       if (!entry.repository?.gitDir) continue;
-      const canonicalEntry = await canonicalCwd(entry.repository.gitDir);
+      const canonicalEntry = canonicalCwd(entry.repository.gitDir);
       if (canonicalEntry === canonicalGitDir) return true;
     }
     return false;
@@ -390,7 +375,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
   /** One-time removal of legacy git-indexes directory from pre-v1.5.1 store layout */
   async function cleanLegacyGitIndexes(): Promise<void> {
-    const legacy = join(await canonicalCwd(storeRootDirectory()), "git-indexes");
+    const legacy = join(canonicalCwd(storeRootDirectory()), "git-indexes");
     await rm(legacy, { recursive: true, force: true }).catch(() => undefined);
   }
 
@@ -479,7 +464,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  flight, and even then the repo is only renamed aside as `.evicted-<ts>`
    *  trash for EVICTION_TRASH_RETENTION_MS instead of being deleted outright. */
   async function evictStalePrivateRepos(): Promise<void> {
-    const reposDir = join(await canonicalCwd(storeRootDirectory()), "repos");
+    const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
     let entries: string[];
     try {
       entries = await readdir(reposDir);
@@ -726,7 +711,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   }
 
   function track(operation: () => Promise<void>): Promise<void> {
-    const { promise: tracked, resolve, reject } = promiseWithResolvers<void>();
+    const { promise: tracked, resolve, reject } = Promise.withResolvers<void>();
     activeOperations.add(tracked);
     void (async () => {
       try {
@@ -770,23 +755,21 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     const capture: PendingCapture = {
       complete: Promise.resolve(),
       checkpoint: null,
-      failed: false,
     };
-    const { promise: complete, resolve } = promiseWithResolvers<void>();
+    const { promise: complete, resolve } = Promise.withResolvers<void>();
     capture.complete = complete;
     void track(async () => {
       try {
         const checkpoint = await task();
         if (closing || pendingCaptures.get(sessionId) !== capture) {
           await releasePending(checkpoint);
-          capture.failed = true;
         } else {
           capture.checkpoint = checkpoint;
           pending.set(sessionId, checkpoint);
           if (
             checkpoint.kind === "git" &&
             checkpoint.repository.gitDir &&
-            (await isPrivateRepository(checkpoint.repository.gitDir))
+            isPrivateRepository(checkpoint.repository.gitDir)
           ) {
             const gitDir = checkpoint.repository.gitDir;
             const count = (capturesSinceGcByGitDir.get(gitDir) ?? 0) + 1;
@@ -808,7 +791,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           }
         }
       } catch {
-        capture.failed = true;
+        // Nothing to unwind: the finally below unblocks waiters and the turn
+        // falls back to session-only.
       } finally {
         resolve();
         if (pendingCaptures.get(sessionId) === capture) pendingCaptures.delete(sessionId);
@@ -934,11 +918,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
             : { kind: "session", reason: prepared.reason, parentLeafId };
         return checkpoint;
       });
-      const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
-      if (outcome.timedOut) return;
-
-      const settled = pending.get(sessionId);
-      if (!settled) return;
+      await awaitWithDeadline(capture.complete, captureDeadlineMs);
     }),
   );
 
@@ -1088,7 +1068,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (!capture && !settled) return;
       await beginFinalizeTurn(
         typed,
-        capture ?? { complete: Promise.resolve(), checkpoint: settled, failed: false },
+        capture ?? { complete: Promise.resolve(), checkpoint: settled },
         typed.sessionManager.getLeafId(),
         turnStartLeafBySession.get(sessionId) ?? null,
       );

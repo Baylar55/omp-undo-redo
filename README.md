@@ -191,7 +191,7 @@ The implementation uses only public OMP extension APIs. Keep changes focused, pr
 
 ## Release
 
-A release consists of a reviewed change, a clean verification run (running the compiled package-entry smoke check), an updated `CHANGELOG.md` entry, and a published npm package containing `index.js`, `dist/`, `README.md`, `LICENSE`, and `CHANGELOG.md`. The package manifest is the source of truth for the extension entry point and peer compatibility. Never place npm tokens, registry credentials, or other secrets in the repository or release logs.
+Tag-triggered CI does the publishing; the runbook is [RELEASE.md](./RELEASE.md). Never put npm tokens, registry credentials, or other secrets in the repository or release logs.
 
 ## Security
 

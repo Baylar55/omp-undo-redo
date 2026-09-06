@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Dirent } from "node:fs";
+import { writeFileAtomic } from "./atomic-write.js";
 import { checkpointNamespace } from "./checkpoints.js";
 import type { ActionInvocationResult, NavigationState, RuntimeActionState } from "./types.js";
 
@@ -11,6 +12,20 @@ const ACTION_STATE_SCHEMA = 2;
 const RUNTIME_PROTOCOL = "omp-undo-redo/runtime";
 const ACTION_STATE_PROTOCOL = "omp-undo-redo/action-state";
 const MAX_STATE_BYTES = 64 * 1024;
+const STALE_RUNTIME_MS = 24 * 60 * 60 * 1_000;
+
+/** A runtime directory is reapable only when both its marker timestamp and its
+ *  own mtime are older than the stale window. An unreadable mtime counts as
+ *  fresh: never delete on a failed stat. */
+async function isAncient(dir: string, startedAt: unknown): Promise<boolean> {
+  const startedMs = typeof startedAt === "string" ? Date.parse(startedAt) : NaN;
+  if (!Number.isNaN(startedMs) && Date.now() - startedMs < STALE_RUNTIME_MS) return false;
+  try {
+    return Date.now() - (await stat(dir)).mtimeMs >= STALE_RUNTIME_MS;
+  } catch {
+    return false;
+  }
+}
 
 type RuntimeMarker = {
   schemaVersion: typeof RUNTIME_SCHEMA;
@@ -40,9 +55,7 @@ export type RuntimeActionStateStoreOptions = {
   pid?: number;
   runtimeId?: string;
   clock?: () => Date;
-  now?: () => Date;
   uuid?: () => string;
-  maxStateBytes?: number;
 };
 
 function navigationRevision(state: NavigationState, activeSessionLeaf: string | null): string {
@@ -73,7 +86,6 @@ export class RuntimeActionStateStore {
   private readonly rootDirectory: string;
   private readonly clock: () => Date;
   private readonly uuid: () => string;
-  private readonly maxStateBytes: number;
   private readonly tails = new Map<string, Promise<void>>();
   private readonly latest = new Map<
     string,
@@ -88,9 +100,8 @@ export class RuntimeActionStateStore {
     this.rootDirectory = runtimeRootDirectory(options.rootDirectory);
     this.pid = options.pid ?? process.pid;
     this.runtimeId = options.runtimeId ?? randomUUID();
-    this.clock = options.clock ?? options.now ?? (() => new Date());
+    this.clock = options.clock ?? (() => new Date());
     this.uuid = options.uuid ?? randomUUID;
-    this.maxStateBytes = options.maxStateBytes ?? MAX_STATE_BYTES;
     this.runtimeDirectory = join(this.rootDirectory, String(this.pid));
     this.sessionsDirectory = join(this.runtimeDirectory, "sessions");
   }
@@ -142,7 +153,6 @@ export class RuntimeActionStateStore {
 
   private async reapStaleRuntimes(): Promise<void> {
     if (!this.active) return;
-    const STALE_RUNTIME_MS = 24 * 60 * 60 * 1_000;
     const localHostname = hostname();
     let entries: Dirent[];
     try {
@@ -157,75 +167,35 @@ export class RuntimeActionStateStore {
     const worker = async (): Promise<void> => {
       while (index < candidates.length) {
         const entry = candidates[index++];
-        const pid = Number(entry.name);
-        if (pid === this.pid) continue;
+        if (Number(entry.name) === this.pid) continue;
         const dir = join(this.rootDirectory, entry.name);
-        const markerPath = join(dir, "runtime.json");
-        let shouldRemove = false;
-        let markerHostname: string | null = null;
-        let markerPid: number | null = null;
-        let markerStartedAt: string | null = null;
+        let marker: Partial<RuntimeMarker> = {};
         try {
-          const content = await readFile(markerPath, "utf8");
-          const parsed = JSON.parse(content) as Partial<RuntimeMarker>;
-          if (typeof parsed.hostname === "string") markerHostname = parsed.hostname;
-          if (typeof parsed.pid === "number") markerPid = parsed.pid;
-          if (typeof parsed.startedAt === "string") markerStartedAt = parsed.startedAt;
+          marker = JSON.parse(
+            await readFile(join(dir, "runtime.json"), "utf8"),
+          ) as Partial<RuntimeMarker>;
         } catch {
-          // Missing/unreadable marker — fall back to directory mtime check below
+          // Missing/unreadable marker: the age check decides alone.
         }
-        // Cross-host guard: never delete remote host's directory even if pid appears dead locally
-        if (markerHostname && markerHostname !== localHostname) continue;
-        if (markerPid !== null) {
+        // Cross-host guard: never delete another host's directory, however
+        // dead its pid looks locally.
+        if (typeof marker.hostname === "string" && marker.hostname !== localHostname) continue;
+        let dead = false;
+        if (typeof marker.pid === "number") {
           try {
-            process.kill(markerPid, 0);
-            // Process alive — keep unless marker is ancient (PID recycling guard)
-            if (markerStartedAt) {
-              const startedMs = Date.parse(markerStartedAt);
-              if (!Number.isNaN(startedMs) && Date.now() - startedMs < STALE_RUNTIME_MS) {
-                continue;
-              }
-            }
-            // Also check directory mtime as secondary guard
-            try {
-              const st = await stat(dir);
-              if (Date.now() - st.mtimeMs < STALE_RUNTIME_MS) continue;
-            } catch {
-              continue;
-            }
-            shouldRemove = true;
+            process.kill(marker.pid, 0);
           } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
-            if (code === "ESRCH") shouldRemove = true;
-            else if (code === "EPERM") {
-              // Process exists but no permission — treat as alive unless ancient
-              if (markerStartedAt) {
-                const startedMs = Date.parse(markerStartedAt);
-                if (!Number.isNaN(startedMs) && Date.now() - startedMs < STALE_RUNTIME_MS) continue;
-              }
-              try {
-                const st = await stat(dir);
-                if (Date.now() - st.mtimeMs < STALE_RUNTIME_MS) continue;
-              } catch {
-                continue;
-              }
-              shouldRemove = true;
-            } else {
-              continue;
-            }
-          }
-        } else {
-          // No valid marker — use directory mtime only
-          try {
-            const st = await stat(dir);
-            if (Date.now() - st.mtimeMs >= STALE_RUNTIME_MS) shouldRemove = true;
-          } catch {
-            continue;
+            // ESRCH: gone. EPERM: alive but foreign, so fall through to the age
+            // check. Any other code: leave the directory alone.
+            if (code === "ESRCH") dead = true;
+            else if (code !== "EPERM") continue;
           }
         }
-        if (shouldRemove) {
-          await rm(dir, { recursive: true, force: true }).catch(() => undefined);
-        }
+        // PID-recycling guard: a live (or unprobeable) pid only loses its
+        // directory once the marker and the directory are both ancient.
+        if (!dead && !(await isAncient(dir, marker.startedAt))) continue;
+        await rm(dir, { recursive: true, force: true }).catch(() => undefined);
       }
     };
     await Promise.all(
@@ -235,14 +205,9 @@ export class RuntimeActionStateStore {
 
   private async writeJsonAtomic(path: string, value: unknown): Promise<void> {
     const serialized = JSON.stringify(value);
-    if (Buffer.byteLength(serialized, "utf8") > this.maxStateBytes) return;
+    if (Buffer.byteLength(serialized, "utf8") > MAX_STATE_BYTES) return;
     const temporary = join(dirname(path), `.${basename(path)}.${this.uuid()}.tmp`);
-    try {
-      await writeFile(temporary, serialized, { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, path);
-    } finally {
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
+    await writeFileAtomic(path, temporary, serialized);
   }
 
   private enqueue(sessionHash: string, operation: () => Promise<void>): Promise<void> {

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { createEnvGitRunner, createGitRunner } from "../src/core/git-runner.js";
+import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
 import { context, FakeExtensionApi, rmRetry, type TestContext } from "./helpers.js";
@@ -76,7 +76,7 @@ describe("private-repo housekeeping", () => {
       const pi = new FakeExtensionApi();
       const dependencies: OmpUndoRedoDependencies = {
         gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
-          const inner = env ? createEnvGitRunner(cwd2, env) : createGitRunner(cwd2);
+          const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
           const wrapped: GitRunner = async (args, options) => {
             commands.push(args);
             return inner(args, options);

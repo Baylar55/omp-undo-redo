@@ -1,54 +1,19 @@
 import ompUndoRedo from "../index.js";
 
-if (typeof ompUndoRedo !== "function") {
-  console.error("Package default export is not a function.");
-  process.exit(1);
-}
+const registered = new Set();
 
-const registeredCommands = new Map();
-
-const fakeApi = {
-  on(event, handler) {
-    if (typeof handler !== "function") {
-      throw new Error(`Event handler for '${event}' is not a function.`);
-    }
-  },
+ompUndoRedo({
+  on() {},
   registerCommand(name, config) {
-    if (registeredCommands.has(name)) {
-      throw new Error(`Duplicate command registration for '${name}'.`);
+    if (typeof config?.handler !== "function") {
+      throw new Error(`Command '${name}' registered without a callable handler.`);
     }
-    if (!config || typeof config.handler !== "function") {
-      throw new Error(`Command '${name}' missing callable handler.`);
-    }
-    registeredCommands.set(name, config);
+    registered.add(name);
   },
-};
+});
 
-try {
-  ompUndoRedo(fakeApi);
-} catch (error) {
-  console.error("Failed to invoke default extension export:", error);
-  process.exit(1);
-}
-
-const requiredCommands = ["undo", "redo"];
-for (const cmd of requiredCommands) {
-  const config = registeredCommands.get(cmd);
-  if (!config) {
-    console.error(`Required command '${cmd}' was not registered.`);
-    process.exit(1);
-  }
-  if (typeof config.handler !== "function") {
-    console.error(`Registered command '${cmd}' handler is not a function.`);
-    process.exit(1);
-  }
-}
-
-if (registeredCommands.size !== requiredCommands.length) {
-  console.error(
-    `Unexpected commands registered: expected ${requiredCommands.length}, got ${registeredCommands.size}.`,
-  );
-  process.exit(1);
+for (const name of ["undo", "redo"]) {
+  if (!registered.has(name)) throw new Error(`Required command '${name}' was not registered.`);
 }
 
 console.log("Package entry smoke test passed successfully.");

@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEnvGitRunner } from "../src/core/git-runner.js";
+import { createGitRunner } from "../src/core/git-runner.js";
 import {
   DEFAULT_EXCLUDES,
   ensurePrivateGitRepository,
@@ -26,7 +26,7 @@ describe("private per-workspace git repositories", () => {
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
     try {
       const repository = await ensurePrivateGitRepository(
-        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        (cwd2, env) => createGitRunner(cwd2, { env }),
         cwd,
         storeRoot,
       );
@@ -39,7 +39,7 @@ describe("private per-workspace git repositories", () => {
       expect(repository.worktree).toBe(canonical);
       expect(repository.commonDir).toBe(repository.gitDir);
 
-      const envGit = createEnvGitRunner(cwd, { GIT_DIR: repository.gitDir });
+      const envGit = createGitRunner(cwd, { env: { GIT_DIR: repository.gitDir } });
       const configs: Array<[string, string]> = [
         ["core.bare", "false"],
         ["core.autocrlf", "false"],
@@ -59,7 +59,7 @@ describe("private per-workspace git repositories", () => {
       }
 
       const second = await ensurePrivateGitRepository(
-        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        (cwd2, env) => createGitRunner(cwd2, { env }),
         cwd,
         storeRoot,
       );
@@ -139,7 +139,7 @@ describe("private per-workspace git repositories", () => {
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
     try {
       const repository = await ensurePrivateGitRepository(
-        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        (cwd2, env) => createGitRunner(cwd2, { env }),
         cwd,
         storeRoot,
       );
@@ -155,14 +155,14 @@ describe("private per-workspace git repositories", () => {
         recorded.push({ args, env: options.env });
         throw new Error("stub");
       }) as unknown as typeof spawn;
-      const stubbed = createEnvGitRunner(cwd, { GIT_DIR: repository.gitDir }, { spawnGit });
+      const stubbed = createGitRunner(cwd, { env: { GIT_DIR: repository.gitDir }, spawnGit });
       await stubbed(["update-ref", "--stdin"], { stdin: "" });
       expect(recorded.length).toBeGreaterThan(0);
       for (const entry of recorded) {
         expect(entry.env.GIT_DIR).toBe(repository.gitDir);
       }
 
-      const envGit = createEnvGitRunner(cwd, { GIT_DIR: repository.gitDir });
+      const envGit = createGitRunner(cwd, { env: { GIT_DIR: repository.gitDir } });
       const invocations: Array<{ args: string[]; env: Record<string, string | undefined> }> = [];
       const recording = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) => {
@@ -187,7 +187,7 @@ describe("private per-workspace git repositories", () => {
     try {
       const storeRoot = join(cwd, ".omp");
       const repository = await ensurePrivateGitRepository(
-        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        (cwd2, env) => createGitRunner(cwd2, { env }),
         cwd,
         storeRoot,
       );
@@ -201,7 +201,7 @@ describe("private per-workspace git repositories", () => {
       const excludePath = join(repository.gitDir, "info", "exclude");
       await writeFile(excludePath, `${await readFile(excludePath, "utf8")}node_modules/\n`);
 
-      const envGit = createEnvGitRunner(cwd, { GIT_DIR: repository.gitDir });
+      const envGit = createGitRunner(cwd, { env: { GIT_DIR: repository.gitDir } });
       const snapshot = await createSnapshotCommit(envGit, "ignore-test");
       expect("hash" in snapshot).toBe(true);
       if (!("hash" in snapshot)) return;
@@ -220,7 +220,7 @@ describe("private per-workspace git repositories", () => {
     try {
       const storeRoot = join(cwd, ".omp");
       const repository = await ensurePrivateGitRepository(
-        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        (cwd2, env) => createGitRunner(cwd2, { env }),
         cwd,
         storeRoot,
       );
@@ -303,7 +303,7 @@ describe("private per-workspace git repositories", () => {
       // and cwd must land at the canonical path, and that path must be its
       // own realpath form — the exact comparison the checkpoint side makes.
       const repository = await ensurePrivateGitRepository(
-        (cwd2, env) => createEnvGitRunner(cwd2, env),
+        (cwd2, env) => createGitRunner(cwd2, { env }),
         cwd,
         storeRoot,
       );

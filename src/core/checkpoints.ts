@@ -3,6 +3,7 @@ import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
+import { deleteRefsBatched } from "./git-refs.js";
 import type {
   FileCheckpointUnavailableReason,
   GitCheckpoint,
@@ -291,7 +292,7 @@ async function createSnapshotCommitFromLease(
   }
 }
 
-export interface RefRelease {
+interface RefRelease {
   repository: GitRepository;
   ref: string;
   expectedHash: string;
@@ -313,35 +314,6 @@ async function releaseLooseRef(
   }
 }
 
-async function releaseRefBatch(
-  git: GitRunner,
-  refs: readonly Pick<RefRelease, "ref" | "expectedHash">[],
-  repository?: GitRepository,
-  timeoutMs?: number,
-): Promise<boolean> {
-  if (refs.length === 0) return true;
-  const input = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n");
-  const options = repository
-    ? { env: { GIT_DIR: repository.commonDir }, stdin: `${input}\n`, timeoutMs }
-    : { stdin: `${input}\n`, timeoutMs };
-  try {
-    const result = await git(["update-ref", "--stdin"], options);
-    if (result.code === 0) return true;
-    if (result.error === "timeout") return false;
-  } catch {
-    // Retry smaller batches below.
-  }
-  if (refs.length === 1) {
-    return repository
-      ? await releaseLooseRef(repository, refs[0].ref, refs[0].expectedHash)
-      : false;
-  }
-  const midpoint = Math.ceil(refs.length / 2);
-  const left = await releaseRefBatch(git, refs.slice(0, midpoint), repository, timeoutMs);
-  const right = await releaseRefBatch(git, refs.slice(midpoint), repository, timeoutMs);
-  return left && right;
-}
-
 export async function releaseRefs(
   gitForRepository: (repository: GitRepository) => GitRunner,
   refs: readonly RefRelease[],
@@ -360,7 +332,12 @@ export async function releaseRefs(
   const results = await Promise.allSettled(
     [...grouped.values()].map(async ({ repository, refs: groupedRefs }) => {
       try {
-        return await releaseRefBatch(gitForRepository(repository), groupedRefs, repository);
+        const outcome = await deleteRefsBatched(gitForRepository(repository), groupedRefs, {
+          env: { GIT_DIR: repository.commonDir },
+          onSingleFailure: ({ ref, expectedHash }) =>
+            releaseLooseRef(repository, ref, expectedHash),
+        });
+        return outcome === "ok";
       } catch {
         return false;
       }
@@ -402,14 +379,14 @@ export async function releasePendingCheckpoint(
   >,
 ): Promise<boolean> {
   const [releasedRef, releasedLease] = await Promise.all([
-    releaseRefBatch(
-      git,
-      [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }],
-      pending.repository,
-    ),
+    deleteRefsBatched(git, [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }], {
+      env: { GIT_DIR: pending.repository.commonDir },
+      onSingleFailure: ({ ref, expectedHash }) =>
+        releaseLooseRef(pending.repository, ref, expectedHash),
+    }),
     releaseSnapshotIndexLease(pending.snapshotIndexLease),
   ]);
-  return releasedRef && releasedLease;
+  return releasedRef === "ok" && releasedLease;
 }
 
 export type PrepareBeforeTurnResult =
@@ -495,7 +472,7 @@ export async function finishAfterTurn(
   git: GitRunner,
   before: Pick<
     PendingGitCheckpoint,
-    "repository" | "beforeHash" | "beforeRef" | "checkpointId" | "snapshotIndexLease"
+    "repository" | "beforeHash" | "beforeRef" | "snapshotIndexLease"
   >,
   parentLeafId: string | null,
   leafId: string | null,

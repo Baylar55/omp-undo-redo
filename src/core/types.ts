@@ -81,7 +81,7 @@ export type GitCommandResult = {
 
 export type GitRunner = ((args: string[], options?: GitRunOptions) => Promise<GitCommandResult>) & {
   cwd?: string;
-  /** Fixed env merged into every invocation (set by createEnvGitRunner). */
+  /** Fixed env merged into every invocation (set via createGitRunner's `env`). */
   env?: Record<string, string>;
 };
 

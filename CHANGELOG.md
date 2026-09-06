@@ -11,6 +11,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 ### Changed
 
 - Repository resolution issues one `git rev-parse` instead of three, removing two process spawns per turn.
+- **Breaking: requires Node.js >= 22** (`package.json` `engines`, CI). Node 20 reached end of life in April 2026; the extension now uses the built-in `Promise.withResolvers()` instead of a hand-rolled equivalent.
 
 ## [1.6.0] - 2026-09-05
 

@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { createEnvGitRunner, createGitRunner } from "../src/core/git-runner.js";
+import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
 import { context, FakeExtensionApi, rmRetry } from "./helpers.js";
@@ -46,7 +46,7 @@ function slowAddRunnerFactory(delayMs: number): {
     cwd: string,
     env?: Record<string, string>,
   ): GitRunner => {
-    const inner = env ? createEnvGitRunner(cwd, env) : createGitRunner(cwd);
+    const inner = env ? createGitRunner(cwd, { env }) : createGitRunner(cwd);
     const slow: GitRunner = async (args, options) => {
       if (args.includes("add")) {
         const result = await inner(args, options);
@@ -96,7 +96,7 @@ function raceRunnerFactory(delayMs: number): {
     cwd: string,
     env?: Record<string, string>,
   ): GitRunner => {
-    const inner = env ? createEnvGitRunner(cwd, env) : createGitRunner(cwd);
+    const inner = env ? createGitRunner(cwd, { env }) : createGitRunner(cwd);
     const slow: GitRunner = async (args, options) => {
       if (args.includes("add")) {
         const result = await inner(args, options);
@@ -316,7 +316,7 @@ describe("bounded capture lifecycle", () => {
     let updateRefCount = 0;
     let finalizeAtGate = false;
     const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
-      const inner = env ? createEnvGitRunner(workCwd, env) : createGitRunner(workCwd);
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
       const gated: GitRunner = async (args, options) => {
         if (args[0] === "update-ref") {
           updateRefCount += 1;

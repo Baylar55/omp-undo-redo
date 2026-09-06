@@ -17,17 +17,11 @@ type ExpectedTreeNavigation = {
   newLeafId: string | null;
 };
 
-export interface CheckpointApplier {
-  git(
-    checkpoint: GitCheckpoint,
-    sourceHash: string,
-    targetHash: string,
-  ): Promise<CheckpointApplyResult>;
-}
-
-export interface CheckpointReleaser {
-  git(checkpoints: readonly GitCheckpoint[]): Promise<boolean>;
-}
+type ApplyCheckpoint = (
+  checkpoint: GitCheckpoint,
+  sourceHash: string,
+  targetHash: string,
+) => Promise<CheckpointApplyResult>;
 
 export class SessionNavigation {
   private checkpoints: TurnCheckpoint[] = [];
@@ -37,8 +31,7 @@ export class SessionNavigation {
   private readonly gitForRepository: GitRunnerFactory;
   private navigationTail: Promise<void> = Promise.resolve();
   private readonly stateChanged: (state: NavigationState) => Promise<void>;
-  private readonly applier: CheckpointApplier;
-  private readonly releaser: CheckpointReleaser;
+  private readonly applyGit: ApplyCheckpoint;
 
   constructor(
     private readonly port: Omit<NavigationPort, "navigateTree"> & {
@@ -47,20 +40,14 @@ export class SessionNavigation {
     git: GitRunner,
     gitFactory?: GitRunnerFactory,
     stateChanged?: (state: NavigationState) => Promise<void>,
-    applier?: Partial<CheckpointApplier>,
-    releaser?: Partial<CheckpointReleaser>,
+    applyGit?: ApplyCheckpoint,
   ) {
     this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git);
     this.stateChanged = stateChanged ?? (async () => undefined);
-    this.applier = {
-      git: (checkpoint, sourceHash, targetHash) =>
-        applyCheckpoint(this.gitForRepository(checkpoint.repository), sourceHash, targetHash),
-      ...applier,
-    };
-    this.releaser = {
-      git: (checkpoints) => releaseCheckpoints(this.gitForRepository, checkpoints),
-      ...releaser,
-    };
+    this.applyGit =
+      applyGit ??
+      ((checkpoint, sourceHash, targetHash) =>
+        applyCheckpoint(this.gitForRepository(checkpoint.repository), sourceHash, targetHash));
     if (port.navigateTree) this.navigateTree = port.navigateTree.bind(port);
   }
 
@@ -153,7 +140,8 @@ export class SessionNavigation {
   }
 
   private async releaseFileCheckpoints(entries: readonly TurnCheckpoint[]): Promise<void> {
-    await this.releaser.git(
+    await releaseCheckpoints(
+      this.gitForRepository,
       entries.filter((entry): entry is GitCheckpoint => entry.kind === "git"),
     );
   }
@@ -190,7 +178,8 @@ export class SessionNavigation {
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
     this.currentIndex = -1;
-    await this.releaser.git(
+    await releaseCheckpoints(
+      this.gitForRepository,
       checkpoints.filter(
         (checkpoint): checkpoint is GitCheckpoint =>
           checkpoint.kind === "git" &&
@@ -213,7 +202,7 @@ export class SessionNavigation {
     checkpoint: GitCheckpoint,
     source: "before" | "after",
   ): Promise<{ status: "applied" } | { status: "conflict" | "failed" }> {
-    const result = await this.applier.git(
+    const result = await this.applyGit(
       checkpoint,
       source === "before" ? checkpoint.afterHash : checkpoint.beforeHash,
       source === "before" ? checkpoint.beforeHash : checkpoint.afterHash,

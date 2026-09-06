@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { writeFileAtomic } from "./atomic-write.js";
 import { checkpointNamespace } from "./checkpoints.js";
+import { parseRefLines } from "./git-refs.js";
 import {
   pruneStaleHeartbeats,
   sessionHeartbeatIsFresh,
@@ -16,11 +18,30 @@ import type {
   GitRunner,
   HistoryLoadResult,
   NavigationState,
+  SessionEntryLike,
   SessionReader,
   TurnCheckpoint,
 } from "./types.js";
-import { effectiveLeaf, entryExists, isSessionExitEntry } from "./session-tree-utils.js";
-export { effectiveLeaf, entryExists, isSessionExitEntry } from "./session-tree-utils.js";
+
+function entryExists(reader: SessionReader, id: string | null): boolean {
+  return id === null || reader.getEntry(id) !== undefined;
+}
+
+function isSessionExitEntry(entry: SessionEntryLike | undefined): boolean {
+  return entry?.type === "custom" && entry.customType === "session_exit";
+}
+
+function effectiveLeaf(reader: SessionReader): string | null {
+  let leafId = reader.getLeafId();
+  const visited = new Set<string>();
+  while (leafId && !visited.has(leafId)) {
+    visited.add(leafId);
+    const entry = reader.getEntry(leafId);
+    if (!isSessionExitEntry(entry)) return leafId;
+    leafId = entry?.parentId ?? null;
+  }
+  return leafId;
+}
 
 const HISTORY_SCHEMA_CURRENT = 2;
 const ACCEPTED_SCHEMAS = new Set([1, 2]);
@@ -41,17 +62,14 @@ const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
   private_repository_unavailable: true,
 };
 
-/** Write JSON so readers never see a partial document: temp file beside the
- *  target, then rename over it. Throws on failure; the temp never leaks. */
+/** Write JSON so readers never see a partial document. */
 async function writeJsonAtomic(directory: string, path: string, value: unknown): Promise<void> {
-  const temporary = join(directory, `.${basename(path)}.${randomUUID()}.tmp`);
-  try {
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    await writeFile(temporary, JSON.stringify(value), { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, path);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined);
-  }
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFileAtomic(
+    path,
+    join(directory, `.${basename(path)}.${randomUUID()}.tmp`),
+    JSON.stringify(value),
+  );
 }
 
 type StoredHistory = {
@@ -204,14 +222,8 @@ async function existingRefs(git: GitRunner, prefix: string): Promise<Map<string,
   try {
     const result = await git(["for-each-ref", "--format=%(refname)%00%(objectname)", prefix]);
     if (result.code !== 0 || result.error) return null;
-    const refs = new Map<string, string>();
-    for (const line of result.stdout.split(/\r?\n/)) {
-      if (!line) continue;
-      const separator = line.indexOf("\0");
-      if (separator < 0 || line.indexOf("\0", separator + 1) >= 0) return null;
-      refs.set(line.slice(0, separator), line.slice(separator + 1));
-    }
-    return refs;
+    const refs = parseRefLines(result.stdout);
+    return refs && new Map(refs.map(({ ref, expectedHash }) => [ref, expectedHash]));
   } catch {
     return null;
   }

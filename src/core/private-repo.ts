@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { GitRepository, GitRunner } from "./types.js";
@@ -45,7 +45,11 @@ function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function canonicalCwdSync(cwd: string): string {
+/** Canonical (long-form, symlink-resolved) absolute path. Sync because the
+ *  callers that key the store by it are sync, and `fs/promises` has no
+ *  `realpath.native` — the native form is what the 8.3 short-path fixes on
+ *  Windows depend on. */
+function canonicalCwd(cwd: string): string {
   try {
     return realpathSync.native(cwd);
   } catch {
@@ -69,38 +73,18 @@ function canonicalCwdSync(cwd: string): string {
   }
 }
 
-async function canonicalCwd(cwd: string): Promise<string> {
-  try {
-    return await realpath(cwd);
-  } catch {
-    let current = resolve(cwd);
-    const suffix: string[] = [];
-    while (true) {
-      try {
-        const canonical = await realpath(current);
-        return suffix.length ? join(canonical, ...suffix.reverse()) : canonical;
-      } catch {
-        const parent = dirname(current);
-        if (parent === current) return resolve(cwd);
-        suffix.push(basename(current));
-        current = parent;
-      }
-    }
-  }
-}
-
 function basenameIsRuntime(value: string): boolean {
   return value.endsWith(`${sep}runtime`) || value.endsWith("/runtime");
 }
 
 export function storeRootDirectory(): string {
   const explicit = process.env.OMP_UNDO_REDO_STORE_DIR ?? process.env.OMP_UNDO_REDO_BLOB_DIR;
-  if (explicit) return canonicalCwdSync(explicit);
+  if (explicit) return canonicalCwd(explicit);
   if (process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
     const runtime = resolve(process.env.OMP_UNDO_REDO_RUNTIME_DIR);
-    return canonicalCwdSync(basenameIsRuntime(runtime) ? dirname(runtime) : runtime);
+    return canonicalCwd(basenameIsRuntime(runtime) ? dirname(runtime) : runtime);
   }
-  return canonicalCwdSync(join(homedir(), ".omp", "omp-undo-redo"));
+  return canonicalCwd(join(homedir(), ".omp", "omp-undo-redo"));
 }
 
 /** The private git dir for a workspace: `<storeRoot>/repos/<sha256(cwd)>.git`.
@@ -111,7 +95,7 @@ export function storeRootDirectory(): string {
  *  differs from the realpath-canonicalized form recorded on checkpoints,
  *  so `isPrivateRepository` string comparisons would silently fail. */
 export function privateRepositoryPath(storeRoot: string, cwd: string): string {
-  return join(canonicalCwdSync(storeRoot), "repos", `${sha256Hex(canonicalCwdSync(cwd))}.git`);
+  return join(canonicalCwd(storeRoot), "repos", `${sha256Hex(canonicalCwd(cwd))}.git`);
 }
 
 async function repoExists(gitDir: string): Promise<boolean> {
@@ -146,8 +130,8 @@ async function ensureExclude(gitDir: string, worktree: string, storeRoot: string
       .map((line) => line.trim())
       .filter((line) => line.length > 0 && !line.startsWith("#")),
   );
-  const canonicalStoreRoot = await canonicalCwd(storeRoot);
-  const canonicalWorktree = await canonicalCwd(worktree);
+  const canonicalStoreRoot = canonicalCwd(storeRoot);
+  const canonicalWorktree = canonicalCwd(worktree);
   const rel = relative(canonicalWorktree, canonicalStoreRoot);
   if (rel && rel !== "." && !rel.startsWith("..") && !isAbsolute(rel)) {
     entries.add(`${rel.replace(/\\/g, "/")}/`);
@@ -168,7 +152,7 @@ export async function ensurePrivateGitRepository(
   cwd: string,
   storeRoot: string,
 ): Promise<GitRepository | null> {
-  const worktree = await canonicalCwd(cwd);
+  const worktree = canonicalCwd(cwd);
   const gitDir = privateRepositoryPath(storeRoot, worktree);
   const envGit = gitRunnerFactory(worktree, { GIT_DIR: gitDir });
   try {
