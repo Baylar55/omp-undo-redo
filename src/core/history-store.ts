@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { writeFileAtomic } from "./atomic-write.js";
-import { checkpointNamespace } from "./checkpoints.js";
+import { checkpointNamespace, historyRefPrefix } from "./checkpoints.js";
 import { parseRefLines } from "./git-refs.js";
 import {
   pruneStaleHeartbeats,
@@ -12,7 +12,6 @@ import {
 import { pruneExpiredTombstones } from "./prune-tombstones.js";
 import type {
   ExpirationTombstone,
-  FileCheckpointUnavailableReason,
   GitCheckpoint,
   GitRepository,
   GitRunner,
@@ -22,6 +21,7 @@ import type {
   SessionReader,
   TurnCheckpoint,
 } from "./types.js";
+import { UNAVAILABLE_REASONS } from "./types.js";
 
 function entryExists(reader: SessionReader, id: string | null): boolean {
   return id === null || reader.getEntry(id) !== undefined;
@@ -48,19 +48,6 @@ const ACCEPTED_SCHEMAS = new Set([1, 2]);
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
 const GIT_OBJECT_ID = /^[0-9a-f]{40,64}$/;
 const HASH = /^[0-9a-f]{64}$/;
-const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
-  git_unavailable: true,
-  not_repository: true,
-  repository_unresolvable: true,
-  invalid_head: true,
-  before_snapshot_failed: true,
-  before_ref_failed: true,
-  after_snapshot_failed: true,
-  after_ref_failed: true,
-  file_history_gap: true,
-  resumed_checkpoint_unavailable: true,
-  private_repository_unavailable: true,
-};
 
 /** Write JSON so readers never see a partial document. */
 async function writeJsonAtomic(directory: string, path: string, value: unknown): Promise<void> {
@@ -144,7 +131,7 @@ function isSessionCheckpoint(value: unknown): value is TurnCheckpoint {
   return (
     candidate.kind === "session" &&
     typeof candidate.reason === "string" &&
-    candidate.reason in UNAVAILABLE_REASONS &&
+    (UNAVAILABLE_REASONS as readonly string[]).includes(candidate.reason) &&
     isNullableString(candidate.parentLeafId) &&
     isNullableString(candidate.leafId)
   );
@@ -186,7 +173,7 @@ function parseHistory(
   if (!value || typeof value !== "object") return null;
   const candidate = value as Record<string, unknown>;
   const sessionHash = checkpointNamespace(sessionId);
-  const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+  const refPrefix = historyRefPrefix(sessionHash);
   if (
     typeof candidate.schemaVersion !== "number" ||
     !ACCEPTED_SCHEMAS.has(candidate.schemaVersion) ||
@@ -327,7 +314,7 @@ export async function expireGitSessionHistories(
     // another process may have touched while the timestamp was being read.
     if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
 
-    const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+    const refPrefix = historyRefPrefix(sessionHash);
     const refsMap = await existingRefs(git, refPrefix);
     if (refsMap === null) continue;
 
@@ -400,7 +387,7 @@ export class SessionHistoryStore {
       const candidate = value as Record<string, unknown>;
       const parsed = parseHistory(value, this.sessionId, this.repository);
       if (!parsed) return { status: "unavailable", reason: "unusable" };
-      const refPrefix = `refs/omp-undo-redo/history/${parsed.sessionHash}/`;
+      const refPrefix = historyRefPrefix(parsed.sessionHash);
       const refs = await existingRefs(this.git, refPrefix);
       if (refs === null) return { status: "unavailable", reason: "unusable" };
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
@@ -473,7 +460,7 @@ export class SessionHistoryStore {
       return;
     }
     const sessionHash = checkpointNamespace(this.sessionId);
-    const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+    const refPrefix = historyRefPrefix(sessionHash);
     const checkpoints = state.checkpoints.map((checkpoint): TurnCheckpoint => {
       if (
         checkpoint.kind === "session" ||

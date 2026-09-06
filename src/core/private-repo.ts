@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { GitRepository, GitRunner } from "./types.js";
+import type { CwdGitRunnerFactory, GitRepository } from "./types.js";
 
 export const DEFAULT_EXCLUDES = [
   ".git",
@@ -148,7 +148,7 @@ async function ensureExclude(gitDir: string, worktree: string, storeRoot: string
  *  Idempotent: an existing repo (HEAD present) skips init/config but still
  *  gets the exclude entries. Returns null when init/config fails. */
 export async function ensurePrivateGitRepository(
-  gitRunnerFactory: (cwd: string, env?: Record<string, string>) => GitRunner,
+  gitRunnerFactory: CwdGitRunnerFactory,
   cwd: string,
   storeRoot: string,
 ): Promise<GitRepository | null> {

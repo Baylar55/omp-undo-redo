@@ -36,6 +36,7 @@ import {
 import { touchSessionHeartbeat } from "./core/history-liveness.js";
 import type {
   ActionId,
+  CwdGitRunnerFactory,
   GitRepository,
   GitRunner,
   NavigationState,
@@ -57,11 +58,9 @@ type AnyContext = {
   };
 };
 
-function readRetentionConfig(): { retentionDays: number } {
+function readRetentionDays(): number {
   const days = parseInt(process.env.OMP_UNDO_REDO_RETENTION_DAYS ?? "", 10);
-  return {
-    retentionDays: Number.isFinite(days) && days >= 0 ? days : 2,
-  };
+  return Number.isFinite(days) && days >= 0 ? days : 2;
 }
 
 export type SessionOnlyReason =
@@ -76,7 +75,7 @@ export type OmpUndoRedoDependencies = {
    *  behavior (e.g. slowing captures to exercise the bounded handler path).
    *  Receives the canonical worktree and an optional fixed env (used for
    *  private per-workspace repositories). */
-  gitRunnerFactory?: (cwd: string, env?: Record<string, string>) => GitRunner;
+  gitRunnerFactory?: CwdGitRunnerFactory;
   /** How long the before_agent_start / agent_end / undo / redo handlers wait
    *  for an in-flight checkpoint capture before returning without it. The
    *  capture keeps running and the turn is finalized when it settles. */
@@ -89,22 +88,18 @@ function defaultGitRunnerFactory(cwd: string, env?: Record<string, string>): Git
   return createGitRunner(cwd, { env });
 }
 
-async function awaitWithDeadline<T>(
-  promise: Promise<T>,
-  ms: number,
-): Promise<{ value: T | undefined; timedOut: boolean }> {
+/** True when `ms` elapsed before `promise` settled. The promise keeps running;
+ *  callers use this only to stop waiting, never to abandon the work. */
+async function timedOutAfter(promise: Promise<unknown>, ms: number): Promise<boolean> {
   let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<{ timedOut: true; value: undefined }>((resolve) => {
-    timer = setTimeout(() => resolve({ timedOut: true, value: undefined }), Math.max(1, ms));
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(true), Math.max(1, ms));
     timer.unref?.();
   });
   try {
-    return await Promise.race([
-      promise.then((value) => ({ timedOut: false as const, value })),
-      timeout,
-    ]);
+    return await Promise.race([promise.then(() => false), timeout]);
   } finally {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
   }
 }
 
@@ -124,10 +119,7 @@ type HistoryWriter = { save(state: NavigationState): Promise<void> };
 
 function startPrivateRepo(
   canonical: string,
-  gitRunnerFactory: (
-    cwd: string,
-    env?: Record<string, string>,
-  ) => GitRunner = defaultGitRunnerFactory,
+  gitRunnerFactory: CwdGitRunnerFactory,
 ): ActivePrivateRepoEntry {
   const storeRoot = storeRootDirectory();
   const entry: ActivePrivateRepoEntry = {
@@ -152,10 +144,7 @@ function startPrivateRepo(
 async function resolvePrivateGit(
   cwd: string,
   privateRepositories: Map<string, PrivateRepoEntry>,
-  gitRunnerFactory: (
-    cwd: string,
-    env?: Record<string, string>,
-  ) => GitRunner = defaultGitRunnerFactory,
+  gitRunnerFactory: CwdGitRunnerFactory,
 ): Promise<{ repository: GitRepository; git: GitRunner } | null> {
   const canonical = canonicalCwd(cwd);
   const existing = privateRepositories.get(canonical);
@@ -179,10 +168,7 @@ async function resolvePrivateGit(
 export async function resolveBackend(
   cwd: string,
   privateRepositories: Map<string, PrivateRepoEntry> = new Map(),
-  gitRunnerFactory: (
-    cwd: string,
-    env?: Record<string, string>,
-  ) => GitRunner = defaultGitRunnerFactory,
+  gitRunnerFactory: CwdGitRunnerFactory = defaultGitRunnerFactory,
 ): Promise<FileBackend> {
   const git = gitRunnerFactory(cwd);
   const resolved = await resolveRepository(git);
@@ -213,10 +199,7 @@ function createNavigation(
   runtimeStore: RuntimeActionStateStore,
   backend?: FileBackend,
   gitForRepository?: (repository: GitRepository) => GitRunner,
-  gitRunnerFactory: (
-    cwd: string,
-    env?: Record<string, string>,
-  ) => GitRunner = defaultGitRunnerFactory,
+  gitRunnerFactory: CwdGitRunnerFactory = defaultGitRunnerFactory,
 ): SessionNavigation {
   const manager = ctx.sessionManager;
   return new SessionNavigation(
@@ -304,7 +287,7 @@ export async function purgeLegacyBlobStore(): Promise<void> {
 }
 
 export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependencies = {}): void {
-  const retentionConfig = readRetentionConfig();
+  const retentionDays = readRetentionDays();
   const privateRepositories = new Map<string, PrivateRepoEntry>();
   const gitRunnerFactory = deps.gitRunnerFactory ?? defaultGitRunnerFactory;
   const captureDeadlineMs = deps.captureDeadlineMs ?? DEFAULT_CAPTURE_DEADLINE_MS;
@@ -553,18 +536,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const explicitActiveHashes = new Set<string>();
 
   function activeSessionHashes(): ReadonlySet<string> {
-    const hashes = new Set<string>();
-    for (const sessionId of navigations.keys()) {
+    const hashes = new Set<string>(explicitActiveHashes);
+    for (const sessionId of [...navigations.keys(), ...pending.keys(), ...initializations.keys()]) {
       hashes.add(checkpointNamespace(sessionId));
-    }
-    for (const sessionId of pending.keys()) {
-      hashes.add(checkpointNamespace(sessionId));
-    }
-    for (const sessionId of initializations.keys()) {
-      hashes.add(checkpointNamespace(sessionId));
-    }
-    for (const hash of explicitActiveHashes) {
-      hashes.add(hash);
     }
     return hashes;
   }
@@ -602,16 +576,14 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       "The Git repository could not be resolved.\nSession navigation still works, but file changes cannot be restored.",
   };
 
-  const notifiedReasonsBySession = new Map<string, Set<SessionOnlyReason>>();
+  // Keyed `${sessionId}\0${reason}`: session ids are UUIDs, so the separator
+  // cannot collide. Never pruned, same as the map it replaced.
+  const notifiedSessionReasons = new Set<string>();
   function notifySessionOnly(ctx: AnyContext, sessionId: string, reason: SessionOnlyReason): void {
     if (!ctx.ui?.notify) return;
-    let set = notifiedReasonsBySession.get(sessionId);
-    if (!set) {
-      set = new Set<SessionOnlyReason>();
-      notifiedReasonsBySession.set(sessionId, set);
-    }
-    if (set.has(reason)) return;
-    set.add(reason);
+    const key = `${sessionId}\0${reason}`;
+    if (notifiedSessionReasons.has(key)) return;
+    notifiedSessionReasons.add(key);
     ctx.ui.notify(NOTIFICATION_MESSAGES[reason], "warning");
   }
 
@@ -643,7 +615,6 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         backend.kind === "git" &&
         !expirationPromises.has(`git:${backend.repository.commonDir}`)
       ) {
-        const { retentionDays } = retentionConfig;
         const expiration = expireGitSessionHistories(
           backend.repository,
           backend.git,
@@ -752,12 +723,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     sessionId: string,
     task: () => Promise<PendingTurnCheckpoint>,
   ): PendingCapture {
-    const capture: PendingCapture = {
-      complete: Promise.resolve(),
-      checkpoint: null,
-    };
     const { promise: complete, resolve } = Promise.withResolvers<void>();
-    capture.complete = complete;
+    const capture: PendingCapture = { complete, checkpoint: null };
     void track(async () => {
       try {
         const checkpoint = await task();
@@ -802,15 +769,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return capture;
   }
 
-  async function disposeDetached(
+  async function suspendDetached(
     detachedNavigations: readonly SessionNavigation[],
     detachedPending: readonly PendingTurnCheckpoint[],
-    releaseNavigations = true,
   ): Promise<void> {
     await Promise.allSettled([
-      ...detachedNavigations.map((navigation) =>
-        releaseNavigations ? navigation.dispose() : navigation.suspend(),
-      ),
+      ...detachedNavigations.map((navigation) => navigation.suspend()),
       ...detachedPending.map((pendingCheckpoint) => releasePending(pendingCheckpoint)),
     ]);
   }
@@ -826,7 +790,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     const detachedPending = [...pending.values()];
     navigations.clear();
     pending.clear();
-    await disposeDetached(detachedNavigations, detachedPending, false);
+    await suspendDetached(detachedNavigations, detachedPending);
   }
 
   pi.on("session_start", (_event, ctx) =>
@@ -918,7 +882,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
             : { kind: "session", reason: prepared.reason, parentLeafId };
         return checkpoint;
       });
-      await awaitWithDeadline(capture.complete, captureDeadlineMs);
+      await timedOutAfter(capture.complete, captureDeadlineMs);
     }),
   );
 
@@ -935,8 +899,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     });
     const work = (async () => {
       try {
-        const outcome = await awaitWithDeadline(capture.complete, captureDeadlineMs);
-        if (outcome.timedOut) {
+        if (await timedOutAfter(capture.complete, captureDeadlineMs)) {
           // The capture overran the handler deadline. Keep this turn's
           // finalize identity-bound — same capture, same leaf, same turn-start
           // leaf, same context — so when it settles it finalizes its own
@@ -965,6 +928,27 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (pendingFinalizations.get(sessionId) === tracked) pendingFinalizations.delete(sessionId);
     });
     return handlerDone;
+  }
+
+  /** The live navigation for `sessionId`, creating and publishing one when the
+   *  session has none (a turn can finalize before any navigation was built). */
+  async function resolveNavigation(
+    typed: AnyContext,
+    sessionId: string,
+  ): Promise<SessionNavigation> {
+    const nav =
+      (await ensureNavigation(typed)) ??
+      createNavigation(
+        typed,
+        sessionId,
+        undefined,
+        runtimeStore,
+        undefined,
+        gitRunnerFor,
+        gitRunnerFactory,
+      );
+    navigations.set(sessionId, nav);
+    return nav;
   }
 
   async function finalizeTurn(
@@ -1020,18 +1004,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           sessionId,
           result.checkpoint,
         );
-        const nav =
-          (await ensureNavigation(typed)) ??
-          createNavigation(
-            typed,
-            sessionId,
-            undefined,
-            runtimeStore,
-            undefined,
-            gitRunnerFor,
-            gitRunnerFactory,
-          );
-        navigations.set(sessionId, nav);
+        const nav = await resolveNavigation(typed, sessionId);
         await nav.recordTurnEnd(retained);
         return;
       }
@@ -1042,18 +1015,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         leafId: leafId,
       };
     }
-    const nav =
-      (await ensureNavigation(typed)) ??
-      createNavigation(
-        typed,
-        sessionId,
-        undefined,
-        runtimeStore,
-        undefined,
-        gitRunnerFor,
-        gitRunnerFactory,
-      );
-    navigations.set(sessionId, nav);
+    const nav = await resolveNavigation(typed, sessionId);
     await nav.recordTurnEnd(completed);
   }
 
@@ -1091,11 +1053,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       clearInterval(heartbeatTimer);
       await Promise.allSettled([...expirationPromises.values()]);
       explicitActiveHashes.clear();
-      await disposeDetached(detachedNavigations, detachedPending, false);
+      await suspendDetached(detachedNavigations, detachedPending);
       // Bounded: an overrunning capture must not delay shutdown indefinitely.
       // Any capture still running now self-releases on completion (closing is
       // set), and its temporary index is reclaimed by git or the OS.
-      await awaitWithDeadline(Promise.allSettled([...activeOperations]), 5_000);
+      await timedOutAfter(Promise.allSettled([...activeOperations]), 5_000);
       await releaseAllPersistentSnapshotIndices();
       await drainState();
       await ownerRegistry.shutdown();
@@ -1140,8 +1102,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     ];
     for (const [work, reason] of guards) {
       if (!work) continue;
-      const outcome = await awaitWithDeadline(work, captureDeadlineMs);
-      if (outcome.timedOut) {
+      if (await timedOutAfter(work, captureDeadlineMs)) {
         ctx.ui.notify(`Cannot ${id} while ${reason}; try again shortly.`, "warning");
         return;
       }

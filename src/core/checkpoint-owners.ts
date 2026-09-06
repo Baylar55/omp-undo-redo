@@ -179,23 +179,21 @@ export async function resolvePersistentHostId(
   const id = (options.randomId ?? randomUUID)();
   if (!isCanonicalUuid(id)) return { id: null, persistent: false };
   const temporary = `${path}.${randomUUID()}.tmp`;
+  const adoptWinner = async (): Promise<HostIdentity> => {
+    const winner = await readValidUuid(path);
+    return winner && winner !== "unreadable"
+      ? { id: winner, persistent: true }
+      : { id: null, persistent: false };
+  };
   try {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-    if (!(await writeExclusive(temporary, `${id}\n`))) {
-      const winner = await readValidUuid(path);
-      return winner && winner !== "unreadable"
-        ? { id: winner, persistent: true }
-        : { id: null, persistent: false };
-    }
+    if (!(await writeExclusive(temporary, `${id}\n`))) return adoptWinner();
     try {
       await link(temporary, path);
       await rm(temporary, { force: true });
       return { id, persistent: true };
     } catch {
-      const winner = await readValidUuid(path);
-      return winner && winner !== "unreadable"
-        ? { id: winner, persistent: true }
-        : { id: null, persistent: false };
+      return adoptWinner();
     }
   } catch {
     return { id: null, persistent: false };

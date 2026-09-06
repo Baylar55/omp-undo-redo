@@ -12,18 +12,21 @@ export interface SessionReader {
   getEntry(id: string): SessionEntryLike | undefined;
 }
 
-export type FileCheckpointUnavailableReason =
-  | "git_unavailable"
-  | "not_repository"
-  | "repository_unresolvable"
-  | "invalid_head"
-  | "before_snapshot_failed"
-  | "before_ref_failed"
-  | "after_snapshot_failed"
-  | "after_ref_failed"
-  | "file_history_gap"
-  | "resumed_checkpoint_unavailable"
-  | "private_repository_unavailable";
+export const UNAVAILABLE_REASONS = [
+  "git_unavailable",
+  "not_repository",
+  "repository_unresolvable",
+  "invalid_head",
+  "before_snapshot_failed",
+  "before_ref_failed",
+  "after_snapshot_failed",
+  "after_ref_failed",
+  "file_history_gap",
+  "resumed_checkpoint_unavailable",
+  "private_repository_unavailable",
+] as const;
+
+export type FileCheckpointUnavailableReason = (typeof UNAVAILABLE_REASONS)[number];
 
 export type TreeNavigationResult = {
   cancelled: boolean;
@@ -153,3 +156,8 @@ export type HistoryLoadResult =
 export type PendingTurnCheckpoint = PendingGitCheckpoint | PendingSessionCheckpoint;
 
 export type GitRunnerFactory = (repository: GitRepository) => GitRunner;
+
+/** Creates a runner bound to a worktree, optionally with a fixed environment
+ *  (used for private per-workspace repositories that pin `GIT_DIR`). Distinct
+ *  from `GitRunnerFactory`, which is keyed by an already-resolved repository. */
+export type CwdGitRunnerFactory = (cwd: string, env?: Record<string, string>) => GitRunner;

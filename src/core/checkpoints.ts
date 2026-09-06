@@ -18,6 +18,13 @@ const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-
 const REF_ROOT = "refs/omp-undo-redo";
 const WORKTREE_PATHSPEC = ":(top)";
 
+/** Single spelling of the retained-history ref namespace. Takes an
+ *  already-hashed session (`checkpointNamespace(sessionId)`), never a raw id. */
+export const HISTORY_REF_ROOT = `${REF_ROOT}/history/`;
+export function historyRefPrefix(sessionHash: string): string {
+  return `${HISTORY_REF_ROOT}${sessionHash}/`;
+}
+
 // Alternate index reused across turns so each turn is not a full `git add -A`
 // re-hash of the whole worktree. The first turn seeds it (a full `add -A` that
 // records a valid stat cache); every later turn's before/after snapshot reuses
@@ -318,19 +325,11 @@ export async function releaseRefs(
   gitForRepository: (repository: GitRepository) => GitRunner,
   refs: readonly RefRelease[],
 ): Promise<boolean> {
-  const grouped = new Map<string, { repository: GitRepository; refs: RefRelease[] }>();
-  for (const ref of refs) {
-    const key = ref.repository.commonDir;
-    const group = grouped.get(key);
-    if (group) {
-      group.refs.push(ref);
-    } else {
-      grouped.set(key, { repository: ref.repository, refs: [ref] });
-    }
-  }
-
+  const grouped = Map.groupBy(refs, (ref) => ref.repository.commonDir);
   const results = await Promise.allSettled(
-    [...grouped.values()].map(async ({ repository, refs: groupedRefs }) => {
+    [...grouped.values()].map(async (groupedRefs) => {
+      // groupBy never yields an empty group, so the head carries the repository.
+      const { repository } = groupedRefs[0];
       try {
         const outcome = await deleteRefsBatched(gitForRepository(repository), groupedRefs, {
           env: { GIT_DIR: repository.commonDir },
@@ -534,7 +533,7 @@ export async function retainCheckpointForResume(
   checkpoint: GitCheckpoint,
 ): Promise<GitCheckpoint> {
   const checkpointId = randomUUID();
-  const prefix = `${REF_ROOT}/history/${checkpointNamespace(sessionId)}/${checkpointId}`;
+  const prefix = `${historyRefPrefix(checkpointNamespace(sessionId))}${checkpointId}`;
   const beforeRef = `${prefix}/before`;
   const afterRef = `${prefix}/after`;
   const input = [

@@ -342,7 +342,7 @@ describe("checkpoint owner boundaries", () => {
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("before\n");
       expect(await navigation.redo()).toEqual({ status: "moved", files: "restored" });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("after\n");
-      await navigation.dispose();
+      await navigation.suspend();
     } finally {
       await ownerRegistry.shutdown();
       await rm(cwd, { recursive: true, force: true });

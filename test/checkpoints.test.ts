@@ -1126,6 +1126,45 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("rejects prototype-polluting session checkpoint reasons as unusable", async () => {
+    const { cwd, git } = await makeRepo();
+    const repository = {
+      worktree: cwd,
+      gitDir: join(cwd, ".git"),
+      commonDir: join(cwd, ".git"),
+    };
+    const sessionId = "chk-proto-reason";
+    const prompt: SessionEntryLike = {
+      id: "p1",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    try {
+      await initializeBranch(git, cwd);
+      const { SessionHistoryStore, historyPath } = await import("../src/core/history-store.js");
+      const store = new SessionHistoryStore(sessionId, repository, git);
+      const hPath = historyPath(repository, sessionId);
+      await mkdir(join(repository.commonDir, "omp-undo-redo", "history"), { recursive: true });
+      await writeFile(
+        hPath,
+        JSON.stringify({
+          schemaVersion: 2,
+          sessionHash: checkpointNamespace(sessionId),
+          repository,
+          checkpoints: [{ kind: "session", reason: "toString", parentLeafId: "p1", leafId: "p1" }],
+          currentIndex: 0,
+        }),
+      );
+      await expect(store.load(reader([prompt], "p1"))).resolves.toEqual({
+        status: "unavailable",
+        reason: "unusable",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("handles HistoryLoadResult, tombstone detection, and schema v1 to v2 upgrade in SessionHistoryStore", async () => {
     const { cwd, git } = await makeRepo();
     const repository = {

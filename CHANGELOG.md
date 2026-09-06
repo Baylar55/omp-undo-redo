@@ -7,6 +7,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 ### Fixed
 
 - **Repository resolution from a subdirectory.** `git rev-parse --git-dir`/`--git-common-dir` print paths relative to the process working directory, but both were resolved against the worktree root. Starting the agent in a subdirectory of a Git repository therefore produced a `commonDir` outside the repository, sending `GIT_DIR`, session history (`<commonDir>/omp-undo-redo/history`), and checkpoint ownership records to a path that does not exist. Now resolved against the working directory, so all cwd positions agree.
+- **History checkpoint validation accepted prototype keys.** `isSessionCheckpoint` tested the reason with `in` against an object map, so a persisted checkpoint carrying `reason: "toString"` (or `constructor`, `__proto__`, `hasOwnProperty`) passed validation and reached the UI as a generic fallback message. The reason set is now a single `as const` array checked with `includes`, and the `FileCheckpointUnavailableReason` union is derived from it.
 
 ### Changed
 

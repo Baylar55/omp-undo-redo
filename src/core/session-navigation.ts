@@ -10,7 +10,12 @@ import type {
   TreeNavigationResult,
   TurnCheckpoint,
 } from "./types.js";
-import { applyCheckpoint, releaseCheckpoints, type CheckpointApplyResult } from "./checkpoints.js";
+import {
+  applyCheckpoint,
+  HISTORY_REF_ROOT,
+  releaseCheckpoints,
+  type CheckpointApplyResult,
+} from "./checkpoints.js";
 
 type ExpectedTreeNavigation = {
   oldLeafId: string | null;
@@ -162,17 +167,6 @@ export class SessionNavigation {
     await this.releaseFileCheckpoints([...discarded, ...converted]);
   }
 
-  /** Teardown-only: runs outside the navigation chain (session_shutdown /
-   *  session_start replacement paths, which exclude concurrent navigation). */
-  async dispose(release = true): Promise<void> {
-    const checkpoints = this.checkpoints;
-    this.checkpoints = [];
-    this.currentIndex = -1;
-    if (!release) return;
-    await this.persistState();
-    await this.releaseFileCheckpoints(checkpoints);
-  }
-
   /** Teardown-only: runs outside the navigation chain (suspend/resume path). */
   async suspend(): Promise<void> {
     const checkpoints = this.checkpoints;
@@ -182,8 +176,7 @@ export class SessionNavigation {
       this.gitForRepository,
       checkpoints.filter(
         (checkpoint): checkpoint is GitCheckpoint =>
-          checkpoint.kind === "git" &&
-          !checkpoint.beforeRef.startsWith("refs/omp-undo-redo/history/"),
+          checkpoint.kind === "git" && !checkpoint.beforeRef.startsWith(HISTORY_REF_ROOT),
       ),
     );
   }
