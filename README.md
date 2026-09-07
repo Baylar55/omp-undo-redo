@@ -18,9 +18,9 @@ The extension uses the shared extension APIs provided by compatible OMP and Pi r
 
 ## Requirements
 
-- Node.js 20 or newer.
+- Node.js 22 or newer.
 - A compatible OMP or Pi release.
-- Git-backed projects use Git snapshots. Non-Git workspaces use a built-in content-addressed snapshot store.
+- Git-backed projects use Git snapshots. Non-Git workspaces snapshot into a private per-workspace Git repository.
 
 An initialized Git repository does not need an existing commit. In an unborn repository, the extension creates full file checkpoints from an empty index.
 
@@ -35,7 +35,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.2.4
+omp plugin install @baylarsadigov/omp-undo-redo@1.6.1
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -61,7 +61,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.2.4
+pi install npm:@baylarsadigov/omp-undo-redo@1.6.1
 ```
 
 To update installed Pi packages:

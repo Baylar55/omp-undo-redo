@@ -2,7 +2,7 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
-## [Unreleased]
+## [1.6.1] - 2026-09-07
 
 ### Fixed
 
@@ -13,6 +13,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 - Repository resolution issues one `git rev-parse` instead of three, removing two process spawns per turn.
 - **Breaking: requires Node.js >= 22** (`package.json` `engines`, CI). Node 20 reached end of life in April 2026; the extension now uses the built-in `Promise.withResolvers()` instead of a hand-rolled equivalent.
+- Internal cleanup with no behavior change: `/undo` and `/redo` share one `runNavigation`/`makeHandler` path (`src/commands/navigate.ts`), repeated atomic JSON writes and ref helpers moved into `src/core/atomic-write.ts` and `src/core/git-refs.ts`, test scaffolding shared through `test/helpers.ts`, and dead exports, unreachable branches, `.npmignore`, and `scripts/check-dist.mjs` removed (~1,200 net lines deleted).
 
 ## [1.6.0] - 2026-09-05
 
