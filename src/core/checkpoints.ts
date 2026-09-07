@@ -549,15 +549,25 @@ export async function retainCheckpointForResume(
 
 export type CheckpointApplyResult = "applied" | "conflict" | "failed";
 
+/** Restore invocations get a far larger ceiling than the runner's default:
+ *  diffing and applying a multi-GB binary change is slow but legitimate, and
+ *  a killed `git apply` can leave the worktree half-written. The deadline
+ *  exists only so a wedged child cannot hang the process forever. */
+const RESTORE_TIMEOUT_MS = 10 * 60 * 1000;
+
 /** Restores `targetHash`'s content over a worktree that currently matches
  *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
  *
- *  Every flag here pins the plumbing contract against the user's own
- *  configuration: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` would
- *  produce a patch `git apply -p1` cannot resolve, `diff.external` and
- *  textconv filters would replace the patch with some other program's output,
- *  and `apply.whitespace=error` would reject content git itself snapshotted.
- *  Without them the feature is deterministically dead on such machines. */
+ *  Every flag pins the plumbing contract against the user's own
+ *  configuration, each of which otherwise kills restoration outright on that
+ *  machine: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` produce a patch
+ *  `git apply -p1` cannot resolve; `color.diff=always` prefixes it with ANSI
+ *  escapes ("No valid patches in input"); `diff.external` and textconv
+ *  filters replace it with another program's output; `diff.submodule=log`
+ *  replaces a gitlink hunk with a commit listing, which invalidates the whole
+ *  patch; `diff.context=0` yields hunks `git apply` refuses without
+ *  `--unidiff-zero`; `apply.whitespace=error` rejects content git itself
+ *  snapshotted. */
 export async function applyCheckpoint(
   git: GitRunner,
   sourceHash: string,
@@ -567,33 +577,75 @@ export async function applyCheckpoint(
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
     const patchPath = join(tempDirectory, "checkpoint.patch");
-    const diff = await invoke(git, [
-      "diff",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--src-prefix=a/",
-      "--dst-prefix=b/",
-      "--exit-code",
-      "--binary",
-      sourceHash,
-      targetHash,
-      `--output=${patchPath}`,
-    ]);
+    const restore = { timeoutMs: RESTORE_TIMEOUT_MS };
+    const diff = await invoke(
+      git,
+      [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--submodule=short",
+        "-U3",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--exit-code",
+        "--binary",
+        sourceHash,
+        targetHash,
+        `--output=${patchPath}`,
+      ],
+      restore,
+    );
+    // A killed or unspawnable child also exits 1, which is `--exit-code`'s
+    // "there were differences": without this the truncated patch `--output`
+    // already wrote would be applied and reported as a complete restore.
+    if (diff.error) return "failed";
     if (diff.code === 0) return "applied";
     if (diff.code !== 1) return "failed";
 
-    const check = await invoke(git, ["apply", "--whitespace=nowarn", "--check", patchPath]);
+    const check = await invoke(
+      git,
+      ["apply", "--whitespace=nowarn", "--check", patchPath],
+      restore,
+    );
     if (check.code !== 0) {
+      if (check.error) return "failed";
       // `apply --check` failing does not prove the worktree drifted: a patch
       // git cannot parse fails identically. When the worktree still matches
       // the source snapshot, the patch is at fault — report that instead of
       // blaming the worktree and sending the user to clean an already clean
       // one.
-      const drift = await invoke(git, ["diff", "--no-ext-diff", "--quiet", sourceHash, "--"]);
-      return drift.code === 0 ? "failed" : "conflict";
+      //
+      // The probe runs against its own index seeded from `sourceHash`, never
+      // the repository's: a private repo never writes its index at all (its
+      // snapshots use alternates), so `git diff <commit>` there reports every
+      // path as deleted, and a user's real index may carry staged adds or
+      // deletes that are not worktree drift. `read-tree` records no stat data,
+      // so the comparison must fall back to content — which is what
+      // `diff.autoRefreshIndex` controls, hence pinning it. Untracked files are
+      // invisible to `diff`, so they are probed separately: an untracked file
+      // colliding with an added path is the classic `apply` failure and is
+      // real drift.
+      const probeEnv: Record<string, string> = {
+        GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
+      };
+      if (git.env?.GIT_DIR && git.cwd) probeEnv.GIT_WORK_TREE = git.cwd;
+      const seeded = await invoke(git, ["read-tree", sourceHash], { env: probeEnv });
+      if (seeded.code !== 0) return "conflict";
+      const tracked = await invoke(
+        git,
+        ["-c", "diff.autoRefreshIndex=true", "diff", "--no-ext-diff", "--quiet", sourceHash, "--"],
+        { env: probeEnv, timeoutMs: RESTORE_TIMEOUT_MS },
+      );
+      if (tracked.code !== 0) return "conflict";
+      const untracked = await invoke(git, ["ls-files", "--others", "--exclude-standard"], {
+        env: probeEnv,
+      });
+      return untracked.code === 0 && untracked.stdout.trim() === "" ? "failed" : "conflict";
     }
 
-    const applied = await invoke(git, ["apply", "--whitespace=nowarn", patchPath]);
+    const applied = await invoke(git, ["apply", "--whitespace=nowarn", patchPath], restore);
     return applied.code === 0 ? "applied" : "failed";
   } catch {
     return "failed";

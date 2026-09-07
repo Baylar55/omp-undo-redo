@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
-import { context, FakeExtensionApi, rmRetry } from "./helpers.js";
+import { context, FakeExtensionApi, makeRepository, privateRefs, rmRetry } from "./helpers.js";
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-test-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -385,6 +385,74 @@ describe("bounded capture lifecycle", () => {
       expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
     } finally {
       releaseUpdateRef?.();
+      await rmRetry(cwd);
+    }
+  });
+
+  it("keeps a deferred finalize's checkpoint alive when the next turn starts", async () => {
+    // Regression: a finalize waiting behind the previous turn's finalize left
+    // its checkpoint in the pending slot, and the next before_agent_start
+    // released it — deleting the before-ref of a checkpoint that was then
+    // recorded anyway, leaving an unreferenced (gc-prunable) before-commit.
+    const cwd = await makeRepository("omp-undo-redo-defer-");
+    const gate = Promise.withResolvers<void>();
+    let retainSeen = 0;
+    let parked = false;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        // The retain of the FIRST turn: park its finalize so the second
+        // turn's finalize has to queue behind it.
+        if (args[0] === "update-ref" && args.includes("--stdin")) {
+          retainSeen += 1;
+          if (retainSeen === 1) {
+            parked = true;
+            await gate.promise;
+          }
+        }
+        return inner(args, options);
+      };
+      gated.cwd = workCwd;
+      if (env) gated.env = env;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
+      const ctx = context(cwd, "defer-session");
+      await pi.emit("session_start", ctx);
+
+      ctx.leaf = "leaf0";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "t1\n");
+      ctx.leaf = "leaf1";
+      const end1 = pi.emit("agent_end", ctx);
+      for (let attempt = 0; attempt < 200 && !parked; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(parked).toBe(true);
+
+      // Turn 2 captures normally, but its finalize must queue behind turn 1's.
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "t2\n");
+      ctx.leaf = "leaf2";
+      await pi.emit("agent_end", ctx);
+      // Turn 3 starts before turn 2's finalize got to record anything.
+      await pi.emit("before_agent_start", ctx);
+
+      gate.resolve();
+      await end1;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const refs = await privateRefs(cwd);
+        if (refs.filter((ref) => ref.includes("/history/")).length >= 4) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      // Both recorded turns keep both of their retained refs; a released
+      // before-ref would leave 3 (and an unreachable snapshot commit).
+      const refs = await privateRefs(cwd);
+      expect(refs.filter((ref) => ref.includes("/history/")).sort()).toHaveLength(4);
+    } finally {
+      gate.resolve();
       await rmRetry(cwd);
     }
   });

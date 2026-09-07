@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -185,6 +185,41 @@ describe("session-only lifecycle fallback", () => {
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
       await pi.runCommand("redo", ctx);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("D\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("restores files outside the session cwd when the session starts in a subdirectory", async () => {
+    // Regression: `git apply` ignores patched paths outside its working
+    // directory, so a session started in a subdirectory restored only that
+    // subtree — and still reported "file snapshot restored".
+    const cwd = await makeRepository("omp-undo-redo-subdir-");
+    try {
+      const nested = join(cwd, "sub");
+      await mkdir(nested);
+      await writeFile(join(nested, "inside.txt"), "base\n");
+      await git(cwd, ["add", "."]);
+      await git(cwd, ["commit", "-qm", "nested"]);
+
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(nested, "subdir-session");
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await writeFile(join(nested, "inside.txt"), "changed\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("base\n");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
     } finally {
       await rmRetry(cwd);
     }

@@ -178,12 +178,18 @@ export async function resolveBackend(
     if (existing && "git" in existing && existing.git) {
       return { kind: "git", repository, git: existing.git };
     }
+    // Rooted at the worktree, not at `cwd`: `git apply` silently ignores
+    // patched paths outside its working directory, so a session started in a
+    // subdirectory would restore only that subtree and still report success.
+    // (`diff.relative=true` truncates the patch the same way.) Capture is
+    // unaffected either way — it pathspecs `:(top)`.
+    const worktreeGit = gitRunnerFactory(repository.worktree);
     privateRepositories.set(repository.commonDir, {
       repository,
-      git,
+      git: worktreeGit,
       ready: Promise.resolve(true),
     });
-    return { kind: "git", repository, git };
+    return { kind: "git", repository, git: worktreeGit };
   }
   if (resolved.reason !== "not_repository") return { kind: "session", reason: resolved.reason };
   const priv = await resolvePrivateGit(cwd, privateRepositories, gitRunnerFactory);
@@ -305,10 +311,19 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const runtimeReady = runtimeStore.initialize();
   const navigations = new Map<string, SessionNavigation>();
   const backends = new Map<string, FileBackend>();
+  /** Checkpoints of the CURRENT turn that no finalize owns yet. Anything left
+   *  here when the next turn starts is released: ownership is what keeps a
+   *  deferred finalize's checkpoint alive (see `PendingCapture.owned`). */
   const pending = new Map<string, PendingTurnCheckpoint>();
   type PendingCapture = {
     complete: Promise<void>;
     checkpoint: PendingTurnCheckpoint | null;
+    /** Set when a finalize claims this capture. An owned capture's checkpoint
+     *  belongs to that finalize alone: it is never published into `pending`
+     *  (where the next turn would release it mid-finalize), and it is never
+     *  released by the capture itself. An unowned capture whose turn is gone
+     *  has no finalize coming, so it releases its own checkpoint. */
+    owned?: boolean;
   };
   /** Leaf the current turn started from, per session. Used to bind a
    *  checkpoint to the turn that captured it: a deferred finalize whose
@@ -739,17 +754,20 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     void track(async () => {
       try {
         const checkpoint = await task();
-        if (closing || pendingCaptures.get(sessionId) !== capture) {
+        // The capture's own turn is over once turnStartLeaf moved on. Its
+        // checkpoint then belongs to the finalize that claimed this capture —
+        // and to nobody at all if no `agent_end` ever claimed it (two
+        // `before_agent_start` events without one in between), in which case
+        // this is the only place left that can release it.
+        const ownTurn = turnStartLeafBySession.get(sessionId) === checkpoint.parentLeafId;
+        if (closing || pendingCaptures.get(sessionId) !== capture || !(ownTurn || capture.owned)) {
           await releasePending(checkpoint);
         } else {
           capture.checkpoint = checkpoint;
-          // `pending` is the CURRENT turn's slot. A capture that outlived its
-          // own turn must not publish into it: the later turn already recorded
-          // its own boundary there, and this checkpoint is still reachable for
-          // the deferred finalize through `capture.checkpoint`.
-          if (turnStartLeafBySession.get(sessionId) === checkpoint.parentLeafId) {
-            pending.set(sessionId, checkpoint);
-          }
+          // `pending` holds only unowned checkpoints: publishing an owned one
+          // would let the next turn's `before_agent_start` release it while
+          // its finalize is still deferred.
+          if (ownTurn && !capture.owned) pending.set(sessionId, checkpoint);
           if (
             checkpoint.kind === "git" &&
             checkpoint.repository.gitDir &&
@@ -923,6 +941,14 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     turnStartLeaf: string | null,
   ): Promise<void> {
     const sessionId = typed.sessionManager.getSessionId();
+    // Claim the capture: from here its checkpoint is this finalize's alone.
+    // Taking the slot matters because the gate below can defer this finalize
+    // past the next `before_agent_start`, which releases whatever `pending`
+    // still holds.
+    capture.owned = true;
+    if (capture.checkpoint && pending.get(sessionId) === capture.checkpoint) {
+      pending.delete(sessionId);
+    }
     // An earlier turn whose capture overran its deadline may still be
     // finalizing. Its checkpoint must land in the history before this turn's,
     // or the recorded order would not match the turn order (and a session-only
@@ -1001,9 +1027,6 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     if (!before) return;
     // Consume the checkpoint: exactly one finalize (this turn's) may record it.
     capture.checkpoint = null;
-    // Only ever clear our own slot: a later turn may already own `pending`
-    // (its boundary was recorded while this capture was still in flight).
-    if (pending.get(sessionId) === before) pending.delete(sessionId);
     // The checkpoint must belong to the turn that is finalizing: its pre-turn
     // leaf must be the turn-start leaf captured when this finalize was first
     // invoked. If a later turn's finalize reaches it first, releasing the
