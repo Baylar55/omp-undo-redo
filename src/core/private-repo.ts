@@ -168,7 +168,7 @@ export async function ensurePrivateGitRepository(
       if (worktreeConfig.code !== 0) return null;
     }
     await ensureExclude(gitDir, worktree, storeRoot);
-    return { worktree, gitDir, commonDir: gitDir };
+    return { worktree, gitDir, commonDir: gitDir, private: true };
   } catch {
     return null;
   }

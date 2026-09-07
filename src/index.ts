@@ -317,7 +317,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const turnStartLeafBySession = new Map<string, string | null>();
 
   /** True when `gitDir` belongs to one of our private per-workspace repos.
-   *  Guards gc/prune triggers so they can never touch a user's own repo.
+   *  Guards gc/prune triggers so they can never touch a user's own repo:
+   *  `privateRepositories` also caches the user's repository in Git mode
+   *  (resolveBackend), so only the `private` flag stamped by
+   *  ensurePrivateGitRepository proves ownership — never map membership.
    *  The incoming gitDir is realpath-canonicalized before comparing so a
    *  checkpoint recorded with a long-form path still matches a repository
    *  whose gitDir was built from a short-form (8.3) store root or cwd —
@@ -327,7 +330,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     const canonicalGitDir = canonicalCwd(gitDir);
     for (const entry of privateRepositories.values()) {
       if ("failure" in entry) continue;
-      if (!entry.repository?.gitDir) continue;
+      if (entry.repository?.private !== true || !entry.repository.gitDir) continue;
       const canonicalEntry = canonicalCwd(entry.repository.gitDir);
       if (canonicalEntry === canonicalGitDir) return true;
     }
@@ -1074,7 +1077,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         .then(() =>
           Promise.allSettled(
             [...privateRepositories.values()].map(async (entry) => {
-              if ("failure" in entry || !entry.repository || !entry.git) return;
+              if ("failure" in entry || entry.repository?.private !== true || !entry.git) return;
               const gitDir = entry.repository.gitDir;
               if (!capturesSinceGcByGitDir.has(gitDir)) return;
               capturesSinceGcByGitDir.delete(gitDir);

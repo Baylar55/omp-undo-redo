@@ -92,6 +92,11 @@ export interface GitRepository {
   worktree: string;
   gitDir: string;
   commonDir: string;
+  /** Set only by `ensurePrivateGitRepository`: this repository is the
+   *  extension's own snapshot store, not the user's. Ownership is marked at
+   *  construction because it can never be inferred from a shared map that
+   *  holds user repositories too (gc/prune must never touch those). */
+  private?: true;
 }
 
 export interface SnapshotIndexLease {
