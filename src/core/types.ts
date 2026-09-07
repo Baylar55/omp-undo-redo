@@ -12,20 +12,21 @@ export interface SessionReader {
   getEntry(id: string): SessionEntryLike | undefined;
 }
 
-export type FileCheckpointUnavailableReason =
-  | "git_unavailable"
-  | "not_repository"
-  | "repository_unresolvable"
-  | "invalid_head"
-  | "before_snapshot_failed"
-  | "before_ref_failed"
-  | "after_snapshot_failed"
-  | "after_ref_failed"
-  | "file_history_gap"
-  | "resumed_checkpoint_unavailable"
-  | "workspace_unresolvable"
-  | "private_repository_unavailable"
-  | "history_expired";
+export const UNAVAILABLE_REASONS = [
+  "git_unavailable",
+  "not_repository",
+  "repository_unresolvable",
+  "invalid_head",
+  "before_snapshot_failed",
+  "before_ref_failed",
+  "after_snapshot_failed",
+  "after_ref_failed",
+  "file_history_gap",
+  "resumed_checkpoint_unavailable",
+  "private_repository_unavailable",
+] as const;
+
+export type FileCheckpointUnavailableReason = (typeof UNAVAILABLE_REASONS)[number];
 
 export type TreeNavigationResult = {
   cancelled: boolean;
@@ -83,7 +84,7 @@ export type GitCommandResult = {
 
 export type GitRunner = ((args: string[], options?: GitRunOptions) => Promise<GitCommandResult>) & {
   cwd?: string;
-  /** Fixed env merged into every invocation (set by createEnvGitRunner). */
+  /** Fixed env merged into every invocation (set via createGitRunner's `env`). */
   env?: Record<string, string>;
 };
 
@@ -144,14 +145,19 @@ export interface ExpirationTombstone {
   expired: true;
   sessionHash: string;
   expiredAt: string;
-  reason: "age" | "storage_cap";
+  reason: "age";
 }
 
 export type HistoryLoadResult =
   | { status: "loaded"; state: NavigationState }
-  | { status: "expired"; reason: "age" | "storage_cap" }
+  | { status: "expired" }
   | { status: "unavailable"; reason?: "missing" | "unusable" };
 
 export type PendingTurnCheckpoint = PendingGitCheckpoint | PendingSessionCheckpoint;
 
 export type GitRunnerFactory = (repository: GitRepository) => GitRunner;
+
+/** Creates a runner bound to a worktree, optionally with a fixed environment
+ *  (used for private per-workspace repositories that pin `GIT_DIR`). Distinct
+ *  from `GitRunnerFactory`, which is keyed by an already-resolved repository. */
+export type CwdGitRunnerFactory = (cwd: string, env?: Record<string, string>) => GitRunner;

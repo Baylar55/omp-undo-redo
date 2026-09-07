@@ -24,9 +24,9 @@ import {
   prepareBeforeTurn,
   releaseAllPersistentSnapshotIndices,
   releaseCheckpoint,
-  previousCheckpoint,
   releaseRefs,
   releasePendingCheckpoint,
+  resolveRepository,
 } from "../src/core/checkpoints.js";
 import type {
   GitCheckpoint,
@@ -55,13 +55,6 @@ function reader(entries: SessionEntryLike[], leafId: string | null): SessionRead
     },
   };
 }
-
-const entries: SessionEntryLike[] = [
-  { id: "u1", parentId: null, type: "message", message: { role: "user" } },
-  { id: "a1", parentId: "u1", type: "message", message: { role: "assistant" } },
-  { id: "u2", parentId: "a1", type: "message", message: { role: "user" } },
-  { id: "a2", parentId: "u2", type: "message", message: { role: "assistant" } },
-];
 
 function gitRunner(cwd: string): GitRunner {
   const runner: GitRunner = async (args, options) => {
@@ -188,22 +181,35 @@ function checkpointWithRepository(
   };
 }
 
-describe("previousCheckpoint", () => {
-  it("selects the first prompt boundary so the first interaction is undoable", () => {
-    expect(previousCheckpoint(reader(entries.slice(0, 2), "a1"))).toBe("u1");
-    expect(previousCheckpoint(reader(entries.slice(0, 1), "u1"))).toBeNull();
-  });
-
-  it("selects the latest prompt boundary", () => {
-    expect(previousCheckpoint(reader(entries, "a2"))).toBe("u2");
-  });
-});
-
 describe("checkpoint namespaces", () => {
   it("hashes session IDs and keeps refs in the private namespace", () => {
     const namespace = checkpointNamespace("session/raw id");
     expect(namespace).toMatch(/^[0-9a-f]{64}$/);
     expect(namespace).not.toContain("session");
+  });
+});
+
+describe("repository resolution", () => {
+  it("resolves gitDir and commonDir identically from a subdirectory", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const nested = join(cwd, "pkg", "deep");
+      await mkdir(nested, { recursive: true });
+
+      const fromRoot = await resolveRepository(gitRunner(cwd));
+      const fromNested = await resolveRepository(gitRunner(nested));
+      expect("repository" in fromRoot).toBe(true);
+      expect("repository" in fromNested).toBe(true);
+      if (!("repository" in fromRoot) || !("repository" in fromNested)) return;
+
+      // git prints --git-dir/--git-common-dir relative to cwd; resolving them
+      // against the worktree root escaped the repository from a subdirectory.
+      expect(fromNested.repository).toEqual(fromRoot.repository);
+      expect(fromNested.repository.commonDir.startsWith(fromRoot.repository.worktree)).toBe(true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1120,6 +1126,45 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("rejects prototype-polluting session checkpoint reasons as unusable", async () => {
+    const { cwd, git } = await makeRepo();
+    const repository = {
+      worktree: cwd,
+      gitDir: join(cwd, ".git"),
+      commonDir: join(cwd, ".git"),
+    };
+    const sessionId = "chk-proto-reason";
+    const prompt: SessionEntryLike = {
+      id: "p1",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    try {
+      await initializeBranch(git, cwd);
+      const { SessionHistoryStore, historyPath } = await import("../src/core/history-store.js");
+      const store = new SessionHistoryStore(sessionId, repository, git);
+      const hPath = historyPath(repository, sessionId);
+      await mkdir(join(repository.commonDir, "omp-undo-redo", "history"), { recursive: true });
+      await writeFile(
+        hPath,
+        JSON.stringify({
+          schemaVersion: 2,
+          sessionHash: checkpointNamespace(sessionId),
+          repository,
+          checkpoints: [{ kind: "session", reason: "toString", parentLeafId: "p1", leafId: "p1" }],
+          currentIndex: 0,
+        }),
+      );
+      await expect(store.load(reader([prompt], "p1"))).resolves.toEqual({
+        status: "unavailable",
+        reason: "unusable",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("handles HistoryLoadResult, tombstone detection, and schema v1 to v2 upgrade in SessionHistoryStore", async () => {
     const { cwd, git } = await makeRepo();
     const repository = {
@@ -1208,10 +1253,7 @@ describe("history-safe Git checkpoints", () => {
         }),
       );
 
-      await expect(store.load(r)).resolves.toEqual({
-        status: "expired",
-        reason: "age",
-      });
+      await expect(store.load(r)).resolves.toEqual({ status: "expired" });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

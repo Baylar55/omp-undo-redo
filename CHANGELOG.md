@@ -2,6 +2,19 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.6.1] - 2026-09-07
+
+### Fixed
+
+- **Repository resolution from a subdirectory.** `git rev-parse --git-dir`/`--git-common-dir` print paths relative to the process working directory, but both were resolved against the worktree root. Starting the agent in a subdirectory of a Git repository therefore produced a `commonDir` outside the repository, sending `GIT_DIR`, session history (`<commonDir>/omp-undo-redo/history`), and checkpoint ownership records to a path that does not exist. Now resolved against the working directory, so all cwd positions agree.
+- **History checkpoint validation accepted prototype keys.** `isSessionCheckpoint` tested the reason with `in` against an object map, so a persisted checkpoint carrying `reason: "toString"` (or `constructor`, `__proto__`, `hasOwnProperty`) passed validation and reached the UI as a generic fallback message. The reason set is now a single `as const` array checked with `includes`, and the `FileCheckpointUnavailableReason` union is derived from it.
+
+### Changed
+
+- Repository resolution issues one `git rev-parse` instead of three, removing two process spawns per turn.
+- **Breaking: requires Node.js >= 22** (`package.json` `engines`, CI). Node 20 reached end of life in April 2026; the extension now uses the built-in `Promise.withResolvers()` instead of a hand-rolled equivalent.
+- Internal cleanup with no behavior change: `/undo` and `/redo` share one `runNavigation`/`makeHandler` path (`src/commands/navigate.ts`), repeated atomic JSON writes and ref helpers moved into `src/core/atomic-write.ts` and `src/core/git-refs.ts`, test scaffolding shared through `test/helpers.ts`, and dead exports, unreachable branches, `.npmignore`, and `scripts/check-dist.mjs` removed (~1,200 net lines deleted).
+
 ## [1.6.0] - 2026-09-05
 
 ### Changed

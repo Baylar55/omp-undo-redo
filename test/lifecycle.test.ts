@@ -1,128 +1,24 @@
-import { execFile } from "node:child_process";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { checkpointNamespace } from "../src/core/checkpoints.js";
 import { runtimeRootDirectory } from "../src/core/runtime-action-state-store.js";
 import ompUndoRedo from "../src/index.js";
+import {
+  context,
+  FakeExtensionApi,
+  git,
+  makeRepository,
+  privateRefs,
+  rmRetry as rmRetryTimes,
+  type TestContext,
+  type TestEntry,
+} from "./helpers.js";
 
-const execFileAsync = promisify(execFile);
-type Handler = (...args: unknown[]) => unknown;
-
-async function rmRetry(path: string): Promise<void> {
-  // Windows keeps a directory handle until the last git child whose cwd it
-  // was exits, so a teardown rm can race a slow capture/sweep. Retry longer
-  // than the bounded-capture suite's rmRetry (200 ms waits) — lifecycle tests
-  // tear down whole workspaces whose captures may still be settling.
-  for (let i = 0; i < 10; i++) {
-    try {
-      await rm(path, { recursive: true, force: true });
-      return;
-    } catch (err) {
-      if (i === 9) throw err;
-      await new Promise((r) => setTimeout(r, 200));
-    }
-  }
-}
-
-type TestEntry = {
-  id: string;
-  parentId: string | null;
-  type: string;
-  message?: { role?: string };
-  customType?: string;
-};
-
-type TestContext = {
-  branch: TestEntry[];
-  entries: TestEntry[];
-  sessionManager: {
-    getSessionId(): string;
-    getLeafId(): string;
-    getBranch(): TestEntry[];
-    getEntry(id: string): TestEntry | undefined;
-  };
-  navigateTree(targetId: string): Promise<{ cancelled: boolean }>;
-  waitForIdle(): Promise<void>;
-  isIdle(): boolean;
-  ui: {
-    notifications: Array<{ message: string; level: string }>;
-    notify(message: string, level: string): void;
-  };
-};
-
-class FakeExtensionApi {
-  private readonly handlers = new Map<string, Handler>();
-  private readonly commands = new Map<string, Handler>();
-
-  on(event: string, handler: Handler): void {
-    this.handlers.set(event, handler);
-  }
-
-  registerCommand(name: string, config: { handler: Handler }): void {
-    this.commands.set(name, config.handler);
-  }
-
-  async runCommand(name: string, context: TestContext): Promise<void> {
-    const handler = this.commands.get(name);
-    if (!handler) throw new Error(`No command registered for ${name}`);
-    await handler("", context);
-  }
-
-  async emit(
-    event: string,
-    context: TestContext,
-    payload?: Record<string, unknown>,
-  ): Promise<void> {
-    const handler = this.handlers.get(event);
-    if (!handler) throw new Error(`No handler registered for ${event}`);
-    await handler(payload ?? { type: event }, context);
-  }
-}
-
-function context(cwd: string, sessionId: string): TestContext {
-  const value: TestContext = {
-    cwd,
-    leaf: "leaf",
-    branch: [],
-    entries: [],
-    sessionManager: {
-      getSessionId: () => sessionId,
-      getLeafId: () => value.leaf,
-      getBranch: () => value.branch,
-      getEntry: (id) => value.entries.find((entry) => entry.id === id),
-    },
-    navigateTree: async () => ({ cancelled: true }),
-    waitForIdle: async () => {},
-    isIdle: () => true,
-    ui: {
-      notifications: [],
-      notify(message, level) {
-        value.ui.notifications.push({ message, level });
-      },
-    },
-  };
-  return value;
-}
-
-async function git(cwd: string, args: string[]): Promise<string> {
-  const result = await execFileAsync("git", args, { cwd, windowsHide: true });
-  return result.stdout.trim();
-}
-
-async function makeRepository(): Promise<string> {
-  const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-lifecycle-"));
-  await git(cwd, ["init", "-q"]);
-  await git(cwd, ["config", "user.name", "test"]);
-  await git(cwd, ["config", "user.email", "test@example.com"]);
-  await git(cwd, ["config", "core.autocrlf", "false"]);
-  await writeFile(join(cwd, "tracked.txt"), "base\n");
-  await git(cwd, ["add", "."]);
-  await git(cwd, ["commit", "-qm", "base"]);
-  return cwd;
-}
+/** Lifecycle tests tear down whole workspaces whose captures may still be
+ *  settling, so they retry longer than the shared default. */
+const rmRetry = (path: string): Promise<void> => rmRetryTimes(path, 10);
 
 async function makeUnbornRepository(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-unborn-"));
@@ -131,11 +27,6 @@ async function makeUnbornRepository(): Promise<string> {
   await git(cwd, ["config", "user.email", "test@example.com"]);
   await git(cwd, ["config", "core.autocrlf", "false"]);
   return cwd;
-}
-
-async function privateRefs(cwd: string): Promise<string[]> {
-  const output = await git(cwd, ["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"]);
-  return output ? output.split("\n") : [];
 }
 
 async function runtimeState(sessionId: string): Promise<Record<string, unknown>> {

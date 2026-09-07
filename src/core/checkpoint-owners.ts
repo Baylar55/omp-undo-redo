@@ -2,12 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, readlink, rename, rm, stat } from "node:fs/promises";
 import { hostname as systemHostname, homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
+import { deleteRefsBatched, parseRefLines, type RefSpec } from "./git-refs.js";
 import type { GitRepository, GitRunner, GitCommandResult, OwnershipMode } from "./types.js";
 
-export const CHECKPOINT_OWNER_REF_ROOT = "refs/omp-undo-redo/v2";
-export const CHECKPOINT_OWNER_LEASE_SCHEMA = 1;
+const CHECKPOINT_OWNER_REF_ROOT = "refs/omp-undo-redo/v2";
+const CHECKPOINT_OWNER_LEASE_SCHEMA = 1;
 const MAX_LEASE_BYTES = 64 * 1024;
-const DEFAULT_CLEANUP_TIMEOUT_MS = 1_000;
+const CLEANUP_TIMEOUT_MS = 1_000;
+const MAX_CONCURRENT_OWNERS = 4;
 const DEFAULT_SHUTDOWN_WAIT_MS = 1_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -60,8 +62,6 @@ export interface OwnerRegistryOptions {
   hostIdentity?: HostIdentity;
   hostname?: string;
   runtimeScope?: string | null;
-  maxConcurrentOwners?: number;
-  cleanupTimeoutMs?: number;
   shutdownWaitMs?: number;
   now?: () => Date;
   resolveHostIdentity?: () => Promise<HostIdentity>;
@@ -69,16 +69,8 @@ export interface OwnerRegistryOptions {
   probePid?: (pid: number) => void;
 }
 
-export function isCanonicalUuid(value: string): boolean {
+function isCanonicalUuid(value: string): boolean {
   return UUID_PATTERN.test(value);
-}
-
-export function isSha256Hash(value: string): boolean {
-  return SHA256_PATTERN.test(value);
-}
-
-export function isGitObjectId(value: string): boolean {
-  return OBJECT_ID_PATTERN.test(value);
 }
 
 export function parseCheckpointOwnerRef(ref: string): ParsedCheckpointRef | null {
@@ -86,7 +78,11 @@ export function parseCheckpointOwnerRef(ref: string): ParsedCheckpointRef | null
   if (parts.length !== 7) return null;
   if (parts.slice(0, 3).join("/") !== CHECKPOINT_OWNER_REF_ROOT) return null;
   const [, , , ownerId, sessionHash, checkpointId, phase] = parts;
-  if (!isCanonicalUuid(ownerId) || !isSha256Hash(sessionHash) || !isCanonicalUuid(checkpointId)) {
+  if (
+    !isCanonicalUuid(ownerId) ||
+    !SHA256_PATTERN.test(sessionHash) ||
+    !isCanonicalUuid(checkpointId)
+  ) {
     return null;
   }
   if (phase !== "before" && phase !== "after") return null;
@@ -177,44 +173,27 @@ export async function resolvePersistentHostId(
   options: HostIdentityOptions = {},
 ): Promise<HostIdentity> {
   const path = hostIdentityPath(options);
-  // A2: reap leaked host-id.*.tmp files from prior crashed attempts (fire-and-forget, <1ms)
-  try {
-    const hostDir = dirname(path);
-    const hostEntries = await readdir(hostDir, { withFileTypes: true }).catch(() => null);
-    if (hostEntries) {
-      const tmpPattern = /^host-id\.[0-9a-f-]{36}\.tmp$/;
-      await Promise.all(
-        hostEntries
-          .filter((e) => e.isFile() && tmpPattern.test(e.name))
-          .map((e) => rm(join(hostDir, e.name), { force: true }).catch(() => undefined)),
-      );
-    }
-  } catch {
-    // Best-effort cleanup
-  }
   const existing = await readValidUuid(path);
   if (existing === "unreadable") return { id: null, persistent: false };
   if (existing) return { id: existing, persistent: true };
   const id = (options.randomId ?? randomUUID)();
   if (!isCanonicalUuid(id)) return { id: null, persistent: false };
   const temporary = `${path}.${randomUUID()}.tmp`;
+  const adoptWinner = async (): Promise<HostIdentity> => {
+    const winner = await readValidUuid(path);
+    return winner && winner !== "unreadable"
+      ? { id: winner, persistent: true }
+      : { id: null, persistent: false };
+  };
   try {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-    if (!(await writeExclusive(temporary, `${id}\n`))) {
-      const winner = await readValidUuid(path);
-      return winner && winner !== "unreadable"
-        ? { id: winner, persistent: true }
-        : { id: null, persistent: false };
-    }
+    if (!(await writeExclusive(temporary, `${id}\n`))) return adoptWinner();
     try {
       await link(temporary, path);
       await rm(temporary, { force: true });
       return { id, persistent: true };
     } catch {
-      const winner = await readValidUuid(path);
-      return winner && winner !== "unreadable"
-        ? { id: winner, persistent: true }
-        : { id: null, persistent: false };
+      return adoptWinner();
     }
   } catch {
     return { id: null, persistent: false };
@@ -292,20 +271,6 @@ function leaseContents(
     startedAt: now().toISOString(),
   });
 }
-async function removeCurrentOwnerTemporaryFiles(directory: string, ownerId: string): Promise<void> {
-  const pattern = new RegExp(`^\\.${ownerId}\\.[0-9a-f-]{36}\\.tmp$`);
-  let entries;
-  try {
-    entries = await readdir(directory, { withFileTypes: true });
-  } catch {
-    return;
-  }
-  await Promise.all(
-    entries
-      .filter((entry) => entry.isFile() && pattern.test(entry.name))
-      .map((entry) => rm(join(directory, entry.name), { force: true }).catch(() => undefined)),
-  );
-}
 
 async function publishLease(
   repository: GitRepository,
@@ -320,7 +285,6 @@ async function publishLease(
   const temporary = join(directory, `.${ownerId}.${randomUUID()}.tmp`);
   try {
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    await removeCurrentOwnerTemporaryFiles(directory, ownerId);
     if (
       !(await writeExclusive(
         temporary,
@@ -342,7 +306,7 @@ async function enumerateOwnerRefs(
   repository: GitRepository,
   ownerId: string,
   timeoutMs: number,
-): Promise<{ ok: true; refs: Array<{ ref: string; expectedHash: string }> } | { ok: false }> {
+): Promise<{ ok: true; refs: RefSpec[] } | { ok: false }> {
   const prefix = ownerCheckpointPrefix(ownerId);
   if (!prefix) return { ok: false };
   let result: GitCommandResult;
@@ -355,47 +319,15 @@ async function enumerateOwnerRefs(
     return { ok: false };
   }
   if (result.error || result.code !== 0) return { ok: false };
-  const refs: Array<{ ref: string; expectedHash: string }> = [];
-  for (const line of result.stdout.split(/\r?\n/)) {
-    if (!line) continue;
-    const separator = line.indexOf("\0");
-    if (separator < 0 || line.indexOf("\0", separator + 1) >= 0) return { ok: false };
-    const ref = line.slice(0, separator);
-    const expectedHash = line.slice(separator + 1);
+  const refs = parseRefLines(result.stdout);
+  if (!refs) return { ok: false };
+  for (const { ref, expectedHash } of refs) {
     const parsed = parseCheckpointOwnerRef(ref);
-    if (!parsed || parsed.ownerId !== ownerId || !isGitObjectId(expectedHash)) return { ok: false };
-    refs.push({ ref, expectedHash });
+    if (!parsed || parsed.ownerId !== ownerId || !OBJECT_ID_PATTERN.test(expectedHash)) {
+      return { ok: false };
+    }
   }
   return { ok: true, refs };
-}
-
-async function deleteOwnerRefs(
-  git: GitRunner,
-  repository: GitRepository,
-  refs: readonly { ref: string; expectedHash: string }[],
-  timeoutMs: number,
-): Promise<"ok" | "failed" | "timeout"> {
-  if (refs.length === 0) return "ok";
-  const input = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n");
-  let result: GitCommandResult;
-  try {
-    result = await git(["update-ref", "--stdin"], {
-      env: { GIT_DIR: repository.commonDir },
-      stdin: `${input}\n`,
-      timeoutMs,
-    });
-  } catch {
-    return "failed";
-  }
-  if (result.error === "timeout") return "timeout";
-  if (result.code === 0) return "ok";
-  if (refs.length === 1) return "failed";
-  const midpoint = Math.ceil(refs.length / 2);
-  const left = await deleteOwnerRefs(git, repository, refs.slice(0, midpoint), timeoutMs);
-  if (left === "timeout") return "timeout";
-  const right = await deleteOwnerRefs(git, repository, refs.slice(midpoint), timeoutMs);
-  if (right === "timeout") return "timeout";
-  return left === "ok" && right === "ok" ? "ok" : "failed";
 }
 
 async function cleanupStaleOwner(
@@ -406,7 +338,10 @@ async function cleanupStaleOwner(
 ): Promise<void> {
   const first = await enumerateOwnerRefs(git, repository, ownerId, timeoutMs);
   if (!first.ok) return;
-  const deletion = await deleteOwnerRefs(git, repository, first.refs, timeoutMs);
+  const deletion = await deleteRefsBatched(git, first.refs, {
+    env: { GIT_DIR: repository.commonDir },
+    timeoutMs,
+  });
   if (deletion === "timeout") return;
   const second = await enumerateOwnerRefs(git, repository, ownerId, timeoutMs);
   if (!second.ok || second.refs.length !== 0) return;
@@ -416,9 +351,7 @@ async function cleanupStaleOwner(
 export class CheckpointOwnerRegistry {
   readonly ownerId: string;
   private readonly hostname: string;
-  private readonly options: Required<
-    Pick<OwnerRegistryOptions, "maxConcurrentOwners" | "cleanupTimeoutMs" | "shutdownWaitMs">
-  >;
+  private readonly shutdownWaitMs: number;
   private readonly now: () => Date;
   private readonly probePid: (pid: number) => void;
   private readonly hostIdentityPromise: Promise<HostIdentity>;
@@ -431,11 +364,7 @@ export class CheckpointOwnerRegistry {
     this.ownerId =
       configuredOwnerId && isCanonicalUuid(configuredOwnerId) ? configuredOwnerId : randomUUID();
     this.hostname = options.hostname ?? systemHostname();
-    this.options = {
-      maxConcurrentOwners: Math.max(1, options.maxConcurrentOwners ?? 4),
-      cleanupTimeoutMs: Math.max(1, options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS),
-      shutdownWaitMs: Math.max(1, options.shutdownWaitMs ?? DEFAULT_SHUTDOWN_WAIT_MS),
-    };
+    this.shutdownWaitMs = Math.max(1, options.shutdownWaitMs ?? DEFAULT_SHUTDOWN_WAIT_MS);
     this.now = options.now ?? (() => new Date());
     this.probePid = options.probePid ?? ((pid) => process.kill(pid, 0));
     this.hostIdentityPromise = (
@@ -515,7 +444,7 @@ export class CheckpointOwnerRegistry {
     }
     const candidates: Array<{ ownerId: string }> = [];
     for (const entry of entries) {
-      if (!entry.isFile()) continue;
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       const filePath = join(leaseDirectory(repository), entry.name);
       const metadata = await stat(filePath).catch(() => null);
       if (!metadata || metadata.size > MAX_LEASE_BYTES) continue;
@@ -536,26 +465,21 @@ export class CheckpointOwnerRegistry {
     const worker = async () => {
       while (next < candidates.length) {
         const candidate = candidates[next++];
-        await cleanupStaleOwner(git, repository, candidate.ownerId, this.options.cleanupTimeoutMs);
+        await cleanupStaleOwner(git, repository, candidate.ownerId, CLEANUP_TIMEOUT_MS);
       }
     };
     await Promise.all(
-      Array.from({ length: Math.min(this.options.maxConcurrentOwners, candidates.length) }, worker),
+      Array.from({ length: Math.min(MAX_CONCURRENT_OWNERS, candidates.length) }, worker),
     );
   }
 
   async shutdown(): Promise<void> {
     const scans = [...this.scans];
     if (scans.length > 0) {
-      await Promise.race([Promise.allSettled(scans), delay(this.options.shutdownWaitMs)]);
+      await Promise.race([Promise.allSettled(scans), delay(this.shutdownWaitMs)]);
     }
     for (const { repository, git } of this.initialized.values()) {
-      const refs = await enumerateOwnerRefs(
-        git,
-        repository,
-        this.ownerId,
-        this.options.cleanupTimeoutMs,
-      );
+      const refs = await enumerateOwnerRefs(git, repository, this.ownerId, CLEANUP_TIMEOUT_MS);
       if (!refs.ok || refs.refs.length !== 0) continue;
       await rm(leasePath(repository, this.ownerId), { force: true }).catch(() => undefined);
     }

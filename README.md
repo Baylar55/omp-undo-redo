@@ -18,9 +18,9 @@ The extension uses the shared extension APIs provided by compatible OMP and Pi r
 
 ## Requirements
 
-- Node.js 20 or newer.
+- Node.js 22 or newer.
 - A compatible OMP or Pi release.
-- Git-backed projects use Git snapshots. Non-Git workspaces use a built-in content-addressed snapshot store.
+- Git-backed projects use Git snapshots. Non-Git workspaces snapshot into a private per-workspace Git repository.
 
 An initialized Git repository does not need an existing commit. In an unborn repository, the extension creates full file checkpoints from an empty index.
 
@@ -35,7 +35,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.2.4
+omp plugin install @baylarsadigov/omp-undo-redo@1.6.1
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -61,7 +61,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.2.4
+pi install npm:@baylarsadigov/omp-undo-redo@1.6.1
 ```
 
 To update installed Pi packages:
@@ -181,7 +181,7 @@ For example, if `f.txt` is committed as `base`, a turn changes it to `turn` and 
 
 Install dependencies with npm, then use the scripts in `package.json`:
 
-- `npm run build` replaces `dist/` rather than incrementally accumulating files, compiling `src/` to `dist/` and checking that the emitted file set matches `src/` exactly.
+- `npm run build` replaces `dist/` rather than incrementally accumulating files, compiling `src/` to `dist/`.
 - `npm run typecheck` checks TypeScript without emitting files.
 - `npm test` runs the deterministic test suite.
 - `npm run lint` and `npm run format:check` check style.
@@ -191,7 +191,7 @@ The implementation uses only public OMP extension APIs. Keep changes focused, pr
 
 ## Release
 
-A release consists of a reviewed change, a clean verification run (enforcing exact generated-output parity and running the compiled package-entry smoke check), an updated `CHANGELOG.md` entry, and a published npm package containing `index.js`, `dist/`, `README.md`, `LICENSE`, and `CHANGELOG.md`. The package manifest is the source of truth for the extension entry point and peer compatibility. Never place npm tokens, registry credentials, or other secrets in the repository or release logs.
+Tag-triggered CI does the publishing; the runbook is [RELEASE.md](./RELEASE.md). Never put npm tokens, registry credentials, or other secrets in the repository or release logs.
 
 ## Security
 

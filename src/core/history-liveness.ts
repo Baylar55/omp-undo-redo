@@ -17,7 +17,7 @@ import { join } from "node:path";
  * durably destroys live undo state. Markers whose owners stopped beating are
  * pruned by the same sweeps so the directory stays bounded.
  */
-export const ACTIVE_HEARTBEAT_TTL_MS = 24 * 60 * 60 * 1000;
+const ACTIVE_HEARTBEAT_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function activeHeartbeatPath(historyDir: string, sessionHash: string): string {
   return join(historyDir, `.active.${sessionHash}`);

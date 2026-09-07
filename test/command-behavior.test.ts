@@ -221,12 +221,10 @@ describe("session navigation", () => {
       releaseApply = resolve;
     });
     let applyCalls = 0;
-    const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, {
-      git: async () => {
-        applyCalls++;
-        await applyGate;
-        return "applied";
-      },
+    const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, async () => {
+      applyCalls++;
+      await applyGate;
+      return "applied";
     });
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
@@ -316,7 +314,7 @@ describe("session navigation", () => {
     expect((await navigation.undo()).status).toBe("moved");
   });
 
-  it("does not call Git while disposing session-only entries", async () => {
+  it("does not call Git while suspending session-only entries", async () => {
     let calls = 0;
     const git: GitRunner = async () => {
       calls++;
@@ -324,7 +322,7 @@ describe("session navigation", () => {
     };
     const navigation = new SessionNavigation(port(), git);
     await navigation.recordTurnEnd(sessionCheckpoint("u1", "a1"));
-    await navigation.dispose();
+    await navigation.suspend();
     expect(calls).toBe(0);
   });
 });

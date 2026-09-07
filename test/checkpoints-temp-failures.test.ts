@@ -1,8 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import type * as FsPromises from "node:fs/promises";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +9,13 @@ import ompUndoRedo from "../src/index.js";
 import { applyCheckpoint, finishAfterTurn, prepareBeforeTurn } from "../src/core/checkpoints.js";
 import { SessionNavigation } from "../src/core/session-navigation.js";
 import type { GitRunner } from "../src/core/types.js";
+import {
+  context,
+  FakeExtensionApi,
+  git as rawGit,
+  makeRepository,
+  privateRefs,
+} from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -48,83 +54,6 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     ),
   };
 });
-
-type Handler = (...args: unknown[]) => unknown;
-
-type TestContext = {
-  cwd: string;
-  leaf: string;
-  sessionManager: {
-    getSessionId(): string;
-    getLeafId(): string;
-    getBranch(): [];
-    getEntry(): undefined;
-  };
-  navigateTree(targetId: string): Promise<{ cancelled: boolean }>;
-  waitForIdle(): Promise<void>;
-  isIdle(): boolean;
-  ui: {
-    notifications: Array<{ message: string; level: string }>;
-    notify(message: string, level: string): void;
-  };
-};
-
-class FakeExtensionApi {
-  private readonly handlers = new Map<string, Handler>();
-  private readonly commands = new Map<string, Handler>();
-
-  on(event: string, handler: Handler): void {
-    this.handlers.set(event, handler);
-  }
-
-  registerCommand(name: string, config: { handler: Handler }): void {
-    this.commands.set(name, config.handler);
-  }
-
-  async runCommand(name: string, context: TestContext): Promise<void> {
-    const handler = this.commands.get(name);
-    if (!handler) throw new Error(`No command registered for ${name}`);
-    await handler("", context);
-  }
-
-  async emit(
-    event: string,
-    context: TestContext,
-    payload?: Record<string, unknown>,
-  ): Promise<void> {
-    const handler = this.handlers.get(event);
-    if (!handler) throw new Error(`No handler registered for ${event}`);
-    await handler(payload ?? { type: event }, context);
-  }
-}
-
-function context(cwd: string, sessionId: string): TestContext {
-  const value: TestContext = {
-    cwd,
-    leaf: "leaf",
-    sessionManager: {
-      getSessionId: () => sessionId,
-      getLeafId: () => value.leaf,
-      getBranch: () => [],
-      getEntry: () => undefined,
-    },
-    navigateTree: async () => ({ cancelled: true }),
-    waitForIdle: async () => {},
-    isIdle: () => true,
-    ui: {
-      notifications: [],
-      notify(message, level) {
-        value.ui.notifications.push({ message, level });
-      },
-    },
-  };
-  return value;
-}
-
-async function rawGit(cwd: string, args: string[]): Promise<string> {
-  const result = await execFileAsync("git", args, { cwd, windowsHide: true });
-  return result.stdout.trim();
-}
 
 function makeGitRunner(cwd: string, options?: { failCommand?: string }): GitRunner {
   return async (args, runOpts) => {
@@ -173,23 +102,6 @@ function makeGitRunner(cwd: string, options?: { failCommand?: string }): GitRunn
       };
     }
   };
-}
-
-async function makeRepository(): Promise<string> {
-  const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-temp-fail-"));
-  await rawGit(cwd, ["init", "-q"]);
-  await rawGit(cwd, ["config", "user.name", "test"]);
-  await rawGit(cwd, ["config", "user.email", "test@example.com"]);
-  await rawGit(cwd, ["config", "core.autocrlf", "false"]);
-  await writeFile(join(cwd, "tracked.txt"), "base\n");
-  await rawGit(cwd, ["add", "."]);
-  await rawGit(cwd, ["commit", "-qm", "base"]);
-  return cwd;
-}
-
-async function privateRefs(cwd: string): Promise<string[]> {
-  const output = await rawGit(cwd, ["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"]);
-  return output ? output.split("\n") : [];
 }
 
 describe("temp-directory failure resilience", () => {

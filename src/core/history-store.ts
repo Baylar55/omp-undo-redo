@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { checkpointNamespace } from "./checkpoints.js";
+import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import { basename, join } from "node:path";
+import { writeFileAtomic } from "./atomic-write.js";
+import { checkpointNamespace, historyRefPrefix } from "./checkpoints.js";
+import { parseRefLines } from "./git-refs.js";
 import {
   pruneStaleHeartbeats,
   sessionHeartbeatIsFresh,
@@ -10,38 +12,52 @@ import {
 import { pruneExpiredTombstones } from "./prune-tombstones.js";
 import type {
   ExpirationTombstone,
-  FileCheckpointUnavailableReason,
   GitCheckpoint,
   GitRepository,
   GitRunner,
   HistoryLoadResult,
   NavigationState,
+  SessionEntryLike,
   SessionReader,
   TurnCheckpoint,
 } from "./types.js";
-import { effectiveLeaf, entryExists, isSessionExitEntry } from "./session-tree-utils.js";
-export { effectiveLeaf, entryExists, isSessionExitEntry } from "./session-tree-utils.js";
+import { UNAVAILABLE_REASONS } from "./types.js";
+
+function entryExists(reader: SessionReader, id: string | null): boolean {
+  return id === null || reader.getEntry(id) !== undefined;
+}
+
+function isSessionExitEntry(entry: SessionEntryLike | undefined): boolean {
+  return entry?.type === "custom" && entry.customType === "session_exit";
+}
+
+function effectiveLeaf(reader: SessionReader): string | null {
+  let leafId = reader.getLeafId();
+  const visited = new Set<string>();
+  while (leafId && !visited.has(leafId)) {
+    visited.add(leafId);
+    const entry = reader.getEntry(leafId);
+    if (!isSessionExitEntry(entry)) return leafId;
+    leafId = entry?.parentId ?? null;
+  }
+  return leafId;
+}
 
 const HISTORY_SCHEMA_CURRENT = 2;
 const ACCEPTED_SCHEMAS = new Set([1, 2]);
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
 const GIT_OBJECT_ID = /^[0-9a-f]{40,64}$/;
 const HASH = /^[0-9a-f]{64}$/;
-const UNAVAILABLE_REASONS: Record<FileCheckpointUnavailableReason, true> = {
-  git_unavailable: true,
-  not_repository: true,
-  repository_unresolvable: true,
-  invalid_head: true,
-  before_snapshot_failed: true,
-  before_ref_failed: true,
-  after_snapshot_failed: true,
-  after_ref_failed: true,
-  file_history_gap: true,
-  resumed_checkpoint_unavailable: true,
-  workspace_unresolvable: true,
-  private_repository_unavailable: true,
-  history_expired: true,
-};
+
+/** Write JSON so readers never see a partial document. */
+async function writeJsonAtomic(directory: string, path: string, value: unknown): Promise<void> {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFileAtomic(
+    path,
+    join(directory, `.${basename(path)}.${randomUUID()}.tmp`),
+    JSON.stringify(value),
+  );
+}
 
 type StoredHistory = {
   schemaVersion: number;
@@ -80,13 +96,13 @@ async function readTombstone(
       candidate.expired === true &&
       candidate.sessionHash === sessionHash &&
       typeof candidate.expiredAt === "string" &&
-      (candidate.reason === "age" || candidate.reason === "storage_cap")
+      candidate.reason === "age"
     ) {
       return {
         expired: true,
         sessionHash,
         expiredAt: candidate.expiredAt,
-        reason: candidate.reason,
+        reason: "age",
       };
     }
     return null;
@@ -115,7 +131,7 @@ function isSessionCheckpoint(value: unknown): value is TurnCheckpoint {
   return (
     candidate.kind === "session" &&
     typeof candidate.reason === "string" &&
-    candidate.reason in UNAVAILABLE_REASONS &&
+    (UNAVAILABLE_REASONS as readonly string[]).includes(candidate.reason) &&
     isNullableString(candidate.parentLeafId) &&
     isNullableString(candidate.leafId)
   );
@@ -157,7 +173,7 @@ function parseHistory(
   if (!value || typeof value !== "object") return null;
   const candidate = value as Record<string, unknown>;
   const sessionHash = checkpointNamespace(sessionId);
-  const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+  const refPrefix = historyRefPrefix(sessionHash);
   if (
     typeof candidate.schemaVersion !== "number" ||
     !ACCEPTED_SCHEMAS.has(candidate.schemaVersion) ||
@@ -193,14 +209,8 @@ async function existingRefs(git: GitRunner, prefix: string): Promise<Map<string,
   try {
     const result = await git(["for-each-ref", "--format=%(refname)%00%(objectname)", prefix]);
     if (result.code !== 0 || result.error) return null;
-    const refs = new Map<string, string>();
-    for (const line of result.stdout.split(/\r?\n/)) {
-      if (!line) continue;
-      const separator = line.indexOf("\0");
-      if (separator < 0 || line.indexOf("\0", separator + 1) >= 0) return null;
-      refs.set(line.slice(0, separator), line.slice(separator + 1));
-    }
-    return refs;
+    const refs = parseRefLines(result.stdout);
+    return refs && new Map(refs.map(({ ref, expectedHash }) => [ref, expectedHash]));
   } catch {
     return null;
   }
@@ -304,7 +314,7 @@ export async function expireGitSessionHistories(
     // another process may have touched while the timestamp was being read.
     if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
 
-    const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+    const refPrefix = historyRefPrefix(sessionHash);
     const refsMap = await existingRefs(git, refPrefix);
     if (refsMap === null) continue;
 
@@ -330,16 +340,8 @@ export async function expireGitSessionHistories(
       expiredAt: new Date().toISOString(),
       reason: "age",
     };
-    const temporary = join(dir, `.${sessionHash}.${randomUUID()}.tmp`);
-    try {
-      await mkdir(dir, { recursive: true, mode: 0o700 });
-      await writeFile(temporary, JSON.stringify(tombstoneData), { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, tombstoneFile);
-    } catch {
-      // tombstone write failure is non-fatal
-    } finally {
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
+    // tombstone write failure is non-fatal
+    await writeJsonAtomic(dir, tombstoneFile, tombstoneData).catch(() => undefined);
 
     await rm(filePath, { force: true }).catch(() => undefined);
   }
@@ -367,7 +369,7 @@ export class SessionHistoryStore {
     const tombstoneFile = tombstonePath(this.repository, this.sessionId);
     const tombstone = await readTombstone(tombstoneFile, sessionHash);
     if (tombstone) {
-      return { status: "expired", reason: tombstone.reason };
+      return { status: "expired" };
     }
 
     const path = historyPath(this.repository, this.sessionId);
@@ -385,7 +387,7 @@ export class SessionHistoryStore {
       const candidate = value as Record<string, unknown>;
       const parsed = parseHistory(value, this.sessionId, this.repository);
       if (!parsed) return { status: "unavailable", reason: "unusable" };
-      const refPrefix = `refs/omp-undo-redo/history/${parsed.sessionHash}/`;
+      const refPrefix = historyRefPrefix(parsed.sessionHash);
       const refs = await existingRefs(this.git, refPrefix);
       if (refs === null) return { status: "unavailable", reason: "unusable" };
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
@@ -447,17 +449,7 @@ export class SessionHistoryStore {
       currentIndex: candidate.currentIndex as number,
       lastAccessedAt: new Date().toISOString(),
     };
-    const temporary = join(
-      directory,
-      `.${checkpointNamespace(this.sessionId)}.${randomUUID()}.tmp`,
-    );
-    try {
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await writeFile(temporary, JSON.stringify(stored), { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, historyPath(this.repository, this.sessionId));
-    } finally {
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
+    await writeJsonAtomic(directory, historyPath(this.repository, this.sessionId), stored);
   }
 
   async save(state: NavigationState): Promise<void> {
@@ -468,7 +460,7 @@ export class SessionHistoryStore {
       return;
     }
     const sessionHash = checkpointNamespace(this.sessionId);
-    const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
+    const refPrefix = historyRefPrefix(sessionHash);
     const checkpoints = state.checkpoints.map((checkpoint): TurnCheckpoint => {
       if (
         checkpoint.kind === "session" ||
@@ -492,17 +484,7 @@ export class SessionHistoryStore {
       currentIndex: state.currentIndex,
       lastAccessedAt: new Date().toISOString(),
     };
-    const temporary = join(
-      directory,
-      `.${checkpointNamespace(this.sessionId)}.${randomUUID()}.tmp`,
-    );
-    try {
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await writeFile(temporary, JSON.stringify(stored), { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, path);
-    } finally {
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
+    await writeJsonAtomic(directory, path, stored);
     // A live owner saving new history supersedes any earlier expiration
     // marker, so clear it — otherwise every future resume would discard the
     // freshly saved checkpoints until the marker aged out of the tombstone

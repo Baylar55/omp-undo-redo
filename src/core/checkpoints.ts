@@ -3,6 +3,7 @@ import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
+import { deleteRefsBatched } from "./git-refs.js";
 import type {
   FileCheckpointUnavailableReason,
   GitCheckpoint,
@@ -11,12 +12,18 @@ import type {
   OwnershipMode,
   PendingGitCheckpoint,
   SnapshotIndexLease,
-  SessionReader,
 } from "./types.js";
 
 const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-redo@local"];
 const REF_ROOT = "refs/omp-undo-redo";
 const WORKTREE_PATHSPEC = ":(top)";
+
+/** Single spelling of the retained-history ref namespace. Takes an
+ *  already-hashed session (`checkpointNamespace(sessionId)`), never a raw id. */
+export const HISTORY_REF_ROOT = `${REF_ROOT}/history/`;
+export function historyRefPrefix(sessionHash: string): string {
+  return `${HISTORY_REF_ROOT}${sessionHash}/`;
+}
 
 // Alternate index reused across turns so each turn is not a full `git add -A`
 // re-hash of the whole worktree. The first turn seeds it (a full `add -A` that
@@ -86,9 +93,16 @@ export type RepositoryResolution =
   | { reason: "git_unavailable" | "not_repository" | "repository_unresolvable" };
 
 export async function resolveRepository(git: GitRunner): Promise<RepositoryResolution> {
-  const worktreeResult = await invoke(git, ["rev-parse", "--show-toplevel"]);
-  if (worktreeResult.error === "unavailable") return { reason: "git_unavailable" };
-  const worktree = worktreeResult.code === 0 ? worktreeResult.stdout.trim() : "";
+  // One spawn: rev-parse prints each flag's answer on its own stdout line, in order.
+  const result = await invoke(git, [
+    "rev-parse",
+    "--show-toplevel",
+    "--git-dir",
+    "--git-common-dir",
+  ]);
+  if (result.error === "unavailable") return { reason: "git_unavailable" };
+  const lines = result.code === 0 ? result.stdout.trim().split("\n") : [];
+  const [worktree = "", gitDir = "", commonDir = ""] = lines.map((line) => line.trim());
   if (!worktree) {
     const cwd = git.cwd;
     if (!cwd) return { reason: "not_repository" };
@@ -108,22 +122,16 @@ export async function resolveRepository(git: GitRunner): Promise<RepositoryResol
       return { reason: "not_repository" };
     }
   }
-
-  const gitDirResult = await invoke(git, ["rev-parse", "--git-dir"]);
-  const commonDirResult = await invoke(git, ["rev-parse", "--git-common-dir"]);
-  if (gitDirResult.error === "unavailable" || commonDirResult.error === "unavailable") {
-    return { reason: "git_unavailable" };
-  }
-  const gitDir = gitDirResult.code === 0 ? gitDirResult.stdout.trim() : "";
-  const commonDir = commonDirResult.code === 0 ? commonDirResult.stdout.trim() : "";
   if (!gitDir || !commonDir) return { reason: "repository_unresolvable" };
 
-  const canonicalWorktree = await canonicalPath(worktree, worktree);
+  // git prints --git-dir/--git-common-dir relative to the process cwd, not to the
+  // worktree root; resolving them against the worktree escapes the repo from a subdir.
+  const base = git.cwd ?? worktree;
   return {
     repository: {
-      worktree: canonicalWorktree,
-      gitDir: await canonicalPath(gitDir, canonicalWorktree),
-      commonDir: await canonicalPath(commonDir, canonicalWorktree),
+      worktree: await canonicalPath(worktree, worktree),
+      gitDir: await canonicalPath(gitDir, base),
+      commonDir: await canonicalPath(commonDir, base),
     },
   };
 }
@@ -186,7 +194,6 @@ export async function createSnapshotCommit(
   git: GitRunner,
   message: string,
   retainIndex = false,
-  worktree?: string,
 ): Promise<SnapshotResult> {
   let tempDirectory: string | null = null;
   try {
@@ -197,10 +204,7 @@ export async function createSnapshotCommit(
     if (seeded.status === "invalid_head") return { reason: "invalid_head" };
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const addEnv: Record<string, string> = { ...env };
-    if (git.env?.GIT_DIR) {
-      const addWorktree = git.cwd ?? worktree;
-      if (addWorktree) addEnv.GIT_WORK_TREE = addWorktree;
-    }
+    if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
     const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
     if (added.code !== 0) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
@@ -232,7 +236,6 @@ async function createSnapshotCommitFromLease(
   git: GitRunner,
   lease: SnapshotIndexLease,
   message: string,
-  worktree?: string,
 ): Promise<SnapshotResult> {
   const currentHead = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
   if (currentHead.code !== 0 || currentHead.stdout.trim() !== lease.headTree) {
@@ -277,10 +280,7 @@ async function createSnapshotCommitFromLease(
     }
 
     const addEnv: Record<string, string> = { ...env };
-    if (git.env?.GIT_DIR) {
-      const addWorktree = git.cwd ?? worktree;
-      if (addWorktree) addEnv.GIT_WORK_TREE = addWorktree;
-    }
+    if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
     const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
     if (added.code !== 0) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
@@ -299,7 +299,7 @@ async function createSnapshotCommitFromLease(
   }
 }
 
-export interface RefRelease {
+interface RefRelease {
   repository: GitRepository;
   ref: string;
   expectedHash: string;
@@ -321,54 +321,22 @@ async function releaseLooseRef(
   }
 }
 
-async function releaseRefBatch(
-  git: GitRunner,
-  refs: readonly Pick<RefRelease, "ref" | "expectedHash">[],
-  repository?: GitRepository,
-  timeoutMs?: number,
-): Promise<boolean> {
-  if (refs.length === 0) return true;
-  const input = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n");
-  const options = repository
-    ? { env: { GIT_DIR: repository.commonDir }, stdin: `${input}\n`, timeoutMs }
-    : { stdin: `${input}\n`, timeoutMs };
-  try {
-    const result = await git(["update-ref", "--stdin"], options);
-    if (result.code === 0) return true;
-    if (result.error === "timeout") return false;
-  } catch {
-    // Retry smaller batches below.
-  }
-  if (refs.length === 1) {
-    return repository
-      ? await releaseLooseRef(repository, refs[0].ref, refs[0].expectedHash)
-      : false;
-  }
-  const midpoint = Math.ceil(refs.length / 2);
-  const left = await releaseRefBatch(git, refs.slice(0, midpoint), repository, timeoutMs);
-  const right = await releaseRefBatch(git, refs.slice(midpoint), repository, timeoutMs);
-  return left && right;
-}
-
 export async function releaseRefs(
   gitForRepository: (repository: GitRepository) => GitRunner,
   refs: readonly RefRelease[],
 ): Promise<boolean> {
-  const grouped = new Map<string, { repository: GitRepository; refs: RefRelease[] }>();
-  for (const ref of refs) {
-    const key = ref.repository.commonDir;
-    const group = grouped.get(key);
-    if (group) {
-      group.refs.push(ref);
-    } else {
-      grouped.set(key, { repository: ref.repository, refs: [ref] });
-    }
-  }
-
+  const grouped = Map.groupBy(refs, (ref) => ref.repository.commonDir);
   const results = await Promise.allSettled(
-    [...grouped.values()].map(async ({ repository, refs: groupedRefs }) => {
+    [...grouped.values()].map(async (groupedRefs) => {
+      // groupBy never yields an empty group, so the head carries the repository.
+      const { repository } = groupedRefs[0];
       try {
-        return await releaseRefBatch(gitForRepository(repository), groupedRefs, repository);
+        const outcome = await deleteRefsBatched(gitForRepository(repository), groupedRefs, {
+          env: { GIT_DIR: repository.commonDir },
+          onSingleFailure: ({ ref, expectedHash }) =>
+            releaseLooseRef(repository, ref, expectedHash),
+        });
+        return outcome === "ok";
       } catch {
         return false;
       }
@@ -398,25 +366,8 @@ export async function releaseCheckpoints(
   );
 }
 
-export async function releaseCheckpoint(
-  git: GitRunner,
-  checkpoint: GitCheckpoint,
-): Promise<boolean> {
-  return releaseRefs(
-    () => git,
-    [
-      {
-        repository: checkpoint.repository,
-        ref: checkpoint.beforeRef,
-        expectedHash: checkpoint.beforeHash,
-      },
-      {
-        repository: checkpoint.repository,
-        ref: checkpoint.afterRef,
-        expectedHash: checkpoint.afterHash,
-      },
-    ],
-  );
+export function releaseCheckpoint(git: GitRunner, checkpoint: GitCheckpoint): Promise<boolean> {
+  return releaseCheckpoints(() => git, [checkpoint]);
 }
 
 export async function releasePendingCheckpoint(
@@ -427,14 +378,14 @@ export async function releasePendingCheckpoint(
   >,
 ): Promise<boolean> {
   const [releasedRef, releasedLease] = await Promise.all([
-    releaseRefBatch(
-      git,
-      [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }],
-      pending.repository,
-    ),
+    deleteRefsBatched(git, [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }], {
+      env: { GIT_DIR: pending.repository.commonDir },
+      onSingleFailure: ({ ref, expectedHash }) =>
+        releaseLooseRef(pending.repository, ref, expectedHash),
+    }),
     releaseSnapshotIndexLease(pending.snapshotIndexLease),
   ]);
-  return releasedRef && releasedLease;
+  return releasedRef === "ok" && releasedLease;
 }
 
 export type PrepareBeforeTurnResult =
@@ -520,7 +471,7 @@ export async function finishAfterTurn(
   git: GitRunner,
   before: Pick<
     PendingGitCheckpoint,
-    "repository" | "beforeHash" | "beforeRef" | "checkpointId" | "snapshotIndexLease"
+    "repository" | "beforeHash" | "beforeRef" | "snapshotIndexLease"
   >,
   parentLeafId: string | null,
   leafId: string | null,
@@ -582,7 +533,7 @@ export async function retainCheckpointForResume(
   checkpoint: GitCheckpoint,
 ): Promise<GitCheckpoint> {
   const checkpointId = randomUUID();
-  const prefix = `${REF_ROOT}/history/${checkpointNamespace(sessionId)}/${checkpointId}`;
+  const prefix = `${historyRefPrefix(checkpointNamespace(sessionId))}${checkpointId}`;
   const beforeRef = `${prefix}/before`;
   const afterRef = `${prefix}/after`;
   const input = [
@@ -630,16 +581,4 @@ export async function applyCheckpoint(
       await rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
     }
   }
-}
-
-export function previousCheckpoint(ctx: SessionReader): string | null {
-  const leafId = ctx.getLeafId();
-  if (!leafId) return null;
-  const entries = ctx.getBranch(leafId);
-  const currentIndex = entries.findIndex((e) => e.id === leafId);
-  for (let i = currentIndex - 1; i >= 0; i--) {
-    const entry = entries[i];
-    if (entry.type === "message" && entry.message?.role === "user") return entry.id;
-  }
-  return null;
 }

@@ -2,11 +2,10 @@ import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { createEnvGitRunner, createGitRunner } from "../src/core/git-runner.js";
+import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
-
-type Handler = (...args: unknown[]) => unknown;
+import { context, FakeExtensionApi, rmRetry, type TestContext } from "./helpers.js";
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-gc-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -14,18 +13,6 @@ process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
 afterAll(async () => {
   await rm(testStoreRoot, { recursive: true, force: true });
 });
-
-async function rmRetry(path: string, attempts = 6): Promise<void> {
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      await rm(path, { recursive: true, force: true });
-      return;
-    } catch (error) {
-      if (attempt === attempts - 1) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-  }
-}
 
 /** Isolated store per test: sweeps and background gcs from other instances
  *  can then never race this file's assertions on the repos directory. */
@@ -65,87 +52,6 @@ async function waitFor(predicate: () => Promise<boolean>, attempts = 50): Promis
   return false;
 }
 
-type TestEntry = {
-  id: string;
-  parentId: string | null;
-  type: string;
-  message?: { role?: string };
-  customType?: string;
-};
-
-type TestContext = {
-  branch: TestEntry[];
-  entries: TestEntry[];
-  leaf: string;
-  sessionManager: {
-    getSessionId(): string;
-    getLeafId(): string;
-    getBranch(): TestEntry[];
-    getEntry(id: string): TestEntry | undefined;
-  };
-  navigateTree(targetId: string): Promise<{ cancelled: boolean }>;
-  waitForIdle(): Promise<void>;
-  isIdle(): boolean;
-  ui: {
-    notifications: Array<{ message: string; level: string }>;
-    notify(message: string, level: string): void;
-  };
-};
-
-class FakeExtensionApi {
-  private readonly handlers = new Map<string, Handler>();
-  private readonly commands = new Map<string, Handler>();
-
-  on(event: string, handler: Handler): void {
-    this.handlers.set(event, handler);
-  }
-
-  registerCommand(name: string, config: { handler: Handler }): void {
-    this.commands.set(name, config.handler);
-  }
-
-  async runCommand(name: string, context: TestContext): Promise<void> {
-    const handler = this.commands.get(name);
-    if (!handler) throw new Error(`No command registered for ${name}`);
-    await handler("", context);
-  }
-
-  async emit(
-    event: string,
-    context: TestContext,
-    payload?: Record<string, unknown>,
-  ): Promise<void> {
-    const handler = this.handlers.get(event);
-    if (!handler) throw new Error(`No handler registered for ${event}`);
-    await handler(payload ?? { type: event }, context);
-  }
-}
-
-function context(cwd: string, sessionId: string): TestContext {
-  const value: TestContext = {
-    cwd,
-    leaf: "leaf",
-    branch: [],
-    entries: [],
-    sessionManager: {
-      getSessionId: () => sessionId,
-      getLeafId: () => value.leaf,
-      getBranch: () => value.branch,
-      getEntry: (id) => value.entries.find((entry) => entry.id === id),
-    },
-    navigateTree: async () => ({ cancelled: true }),
-    waitForIdle: async () => {},
-    isIdle: () => true,
-    ui: {
-      notifications: [],
-      notify(message, level) {
-        value.ui.notifications.push({ message, level });
-      },
-    },
-  };
-  return value;
-}
-
 /** Turns a fresh private-repo capture into the extension's housekeeping. */
 async function runTurns(
   pi: FakeExtensionApi,
@@ -170,7 +76,7 @@ describe("private-repo housekeeping", () => {
       const pi = new FakeExtensionApi();
       const dependencies: OmpUndoRedoDependencies = {
         gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
-          const inner = env ? createEnvGitRunner(cwd2, env) : createGitRunner(cwd2);
+          const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
           const wrapped: GitRunner = async (args, options) => {
             commands.push(args);
             return inner(args, options);

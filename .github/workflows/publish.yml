@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,16 +12,15 @@ permissions:
 jobs:
   publish:
     name: Publish package
-    if: github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && startsWith(github.ref_name, 'v'))
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: https://registry.npmjs.org
           cache: npm
 
@@ -42,12 +40,9 @@ jobs:
             exit 1
           fi
 
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            EXPECTED_TAG="v$PACKAGE_VERSION"
-            if [[ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]]; then
-              echo "Tag $GITHUB_REF_NAME does not match package version $PACKAGE_VERSION" >&2
-              exit 1
-            fi
+          if [[ "$GITHUB_REF_NAME" != "v$PACKAGE_VERSION" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $PACKAGE_VERSION" >&2
+            exit 1
           fi
 
           {
@@ -87,7 +82,6 @@ jobs:
         run: npm publish --access public --provenance
 
       - name: Create GitHub Release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
