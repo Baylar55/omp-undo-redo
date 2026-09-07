@@ -3,6 +3,15 @@ import type { GitRunner } from "./types.js";
 
 const TERMINATION_GRACE_MS = 250;
 
+/** Ceiling for any invocation that does not ask for a shorter one. A git child
+ *  that never exits (stalled SMB/NFS mount, AV holding a handle, a `.git` lock
+ *  contended by a wedged sibling) would otherwise leave its capture promise
+ *  unsettled forever, which permanently blocks `/undo`//`redo` ("still being
+ *  captured") and makes every later turn skip its capture. Generous on
+ *  purpose: a timeout degrades the turn to session-only, so it must only fire
+ *  when the child is genuinely wedged, never on a merely slow workspace. */
+export const DEFAULT_TIMEOUT_MS = 120_000;
+
 type ChildResult = {
   stdout: string;
   stderr: string;
@@ -96,9 +105,7 @@ function runGit(
   });
   child.stdin.on("error", () => {});
   child.stdin.end(options?.stdin);
-  if (options?.timeoutMs !== undefined) {
-    deadlineTimer = setTimeout(terminate, Math.max(1, options.timeoutMs));
-  }
+  deadlineTimer = setTimeout(terminate, Math.max(1, options?.timeoutMs ?? DEFAULT_TIMEOUT_MS));
   return promise;
 }
 

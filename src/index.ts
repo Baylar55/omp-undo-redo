@@ -342,6 +342,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const PRIVATE_GC_AFTER_CAPTURES = 20;
   const capturesSinceGcByGitDir = new Map<string, number>();
 
+  /** Repacking a large snapshot repo legitimately outruns the runner's
+   *  default per-child deadline, so gc gets its own ceiling: long enough that
+   *  a real gc always finishes, short enough that a wedged child cannot hold
+   *  a tracked operation (and with it the eviction sweep) forever. */
+  const PRIVATE_GC_TIMEOUT_MS = 15 * 60 * 1000;
+
   /** Best-effort `git gc` over a private repo. Runs outside the handler
    *  deadline accounting (never awaited by a handler) so a slow gc can never
    *  hit the host's timeout. `--prune=now` drops unreferenced objects
@@ -353,7 +359,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // user's workspace or the snapshot repo itself (Windows keeps a child's
       // cwd handle until it exits, which would race teardown rms and the
       // eviction sweep). GIT_DIR is set, so the repo operations work anywhere.
-      await gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir })(["gc", "--prune=now"]);
+      await gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir })(["gc", "--prune=now"], {
+        timeoutMs: PRIVATE_GC_TIMEOUT_MS,
+      });
     } catch {
       // Best-effort: a failed gc leaves more work for the next trigger.
     }
