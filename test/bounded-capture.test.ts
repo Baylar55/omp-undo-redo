@@ -181,7 +181,7 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
-  it("keeps a deferred finalize bound to its turn when a later turn starts before it settles", async () => {
+  it("records a session-only boundary for a turn the in-flight-capture guard skipped", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-race-"));
     const { runner, waitForAdds } = raceRunnerFactory(500);
     try {
@@ -213,22 +213,37 @@ describe("bounded capture lifecycle", () => {
         ctx.leaf = targetId;
         return { cancelled: false };
       };
-      for (let attempt = 0; attempt < 40; attempt += 1) {
-        await pi.runCommand("undo", ctx);
-        const message = ctx.ui.notifications.at(-1)?.message ?? "";
-        if (
-          message.includes("Nothing to undo") ||
-          message.includes("still being captured") ||
-          message.includes("still being finalized")
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 100));
-          continue;
+      // Both turns must be navigable. N+1's boundary is session-only (its
+      // capture was skipped), and recording it marks the file history as
+      // gapped, so neither undo restores files: N's after-snapshot was taken
+      // after N+1's edits, so restoring from it would revert two turns of file
+      // changes while moving one session boundary.
+      // Real-time polling is deliberate: finalizes settle on their own
+      // schedule behind the handler deadline, with no observable signal.
+      const messages: string[] = [];
+      for (let undos = 0; undos < 2; undos += 1) {
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          await pi.runCommand("undo", ctx);
+          const message = ctx.ui.notifications.at(-1)?.message ?? "";
+          if (
+            message.includes("Nothing to undo") ||
+            message.includes("still being captured") ||
+            message.includes("still being finalized")
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            continue;
+          }
+          messages.push(message);
+          break;
         }
-        break;
       }
-      // The undo must restore N's pre-turn state — not N+1's "changed-again".
-      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
-      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(messages).toHaveLength(2);
+      for (const message of messages) expect(message).toContain("files were not restored");
+      // Two boundaries, no more: the third undo finds an empty history.
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("Nothing to undo");
+      expect(ctx.leaf).toBe("leafN");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed-again\n");
     } finally {
       await waitForAdds(3).catch(() => undefined);
       await new Promise((resolve) => setTimeout(resolve, 100));

@@ -743,7 +743,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           await releasePending(checkpoint);
         } else {
           capture.checkpoint = checkpoint;
-          pending.set(sessionId, checkpoint);
+          // `pending` is the CURRENT turn's slot. A capture that outlived its
+          // own turn must not publish into it: the later turn already recorded
+          // its own boundary there, and this checkpoint is still reachable for
+          // the deferred finalize through `capture.checkpoint`.
+          if (turnStartLeafBySession.get(sessionId) === checkpoint.parentLeafId) {
+            pending.set(sessionId, checkpoint);
+          }
           if (
             checkpoint.kind === "git" &&
             checkpoint.repository.gitDir &&
@@ -869,10 +875,21 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
       // Record the leaf this turn starts from, then bound concurrent captures:
       // a turn that starts while the previous turn's capture is still in flight
-      // gets no new capture (its undo boundary is session-only) instead of
-      // stacking overlapping `git add` runs over the same workspace.
-      turnStartLeafBySession.set(sessionId, typed.sessionManager.getLeafId());
-      if (pendingCaptures.has(sessionId)) return;
+      // gets no new capture instead of stacking overlapping `git add` runs over
+      // the same workspace. Its boundary is recorded as session-only right
+      // here — leaving `pending` empty would drop the turn from the history
+      // entirely, because agent_end would then finalize the earlier turn's
+      // in-flight capture and this turn would produce no checkpoint at all.
+      const turnStartLeaf = typed.sessionManager.getLeafId();
+      turnStartLeafBySession.set(sessionId, turnStartLeaf);
+      if (pendingCaptures.has(sessionId)) {
+        pending.set(sessionId, {
+          kind: "session",
+          reason: "before_snapshot_failed",
+          parentLeafId: turnStartLeaf,
+        });
+        return;
+      }
 
       const backend =
         backends.get(sessionId) ??
@@ -881,16 +898,18 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (backend.kind === "session") {
         notifySessionOnly(typed, sessionId, backend.reason);
       }
-      const parentLeafId = typed.sessionManager.getLeafId();
       const capture = beginCapture(sessionId, async () => {
         const prepared =
           backend.kind === "git"
             ? await prepareBeforeTurn(backend.git, sessionId, ownerRegistry)
             : { status: "session_only" as const, reason: backend.reason };
+        // Bound to the leaf recorded above, never a fresh getLeafId(): the
+        // finalize identity check and the pending-slot check both compare
+        // against that value.
         const checkpoint: PendingTurnCheckpoint =
           prepared.status === "git"
-            ? { ...prepared.checkpoint, parentLeafId }
-            : { kind: "session", reason: prepared.reason, parentLeafId };
+            ? { ...prepared.checkpoint, parentLeafId: turnStartLeaf }
+            : { kind: "session", reason: prepared.reason, parentLeafId: turnStartLeaf };
         return checkpoint;
       });
       await timedOutAfter(capture.complete, captureDeadlineMs);
@@ -904,19 +923,27 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     turnStartLeaf: string | null,
   ): Promise<void> {
     const sessionId = typed.sessionManager.getSessionId();
+    // An earlier turn whose capture overran its deadline may still be
+    // finalizing. Its checkpoint must land in the history before this turn's,
+    // or the recorded order would not match the turn order (and a session-only
+    // boundary would convert file checkpoints that are not yet recorded).
+    const previousFinalize = pendingFinalizations.get(sessionId);
+    const ready = previousFinalize
+      ? previousFinalize.then(() => capture.complete)
+      : capture.complete;
     let handlerRelease!: () => void;
     const handlerDone = new Promise<void>((resolve) => {
       handlerRelease = resolve;
     });
     const work = (async () => {
       try {
-        if (await timedOutAfter(capture.complete, captureDeadlineMs)) {
-          // The capture overran the handler deadline. Keep this turn's
-          // finalize identity-bound — same capture, same leaf, same turn-start
-          // leaf, same context — so when it settles it finalizes its own
-          // checkpoint instead of a later turn's.
+        if (await timedOutAfter(ready, captureDeadlineMs)) {
+          // The capture (or the previous turn's finalize) overran the handler
+          // deadline. Keep this turn's finalize identity-bound — same capture,
+          // same leaf, same turn-start leaf, same context — so when it settles
+          // it finalizes its own checkpoint instead of a later turn's.
           handlerRelease();
-          await capture.complete;
+          await ready;
           await finalizeTurn(typed, capture, leafId, turnStartLeaf);
           return;
         }
@@ -974,17 +1001,18 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     if (!before) return;
     // Consume the checkpoint: exactly one finalize (this turn's) may record it.
     capture.checkpoint = null;
+    // Only ever clear our own slot: a later turn may already own `pending`
+    // (its boundary was recorded while this capture was still in flight).
+    if (pending.get(sessionId) === before) pending.delete(sessionId);
     // The checkpoint must belong to the turn that is finalizing: its pre-turn
     // leaf must be the turn-start leaf captured when this finalize was first
     // invoked. If a later turn's finalize reaches it first, releasing the
     // stale checkpoint is safer than recording it with the wrong leaf (which
     // would make an undo restore the wrong pre-turn state).
     if (before.parentLeafId !== turnStartLeaf) {
-      pending.delete(sessionId);
       await releasePending(before);
       return;
     }
-    pending.delete(sessionId);
     if (closing) {
       await releasePending(before);
       return;
@@ -1034,16 +1062,24 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     track(async () => {
       const typed = ctx as unknown as AnyContext;
       const sessionId = typed.sessionManager.getSessionId();
-      const capture = pendingCaptures.get(sessionId);
+      const turnStartLeaf = turnStartLeafBySession.get(sessionId) ?? null;
+      const own = pending.get(sessionId) ?? null;
+      // Prefer this turn's own boundary. An in-flight capture belonging to an
+      // earlier turn (the guard in before_agent_start skipped this turn's
+      // capture) must not be finalized here: it is this turn's leaf that would
+      // be attached to it, and the earlier turn's own deferred finalize is
+      // already waiting to record it correctly.
+      const capture =
+        own?.parentLeafId === turnStartLeaf ? undefined : pendingCaptures.get(sessionId);
       // A capture that already settled leaves no entry (its finally deletes
       // it), but its checkpoint stays in the pending map — finalize from that.
-      const settled = capture ? null : (pending.get(sessionId) ?? null);
+      const settled = capture ? null : own;
       if (!capture && !settled) return;
       await beginFinalizeTurn(
         typed,
         capture ?? { complete: Promise.resolve(), checkpoint: settled },
         typed.sessionManager.getLeafId(),
-        turnStartLeafBySession.get(sessionId) ?? null,
+        turnStartLeaf,
       );
     }),
   );
