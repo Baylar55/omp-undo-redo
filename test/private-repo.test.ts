@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import type { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGitRunner } from "../src/core/git-runner.js";
 import {
@@ -42,6 +42,7 @@ describe("private per-workspace git repositories", () => {
       const envGit = createGitRunner(cwd, { env: { GIT_DIR: repository.gitDir } });
       const configs: Array<[string, string]> = [
         ["core.bare", "false"],
+        ["core.sharedRepository", "0600"],
         ["core.autocrlf", "false"],
         ["core.longpaths", "true"],
         ["core.symlinks", "true"],
@@ -75,6 +76,36 @@ describe("private per-workspace git repositories", () => {
       await rm(storeRoot, { recursive: true, force: true });
     }
   });
+
+  // POSIX-only: Windows ignores these mode bits, so the assertion is
+  // meaningless there (and this fix is POSIX-only exposure).
+  it.skipIf(process.platform === "win32")(
+    "creates the private store owner-only so other local users cannot read snapshots",
+    async () => {
+      // A Private-Git snapshot captures every workspace file outside the
+      // built-in ignore list — .env, id_rsa, credentials.json included — so a
+      // 0755 store let any local user read the whole workspace out of
+      // <storeRoot>/repos/<sha256>.git/objects/.
+      const cwd = await mkdtemp(join(tmpdir(), "omp-private-perm-"));
+      const storeParent = await mkdtemp(join(tmpdir(), "omp-private-perm-store-"));
+      const storeRoot = join(storeParent, "store");
+      try {
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, { env }),
+          cwd,
+          storeRoot,
+        );
+        expect(repository).not.toBeNull();
+        if (!repository) return;
+        for (const directory of [dirname(repository.gitDir), await realpath(storeRoot)]) {
+          expect((await stat(directory)).mode & 0o777).toBe(0o700);
+        }
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeParent, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("resolveBackend returns a git backend for a non-git cwd when git is available", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-backend-"));
