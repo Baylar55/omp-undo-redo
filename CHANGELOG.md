@@ -2,6 +2,22 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **`git gc --prune=now` ran against the user's own repository.** `isPrivateRepository()` scanned the same map `resolveBackend()` populates with the user's repository, so every Git-mode checkpoint counted as private and 20 before-captures triggered `gc --prune=now` with `GIT_DIR` pointing at the workspace's `.git` — pruning unreachable objects with no grace period (a concurrent rebase, another agent, or `fsck --lost-found` recovery could lose objects) and repacking a repository the extension does not own. Ownership is now stamped at construction (`GitRepository.private`, set only by `ensurePrivateGitRepository`) and required by both the capture-threshold trigger and the shutdown sweep.
+- **User diff configuration silently killed all file restoration.** The restore patch was generated with the user's presentation config in effect, so `diff.noprefix` (widely recommended in dotfile guides), `diff.external`, `color.diff=always`, `diff.submodule=log`, `diff.context=0`, `diff.relative` or `apply.whitespace=error` each made `git apply` reject the patch — reported as "Worktree changed; nothing was undone" on every `/undo`, forever, on that machine. The diff now pins `--no-color --no-ext-diff --no-textconv --submodule=short -U3 --src-prefix=a/ --dst-prefix=b/` and both applies pass `--whitespace=nowarn`.
+- **A failed patch is no longer blamed on the worktree.** When `apply --check` fails, the worktree is compared against the source snapshot through an index the probe seeds itself (the repository's own index is never written in Private-Git mode, and a user's staged changes are not worktree drift), including untracked collisions. A clean worktree now reports a restore failure instead of a phantom conflict.
+- **A single hung git child no longer disables capture and `/undo`//`redo` permanently.** `runGit` armed its deadline only when a caller passed `timeoutMs`, and no capture or apply invocation did: a child that never exited (stalled network mount, AV handle, contended `.git` lock) left the capture unsettled for the process lifetime, so `/undo` answered "still being captured" forever and every later turn skipped its capture. Every invocation now has a 120 s default ceiling, with 10 min for restores and 15 min for private-repo `gc`; a timeout degrades the turn to session-only and the next turn retries.
+- **A restore killed by its deadline is never reported as applied.** A killed `git diff` exits 1, which is also `--exit-code`'s "there were differences", so the truncated patch `--output` had already written was applied and reported as a complete restore.
+- **Turns skipped by the in-flight-capture guard were recorded nowhere.** A turn starting while the previous turn's capture was still in flight produced no checkpoint at all: its boundary vanished, one `/undo` reverted two turns of file changes while moving one session boundary, and `/redo` could restore one turn's files at another turn's session leaf. The guard now records a session-only boundary (which also raises the existing file-history-gap barrier), `agent_end` prefers the current turn's boundary over an alien in-flight capture, and a turn's finalize waits for the previous turn's so recorded order matches turn order.
+- **Restores from a subdirectory only restored that subdirectory.** `git apply` ignores patched paths outside its working directory, so a session started in a subdirectory of a repository restored just that subtree and still reported success. Git-mode runners are now rooted at the worktree.
+
+### Security
+
+- **Private snapshot store is created owner-only.** `<storeRoot>` and `<storeRoot>/repos` were created with the process umask (0755 by default) and git then wrote loose objects world-readable. Because a non-Git workspace usually has no `.gitignore`, those snapshots contain everything outside the built-in ignore list — `.env`, private keys, credential files — so on a shared POSIX host any local user could read the whole workspace out of `<storeRoot>/repos/<sha256>.git/objects/`. Both directories are now created with mode `0700` (plus an explicit `chmod` for a store root created earlier), and fresh private repositories set `core.sharedRepository=0600`. README and SECURITY.md now document what these snapshots contain; a store created by an earlier version keeps its original object modes, so remove `<storeRoot>/repos` once on a shared host.
+
 ## [1.6.1] - 2026-09-07
 
 ### Fixed
