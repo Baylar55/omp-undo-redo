@@ -1353,4 +1353,34 @@ describe("history-safe Git checkpoints", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("restores files despite hostile local diff and apply configuration", async () => {
+    // Regression: the restore patch inherited the user's presentation config,
+    // so `diff.noprefix` (a common dotfile setting) or `diff.external` made
+    // every `git apply --check` fail and every /undo report "Worktree
+    // changed; nothing was undone" — file restoration was dead per-machine.
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "diff.noprefix", "true"]);
+      await git(["config", "diff.external", "echo"]);
+      await git(["config", "apply.whitespace", "error"]);
+      const prepared = await prepareBeforeTurn(git, "hostile-config-session");
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      // Trailing whitespace so `apply.whitespace=error` would also reject.
+      await writeFile(join(cwd, "tracked.txt"), "turn   \n");
+      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+      const { beforeHash, afterHash } = finished.checkpoint;
+
+      expect(await applyCheckpoint(git, afterHash, beforeHash)).toBe("applied");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await applyCheckpoint(git, beforeHash, afterHash)).toBe("applied");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn   \n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

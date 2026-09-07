@@ -549,6 +549,15 @@ export async function retainCheckpointForResume(
 
 export type CheckpointApplyResult = "applied" | "conflict" | "failed";
 
+/** Restores `targetHash`'s content over a worktree that currently matches
+ *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
+ *
+ *  Every flag here pins the plumbing contract against the user's own
+ *  configuration: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` would
+ *  produce a patch `git apply -p1` cannot resolve, `diff.external` and
+ *  textconv filters would replace the patch with some other program's output,
+ *  and `apply.whitespace=error` would reject content git itself snapshotted.
+ *  Without them the feature is deterministically dead on such machines. */
 export async function applyCheckpoint(
   git: GitRunner,
   sourceHash: string,
@@ -558,8 +567,12 @@ export async function applyCheckpoint(
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
     const patchPath = join(tempDirectory, "checkpoint.patch");
-    const diff = await git([
+    const diff = await invoke(git, [
       "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
       "--exit-code",
       "--binary",
       sourceHash,
@@ -569,10 +582,18 @@ export async function applyCheckpoint(
     if (diff.code === 0) return "applied";
     if (diff.code !== 1) return "failed";
 
-    const check = await git(["apply", "--check", patchPath]);
-    if (check.code !== 0) return "conflict";
+    const check = await invoke(git, ["apply", "--whitespace=nowarn", "--check", patchPath]);
+    if (check.code !== 0) {
+      // `apply --check` failing does not prove the worktree drifted: a patch
+      // git cannot parse fails identically. When the worktree still matches
+      // the source snapshot, the patch is at fault — report that instead of
+      // blaming the worktree and sending the user to clean an already clean
+      // one.
+      const drift = await invoke(git, ["diff", "--no-ext-diff", "--quiet", sourceHash, "--"]);
+      return drift.code === 0 ? "failed" : "conflict";
+    }
 
-    const applied = await git(["apply", patchPath]);
+    const applied = await invoke(git, ["apply", "--whitespace=nowarn", patchPath]);
     return applied.code === 0 ? "applied" : "failed";
   } catch {
     return "failed";
