@@ -1427,11 +1427,24 @@ describe("history-safe Git checkpoints", () => {
       await writeFile(join(cwd, "tracked.txt"), "drifted\n");
       expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toBe("conflict");
 
-      // So does an untracked file colliding with the patch, which `git diff`
-      // alone cannot see.
+      // An unrelated untracked file must NOT be misdiagnosed as a conflict:
+      // the patch failed, not the worktree.
       await writeFile(join(cwd, "tracked.txt"), "base\n");
-      await writeFile(join(cwd, "collides.txt"), "extra\n");
-      expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toBe("conflict");
+      await writeFile(join(cwd, "unrelated.txt"), "extra\n");
+      expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toBe("failed");
+
+      // An actual collision (reported by git apply as 'already exists in working directory')
+      // IS a worktree conflict.
+      const collisionCheck: GitRunner = async (args, options) =>
+        args[0] === "apply" && args.includes("--check")
+          ? {
+              stdout: "",
+              stderr: "error: new-file.txt: already exists in working directory",
+              code: 1,
+            }
+          : git(args, options);
+      collisionCheck.cwd = git.cwd;
+      expect(await applyCheckpoint(collisionCheck, beforeHash, afterHash)).toBe("conflict");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

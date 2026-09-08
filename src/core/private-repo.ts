@@ -168,6 +168,7 @@ export async function ensurePrivateGitRepository(
     await mkdir(dirname(gitDir), { recursive: true, mode: 0o700 });
     if (process.platform !== "win32") {
       await chmod(dirname(gitDir), 0o700).catch(() => undefined);
+      await chmod(canonicalCwd(storeRoot), 0o700).catch(() => undefined);
     }
     if (!(await repoExists(gitDir))) {
       const init = await envGit(["init", "-q"]);
@@ -178,6 +179,9 @@ export async function ensurePrivateGitRepository(
       }
       const worktreeConfig = await envGit(["config", "core.worktree", worktree]);
       if (worktreeConfig.code !== 0) return null;
+    } else {
+      // Ensure repositories created by earlier versions write future objects owner-only
+      await envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined);
     }
     await ensureExclude(gitDir, worktree, storeRoot);
     return { worktree, gitDir, commonDir: gitDir, private: true };

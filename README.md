@@ -18,7 +18,7 @@ The extension uses the shared extension APIs provided by compatible OMP and Pi r
 
 ## Requirements
 
-- Node.js 22 or newer.
+- Node.js 20 or newer.
 - A compatible OMP or Pi release.
 - Git-backed projects use Git snapshots. Non-Git workspaces snapshot into a private per-workspace Git repository.
 

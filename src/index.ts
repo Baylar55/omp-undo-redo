@@ -107,7 +107,7 @@ async function timedOutAfter(promise: Promise<unknown>, ms: number): Promise<boo
 /** Per-controller private-repo state: a ready entry carries the repository and
  *  the env runner (GIT_DIR fixed), with `ready` resolving true once init
  *  completes; a `failure` entry records a failed init so session fallback is
- *  reused without retrying. Keyed by canonical cwd (private) or commonDir
+ *  reused without retrying. Keyed by canonical cwd (private) or worktree
  *  (git mode). */
 type ActivePrivateRepoEntry = {
   repository?: GitRepository;

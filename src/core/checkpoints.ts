@@ -35,7 +35,7 @@ export function historyRefPrefix(sessionHash: string): string {
 const persistentSnapshotIndices = new Map<string, SnapshotIndexLease>();
 
 function persistentIndexKey(repository: GitRepository, sessionId: string): string {
-  return `${repository.commonDir}\u0000${checkpointNamespace(sessionId)}`;
+  return `${repository.worktree}\u0000${checkpointNamespace(sessionId)}`;
 }
 
 export async function releaseAllPersistentSnapshotIndices(): Promise<void> {
@@ -325,7 +325,12 @@ export async function releaseRefs(
   gitForRepository: (repository: GitRepository) => GitRunner,
   refs: readonly RefRelease[],
 ): Promise<boolean> {
-  const grouped = Map.groupBy(refs, (ref) => ref.repository.commonDir);
+  const grouped = new Map<string, RefRelease[]>();
+  for (const ref of refs) {
+    const list = grouped.get(ref.repository.commonDir);
+    if (list) list.push(ref);
+    else grouped.set(ref.repository.commonDir, [ref]);
+  }
   const results = await Promise.allSettled(
     [...grouped.values()].map(async (groupedRefs) => {
       // groupBy never yields an empty group, so the head carries the repository.
@@ -585,6 +590,8 @@ export async function applyCheckpoint(
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
+        "--no-relative",
+        "--ignore-submodules=none",
         "--submodule=short",
         "-U3",
         "--src-prefix=a/",
@@ -604,11 +611,10 @@ export async function applyCheckpoint(
     if (diff.code === 0) return "applied";
     if (diff.code !== 1) return "failed";
 
-    const check = await invoke(
-      git,
-      ["apply", "--whitespace=nowarn", "--check", patchPath],
-      restore,
-    );
+    const check = await invoke(git, ["apply", "--whitespace=nowarn", "--check", patchPath], {
+      ...restore,
+      env: { LC_ALL: "C" },
+    });
     if (check.code !== 0) {
       if (check.error) return "failed";
       // `apply --check` failing does not prove the worktree drifted: a patch
@@ -623,28 +629,31 @@ export async function applyCheckpoint(
       // path as deleted, and a user's real index may carry staged adds or
       // deletes that are not worktree drift. `read-tree` records no stat data,
       // so the comparison must fall back to content — which is what
-      // `diff.autoRefreshIndex` controls, hence pinning it. Untracked files are
-      // invisible to `diff`, so they are probed separately: an untracked file
-      // colliding with an added path is the classic `apply` failure and is
-      // real drift.
+      // `diff.autoRefreshIndex` controls, hence pinning it.
       const probeEnv: Record<string, string> = {
         GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
       };
       if (git.env?.GIT_DIR && git.cwd) probeEnv.GIT_WORK_TREE = git.cwd;
       const seeded = await invoke(git, ["read-tree", sourceHash], { env: probeEnv });
-      if (seeded.code !== 0) return "conflict";
+      if (seeded.error || seeded.code !== 0) return "failed";
       const tracked = await invoke(
         git,
-        ["-c", "diff.autoRefreshIndex=true", "diff", "--no-ext-diff", "--quiet", sourceHash, "--"],
+        [
+          "-c",
+          "diff.autoRefreshIndex=true",
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--quiet",
+          sourceHash,
+          "--",
+        ],
         { env: probeEnv, timeoutMs: RESTORE_TIMEOUT_MS },
       );
+      if (tracked.error) return "failed";
       if (tracked.code !== 0) return "conflict";
-      const untracked = await invoke(
-        git,
-        ["ls-files", "--others", "--exclude-standard", "--", WORKTREE_PATHSPEC],
-        { env: probeEnv },
-      );
-      return untracked.code === 0 && untracked.stdout.trim() === "" ? "failed" : "conflict";
+      if (check.stderr.includes("already exists in working directory")) return "conflict";
+      return "failed";
     }
 
     const applied = await invoke(git, ["apply", "--whitespace=nowarn", patchPath], restore);
