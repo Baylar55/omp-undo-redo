@@ -35,7 +35,7 @@ export function historyRefPrefix(sessionHash: string): string {
 const persistentSnapshotIndices = new Map<string, SnapshotIndexLease>();
 
 function persistentIndexKey(repository: GitRepository, sessionId: string): string {
-  return `${repository.commonDir}\u0000${checkpointNamespace(sessionId)}`;
+  return `${repository.worktree}\u0000${checkpointNamespace(sessionId)}`;
 }
 
 export async function releaseAllPersistentSnapshotIndices(): Promise<void> {
@@ -325,10 +325,15 @@ export async function releaseRefs(
   gitForRepository: (repository: GitRepository) => GitRunner,
   refs: readonly RefRelease[],
 ): Promise<boolean> {
-  const grouped = Map.groupBy(refs, (ref) => ref.repository.commonDir);
+  const grouped = new Map<string, RefRelease[]>();
+  for (const ref of refs) {
+    const list = grouped.get(ref.repository.commonDir);
+    if (list) list.push(ref);
+    else grouped.set(ref.repository.commonDir, [ref]);
+  }
   const results = await Promise.allSettled(
     [...grouped.values()].map(async (groupedRefs) => {
-      // groupBy never yields an empty group, so the head carries the repository.
+      // Each group has at least one ref, so the head carries the repository.
       const { repository } = groupedRefs[0];
       try {
         const outcome = await deleteRefsBatched(gitForRepository(repository), groupedRefs, {
@@ -549,6 +554,25 @@ export async function retainCheckpointForResume(
 
 export type CheckpointApplyResult = "applied" | "conflict" | "failed";
 
+/** Restore invocations get a far larger ceiling than the runner's default:
+ *  diffing and applying a multi-GB binary change is slow but legitimate, and
+ *  a killed `git apply` can leave the worktree half-written. The deadline
+ *  exists only so a wedged child cannot hang the process forever. */
+const RESTORE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** Restores `targetHash`'s content over a worktree that currently matches
+ *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
+ *
+ *  Every flag pins the plumbing contract against the user's own
+ *  configuration, each of which otherwise kills restoration outright on that
+ *  machine: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` produce a patch
+ *  `git apply -p1` cannot resolve; `color.diff=always` prefixes it with ANSI
+ *  escapes ("No valid patches in input"); `diff.external` and textconv
+ *  filters replace it with another program's output; `diff.submodule=log`
+ *  replaces a gitlink hunk with a commit listing, which invalidates the whole
+ *  patch; `diff.context=0` yields hunks `git apply` refuses without
+ *  `--unidiff-zero`; `apply.whitespace=error` rejects content git itself
+ *  snapshotted. */
 export async function applyCheckpoint(
   git: GitRunner,
   sourceHash: string,
@@ -558,21 +582,81 @@ export async function applyCheckpoint(
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
     const patchPath = join(tempDirectory, "checkpoint.patch");
-    const diff = await git([
-      "diff",
-      "--exit-code",
-      "--binary",
-      sourceHash,
-      targetHash,
-      `--output=${patchPath}`,
-    ]);
+    const restore = { timeoutMs: RESTORE_TIMEOUT_MS };
+    const diff = await invoke(
+      git,
+      [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-relative",
+        "--ignore-submodules=none",
+        "--submodule=short",
+        "-U3",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--exit-code",
+        "--binary",
+        sourceHash,
+        targetHash,
+        `--output=${patchPath}`,
+      ],
+      restore,
+    );
+    // A killed or unspawnable child also exits 1, which is `--exit-code`'s
+    // "there were differences": without this the truncated patch `--output`
+    // already wrote would be applied and reported as a complete restore.
+    if (diff.error) return "failed";
     if (diff.code === 0) return "applied";
     if (diff.code !== 1) return "failed";
 
-    const check = await git(["apply", "--check", patchPath]);
-    if (check.code !== 0) return "conflict";
+    const check = await invoke(git, ["apply", "--whitespace=nowarn", "--check", patchPath], {
+      ...restore,
+      env: { LC_ALL: "C" },
+    });
+    if (check.code !== 0) {
+      if (check.error) return "failed";
+      // `apply --check` failing does not prove the worktree drifted: a patch
+      // git cannot parse fails identically. When the worktree still matches
+      // the source snapshot, the patch is at fault — report that instead of
+      // blaming the worktree and sending the user to clean an already clean
+      // one.
+      //
+      // The probe runs against its own index seeded from `sourceHash`, never
+      // the repository's: a private repo never writes its index at all (its
+      // snapshots use alternates), so `git diff <commit>` there reports every
+      // path as deleted, and a user's real index may carry staged adds or
+      // deletes that are not worktree drift. `read-tree` records no stat data,
+      // so the comparison must fall back to content — which is what
+      // `diff.autoRefreshIndex` controls, hence pinning it.
+      const probeEnv: Record<string, string> = {
+        GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
+      };
+      if (git.env?.GIT_DIR && git.cwd) probeEnv.GIT_WORK_TREE = git.cwd;
+      const seeded = await invoke(git, ["read-tree", sourceHash], { env: probeEnv });
+      if (seeded.error || seeded.code !== 0) return "failed";
+      const tracked = await invoke(
+        git,
+        [
+          "-c",
+          "diff.autoRefreshIndex=true",
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--quiet",
+          sourceHash,
+          "--",
+        ],
+        { env: probeEnv, timeoutMs: RESTORE_TIMEOUT_MS },
+      );
+      if (tracked.error) return "failed";
+      if (tracked.code !== 0) return "conflict";
+      if (check.stderr.includes("already exists in working directory")) return "conflict";
+      return "failed";
+    }
 
-    const applied = await git(["apply", patchPath]);
+    const applied = await invoke(git, ["apply", "--whitespace=nowarn", patchPath], restore);
     return applied.code === 0 ? "applied" : "failed";
   } catch {
     return "failed";

@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
-import { context, FakeExtensionApi, rmRetry } from "./helpers.js";
+import { context, FakeExtensionApi, makeRepository, privateRefs, rmRetry } from "./helpers.js";
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-test-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -181,7 +181,7 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
-  it("keeps a deferred finalize bound to its turn when a later turn starts before it settles", async () => {
+  it("records a session-only boundary for a turn the in-flight-capture guard skipped", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-race-"));
     const { runner, waitForAdds } = raceRunnerFactory(500);
     try {
@@ -213,22 +213,37 @@ describe("bounded capture lifecycle", () => {
         ctx.leaf = targetId;
         return { cancelled: false };
       };
-      for (let attempt = 0; attempt < 40; attempt += 1) {
-        await pi.runCommand("undo", ctx);
-        const message = ctx.ui.notifications.at(-1)?.message ?? "";
-        if (
-          message.includes("Nothing to undo") ||
-          message.includes("still being captured") ||
-          message.includes("still being finalized")
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 100));
-          continue;
+      // Both turns must be navigable. N+1's boundary is session-only (its
+      // capture was skipped), and recording it marks the file history as
+      // gapped, so neither undo restores files: N's after-snapshot was taken
+      // after N+1's edits, so restoring from it would revert two turns of file
+      // changes while moving one session boundary.
+      // Real-time polling is deliberate: finalizes settle on their own
+      // schedule behind the handler deadline, with no observable signal.
+      const messages: string[] = [];
+      for (let undos = 0; undos < 2; undos += 1) {
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          await pi.runCommand("undo", ctx);
+          const message = ctx.ui.notifications.at(-1)?.message ?? "";
+          if (
+            message.includes("Nothing to undo") ||
+            message.includes("still being captured") ||
+            message.includes("still being finalized")
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            continue;
+          }
+          messages.push(message);
+          break;
         }
-        break;
       }
-      // The undo must restore N's pre-turn state — not N+1's "changed-again".
-      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
-      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(messages).toHaveLength(2);
+      for (const message of messages) expect(message).toContain("files were not restored");
+      // Two boundaries, no more: the third undo finds an empty history.
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("Nothing to undo");
+      expect(ctx.leaf).toBe("leafN");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed-again\n");
     } finally {
       await waitForAdds(3).catch(() => undefined);
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -370,6 +385,74 @@ describe("bounded capture lifecycle", () => {
       expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
     } finally {
       releaseUpdateRef?.();
+      await rmRetry(cwd);
+    }
+  });
+
+  it("keeps a deferred finalize's checkpoint alive when the next turn starts", async () => {
+    // Regression: a finalize waiting behind the previous turn's finalize left
+    // its checkpoint in the pending slot, and the next before_agent_start
+    // released it — deleting the before-ref of a checkpoint that was then
+    // recorded anyway, leaving an unreferenced (gc-prunable) before-commit.
+    const cwd = await makeRepository("omp-undo-redo-defer-");
+    const gate = Promise.withResolvers<void>();
+    let retainSeen = 0;
+    let parked = false;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        // The retain of the FIRST turn: park its finalize so the second
+        // turn's finalize has to queue behind it.
+        if (args[0] === "update-ref" && args.includes("--stdin")) {
+          retainSeen += 1;
+          if (retainSeen === 1) {
+            parked = true;
+            await gate.promise;
+          }
+        }
+        return inner(args, options);
+      };
+      gated.cwd = workCwd;
+      if (env) gated.env = env;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
+      const ctx = context(cwd, "defer-session");
+      await pi.emit("session_start", ctx);
+
+      ctx.leaf = "leaf0";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "t1\n");
+      ctx.leaf = "leaf1";
+      const end1 = pi.emit("agent_end", ctx);
+      for (let attempt = 0; attempt < 200 && !parked; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(parked).toBe(true);
+
+      // Turn 2 captures normally, but its finalize must queue behind turn 1's.
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "t2\n");
+      ctx.leaf = "leaf2";
+      await pi.emit("agent_end", ctx);
+      // Turn 3 starts before turn 2's finalize got to record anything.
+      await pi.emit("before_agent_start", ctx);
+
+      gate.resolve();
+      await end1;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const refs = await privateRefs(cwd);
+        if (refs.filter((ref) => ref.includes("/history/")).length >= 4) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      // Both recorded turns keep both of their retained refs; a released
+      // before-ref would leave 3 (and an unreachable snapshot commit).
+      const refs = await privateRefs(cwd);
+      expect(refs.filter((ref) => ref.includes("/history/")).sort()).toHaveLength(4);
+    } finally {
+      gate.resolve();
       await rmRetry(cwd);
     }
   });

@@ -1,3 +1,4 @@
+import "./core/compat.js";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
@@ -106,7 +107,7 @@ async function timedOutAfter(promise: Promise<unknown>, ms: number): Promise<boo
 /** Per-controller private-repo state: a ready entry carries the repository and
  *  the env runner (GIT_DIR fixed), with `ready` resolving true once init
  *  completes; a `failure` entry records a failed init so session fallback is
- *  reused without retrying. Keyed by canonical cwd (private) or commonDir
+ *  reused without retrying. Keyed by canonical cwd (private) or worktree
  *  (git mode). */
 type ActivePrivateRepoEntry = {
   repository?: GitRepository;
@@ -174,16 +175,30 @@ export async function resolveBackend(
   const resolved = await resolveRepository(git);
   if ("repository" in resolved) {
     const repository = resolved.repository;
-    const existing = privateRepositories.get(repository.commonDir);
-    if (existing && "git" in existing && existing.git) {
+    const existing = privateRepositories.get(repository.worktree);
+    if (
+      existing &&
+      "git" in existing &&
+      existing.git &&
+      existing.repository?.gitDir === repository.gitDir
+    ) {
       return { kind: "git", repository, git: existing.git };
     }
-    privateRepositories.set(repository.commonDir, {
+    // Rooted at the worktree, not at `cwd`: `git apply` silently ignores
+    // patched paths outside its working directory, so a session started in a
+    // subdirectory would restore only that subtree and still report success.
+    // (`diff.relative=true` truncates the patch the same way.) Keyed by
+    // `repository.worktree`, not `repository.commonDir`: linked worktrees of
+    // the same repository share commonDir, so keying by commonDir would make
+    // the second worktree reuse the first's runner and run git operations in
+    // the wrong directory.
+    const worktreeGit = gitRunnerFactory(repository.worktree);
+    privateRepositories.set(repository.worktree, {
       repository,
-      git,
+      git: worktreeGit,
       ready: Promise.resolve(true),
     });
-    return { kind: "git", repository, git };
+    return { kind: "git", repository, git: worktreeGit };
   }
   if (resolved.reason !== "not_repository") return { kind: "session", reason: resolved.reason };
   const priv = await resolvePrivateGit(cwd, privateRepositories, gitRunnerFactory);
@@ -293,8 +308,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const captureDeadlineMs = deps.captureDeadlineMs ?? DEFAULT_CAPTURE_DEADLINE_MS;
   function gitRunnerFor(repository: GitRepository): GitRunner {
     const entry =
-      privateRepositories.get(repository.commonDir) ?? privateRepositories.get(repository.worktree);
-    if (entry && "git" in entry && entry.git) return entry.git;
+      privateRepositories.get(repository.worktree) ?? privateRepositories.get(repository.commonDir);
+    if (entry && "git" in entry && entry.git && entry.repository?.gitDir === repository.gitDir) {
+      return entry.git;
+    }
     return gitRunnerFactory(repository.worktree);
   }
   const ownerRegistry = new CheckpointOwnerRegistry({
@@ -305,10 +322,19 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const runtimeReady = runtimeStore.initialize();
   const navigations = new Map<string, SessionNavigation>();
   const backends = new Map<string, FileBackend>();
+  /** Checkpoints of the CURRENT turn that no finalize owns yet. Anything left
+   *  here when the next turn starts is released: ownership is what keeps a
+   *  deferred finalize's checkpoint alive (see `PendingCapture.owned`). */
   const pending = new Map<string, PendingTurnCheckpoint>();
   type PendingCapture = {
     complete: Promise<void>;
     checkpoint: PendingTurnCheckpoint | null;
+    /** Set when a finalize claims this capture. An owned capture's checkpoint
+     *  belongs to that finalize alone: it is never published into `pending`
+     *  (where the next turn would release it mid-finalize), and it is never
+     *  released by the capture itself. An unowned capture whose turn is gone
+     *  has no finalize coming, so it releases its own checkpoint. */
+    owned?: boolean;
   };
   /** Leaf the current turn started from, per session. Used to bind a
    *  checkpoint to the turn that captured it: a deferred finalize whose
@@ -317,7 +343,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const turnStartLeafBySession = new Map<string, string | null>();
 
   /** True when `gitDir` belongs to one of our private per-workspace repos.
-   *  Guards gc/prune triggers so they can never touch a user's own repo.
+   *  Guards gc/prune triggers so they can never touch a user's own repo:
+   *  `privateRepositories` also caches the user's repository in Git mode
+   *  (resolveBackend), so only the `private` flag stamped by
+   *  ensurePrivateGitRepository proves ownership — never map membership.
    *  The incoming gitDir is realpath-canonicalized before comparing so a
    *  checkpoint recorded with a long-form path still matches a repository
    *  whose gitDir was built from a short-form (8.3) store root or cwd —
@@ -327,7 +356,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     const canonicalGitDir = canonicalCwd(gitDir);
     for (const entry of privateRepositories.values()) {
       if ("failure" in entry) continue;
-      if (!entry.repository?.gitDir) continue;
+      if (entry.repository?.private !== true || !entry.repository.gitDir) continue;
       const canonicalEntry = canonicalCwd(entry.repository.gitDir);
       if (canonicalEntry === canonicalGitDir) return true;
     }
@@ -338,6 +367,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   // threshold that triggers a background `git gc`.
   const PRIVATE_GC_AFTER_CAPTURES = 20;
   const capturesSinceGcByGitDir = new Map<string, number>();
+
+  /** Repacking a large snapshot repo legitimately outruns the runner's
+   *  default per-child deadline, so gc gets its own ceiling: long enough that
+   *  a real gc always finishes, short enough that a wedged child cannot hold
+   *  a tracked operation (and with it the eviction sweep) forever. */
+  const PRIVATE_GC_TIMEOUT_MS = 15 * 60 * 1000;
 
   /** Best-effort `git gc` over a private repo. Runs outside the handler
    *  deadline accounting (never awaited by a handler) so a slow gc can never
@@ -350,7 +385,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // user's workspace or the snapshot repo itself (Windows keeps a child's
       // cwd handle until it exits, which would race teardown rms and the
       // eviction sweep). GIT_DIR is set, so the repo operations work anywhere.
-      await gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir })(["gc", "--prune=now"]);
+      await gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir })(["gc", "--prune=now"], {
+        timeoutMs: PRIVATE_GC_TIMEOUT_MS,
+      });
     } catch {
       // Best-effort: a failed gc leaves more work for the next trigger.
     }
@@ -728,11 +765,20 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     void track(async () => {
       try {
         const checkpoint = await task();
-        if (closing || pendingCaptures.get(sessionId) !== capture) {
+        // The capture's own turn is over once turnStartLeaf moved on. Its
+        // checkpoint then belongs to the finalize that claimed this capture —
+        // and to nobody at all if no `agent_end` ever claimed it (two
+        // `before_agent_start` events without one in between), in which case
+        // this is the only place left that can release it.
+        const ownTurn = turnStartLeafBySession.get(sessionId) === checkpoint.parentLeafId;
+        if (closing || pendingCaptures.get(sessionId) !== capture || !(ownTurn || capture.owned)) {
           await releasePending(checkpoint);
         } else {
           capture.checkpoint = checkpoint;
-          pending.set(sessionId, checkpoint);
+          // `pending` holds only unowned checkpoints: publishing an owned one
+          // would let the next turn's `before_agent_start` release it while
+          // its finalize is still deferred.
+          if (ownTurn && !capture.owned) pending.set(sessionId, checkpoint);
           if (
             checkpoint.kind === "git" &&
             checkpoint.repository.gitDir &&
@@ -858,10 +904,21 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
       // Record the leaf this turn starts from, then bound concurrent captures:
       // a turn that starts while the previous turn's capture is still in flight
-      // gets no new capture (its undo boundary is session-only) instead of
-      // stacking overlapping `git add` runs over the same workspace.
-      turnStartLeafBySession.set(sessionId, typed.sessionManager.getLeafId());
-      if (pendingCaptures.has(sessionId)) return;
+      // gets no new capture instead of stacking overlapping `git add` runs over
+      // the same workspace. Its boundary is recorded as session-only right
+      // here — leaving `pending` empty would drop the turn from the history
+      // entirely, because agent_end would then finalize the earlier turn's
+      // in-flight capture and this turn would produce no checkpoint at all.
+      const turnStartLeaf = typed.sessionManager.getLeafId();
+      turnStartLeafBySession.set(sessionId, turnStartLeaf);
+      if (pendingCaptures.has(sessionId)) {
+        pending.set(sessionId, {
+          kind: "session",
+          reason: "before_snapshot_failed",
+          parentLeafId: turnStartLeaf,
+        });
+        return;
+      }
 
       const backend =
         backends.get(sessionId) ??
@@ -870,16 +927,18 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (backend.kind === "session") {
         notifySessionOnly(typed, sessionId, backend.reason);
       }
-      const parentLeafId = typed.sessionManager.getLeafId();
       const capture = beginCapture(sessionId, async () => {
         const prepared =
           backend.kind === "git"
             ? await prepareBeforeTurn(backend.git, sessionId, ownerRegistry)
             : { status: "session_only" as const, reason: backend.reason };
+        // Bound to the leaf recorded above, never a fresh getLeafId(): the
+        // finalize identity check and the pending-slot check both compare
+        // against that value.
         const checkpoint: PendingTurnCheckpoint =
           prepared.status === "git"
-            ? { ...prepared.checkpoint, parentLeafId }
-            : { kind: "session", reason: prepared.reason, parentLeafId };
+            ? { ...prepared.checkpoint, parentLeafId: turnStartLeaf }
+            : { kind: "session", reason: prepared.reason, parentLeafId: turnStartLeaf };
         return checkpoint;
       });
       await timedOutAfter(capture.complete, captureDeadlineMs);
@@ -893,19 +952,35 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     turnStartLeaf: string | null,
   ): Promise<void> {
     const sessionId = typed.sessionManager.getSessionId();
+    // Claim the capture: from here its checkpoint is this finalize's alone.
+    // Taking the slot matters because the gate below can defer this finalize
+    // past the next `before_agent_start`, which releases whatever `pending`
+    // still holds.
+    capture.owned = true;
+    if (capture.checkpoint && pending.get(sessionId) === capture.checkpoint) {
+      pending.delete(sessionId);
+    }
+    // An earlier turn whose capture overran its deadline may still be
+    // finalizing. Its checkpoint must land in the history before this turn's,
+    // or the recorded order would not match the turn order (and a session-only
+    // boundary would convert file checkpoints that are not yet recorded).
+    const previousFinalize = pendingFinalizations.get(sessionId);
+    const ready = previousFinalize
+      ? previousFinalize.then(() => capture.complete)
+      : capture.complete;
     let handlerRelease!: () => void;
     const handlerDone = new Promise<void>((resolve) => {
       handlerRelease = resolve;
     });
     const work = (async () => {
       try {
-        if (await timedOutAfter(capture.complete, captureDeadlineMs)) {
-          // The capture overran the handler deadline. Keep this turn's
-          // finalize identity-bound — same capture, same leaf, same turn-start
-          // leaf, same context — so when it settles it finalizes its own
-          // checkpoint instead of a later turn's.
+        if (await timedOutAfter(ready, captureDeadlineMs)) {
+          // The capture (or the previous turn's finalize) overran the handler
+          // deadline. Keep this turn's finalize identity-bound — same capture,
+          // same leaf, same turn-start leaf, same context — so when it settles
+          // it finalizes its own checkpoint instead of a later turn's.
           handlerRelease();
-          await capture.complete;
+          await ready;
           await finalizeTurn(typed, capture, leafId, turnStartLeaf);
           return;
         }
@@ -969,11 +1044,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     // stale checkpoint is safer than recording it with the wrong leaf (which
     // would make an undo restore the wrong pre-turn state).
     if (before.parentLeafId !== turnStartLeaf) {
-      pending.delete(sessionId);
       await releasePending(before);
       return;
     }
-    pending.delete(sessionId);
     if (closing) {
       await releasePending(before);
       return;
@@ -1023,16 +1096,24 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     track(async () => {
       const typed = ctx as unknown as AnyContext;
       const sessionId = typed.sessionManager.getSessionId();
-      const capture = pendingCaptures.get(sessionId);
+      const turnStartLeaf = turnStartLeafBySession.get(sessionId) ?? null;
+      const own = pending.get(sessionId) ?? null;
+      // Prefer this turn's own boundary. An in-flight capture belonging to an
+      // earlier turn (the guard in before_agent_start skipped this turn's
+      // capture) must not be finalized here: it is this turn's leaf that would
+      // be attached to it, and the earlier turn's own deferred finalize is
+      // already waiting to record it correctly.
+      const capture =
+        own?.parentLeafId === turnStartLeaf ? undefined : pendingCaptures.get(sessionId);
       // A capture that already settled leaves no entry (its finally deletes
       // it), but its checkpoint stays in the pending map — finalize from that.
-      const settled = capture ? null : (pending.get(sessionId) ?? null);
+      const settled = capture ? null : own;
       if (!capture && !settled) return;
       await beginFinalizeTurn(
         typed,
         capture ?? { complete: Promise.resolve(), checkpoint: settled },
         typed.sessionManager.getLeafId(),
-        turnStartLeafBySession.get(sessionId) ?? null,
+        turnStartLeaf,
       );
     }),
   );
@@ -1074,7 +1155,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         .then(() =>
           Promise.allSettled(
             [...privateRepositories.values()].map(async (entry) => {
-              if ("failure" in entry || !entry.repository || !entry.git) return;
+              if ("failure" in entry || entry.repository?.private !== true || !entry.git) return;
               const gitDir = entry.repository.gitDir;
               if (!capturesSinceGcByGitDir.has(gitDir)) return;
               capturesSinceGcByGitDir.delete(gitDir);

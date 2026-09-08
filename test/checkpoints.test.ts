@@ -1353,4 +1353,134 @@ describe("history-safe Git checkpoints", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("restores files despite hostile local diff and apply configuration", async () => {
+    // Regression: the restore patch inherited the user's presentation config,
+    // so `diff.noprefix` (a common dotfile setting) or `diff.external` made
+    // every `git apply --check` fail and every /undo report "Worktree
+    // changed; nothing was undone" — file restoration was dead per-machine.
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      for (const [key, value] of [
+        ["diff.noprefix", "true"],
+        ["diff.external", "echo"],
+        ["diff.context", "0"],
+        ["diff.relative", "true"],
+        ["diff.submodule", "log"],
+        ["diff.autoRefreshIndex", "false"],
+        ["color.diff", "always"],
+        ["apply.whitespace", "error"],
+      ]) {
+        expect((await git(["config", key, value])).code).toBe(0);
+      }
+      const prepared = await prepareBeforeTurn(git, "hostile-config-session");
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      // Trailing whitespace so `apply.whitespace=error` would also reject.
+      await writeFile(join(cwd, "tracked.txt"), "turn   \n");
+      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+      const { beforeHash, afterHash } = finished.checkpoint;
+
+      expect(await applyCheckpoint(git, afterHash, beforeHash)).toBe("applied");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await applyCheckpoint(git, beforeHash, afterHash)).toBe("applied");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn   \n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blames the patch, not the worktree, when the worktree still matches the snapshot", async () => {
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const prepared = await prepareBeforeTurn(git, "drift-probe-session");
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+      const { beforeHash, afterHash } = finished.checkpoint;
+
+      // Worktree back to exactly the before-snapshot, with a staged deletion
+      // in the repository's own index: the probe must answer from an index it
+      // seeds itself, or the user's staging state reads as worktree drift.
+      // (A private repo never writes its index at all, which is the same
+      // failure with an even blunter cause.)
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      expect((await git(["update-index", "--force-remove", "tracked.txt"])).code).toBe(0);
+
+      // Force the check to fail the way an unparsable patch would.
+      const failingCheck: GitRunner = async (args, options) =>
+        args[0] === "apply" && args.includes("--check")
+          ? { stdout: "", stderr: "error: unrecognized input", code: 1 }
+          : git(args, options);
+      failingCheck.cwd = git.cwd;
+
+      expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toBe("failed");
+
+      // Real drift still reports a conflict.
+      await writeFile(join(cwd, "tracked.txt"), "drifted\n");
+      expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toBe("conflict");
+
+      // An unrelated untracked file must NOT be misdiagnosed as a conflict:
+      // the patch failed, not the worktree.
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await writeFile(join(cwd, "unrelated.txt"), "extra\n");
+      expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toBe("failed");
+
+      // An actual collision (reported by git apply as 'already exists in working directory')
+      // IS a worktree conflict.
+      const collisionCheck: GitRunner = async (args, options) =>
+        args[0] === "apply" && args.includes("--check")
+          ? {
+              stdout: "",
+              stderr: "error: new-file.txt: already exists in working directory",
+              code: 1,
+            }
+          : git(args, options);
+      collisionCheck.cwd = git.cwd;
+      expect(await applyCheckpoint(collisionCheck, beforeHash, afterHash)).toBe("conflict");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("never reports a restore as applied when the diff child was killed", async () => {
+    // Regression: a killed `git diff` exits 1, which is also --exit-code's
+    // "there were differences", so the truncated patch that --output already
+    // wrote was applied and reported as a complete restore.
+    const { cwd, git } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const prepared = await prepareBeforeTurn(git, "diff-timeout-session");
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+
+      const timedOutDiff: GitRunner = async (args, options) => {
+        if (args[0] === "diff") {
+          // What runGit returns for a child it had to terminate, after
+          // `--output` already wrote a valid patch prefix.
+          await git(args, options);
+          return { stdout: "", stderr: "", code: 1, error: "timeout" };
+        }
+        return git(args, options);
+      };
+      timedOutDiff.cwd = git.cwd;
+
+      const { afterHash, beforeHash } = finished.checkpoint;
+      expect(await applyCheckpoint(timedOutDiff, afterHash, beforeHash)).toBe("failed");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

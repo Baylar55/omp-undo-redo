@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
-import { context, FakeExtensionApi, rmRetry, type TestContext } from "./helpers.js";
+import { context, FakeExtensionApi, makeRepository, rmRetry, type TestContext } from "./helpers.js";
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-gc-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -97,6 +97,43 @@ describe("private-repo housekeeping", () => {
       expect(
         commands.some((command) => command[0] === "gc" && command.includes("--prune=now")),
       ).toBe(true);
+    } finally {
+      await rmRetry(cwd);
+    }
+  }, 120000);
+
+  it("never runs git gc against the user's own repository", async () => {
+    // Regression: `isPrivateRepository` used to answer "yes" for any repo in
+    // the shared `privateRepositories` map — which caches the user's own repo
+    // in Git mode — so 20 turns triggered `gc --prune=now` with GIT_DIR
+    // pointing at the workspace's .git.
+    const cwd = await makeRepository("omp-undo-redo-gc-usergit-");
+    const commands: string[][] = [];
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
+          const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
+          const wrapped: GitRunner = async (args, options) => {
+            commands.push(args);
+            return inner(args, options);
+          };
+          wrapped.cwd = cwd2;
+          if (env) wrapped.env = env;
+          return wrapped;
+        },
+      });
+      const ctx = context(cwd, "gc-usergit-session");
+      await runTurns(pi, ctx, 20, "tracked.txt");
+      await pi.emit("session_shutdown", ctx);
+      // Shutdown housekeeping is detached, so a gc would appear after the
+      // handler resolves: poll the recorded commands instead of trusting the
+      // handler's return, and require the window to lapse with none.
+      const scheduledGc = await waitFor(
+        async () => commands.some((command) => command[0] === "gc"),
+        20,
+      );
+      expect(scheduledGc).toBe(false);
     } finally {
       await rmRetry(cwd);
     }

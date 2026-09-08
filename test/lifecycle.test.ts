@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -185,6 +185,120 @@ describe("session-only lifecycle fallback", () => {
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
       await pi.runCommand("redo", ctx);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("D\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("restores files outside the session cwd when the session starts in a subdirectory", async () => {
+    // Regression: `git apply` ignores patched paths outside its working
+    // directory, so a session started in a subdirectory restored only that
+    // subtree — and still reported "file snapshot restored".
+    const cwd = await makeRepository("omp-undo-redo-subdir-");
+    try {
+      const nested = join(cwd, "sub");
+      await mkdir(nested);
+      await writeFile(join(nested, "inside.txt"), "base\n");
+      await git(cwd, ["add", "."]);
+      await git(cwd, ["commit", "-qm", "nested"]);
+
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(nested, "subdir-session");
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await writeFile(join(nested, "inside.txt"), "changed\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("base\n");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("binds separate git runners to linked worktrees of the same repository", async () => {
+    // Linked worktrees share `repository.commonDir`. `resolveBackend` must
+    // cache them by `repository.worktree`, or the second linked worktree would
+    // run its git operations inside the first worktree.
+    const mainWs = await makeRepository("omp-undo-redo-main-wt-");
+    const linkedWs = await mkdtemp(join(tmpdir(), "omp-undo-redo-linked-wt-"));
+    try {
+      await git(mainWs, ["worktree", "add", "-b", "linked", linkedWs]);
+      await writeFile(join(linkedWs, "linked.txt"), "linked-base\n");
+      await git(linkedWs, ["add", "."]);
+      await git(linkedWs, ["commit", "-qm", "linked-base"]);
+
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+
+      const mainCtx = context(mainWs, "main-session");
+      const linkedCtx = context(linkedWs, "linked-session");
+      await pi.emit("session_start", mainCtx);
+      await pi.emit("session_start", linkedCtx);
+
+      // Modify only the linked worktree and undo
+      await pi.emit("before_agent_start", linkedCtx);
+      await writeFile(join(linkedWs, "linked.txt"), "linked-changed\n");
+      linkedCtx.leaf = "linked-turn";
+      await pi.emit("agent_end", linkedCtx);
+      linkedCtx.navigateTree = async (targetId) => {
+        linkedCtx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", linkedCtx);
+
+      expect(linkedCtx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(await readFile(join(linkedWs, "linked.txt"), "utf8")).toBe("linked-base\n");
+      expect(await readFile(join(mainWs, "tracked.txt"), "utf8")).toBe("base\n");
+    } finally {
+      await rmRetry(linkedWs);
+      await rmRetry(mainWs);
+    }
+  });
+
+  it("switches to the real git runner when a workspace runs git init mid-session", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-init-mid-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "init-mid-session");
+      await pi.emit("session_start", ctx);
+
+      // Turn 1: non-Git mode (uses private repo)
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "first.txt"), "first\n");
+      ctx.leaf = "turn1";
+      await pi.emit("agent_end", ctx);
+
+      // User initializes Git in the workspace:
+      await git(cwd, ["init", "-q"]);
+      await git(cwd, ["config", "user.name", "test"]);
+      await git(cwd, ["config", "user.email", "test@example.com"]);
+      await git(cwd, ["config", "core.autocrlf", "false"]);
+
+      // Turn 2: must resolve the real Git repo, not reuse the private repo runner
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "second.txt"), "second\n");
+      ctx.leaf = "turn2";
+      await pi.emit("agent_end", ctx);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      await expect(readFile(join(cwd, "second.txt"))).rejects.toThrow();
     } finally {
       await rmRetry(cwd);
     }

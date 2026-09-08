@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CwdGitRunnerFactory, GitRepository } from "./types.js";
@@ -31,6 +31,9 @@ const PRIVATE_REPO_CONFIG: ReadonlyArray<readonly [string, string]> = [
   // non-bare repo so `core.worktree` is honored and the index/worktree
   // semantics used by snapshotting apply.
   ["core.bare", "false"],
+  // Owner-only object/pack modes, so the snapshot store stays unreadable to
+  // other local users even if the directory above it is loosened later.
+  ["core.sharedRepository", "0600"],
   ["core.autocrlf", "false"],
   ["core.longpaths", "true"],
   ["core.symlinks", "true"],
@@ -156,7 +159,17 @@ export async function ensurePrivateGitRepository(
   const gitDir = privateRepositoryPath(storeRoot, worktree);
   const envGit = gitRunnerFactory(worktree, { GIT_DIR: gitDir });
   try {
-    await mkdir(dirname(gitDir), { recursive: true });
+    // Owner-only: a Private-Git snapshot captures everything in the workspace
+    // that is not in DEFAULT_EXCLUDES — .env, id_rsa, credentials.json — and
+    // git's own loose objects are world-readable under the default umask. The
+    // mode covers directories this call creates; the chmod covers a store root
+    // created earlier (by an older version, or by another component) with the
+    // umask default. Windows ignores POSIX modes.
+    await mkdir(dirname(gitDir), { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") {
+      await chmod(dirname(gitDir), 0o700).catch(() => undefined);
+      await chmod(canonicalCwd(storeRoot), 0o700).catch(() => undefined);
+    }
     if (!(await repoExists(gitDir))) {
       const init = await envGit(["init", "-q"]);
       if (init.code !== 0) return null;
@@ -166,9 +179,12 @@ export async function ensurePrivateGitRepository(
       }
       const worktreeConfig = await envGit(["config", "core.worktree", worktree]);
       if (worktreeConfig.code !== 0) return null;
+    } else {
+      // Ensure repositories created by earlier versions write future objects owner-only
+      await envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined);
     }
     await ensureExclude(gitDir, worktree, storeRoot);
-    return { worktree, gitDir, commonDir: gitDir };
+    return { worktree, gitDir, commonDir: gitDir, private: true };
   } catch {
     return null;
   }

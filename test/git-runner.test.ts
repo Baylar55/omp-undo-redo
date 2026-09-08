@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createGitRunner } from "../src/core/git-runner.js";
+import { createGitRunner, DEFAULT_TIMEOUT_MS } from "../src/core/git-runner.js";
 
 async function runnerInTempRepo() {
   const cwd = await mkdtemp(join(tmpdir(), "omp-runner-test-"));
@@ -122,5 +122,28 @@ describe("Git runner", () => {
       code: 1,
       error: "unavailable",
     });
+  });
+
+  it("terminates a wedged child on the default deadline when no timeout is asked for", async () => {
+    // Regression: capture/apply invocations pass no timeoutMs, so a child that
+    // never exits left the capture promise unsettled for the process lifetime —
+    // /undo and /redo answered "still being captured" forever and every later
+    // turn skipped its capture.
+    vi.useFakeTimers();
+    const child = new FakeGitChild();
+    const resultPromise = runnerWithChild(child)(["add", "-A"]);
+    let settled = false;
+    void resultPromise.then(() => {
+      settled = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_TIMEOUT_MS - 1);
+    expect(child.signals).toEqual([]);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(child.signals).toEqual(["SIGTERM"]);
+    child.emit("close", null);
+    await expect(resultPromise).resolves.toMatchObject({ code: 1, error: "timeout" });
   });
 });

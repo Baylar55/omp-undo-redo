@@ -18,7 +18,7 @@ The extension uses the shared extension APIs provided by compatible OMP and Pi r
 
 ## Requirements
 
-- Node.js 22 or newer.
+- Node.js 20 or newer.
 - A compatible OMP or Pi release.
 - Git-backed projects use Git snapshots. Non-Git workspaces snapshot into a private per-workspace Git repository.
 
@@ -35,7 +35,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.6.1
+omp plugin install @baylarsadigov/omp-undo-redo@1.6.2
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -61,7 +61,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.6.1
+pi install npm:@baylarsadigov/omp-undo-redo@1.6.2
 ```
 
 To update installed Pi packages:
@@ -137,7 +137,7 @@ In non-Git workspaces, Private-Git mode expires the session's refs and history f
 Undo/redo operates in one of three modes:
 
 - **Git mode**: Git workspaces create private snapshots through an alternate index and `git commit-tree`, retaining refs under `refs/omp-undo-redo/history/`; `HEAD`, branch refs, and the real index are never touched.
-- **Private-Git mode**: Non-Git workspaces get an isolated private repository under `<storeRoot>/repos/<sha256(cwd)>.git` (defaults to `~/.omp/omp-undo-redo/repos/`, configurable via `OMP_UNDO_REDO_STORE_DIR` or legacy `OMP_UNDO_REDO_BLOB_DIR`), with the workspace as its worktree, and snapshots through the same alternate-index engine. The private repository is seeded with built-in ignores (`node_modules`, `dist`, `.omp`, etc.) so churn is bounded.
+- **Private-Git mode**: Non-Git workspaces get an isolated private repository under `<storeRoot>/repos/<sha256(cwd)>.git` (defaults to `~/.omp/omp-undo-redo/repos/`, configurable via `OMP_UNDO_REDO_STORE_DIR` or legacy `OMP_UNDO_REDO_BLOB_DIR`), with the workspace as its worktree, and snapshots through the same alternate-index engine. The private repository is seeded with built-in ignores (`node_modules`, `dist`, `.omp`, etc.) so churn is bounded. Because a non-Git workspace usually has no `.gitignore`, these snapshots capture **everything** outside that built-in list — `.env`, `id_rsa`, `*.pem`, `credentials.json` included — in plaintext Git objects for the whole retention window. The store root and its `repos/` directory are created owner-only (`0700`) and the repository is configured with `core.sharedRepository=0600`, so other local users on a shared POSIX host cannot read them; repositories created by an earlier version keep their original object modes, so delete `<storeRoot>/repos` if the store was ever created with a permissive umask.
 - **Session-only fallback**: If no Git binary is available or private repository initialization fails, the extension navigates session context without restoring file changes, notifying the user once per session.
 
 Git and Private-Git checkpoints cover tracked files and untracked non-ignored files across the complete repository worktree. Files matched by the repository's `.gitignore` — or by the built-in ignore list, which Private-Git mode seeds into its private repository — are outside these checkpoints: changes to them survive undo/redo untouched.
