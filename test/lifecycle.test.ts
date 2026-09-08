@@ -264,6 +264,45 @@ describe("session-only lifecycle fallback", () => {
       await rmRetry(mainWs);
     }
   });
+
+  it("switches to the real git runner when a workspace runs git init mid-session", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-init-mid-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "init-mid-session");
+      await pi.emit("session_start", ctx);
+
+      // Turn 1: non-Git mode (uses private repo)
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "first.txt"), "first\n");
+      ctx.leaf = "turn1";
+      await pi.emit("agent_end", ctx);
+
+      // User initializes Git in the workspace:
+      await git(cwd, ["init", "-q"]);
+      await git(cwd, ["config", "user.name", "test"]);
+      await git(cwd, ["config", "user.email", "test@example.com"]);
+      await git(cwd, ["config", "core.autocrlf", "false"]);
+
+      // Turn 2: must resolve the real Git repo, not reuse the private repo runner
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "second.txt"), "second\n");
+      ctx.leaf = "turn2";
+      await pi.emit("agent_end", ctx);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      await expect(readFile(join(cwd, "second.txt"))).rejects.toThrow();
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
 });
 
 describe("runtime action-state lifecycle", () => {

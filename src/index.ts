@@ -176,7 +176,12 @@ export async function resolveBackend(
   if ("repository" in resolved) {
     const repository = resolved.repository;
     const existing = privateRepositories.get(repository.worktree);
-    if (existing && "git" in existing && existing.git) {
+    if (
+      existing &&
+      "git" in existing &&
+      existing.git &&
+      existing.repository?.gitDir === repository.gitDir
+    ) {
       return { kind: "git", repository, git: existing.git };
     }
     // Rooted at the worktree, not at `cwd`: `git apply` silently ignores
@@ -304,7 +309,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   function gitRunnerFor(repository: GitRepository): GitRunner {
     const entry =
       privateRepositories.get(repository.worktree) ?? privateRepositories.get(repository.commonDir);
-    if (entry && "git" in entry && entry.git) return entry.git;
+    if (entry && "git" in entry && entry.git && entry.repository?.gitDir === repository.gitDir) {
+      return entry.git;
+    }
     return gitRunnerFactory(repository.worktree);
   }
   const ownerRegistry = new CheckpointOwnerRegistry({

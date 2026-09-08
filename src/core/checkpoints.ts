@@ -333,7 +333,7 @@ export async function releaseRefs(
   }
   const results = await Promise.allSettled(
     [...grouped.values()].map(async (groupedRefs) => {
-      // groupBy never yields an empty group, so the head carries the repository.
+      // Each group has at least one ref, so the head carries the repository.
       const { repository } = groupedRefs[0];
       try {
         const outcome = await deleteRefsBatched(gitForRepository(repository), groupedRefs, {
