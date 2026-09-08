@@ -14,6 +14,10 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - **Turns skipped by the in-flight-capture guard were recorded nowhere.** A turn starting while the previous turn's capture was still in flight produced no checkpoint at all: its boundary vanished, one `/undo` reverted two turns of file changes while moving one session boundary, and `/redo` could restore one turn's files at another turn's session leaf. The guard now records a session-only boundary (which also raises the existing file-history-gap barrier), `agent_end` prefers the current turn's boundary over an alien in-flight capture, and a turn's finalize waits for the previous turn's so recorded order matches turn order.
 - **Restores from a subdirectory only restored that subdirectory.** `git apply` ignores patched paths outside its working directory, so a session started in a subdirectory of a repository restored just that subtree and still reported success. Git-mode runners are now rooted at the worktree.
 
+### Changed
+
+- **Restored Node.js >=20 compatibility.** Reverted the v1.6.1 Node 22 engine requirement (`engines.node: ">=20"`), polyfilling `Promise.withResolvers` transparently on Node 20 runtimes so users on Node 20 LTS are not locked out while Node 22+ continues to use the native V8 implementation.
+
 ### Security
 
 - **Private snapshot store is created owner-only.** `<storeRoot>` and `<storeRoot>/repos` were created with the process umask (0755 by default) and git then wrote loose objects world-readable. Because a non-Git workspace usually has no `.gitignore`, those snapshots contain everything outside the built-in ignore list — `.env`, private keys, credential files — so on a shared POSIX host any local user could read the whole workspace out of `<storeRoot>/repos/<sha256>.git/objects/`. Both directories are now created with mode `0700` (plus an explicit `chmod` for a store root created earlier), and fresh private repositories set `core.sharedRepository=0600`. README and SECURITY.md now document what these snapshots contain; a store created by an earlier version keeps its original object modes, so remove `<storeRoot>/repos` once on a shared host.

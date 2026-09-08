@@ -1,3 +1,4 @@
+import "./core/compat.js";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { readFile, readdir, rename, rm, stat } from "node:fs/promises";

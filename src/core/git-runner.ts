@@ -1,3 +1,4 @@
+import "./compat.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { GitRunner } from "./types.js";
 
