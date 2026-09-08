@@ -639,9 +639,11 @@ export async function applyCheckpoint(
         { env: probeEnv, timeoutMs: RESTORE_TIMEOUT_MS },
       );
       if (tracked.code !== 0) return "conflict";
-      const untracked = await invoke(git, ["ls-files", "--others", "--exclude-standard"], {
-        env: probeEnv,
-      });
+      const untracked = await invoke(
+        git,
+        ["ls-files", "--others", "--exclude-standard", "--", WORKTREE_PATHSPEC],
+        { env: probeEnv },
+      );
       return untracked.code === 0 && untracked.stdout.trim() === "" ? "failed" : "conflict";
     }
 

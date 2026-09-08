@@ -224,6 +224,46 @@ describe("session-only lifecycle fallback", () => {
       await rmRetry(cwd);
     }
   });
+
+  it("binds separate git runners to linked worktrees of the same repository", async () => {
+    // Linked worktrees share `repository.commonDir`. `resolveBackend` must
+    // cache them by `repository.worktree`, or the second linked worktree would
+    // run its git operations inside the first worktree.
+    const mainWs = await makeRepository("omp-undo-redo-main-wt-");
+    const linkedWs = await mkdtemp(join(tmpdir(), "omp-undo-redo-linked-wt-"));
+    try {
+      await git(mainWs, ["worktree", "add", "-b", "linked", linkedWs]);
+      await writeFile(join(linkedWs, "linked.txt"), "linked-base\n");
+      await git(linkedWs, ["add", "."]);
+      await git(linkedWs, ["commit", "-qm", "linked-base"]);
+
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+
+      const mainCtx = context(mainWs, "main-session");
+      const linkedCtx = context(linkedWs, "linked-session");
+      await pi.emit("session_start", mainCtx);
+      await pi.emit("session_start", linkedCtx);
+
+      // Modify only the linked worktree and undo
+      await pi.emit("before_agent_start", linkedCtx);
+      await writeFile(join(linkedWs, "linked.txt"), "linked-changed\n");
+      linkedCtx.leaf = "linked-turn";
+      await pi.emit("agent_end", linkedCtx);
+      linkedCtx.navigateTree = async (targetId) => {
+        linkedCtx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", linkedCtx);
+
+      expect(linkedCtx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(await readFile(join(linkedWs, "linked.txt"), "utf8")).toBe("linked-base\n");
+      expect(await readFile(join(mainWs, "tracked.txt"), "utf8")).toBe("base\n");
+    } finally {
+      await rmRetry(linkedWs);
+      await rmRetry(mainWs);
+    }
+  });
 });
 
 describe("runtime action-state lifecycle", () => {

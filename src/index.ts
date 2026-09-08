@@ -174,17 +174,20 @@ export async function resolveBackend(
   const resolved = await resolveRepository(git);
   if ("repository" in resolved) {
     const repository = resolved.repository;
-    const existing = privateRepositories.get(repository.commonDir);
+    const existing = privateRepositories.get(repository.worktree);
     if (existing && "git" in existing && existing.git) {
       return { kind: "git", repository, git: existing.git };
     }
     // Rooted at the worktree, not at `cwd`: `git apply` silently ignores
     // patched paths outside its working directory, so a session started in a
     // subdirectory would restore only that subtree and still report success.
-    // (`diff.relative=true` truncates the patch the same way.) Capture is
-    // unaffected either way — it pathspecs `:(top)`.
+    // (`diff.relative=true` truncates the patch the same way.) Keyed by
+    // `repository.worktree`, not `repository.commonDir`: linked worktrees of
+    // the same repository share commonDir, so keying by commonDir would make
+    // the second worktree reuse the first's runner and run git operations in
+    // the wrong directory.
     const worktreeGit = gitRunnerFactory(repository.worktree);
-    privateRepositories.set(repository.commonDir, {
+    privateRepositories.set(repository.worktree, {
       repository,
       git: worktreeGit,
       ready: Promise.resolve(true),
@@ -299,7 +302,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const captureDeadlineMs = deps.captureDeadlineMs ?? DEFAULT_CAPTURE_DEADLINE_MS;
   function gitRunnerFor(repository: GitRepository): GitRunner {
     const entry =
-      privateRepositories.get(repository.commonDir) ?? privateRepositories.get(repository.worktree);
+      privateRepositories.get(repository.worktree) ?? privateRepositories.get(repository.commonDir);
     if (entry && "git" in entry && entry.git) return entry.git;
     return gitRunnerFactory(repository.worktree);
   }
