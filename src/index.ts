@@ -341,6 +341,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  checkpoint predates the current turn is released, never recorded with
    *  the wrong leaf. */
   const turnStartLeafBySession = new Map<string, string | null>();
+  /** Monotonic turn counter per session. A turn whose after-snapshot finishes
+   *  only after the next turn already started snapshotted that turn's edits
+   *  too, which is what makes such a checkpoint unrestorable. */
+  const turnSequenceBySession = new Map<string, number>();
 
   /** True when `gitDir` belongs to one of our private per-workspace repos.
    *  Guards gc/prune triggers so they can never touch a user's own repo:
@@ -848,6 +852,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       pending.delete(sessionId);
       if (previousPending) await releasePending(previousPending);
       turnStartLeafBySession.delete(sessionId);
+      turnSequenceBySession.delete(sessionId);
       // An in-flight capture for this session no longer belongs to a live turn:
       // it self-releases on completion via the identity check in beginCapture.
       pendingCaptures.delete(sessionId);
@@ -911,6 +916,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // in-flight capture and this turn would produce no checkpoint at all.
       const turnStartLeaf = typed.sessionManager.getLeafId();
       turnStartLeafBySession.set(sessionId, turnStartLeaf);
+      turnSequenceBySession.set(sessionId, (turnSequenceBySession.get(sessionId) ?? 0) + 1);
       if (pendingCaptures.has(sessionId)) {
         pending.set(sessionId, {
           kind: "session",
@@ -960,6 +966,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     if (capture.checkpoint && pending.get(sessionId) === capture.checkpoint) {
       pending.delete(sessionId);
     }
+    // Read here, not inside the finalize: a deferred finalize runs after the
+    // next turn already bumped the counter, and the comparison below is
+    // exactly what detects that.
+    const turnSequence = turnSequenceBySession.get(sessionId);
     // An earlier turn whose capture overran its deadline may still be
     // finalizing. Its checkpoint must land in the history before this turn's,
     // or the recorded order would not match the turn order (and a session-only
@@ -981,10 +991,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           // it finalizes its own checkpoint instead of a later turn's.
           handlerRelease();
           await ready;
-          await finalizeTurn(typed, capture, leafId, turnStartLeaf);
+          await finalizeTurn(typed, capture, leafId, turnStartLeaf, turnSequence);
           return;
         }
-        await finalizeTurn(typed, capture, leafId, turnStartLeaf);
+        await finalizeTurn(typed, capture, leafId, turnStartLeaf, turnSequence);
       } finally {
         handlerRelease();
       }
@@ -1031,6 +1041,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     capture: PendingCapture,
     leafId: string | null,
     turnStartLeaf: string | null,
+    turnSequence: number | undefined,
   ): Promise<void> {
     const sessionId = typed.sessionManager.getSessionId();
     await capture.complete;
@@ -1070,6 +1081,24 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (result.status === "git") {
         if (closing) {
           await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
+          return;
+        }
+        // The next turn started before this after-snapshot finished, so the
+        // snapshot also contains that turn's edits: restoring from it would
+        // revert two turns of file changes while moving one session boundary.
+        // Only this turn loses its file checkpoint — every earlier turn's
+        // stays restorable, and `applyCheckpoint` patches rather than checks
+        // out, so it reports a conflict instead of clobbering unrecorded
+        // edits when an older restore crosses this gap.
+        if (turnSequenceBySession.get(sessionId) !== turnSequence) {
+          await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
+          const gapped = await resolveNavigation(typed, sessionId);
+          await gapped.recordTurnEnd({
+            kind: "session",
+            reason: "file_history_gap",
+            parentLeafId: before.parentLeafId,
+            leafId,
+          });
           return;
         }
         const retained = await retainCheckpointForResume(

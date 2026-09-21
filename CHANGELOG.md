@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **One session-only turn no longer destroys the whole session's file history.** `recordTurnEnd` rewrote _every_ earlier Git checkpoint to `file_history_gap` and released its refs, irreversibly — on a trigger as cheap as a turn starting while the previous turn's capture was still in flight, a transient git failure, a timeout, or an invalid HEAD. A session-only turn no longer converts anything. The one genuinely unrestorable case is now detected where it happens instead of guessed at: when a turn's finalize is deferred past the next turn's start, its after-snapshot also contains that turn's edits (restoring from it would revert two turns while moving one session boundary), so that turn — and only that turn — is recorded as `file_history_gap` and its refs released together. Checkpoints on either side of a gap stay restorable: `applyCheckpoint` patches instead of checking out, so an un-snapshotted turn's edits survive when they are disjoint and produce a `conflict` instead of being clobbered when they are not.
+
 ## [1.6.2] - 2026-09-08
 
 ### Fixed
