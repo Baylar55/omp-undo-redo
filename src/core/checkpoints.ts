@@ -30,8 +30,10 @@ export function historyRefPrefix(sessionHash: string): string {
 // records a valid stat cache); every later turn's before/after snapshot reuses
 // it, so unchanged files are skipped via git's stat-dance instead of being
 // re-read. Keyed by repository + session so concurrent sessions/repos stay
-// isolated. The lease is dropped (and reseeded) whenever HEAD^{tree} changes,
-// and evicted whenever its directory is released.
+// isolated. The lease is dropped (and reseeded) whenever its baseline tree
+// changes, and evicted whenever its directory is released. With an unborn HEAD
+// there is no baseline commit, so the seeding snapshot's own tree is the
+// baseline and the lease goes stale once HEAD becomes born.
 const persistentSnapshotIndices = new Map<string, SnapshotIndexLease>();
 
 function persistentIndexKey(repository: GitRepository, sessionId: string): string {
@@ -177,6 +179,32 @@ async function createCommitForTree(
   return commitHash ? { hash: commitHash } : { reason: "snapshot_failed" };
 }
 
+/** A lease is usable only while its baseline still describes HEAD: the same
+ *  HEAD tree for a born HEAD, and a still-unborn HEAD for an unborn lease. */
+async function leaseBaselineCurrent(git: GitRunner, lease: SnapshotIndexLease): Promise<boolean> {
+  const head = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
+  if (head.error === "unavailable") return false;
+  const tree = head.code === 0 ? head.stdout.trim() : "";
+  return lease.unborn ? tree === "" : tree === lease.baseTree;
+}
+
+/** Drops index entries that the current ignore rules exclude. Index-only: no
+ *  worktree file is re-read, so the retained stat cache survives. */
+async function pruneIgnoredEntries(git: GitRunner, env: Record<string, string>): Promise<boolean> {
+  const ignored = await invoke(
+    git,
+    ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
+    { env },
+  );
+  if (ignored.code !== 0) return false;
+  if (!ignored.stdout) return true;
+  const removed = await invoke(git, ["update-index", "--force-remove", "-z", "--stdin"], {
+    env,
+    stdin: ignored.stdout,
+  });
+  return removed.code === 0;
+}
+
 async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined): Promise<boolean> {
   if (!lease) return true;
   for (const [key, value] of persistentSnapshotIndices) {
@@ -213,12 +241,15 @@ export async function createSnapshotCommit(
     if (!treeHash) return { reason: "snapshot_failed" };
     const commit = await createCommitForTree(git, treeHash, message);
     if (!("hash" in commit)) return commit;
-    if (retainIndex && seeded.status === "seeded") {
-      const snapshotIndexLease = {
-        directory: tempDirectory,
-        indexPath,
-        headTree: seeded.headTree,
-      };
+    if (retainIndex && (seeded.status === "seeded" || seeded.status === "empty")) {
+      const snapshotIndexLease: SnapshotIndexLease =
+        seeded.status === "seeded"
+          ? { directory: tempDirectory, indexPath, baseTree: seeded.headTree }
+          : // ponytail: unborn HEAD has no baseline commit, so the seeding
+            // snapshot's own tree is the baseline. It is reachable from the
+            // before/after refs; if it is ever pruned, diff-index fails and the
+            // lease is simply reseeded.
+            { directory: tempDirectory, indexPath, baseTree: treeHash, unborn: true };
       tempDirectory = null;
       return { hash: commit.hash, snapshotIndexLease };
     }
@@ -237,10 +268,7 @@ async function createSnapshotCommitFromLease(
   lease: SnapshotIndexLease,
   message: string,
 ): Promise<SnapshotResult> {
-  const currentHead = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
-  if (currentHead.code !== 0 || currentHead.stdout.trim() !== lease.headTree) {
-    return { reason: "snapshot_failed" };
-  }
+  if (!(await leaseBaselineCurrent(git, lease))) return { reason: "snapshot_failed" };
 
   const normalizationPath = join(lease.directory, `normalize-${randomUUID()}.nul`);
   const env = { GIT_INDEX_FILE: lease.indexPath };
@@ -251,11 +279,16 @@ async function createSnapshotCommitFromLease(
         "diff-index",
         "--cached",
         "--no-renames",
-        "--diff-filter=ADT",
+        // Added entries are normalized away only for a real HEAD baseline, where
+        // `reset` restores a tracked path cheaply. An unborn baseline never grows,
+        // so every file created during the session would be flagged `A` and
+        // re-hashed each turn; `pruneIgnoredEntries` covers the one case the drop
+        // exists for (a staged path that later became ignored).
+        `--diff-filter=${lease.unborn ? "DT" : "ADT"}`,
         "--name-only",
         "-z",
         `--output=${normalizationPath}`,
-        lease.headTree,
+        lease.baseTree,
         "--",
       ],
       { env },
@@ -270,7 +303,7 @@ async function createSnapshotCommitFromLease(
           "--literal-pathspecs",
           "reset",
           "-q",
-          lease.headTree,
+          lease.baseTree,
           `--pathspec-from-file=${normalizationPath}`,
           "--pathspec-file-nul",
         ],
@@ -283,14 +316,17 @@ async function createSnapshotCommitFromLease(
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
     const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
     if (added.code !== 0) return { reason: "snapshot_failed" };
+    // An unborn baseline's fresh equivalent is `read-tree --empty` + `add -A`,
+    // which never holds an ignored path. `add -A` cannot drop an entry that
+    // became ignored after it was staged, so prune those explicitly.
+    if (lease.unborn && !(await pruneIgnoredEntries(git, addEnv))) {
+      return { reason: "snapshot_failed" };
+    }
     const tree = await invoke(git, ["write-tree"], { env });
     const treeHash = tree.stdout.trim();
     if (tree.code !== 0 || !treeHash) return { reason: "snapshot_failed" };
 
-    const verifiedHead = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
-    if (verifiedHead.code !== 0 || verifiedHead.stdout.trim() !== lease.headTree) {
-      return { reason: "snapshot_failed" };
-    }
+    if (!(await leaseBaselineCurrent(git, lease))) return { reason: "snapshot_failed" };
     return createCommitForTree(git, treeHash, message);
   } catch {
     return { reason: "snapshot_failed" };

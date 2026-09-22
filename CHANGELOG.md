@@ -2,6 +2,16 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [1.6.3] - 2026-09-22
+
+### Fixed
+
+- **One session-only turn no longer destroys the whole session's file history.** `recordTurnEnd` rewrote _every_ earlier Git checkpoint to `file_history_gap` and released its refs, irreversibly — on a trigger as cheap as a turn starting while the previous turn's capture was still in flight, a transient git failure, a timeout, or an invalid HEAD. A session-only turn no longer converts anything. The one genuinely unrestorable case is now detected where it happens instead of guessed at: when a turn's finalize is deferred past the next turn's start, its after-snapshot also contains that turn's edits (restoring from it would revert two turns while moving one session boundary), so that turn — and only that turn — is recorded as `file_history_gap` and its refs released together. Checkpoints on either side of a gap stay restorable: `applyCheckpoint` patches instead of checking out, so an un-snapshotted turn's edits survive when they are disjoint and produce a `conflict` instead of being clobbered when they are not.
+
+### Performance
+
+- **Unborn HEAD re-hashed the whole workspace twice per turn.** The index lease was retained only when `HEAD^{tree}` resolved, and a Private-Git repository never commits to `HEAD`, so every non-Git workspace (and every Git repository before its first commit) took the cold path forever: a fresh empty index plus a full `git add -A` for both the before- and after-snapshot, with no stat cache. Unborn HEAD now normalizes against the seeding snapshot's own tree, keeps the lease until `HEAD` is born, and prunes newly ignored index entries (`ls-files --cached --ignored` + `update-index --force-remove`) so reused-index trees still match a fresh `read-tree --empty` + `add -A`. Measured on a 4,000-file workspace: ~2.9 s per snapshot before, ~0.6 s after.
+
 ## [1.6.2] - 2026-09-08
 
 ### Fixed
@@ -478,6 +488,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
+[1.6.3]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.6.3
 [1.6.2]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.6.2
 [1.6.1]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.6.1
 [1.3.0]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.3.0

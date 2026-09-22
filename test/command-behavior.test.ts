@@ -279,28 +279,39 @@ describe("session navigation", () => {
     });
   });
 
-  it("treats a session-only checkpoint as a file-history continuity barrier", async () => {
+  it("keeps file checkpoints on both sides of a session-only turn", async () => {
     const session = port();
-    const navigation = makeNavigation(session);
+    const applied: Array<[string, string]> = [];
+    const navigation = new SessionNavigation(
+      session,
+      mockGit(),
+      undefined,
+      undefined,
+      async (_checkpoint, sourceHash, targetHash) => {
+        applied.push([sourceHash, targetHash]);
+        return "applied";
+      },
+    );
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(sessionCheckpoint("a1", "a2"));
+    await navigation.recordTurnEnd(checkpoint("a2", "a3"));
 
+    // A turn with no file snapshot moves the session only; it must not
+    // destroy the file history recorded before or after it.
+    expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
     expect(await navigation.undo()).toMatchObject({
       files: "unavailable",
       reason: "not_repository",
     });
-    expect(await navigation.undo()).toMatchObject({
-      files: "unavailable",
-      reason: "file_history_gap",
-    });
-    expect(await navigation.redo()).toMatchObject({
-      files: "unavailable",
-      reason: "file_history_gap",
-    });
-    expect(await navigation.redo()).toMatchObject({
-      files: "unavailable",
-      reason: "not_repository",
-    });
+    expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
+    expect(session.leaf).toBe("u1");
+    expect(applied).toEqual([
+      ["after-a3", "before-a3"],
+      ["after-a1", "before-a1"],
+    ]);
+
+    expect(await navigation.redo()).toEqual({ status: "moved", files: "restored" });
+    expect(applied.at(-1)).toEqual(["before-a1", "after-a1"]);
   });
 
   it("does not move the history index when session navigation is cancelled", async () => {

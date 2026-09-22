@@ -389,18 +389,37 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
-  it("keeps a deferred finalize's checkpoint alive when the next turn starts", async () => {
+  it("drops only the deferred turn whose after-snapshot raced the next turn", async () => {
     // Regression: a finalize waiting behind the previous turn's finalize left
     // its checkpoint in the pending slot, and the next before_agent_start
     // released it — deleting the before-ref of a checkpoint that was then
     // recorded anyway, leaving an unreferenced (gc-prunable) before-commit.
+    // Turn 2's after-snapshot here is taken after turn 3 started, so it also
+    // holds turn 3's edits: that turn is recorded session-only and both of
+    // its refs go together, while turn 1's checkpoint survives intact.
     const cwd = await makeRepository("omp-undo-redo-defer-");
     const gate = Promise.withResolvers<void>();
     let retainSeen = 0;
     let parked = false;
+    let addSeen = 0;
+    const addListeners = new Set<() => void>();
+    const waitForAdds = (n: number): Promise<void> =>
+      new Promise((resolve) => {
+        const check = () => {
+          if (addSeen >= n) resolve();
+        };
+        addListeners.add(check);
+        check();
+      });
     const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
       const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
       const gated: GitRunner = async (args, options) => {
+        if (args.includes("add")) {
+          const result = await inner(args, options);
+          addSeen += 1;
+          addListeners.forEach((l) => l());
+          return result;
+        }
         // The retain of the FIRST turn: park its finalize so the second
         // turn's finalize has to queue behind it.
         if (args[0] === "update-ref" && args.includes("--stdin")) {
@@ -424,7 +443,8 @@ describe("bounded capture lifecycle", () => {
 
       ctx.leaf = "leaf0";
       await pi.emit("before_agent_start", ctx);
-      await writeFile(join(cwd, "tracked.txt"), "t1\n");
+      await waitForAdds(1);
+      await writeFile(join(cwd, "t1.txt"), "t1\n");
       ctx.leaf = "leaf1";
       const end1 = pi.emit("agent_end", ctx);
       for (let attempt = 0; attempt < 200 && !parked; attempt += 1) {
@@ -434,7 +454,8 @@ describe("bounded capture lifecycle", () => {
 
       // Turn 2 captures normally, but its finalize must queue behind turn 1's.
       await pi.emit("before_agent_start", ctx);
-      await writeFile(join(cwd, "tracked.txt"), "t2\n");
+      await waitForAdds(3);
+      await writeFile(join(cwd, "t2.txt"), "t2\n");
       ctx.leaf = "leaf2";
       await pi.emit("agent_end", ctx);
       // Turn 3 starts before turn 2's finalize got to record anything.
@@ -442,15 +463,37 @@ describe("bounded capture lifecycle", () => {
 
       gate.resolve();
       await end1;
-      for (let attempt = 0; attempt < 200; attempt += 1) {
-        const refs = await privateRefs(cwd);
-        if (refs.filter((ref) => ref.includes("/history/")).length >= 4) break;
-        await new Promise((resolve) => setTimeout(resolve, 25));
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      // Undo retries until no finalize is outstanding, which is the only
+      // observable "everything settled" signal.
+      const messages: string[] = [];
+      for (let undos = 0; undos < 2; undos += 1) {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          await pi.runCommand("undo", ctx);
+          const message = ctx.ui.notifications.at(-1)?.message ?? "";
+          if (
+            message.includes("Nothing to undo") ||
+            message.includes("still being captured") ||
+            message.includes("still being finalized")
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            continue;
+          }
+          messages.push(message);
+          break;
+        }
       }
-      // Both recorded turns keep both of their retained refs; a released
-      // before-ref would leave 3 (and an unreachable snapshot commit).
+      expect(messages[0]).toContain("files were not restored");
+      // Turn 1 kept its file checkpoint: only the turn whose snapshot raced
+      // the next turn is dropped.
+      expect(messages[1]).toContain("file snapshot restored");
+      // Exactly turn 1's retained pair: turn 2's released checkpoint leaves
+      // neither a half-released ref nor an unreachable snapshot commit.
       const refs = await privateRefs(cwd);
-      expect(refs.filter((ref) => ref.includes("/history/")).sort()).toHaveLength(4);
+      expect(refs.filter((ref) => ref.includes("/history/"))).toHaveLength(2);
     } finally {
       gate.resolve();
       await rmRetry(cwd);

@@ -1021,7 +1021,7 @@ describe("history-safe Git checkpoints", () => {
       const prepared = await prepareBeforeTurn(git, "unborn");
       expect(prepared.status).toBe("git");
       if (prepared.status !== "git") return;
-      expect(prepared.checkpoint.snapshotIndexLease).toBeUndefined();
+      expect(prepared.checkpoint.snapshotIndexLease).toBeDefined();
 
       await rm(join(cwd, "before.txt"));
       await writeFile(join(cwd, "after.txt"), "after\n");
@@ -1042,6 +1042,85 @@ describe("history-safe Git checkpoints", () => {
       expect((await git(["rev-parse", "HEAD"])).code).not.toBe(0);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+      await releaseAllPersistentSnapshotIndices();
+    }
+  });
+
+  it("reuses and normalizes the alternate index in an unborn repository", async () => {
+    const { cwd, git } = await makeRepo();
+    const sessionId = "unborn-reuse";
+    try {
+      await writeFile(join(cwd, "tracked.txt"), "initial\n");
+      await writeFile(join(cwd, "candidate.txt"), "untracked before ignore\n");
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(git, sessionId));
+      const leaseDirectory = before1.snapshotIndexLease?.directory;
+      expect(leaseDirectory).toBeDefined();
+      if (!leaseDirectory) return;
+      const after1 = completedCheckpoint(await finishAfterTurn(git, before1, null, null));
+
+      await writeFile(join(cwd, ".gitignore"), "candidate.txt\n");
+      await writeFile(join(cwd, "tracked.txt"), "mutated between turns\n");
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(git, sessionId));
+      expect(before2.snapshotIndexLease?.directory).toBe(leaseDirectory);
+      const after2 = completedCheckpoint(await finishAfterTurn(git, before2, null, null));
+
+      const names = await text(git, ["ls-tree", "-r", "--name-only", after2.afterHash]);
+      expect(names).not.toContain("candidate.txt");
+      expect(await text(git, ["show", `${after2.afterHash}:tracked.txt`])).toBe(
+        "mutated between turns",
+      );
+
+      await releaseCheckpoint(git, after1);
+      await releaseCheckpoint(git, after2);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releaseAllPersistentSnapshotIndices();
+    }
+  });
+
+  it("keeps files created mid-session in the unborn index instead of resetting them", async () => {
+    const { cwd, git: baseGit } = await makeRepo();
+    const sessionId = "unborn-midsession";
+    const commands: string[][] = [];
+    const git = Object.assign(
+      async (args: string[], options?: Parameters<GitRunner>[1]) => {
+        commands.push(args);
+        return baseGit(args, options);
+      },
+      { cwd },
+    ) satisfies GitRunner;
+    try {
+      // Seed the lease against an empty workspace: its baseline tree is empty,
+      // so every later file is "added" relative to it.
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(git, sessionId));
+      await writeFile(join(cwd, "created.txt"), "created during turn 1\n");
+      await writeFile(join(cwd, "ignored-later.txt"), "created during turn 1\n");
+      const after1 = completedCheckpoint(await finishAfterTurn(git, before1, null, null));
+
+      commands.length = 0;
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(git, sessionId));
+      expect(commands.some((args) => args.includes("reset"))).toBe(false);
+      expect(await text(git, ["show", `${before2.beforeHash}:created.txt`])).toBe(
+        "created during turn 1",
+      );
+
+      // A mid-session file that becomes ignored must still leave the tree.
+      await writeFile(join(cwd, ".gitignore"), "ignored-later.txt\n");
+      const after2 = completedCheckpoint(await finishAfterTurn(git, before2, null, null));
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(baseGit, "unborn-ground-truth"));
+      expect(await text(baseGit, ["rev-parse", `${after2.afterHash}^{tree}`])).toBe(
+        await text(baseGit, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+      );
+      const names = await text(baseGit, ["ls-tree", "-r", "--name-only", after2.afterHash]);
+      expect(names).toContain("created.txt");
+      expect(names).not.toContain("ignored-later.txt");
+
+      await releasePendingCheckpoint(baseGit, fresh);
+      await releaseCheckpoint(baseGit, after1);
+      await releaseCheckpoint(baseGit, after2);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releaseAllPersistentSnapshotIndices();
     }
   });
 

@@ -128,22 +128,6 @@ export class SessionNavigation {
     await this.releaseFileCheckpoints(discarded);
   }
 
-  private convertEarlierFileCheckpoints(): GitCheckpoint[] {
-    const converted: GitCheckpoint[] = [];
-    for (let index = 0; index < this.checkpoints.length; index++) {
-      const entry = this.checkpoints[index];
-      if (entry.kind === "session") continue;
-      converted.push(entry);
-      this.checkpoints[index] = {
-        kind: "session",
-        reason: "file_history_gap",
-        parentLeafId: entry.parentLeafId,
-        leafId: entry.leafId,
-      };
-    }
-    return converted;
-  }
-
   private async releaseFileCheckpoints(entries: readonly TurnCheckpoint[]): Promise<void> {
     await releaseCheckpoints(
       this.gitForRepository,
@@ -151,6 +135,14 @@ export class SessionNavigation {
     );
   }
 
+  /** A session-only turn is a hole in the file history, not a reason to
+   *  discard the turns around it. The one genuinely unrestorable case — an
+   *  after-snapshot that raced the next turn's edits — is detected where it
+   *  happens and recorded as `file_history_gap` for that turn alone.
+   *  Checkpoints on the far side of a hole stay restorable: `applyCheckpoint`
+   *  patches instead of checking out, so an un-snapshotted turn's edits
+   *  survive when they are disjoint and produce a `conflict` when they are
+   *  not. */
   async recordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
     await this.serializeNavigation(() => this.performRecordTurnEnd(checkpoint));
   }
@@ -160,11 +152,10 @@ export class SessionNavigation {
       this.currentIndex + 1,
       this.checkpoints.length - this.currentIndex - 1,
     );
-    const converted = checkpoint.kind === "session" ? this.convertEarlierFileCheckpoints() : [];
     this.checkpoints.push(checkpoint);
     this.currentIndex = this.checkpoints.length - 1;
     await this.persistState();
-    await this.releaseFileCheckpoints([...discarded, ...converted]);
+    await this.releaseFileCheckpoints(discarded);
   }
 
   /** Teardown-only: runs outside the navigation chain (suspend/resume path). */

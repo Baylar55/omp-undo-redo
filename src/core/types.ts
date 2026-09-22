@@ -102,7 +102,11 @@ export interface GitRepository {
 export interface SnapshotIndexLease {
   directory: string;
   indexPath: string;
-  headTree: string;
+  /** Normalization baseline: HEAD's tree, or — when HEAD is unborn — the tree
+   *  written by the snapshot that seeded this index. */
+  baseTree: string;
+  /** Seeded against an unborn HEAD; the lease goes stale once HEAD is born. */
+  unborn?: true;
 }
 
 export interface GitCheckpoint {

@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ompUndoRedo from "../src/index.js";
 import { applyCheckpoint, finishAfterTurn, prepareBeforeTurn } from "../src/core/checkpoints.js";
+import { createGitRunner } from "../src/core/git-runner.js";
 import { SessionNavigation } from "../src/core/session-navigation.js";
 import type { GitRunner } from "../src/core/types.js";
 import {
@@ -164,6 +165,64 @@ describe("temp-directory failure resilience", () => {
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
         "Redid the session turn, but files were not restored because the file checkpoint could not be created.",
       );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("A2. a later session-only turn does not destroy an earlier file checkpoint", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      let failAdd = false;
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: (workCwd, env) => {
+          const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+          const gated: GitRunner = async (args, options) =>
+            failAdd && args.includes("add")
+              ? { code: 1, stdout: "", stderr: "simulated add failure", error: null }
+              : inner(args, options);
+          gated.cwd = workCwd;
+          if (env) gated.env = env;
+          return gated;
+        },
+      });
+      const ctx = context(cwd, "sess-gap-keeps-history");
+
+      await pi.emit("session_start", ctx);
+      // Turn 1: a complete file checkpoint over tracked.txt.
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "turn-one\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      // Turn 2: its before-snapshot fails, so the turn is session-only.
+      // Turn 1's checkpoint must survive it.
+      failAdd = true;
+      await pi.emit("before_agent_start", ctx);
+      failAdd = false;
+      await writeFile(join(cwd, "other.txt"), "turn-two\n");
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("turn-1");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("files were not restored");
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      // The un-snapshotted turn's own edit is untouched: the restore patches,
+      // it does not check out.
+      expect(await readFile(join(cwd, "other.txt"), "utf8")).toBe("turn-two\n");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

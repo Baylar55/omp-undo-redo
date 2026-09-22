@@ -22,7 +22,7 @@ The extension uses the shared extension APIs provided by compatible OMP and Pi r
 - A compatible OMP or Pi release.
 - Git-backed projects use Git snapshots. Non-Git workspaces snapshot into a private per-workspace Git repository.
 
-An initialized Git repository does not need an existing commit. In an unborn repository, the extension creates full file checkpoints from an empty index.
+An initialized Git repository does not need an existing commit. In an unborn repository, the extension seeds its checkpoint index from the first snapshot's own tree and keeps that index lease until `HEAD` is born, so later turns reuse the stat cache instead of re-hashing the workspace.
 
 ## Installation
 
@@ -35,7 +35,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.6.2
+omp plugin install @baylarsadigov/omp-undo-redo@1.6.3
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -61,7 +61,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.6.2
+pi install npm:@baylarsadigov/omp-undo-redo@1.6.3
 ```
 
 To update installed Pi packages:
@@ -142,7 +142,7 @@ Undo/redo operates in one of three modes:
 
 Git and Private-Git checkpoints cover tracked files and untracked non-ignored files across the complete repository worktree. Files matched by the repository's `.gitignore` — or by the built-in ignore list, which Private-Git mode seeds into its private repository — are outside these checkpoints: changes to them survive undo/redo untouched.
 
-Checkpoint capture never blocks the agent: `before_agent_start`, `agent_end`, `/undo` and `/redo` wait at most a few seconds (default 3 s, configurable by hosts embedding the extension) for an in-flight capture; when a capture overruns that deadline it keeps running in the background and the turn's undo boundary is recorded as soon as it settles, so a very large or slow workspace cannot time out the extension handlers (OMP's 30 s handler cap). While a capture is still in flight, `/undo`/`/redo` tell you to try again shortly instead of acting on a half-recorded state.
+Checkpoint capture never blocks the agent: `before_agent_start`, `agent_end`, `/undo` and `/redo` wait at most a few seconds (default 3 s, configurable by hosts embedding the extension) for an in-flight capture; when a capture overruns that deadline it keeps running in the background and the turn's undo boundary is recorded as soon as it settles, so a very large or slow workspace cannot time out the extension handlers (OMP's 30 s handler cap). While a capture is still in flight, `/undo`/`/redo` tell you to try again shortly instead of acting on a half-recorded state. A turn whose capture only settles after the next turn already started keeps its session boundary but loses file restoration for that turn alone (its snapshot already contains the next turn's edits); turns before and after it stay restorable.
 
 ### Checkpoint ownership and stale cleanup
 

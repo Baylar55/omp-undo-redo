@@ -161,26 +161,29 @@ describe("session-only lifecycle fallback", () => {
       ctx.leaf = "turn-2";
       await pi.emit("agent_end", ctx);
       await writeFile(join(cwd, ".git", "HEAD"), head);
-      expect(await privateRefs(cwd)).toEqual([]);
+      // Turn 1's checkpoint survives turn 2's missing one.
+      expect(await privateRefs(cwd)).toHaveLength(2);
 
       await pi.emit("before_agent_start", ctx);
       await writeFile(join(cwd, "tracked.txt"), "D\n");
       ctx.leaf = "turn-3";
       await pi.emit("agent_end", ctx);
-      expect(await privateRefs(cwd)).toHaveLength(2);
+      expect(await privateRefs(cwd)).toHaveLength(4);
 
-      await pi.runCommand("undo", ctx);
-      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
       await pi.runCommand("undo", ctx);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
       await pi.runCommand("undo", ctx);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Undid the session turn, but files were not restored because a later turn had no file checkpoint, so this older file checkpoint was discarded.",
+        "Undid the session turn, but files were not restored because the Git repository has an invalid HEAD.",
       );
-
-      await pi.runCommand("redo", ctx);
+      // Turn 1 still owns a file checkpoint, so its restore is attempted and
+      // refused: the gapped turn's edit to the same file is unrecorded and
+      // would be lost. Nothing is written.
+      await pi.runCommand("undo", ctx);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe("Worktree changed; nothing was undone.");
+
       await pi.runCommand("redo", ctx);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
       await pi.runCommand("redo", ctx);
