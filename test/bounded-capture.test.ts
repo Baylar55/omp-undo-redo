@@ -401,9 +401,25 @@ describe("bounded capture lifecycle", () => {
     const gate = Promise.withResolvers<void>();
     let retainSeen = 0;
     let parked = false;
+    let addSeen = 0;
+    const addListeners = new Set<() => void>();
+    const waitForAdds = (n: number): Promise<void> =>
+      new Promise((resolve) => {
+        const check = () => {
+          if (addSeen >= n) resolve();
+        };
+        addListeners.add(check);
+        check();
+      });
     const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
       const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
       const gated: GitRunner = async (args, options) => {
+        if (args.includes("add")) {
+          const result = await inner(args, options);
+          addSeen += 1;
+          addListeners.forEach((l) => l());
+          return result;
+        }
         // The retain of the FIRST turn: park its finalize so the second
         // turn's finalize has to queue behind it.
         if (args[0] === "update-ref" && args.includes("--stdin")) {
@@ -427,7 +443,8 @@ describe("bounded capture lifecycle", () => {
 
       ctx.leaf = "leaf0";
       await pi.emit("before_agent_start", ctx);
-      await writeFile(join(cwd, "tracked.txt"), "t1\n");
+      await waitForAdds(1);
+      await writeFile(join(cwd, "t1.txt"), "t1\n");
       ctx.leaf = "leaf1";
       const end1 = pi.emit("agent_end", ctx);
       for (let attempt = 0; attempt < 200 && !parked; attempt += 1) {
@@ -437,7 +454,8 @@ describe("bounded capture lifecycle", () => {
 
       // Turn 2 captures normally, but its finalize must queue behind turn 1's.
       await pi.emit("before_agent_start", ctx);
-      await writeFile(join(cwd, "tracked.txt"), "t2\n");
+      await waitForAdds(3);
+      await writeFile(join(cwd, "t2.txt"), "t2\n");
       ctx.leaf = "leaf2";
       await pi.emit("agent_end", ctx);
       // Turn 3 starts before turn 2's finalize got to record anything.
