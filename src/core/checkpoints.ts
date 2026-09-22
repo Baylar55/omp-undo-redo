@@ -190,10 +190,7 @@ async function leaseBaselineCurrent(git: GitRunner, lease: SnapshotIndexLease): 
 
 /** Drops index entries that the current ignore rules exclude. Index-only: no
  *  worktree file is re-read, so the retained stat cache survives. */
-async function pruneIgnoredEntries(
-  git: GitRunner,
-  env: Record<string, string>,
-): Promise<boolean> {
+async function pruneIgnoredEntries(git: GitRunner, env: Record<string, string>): Promise<boolean> {
   const ignored = await invoke(
     git,
     ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
