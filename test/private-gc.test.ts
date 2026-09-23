@@ -221,10 +221,13 @@ describe("private-repo housekeeping", () => {
         const repoEntry = `${"f".repeat(64)}.git`;
         const gitDir = join(reposDir, repoEntry);
         await mkdir(gitDir, { recursive: true });
-        await writeFile(
+        await createGitRunner(reposDir)([
+          "config",
+          "--file",
           join(gitDir, "config"),
-          `[core]\n\tworktree = ${join(worktreeParent, "project")}\n`,
-        );
+          "core.worktree",
+          join(worktreeParent, "project"),
+        ]);
         await writeFile(join(gitDir, "gc.pid"), "999999\n");
         await backdateRepo(gitDir);
         ompUndoRedo(new FakeExtensionApi() as never, {});
@@ -240,6 +243,39 @@ describe("private-repo housekeeping", () => {
         await readFile(join(reposDir, trash, "config"), "utf8");
       } finally {
         await rm(worktreeParent, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+  });
+
+  it("keeps a repo whose live workspace path git quotes in config", async () => {
+    // Regression: git writes `worktree = "C:\\…\\C# proj"` for values with
+    // `#`/`;`; a raw regex kept quotes and escapes, stat hit ENOENT, and an
+    // idle repo of a live workspace was evicted.
+    await withHermeticStore(async (reposDir) => {
+      const parent = await mkdtemp(join(tmpdir(), "omp-undo-redo-quoted-ws-"));
+      try {
+        const worktree = join(parent, "C# proj; 2");
+        await mkdir(worktree);
+        const repoEntry = `${"e".repeat(64)}.git`;
+        const gitDir = join(reposDir, repoEntry);
+        await mkdir(gitDir, { recursive: true });
+        await createGitRunner(reposDir)([
+          "config",
+          "--file",
+          join(gitDir, "config"),
+          "core.worktree",
+          worktree,
+        ]);
+        expect(await readFile(join(gitDir, "config"), "utf8")).toContain('"');
+        await backdateRepo(gitDir);
+        ompUndoRedo(new FakeExtensionApi() as never, {});
+        const changed = await waitFor(
+          async () => (await readdir(reposDir)).join(",") !== repoEntry,
+          30,
+        );
+        expect(changed).toBe(false);
+      } finally {
+        await rm(parent, { recursive: true, force: true }).catch(() => undefined);
       }
     });
   });

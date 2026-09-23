@@ -1,7 +1,7 @@
 import "./core/compat.js";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { readdir, rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionEntryLike } from "./core/types.js";
@@ -533,10 +533,19 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         } catch {
           // No pidfile.
         }
-        const config = await readFile(join(path, "config"), "utf8");
-        const worktreeMatch = /^\s*worktree\s*=\s*(.+)$/m.exec(config);
-        if (!worktreeMatch) continue;
-        const worktree = worktreeMatch[1].trim();
+        // Let git decode the value: it quotes values containing `#`/`;` and
+        // escapes `\`/`"`, so a raw regex over the file yields a path that
+        // never stats (e.g. "C:\\…\\C# Projects") and evicts live history.
+        const worktreeConfig = await gitRunnerFactory(reposDir)([
+          "config",
+          "--file",
+          join(path, "config"),
+          "--get",
+          "core.worktree",
+        ]);
+        if (worktreeConfig.code !== 0) continue;
+        const worktree = worktreeConfig.stdout.replace(/\r?\n$/, "");
+        if (!worktree) continue;
         const vanished = async (): Promise<boolean> => {
           try {
             await stat(worktree);
