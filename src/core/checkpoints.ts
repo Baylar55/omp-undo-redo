@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
@@ -596,6 +596,111 @@ export type CheckpointApplyResult = "applied" | "conflict" | "failed";
  *  exists only so a wedged child cannot hang the process forever. */
 const RESTORE_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** Paths of `paths` that `tree`'s own ignore rules exclude. The rules are
+ *  materialized into a scratch worktree (`tree`'s `.gitignore` files only) so
+ *  `check-ignore` evaluates them exactly as git would have when that tree was
+ *  snapshotted, alongside the repository's `info/exclude` and global excludes. */
+async function ignoredUnder(
+  git: GitRunner,
+  tree: string,
+  paths: readonly string[],
+  directory: string,
+  label: string,
+): Promise<string[] | null> {
+  if (paths.length === 0) return [];
+  const rules = join(directory, `${label}-rules`);
+  await mkdir(rules);
+  const env = { GIT_INDEX_FILE: join(directory, `${label}-index`), GIT_WORK_TREE: rules };
+  if ((await invoke(git, ["read-tree", tree], { env })).code !== 0) return null;
+  const files = await invoke(git, ["ls-files", "-z", "--", ":(glob)**/.gitignore"], { env });
+  if (files.code !== 0) return null;
+  if (files.stdout) {
+    const written = await invoke(git, ["checkout-index", "-z", "--stdin"], {
+      env,
+      stdin: files.stdout,
+    });
+    if (written.code !== 0) return null;
+  }
+  const ignored = await invoke(git, ["check-ignore", "--no-index", "-z", "--stdin"], {
+    env,
+    stdin: paths.join("\0"),
+  });
+  if (ignored.error || (ignored.code !== 0 && ignored.code !== 1)) return null;
+  return ignored.stdout.split("\0").filter(Boolean);
+}
+
+/** Snapshots omit ignored paths, so a path can be missing from a tree only
+ *  because that tree's rules ignored it while the file stayed on disk.
+ *  Restoring must leave such a path alone: deleting it destroys the user's
+ *  ignored file (undoing a turn that un-ignored `.env`), and creating it
+ *  collides with the file still on disk (redoing that turn). Returns a tree
+ *  equal to `targetHash` with those paths pinned to their `sourceHash` state,
+ *  or `targetHash` itself when nothing needs pinning. Only a `.gitignore`
+ *  change between the two trees can produce such a path, so every other
+ *  restore costs one `diff-tree`. */
+async function shieldIgnoredPaths(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+  directory: string,
+): Promise<string | null> {
+  const changes = await invoke(git, ["diff-tree", "-r", "-z", sourceHash, targetHash], {
+    timeoutMs: RESTORE_TIMEOUT_MS,
+  });
+  if (changes.error || changes.code !== 0) return null;
+  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
+  // The source mode/sha of an added path are zeros, which `--index-info` reads
+  // as "remove", so one entry format pins both directions.
+  const fields = changes.stdout.split("\0");
+  const deleted = new Map<string, string>();
+  const added = new Map<string, string>();
+  let rulesChanged = false;
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const [sourceMode, , sourceSha, , status] = fields[index]!.slice(1).split(" ");
+    const path = fields[index + 1]!;
+    if (path === ".gitignore" || path.endsWith("/.gitignore")) rulesChanged = true;
+    if (status === "D") deleted.set(path, `${sourceMode} ${sourceSha}`);
+    else if (status === "A") added.set(path, `${sourceMode} ${sourceSha}`);
+  }
+  if (!rulesChanged || (deleted.size === 0 && added.size === 0)) return targetHash;
+
+  const keptOnDisk = await ignoredUnder(git, targetHash, [...deleted.keys()], directory, "target");
+  const hiddenInSource = await ignoredUnder(
+    git,
+    sourceHash,
+    [...added.keys()],
+    directory,
+    "source",
+  );
+  if (!keptOnDisk || !hiddenInSource) return null;
+  const pinned = keptOnDisk.map((path) => `${deleted.get(path)}\t${path}\0`);
+  if (hiddenInSource.length > 0) {
+    const top = await invoke(git, ["rev-parse", "--show-toplevel"]);
+    if (top.code !== 0) return null;
+    const worktree = top.stdout.trim();
+    for (const path of hiddenInSource) {
+      // Absent on disk means nothing to collide with: let the patch create it.
+      const onDisk = await lstat(join(worktree, path)).then(
+        () => true,
+        () => false,
+      );
+      if (onDisk) pinned.push(`${added.get(path)}\t${path}\0`);
+    }
+  }
+  if (pinned.length === 0) return targetHash;
+
+  const env = { GIT_INDEX_FILE: join(directory, "shield-index") };
+  if ((await invoke(git, ["read-tree", targetHash], { env })).code !== 0) return null;
+  const updated = await invoke(git, ["update-index", "-z", "--index-info"], {
+    env,
+    stdin: pinned.join(""),
+  });
+  if (updated.code !== 0) return null;
+  const tree = await invoke(git, ["write-tree"], { env });
+  const treeHash = tree.stdout.trim();
+  return tree.code === 0 && treeHash ? treeHash : null;
+}
+
 /** Restores `targetHash`'s content over a worktree that currently matches
  *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
  *
@@ -619,6 +724,8 @@ export async function applyCheckpoint(
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
     const patchPath = join(tempDirectory, "checkpoint.patch");
     const restore = { timeoutMs: RESTORE_TIMEOUT_MS };
+    const effectiveTarget = await shieldIgnoredPaths(git, sourceHash, targetHash, tempDirectory);
+    if (!effectiveTarget) return "failed";
     const diff = await invoke(
       git,
       [
@@ -635,7 +742,7 @@ export async function applyCheckpoint(
         "--exit-code",
         "--binary",
         sourceHash,
-        targetHash,
+        effectiveTarget,
         `--output=${patchPath}`,
       ],
       restore,

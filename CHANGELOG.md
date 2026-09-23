@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Undo deleted pre-existing ignored files that the turn un-ignored.** Snapshots omit ignored paths, so when a turn removed an ignore rule (e.g. rewrote `.gitignore` without `.env`), the untouched `.env` appeared only in the after-snapshot and `/undo` deleted it as a file the turn had created; once the redo tail was discarded the content was unrecoverable. Restores now evaluate each tree's own ignore rules (`check-ignore --no-index` against that tree's `.gitignore` files) and leave alone any path absent from a snapshot because that snapshot ignored it: no deletion on undo, no "already exists" collision on redo. Restores that change no `.gitignore` pay one extra `diff-tree`.
+
 ## [1.6.3] - 2026-09-22
 
 ### Fixed

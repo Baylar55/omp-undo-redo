@@ -407,6 +407,39 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("keeps a pre-existing ignored file across undo/redo of a turn that un-ignores it", async () => {
+    const { cwd, git } = await makeRepo();
+    const envPath = join(cwd, ".env");
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, ".gitignore"), ".env\n");
+      await git(["add", ".gitignore"]);
+      await git(["commit", "-qm", "ignore fixture"]);
+      await writeFile(envPath, "SECRET=1\n");
+
+      const pending = pendingCheckpoint(await prepareBeforeTurn(git, "unignore-turn"));
+      await writeFile(join(cwd, ".gitignore"), "# cleaned\n");
+      const checkpoint = completedCheckpoint(await finishAfterTurn(git, pending, null, null));
+
+      await expect(applyCheckpoint(git, checkpoint.afterHash, checkpoint.beforeHash)).resolves.toBe(
+        "applied",
+      );
+      expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe(".env\n");
+      expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+
+      await expect(applyCheckpoint(git, checkpoint.beforeHash, checkpoint.afterHash)).resolves.toBe(
+        "applied",
+      );
+      expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe("# cleaned\n");
+      expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+
+      await releaseCheckpoint(git, checkpoint);
+      await releaseAllPersistentSnapshotIndices();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("reuses and normalizes the alternate index without changing fresh snapshot semantics", async () => {
     const { cwd, git: baseGit } = await makeRepo();
     try {
