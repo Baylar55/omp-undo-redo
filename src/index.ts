@@ -1215,6 +1215,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     const token = randomUUID();
     const typed = ctx as unknown as AnyContext;
     const sessionId = typed.sessionManager.getSessionId();
+    // Commands run even mid-stream: the turn's finalize only registers at
+    // agent_end, so the guards below must be read after the idle wait.
+    await ctx.waitForIdle();
     const guards: [Promise<unknown> | undefined, string][] = [
       [pendingCaptures.get(sessionId)?.complete, "the file checkpoint is still being captured"],
       [pendingFinalizations.get(sessionId), "the last turn is still being finalized"],

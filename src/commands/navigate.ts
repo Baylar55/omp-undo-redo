@@ -68,7 +68,6 @@ export async function runNavigation(
   direction: NavigationDirection,
 ): Promise<CommandNavigationResult> {
   const verbs = VERBS[direction];
-  await ctx.waitForIdle();
   if (!ctx.isIdle()) {
     ctx.ui.notify(verbs.busy, "warning");
     return { status: "busy" };

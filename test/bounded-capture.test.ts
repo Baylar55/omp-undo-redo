@@ -389,6 +389,63 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
+  it("reads the finalize guard after the idle wait when undo is issued mid-stream", async () => {
+    // The host runs commands during streaming and stops waiting on an
+    // agent_end handler after its cap, while the finalize keeps running.
+    // A guard snapshotted before the idle wait misses that finalize and undoes
+    // against a history that does not contain the turn yet.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-midstream-"));
+    const gate = Promise.withResolvers<void>();
+    const beforeSnapshot = Promise.withResolvers<void>();
+    const finalizeParked = Promise.withResolvers<void>();
+    let updateRefCount = 0;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        if (args[0] !== "update-ref") return inner(args, options);
+        updateRefCount += 1;
+        // Park the after-snapshot so the finalize outlives the host's wait.
+        if (updateRefCount >= 2) {
+          finalizeParked.resolve();
+          await gate.promise;
+        }
+        const result = await inner(args, options);
+        if (updateRefCount === 1) beforeSnapshot.resolve();
+        return result;
+      };
+      gated.cwd = workCwd;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
+      const ctx = context(cwd, "midstream-session");
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await pi.emit("before_agent_start", ctx);
+      await beforeSnapshot.promise;
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      const idle = Promise.withResolvers<void>();
+      ctx.waitForIdle = () => idle.promise;
+
+      // Issued mid-stream: no finalize is registered yet.
+      const undoRun = pi.runCommand("undo", ctx);
+      const agentEnd = pi.emit("agent_end", ctx);
+      // Host cap elapsed: idle resolves while the finalize is still parked.
+      await finalizeParked.promise;
+      idle.resolve();
+      await undoRun;
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("still being finalized");
+      expect(ctx.leaf).toBe("turn");
+      gate.resolve();
+      await agentEnd;
+    } finally {
+      gate.resolve();
+      await rmRetry(cwd);
+    }
+  });
+
   it("drops only the deferred turn whose after-snapshot raced the next turn", async () => {
     // Regression: a finalize waiting behind the previous turn's finalize left
     // its checkpoint in the pending slot, and the next before_agent_start
