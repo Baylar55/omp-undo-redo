@@ -61,6 +61,8 @@ function runGit(
   let stderr = "";
   let settled = false;
   let timedOut = false;
+  let exited = false;
+  let forced = false;
   let deadlineTimer: NodeJS.Timeout | undefined;
   let graceTimer: NodeJS.Timeout | undefined;
 
@@ -76,12 +78,32 @@ function runGit(
     clearTimers();
     resolve(timedOut ? { ...result, error: "timeout" } : result);
   };
+  /** Destroying the pipes lets Node emit `close` even when a descendant that
+   *  survived the kill (hook, alias shell, orphaned real git.exe) still holds
+   *  them open; without this a timeout would wait on that descendant forever. */
+  const releaseStdio = () => {
+    child.stdout.destroy();
+    child.stderr.destroy();
+  };
   const terminate = () => {
     if (settled) return;
     timedOut = true;
-    child.kill();
+    // Windows `git` is a launcher (Git\cmd\git.exe) that spawns the real
+    // mingw64 git.exe with inherited pipes; `kill()` would end only the
+    // launcher. Kill the tree while the launcher is alive so /T can walk it.
+    if (process.platform === "win32" && child.pid !== undefined && !exited) {
+      spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      }).once("error", () => {});
+    } else {
+      child.kill();
+    }
     graceTimer = setTimeout(() => {
-      if (!settled) child.kill("SIGKILL");
+      if (settled) return;
+      forced = true;
+      child.kill("SIGKILL");
+      if (exited) releaseStdio();
     }, dependencies.terminationGraceMs ?? TERMINATION_GRACE_MS);
   };
 
@@ -100,6 +122,10 @@ function runGit(
       code: 1,
       error: timedOut ? "timeout" : "unavailable",
     });
+  });
+  child.once("exit", () => {
+    exited = true;
+    if (forced) releaseStdio();
   });
   child.once("close", (code: number | null) => {
     settle({ stdout, stderr, code: typeof code === "number" ? code : 1 });
