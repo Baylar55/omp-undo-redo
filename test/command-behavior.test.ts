@@ -250,7 +250,7 @@ describe("session navigation", () => {
     const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, async () => {
       applyCalls++;
       await applyGate;
-      return "applied";
+      return { status: "applied", nestedRepositories: [] };
     });
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
@@ -315,7 +315,7 @@ describe("session navigation", () => {
       undefined,
       async (_checkpoint, sourceHash, targetHash) => {
         applied.push([sourceHash, targetHash]);
-        return "applied";
+        return { status: "applied", nestedRepositories: [] };
       },
     );
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));

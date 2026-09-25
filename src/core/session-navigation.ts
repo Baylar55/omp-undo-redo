@@ -199,13 +199,19 @@ export class SessionNavigation {
   private async applyFileCheckpoint(
     checkpoint: GitCheckpoint,
     source: "before" | "after",
-  ): Promise<{ status: "applied" } | { status: "conflict" | "failed" }> {
-    const result = await this.applyGit(
+  ): Promise<CheckpointApplyResult> {
+    return this.applyGit(
       checkpoint,
       source === "before" ? checkpoint.afterHash : checkpoint.beforeHash,
       source === "before" ? checkpoint.beforeHash : checkpoint.afterHash,
     );
-    return result === "applied" ? { status: "applied" } : { status: result };
+  }
+
+  private restoredResult(applied: { nestedRepositories: string[] }): NavigationResult {
+    const { nestedRepositories } = applied;
+    return nestedRepositories.length > 0
+      ? { status: "moved", files: "partial", nestedRepositories }
+      : { status: "moved", files: "restored" };
   }
 
   undo(): Promise<NavigationResult> {
@@ -236,7 +242,7 @@ export class SessionNavigation {
     }
     this.currentIndex--;
     await this.persistState();
-    return { status: "moved", files: "restored" };
+    return this.restoredResult(applied);
   }
 
   redo(): Promise<NavigationResult> {
@@ -267,6 +273,6 @@ export class SessionNavigation {
     }
     this.currentIndex++;
     await this.persistState();
-    return { status: "moved", files: "restored" };
+    return this.restoredResult(applied);
   }
 }

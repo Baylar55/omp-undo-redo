@@ -436,7 +436,7 @@ describe("temp-directory failure resilience", () => {
         afterRes.checkpoint.afterHash,
         afterRes.checkpoint.afterHash,
       );
-      expect(emptyApplyRes).toBe("applied");
+      expect(emptyApplyRes).toEqual({ status: "applied", nestedRepositories: [] });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

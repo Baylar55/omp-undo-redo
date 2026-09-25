@@ -12,6 +12,7 @@ interface NavigationVerbs {
   busy: string;
   movedUnavailablePrefix: string;
   movedSuccess: string;
+  movedPartialPrefix: string;
   empty: string;
   cancelled: string;
   rollbackFailed: string;
@@ -23,6 +24,7 @@ const VERBS: Record<NavigationDirection, NavigationVerbs> = {
     busy: "Cannot undo while the agent is busy.",
     movedUnavailablePrefix: "Undid the session turn, but files were not restored because ",
     movedSuccess: "Undid last turn: session moved back and file snapshot restored.",
+    movedPartialPrefix: "Undid last turn: session moved back and file snapshot restored, but ",
     empty: "Nothing to undo in this session.",
     cancelled: "Undo was cancelled; the session and files were left unchanged.",
     rollbackFailed:
@@ -33,6 +35,7 @@ const VERBS: Record<NavigationDirection, NavigationVerbs> = {
     busy: "Cannot redo while the agent is busy.",
     movedUnavailablePrefix: "Redid the session turn, but files were not restored because ",
     movedSuccess: "Redid last turn: session moved forward and file snapshot restored.",
+    movedPartialPrefix: "Redid last turn: session moved forward and file snapshot restored, but ",
     empty: "Nothing to redo in this session.",
     cancelled: "Redo was cancelled; the session and files were left unchanged.",
     rollbackFailed:
@@ -62,6 +65,14 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
   }
 }
 
+const LISTED_NESTED_REPOSITORIES = 5;
+
+function nestedRepositoriesMessage(paths: readonly string[]): string {
+  const listed = paths.slice(0, LISTED_NESTED_REPOSITORIES).join(", ");
+  const more = paths.length - LISTED_NESTED_REPOSITORIES;
+  return `files inside nested Git repositories are outside the snapshot and were not restored: ${listed}${more > 0 ? ` and ${more} more` : ""}.`;
+}
+
 export async function runNavigation(
   navigation: SessionNavigation,
   ctx: ExtensionCommandContext,
@@ -76,11 +87,19 @@ export async function runNavigation(
   const outcome: NavigationResult = await navigation[direction]();
   switch (outcome.status) {
     case "moved": {
-      const message =
-        outcome.files === "unavailable"
-          ? `${verbs.movedUnavailablePrefix}${unavailableMessage(outcome.reason)}`
-          : verbs.movedSuccess;
-      ctx.ui.notify(message, "info");
+      if (outcome.files === "unavailable") {
+        ctx.ui.notify(
+          `${verbs.movedUnavailablePrefix}${unavailableMessage(outcome.reason)}`,
+          "info",
+        );
+      } else if (outcome.files === "partial") {
+        ctx.ui.notify(
+          `${verbs.movedPartialPrefix}${nestedRepositoriesMessage(outcome.nestedRepositories)}`,
+          "warning",
+        );
+      } else {
+        ctx.ui.notify(verbs.movedSuccess, "info");
+      }
       break;
     }
     case "empty":

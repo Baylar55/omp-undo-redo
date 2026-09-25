@@ -228,6 +228,89 @@ describe("session-only lifecycle fallback", () => {
     }
   });
 
+  describe("nested repositories", () => {
+    const NOT_RESTORED =
+      "files inside nested Git repositories are outside the snapshot and were not restored";
+
+    async function nestedRepository(path: string, commit: boolean): Promise<void> {
+      await mkdir(path, { recursive: true });
+      await writeFile(join(path, "inner.txt"), "base\n");
+      await git(path, ["init", "-q"]);
+      if (!commit) return;
+      await git(path, ["add", "."]);
+      await git(path, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]);
+    }
+
+    /** One turn that edits `top.txt` and `<nested>/inner.txt`, then `/undo`. */
+    async function undoTurn(cwd: string, nested: string, sessionId: string): Promise<TestContext> {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, sessionId);
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "top.txt"), "turn\n");
+      await writeFile(join(cwd, nested, "inner.txt"), "turn\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "top.txt"), "utf8")).toBe("base\n");
+      expect(await readFile(join(cwd, nested, "inner.txt"), "utf8")).toBe("turn\n");
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "top.txt"), "utf8")).toBe("turn\n");
+      return ctx;
+    }
+
+    it("names a submodule as not restored instead of claiming a full restore", async () => {
+      const cwd = await makeRepository("omp-undo-redo-submodule-");
+      const source = await mkdtemp(join(tmpdir(), "omp-undo-redo-submodule-source-"));
+      try {
+        await nestedRepository(source, true);
+        await writeFile(join(cwd, "top.txt"), "base\n");
+        await git(cwd, [
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "add",
+          "-q",
+          source,
+          "mod",
+        ]);
+        await git(cwd, ["add", "."]);
+        await git(cwd, ["commit", "-qm", "submodule"]);
+
+        const ctx = await undoTurn(cwd, "mod", "submodule-session");
+        const [undo, redo] = ctx.ui.notifications.slice(-2);
+        expect(undo).toEqual({
+          message: `Undid last turn: session moved back and file snapshot restored, but ${NOT_RESTORED}: mod.`,
+          level: "warning",
+        });
+        expect(redo?.message).toContain(`${NOT_RESTORED}: mod.`);
+      } finally {
+        await rmRetry(cwd);
+        await rmRetry(source);
+      }
+    });
+
+    for (const commit of [true, false]) {
+      it(`Private-Git ${commit ? "reports a committed" : "still captures around a commitless"} nested repository`, async () => {
+        const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-nested-private-"));
+        try {
+          await writeFile(join(cwd, "top.txt"), "base\n");
+          await nestedRepository(join(cwd, "app"), commit);
+
+          const ctx = await undoTurn(cwd, "app", `nested-private-${commit}`);
+          expect(ctx.ui.notifications.at(-2)?.message).toContain(`${NOT_RESTORED}: app.`);
+        } finally {
+          await rmRetry(cwd);
+        }
+      });
+    }
+  });
+
   it("binds separate git runners to linked worktrees of the same repository", async () => {
     // Linked worktrees share `repository.commonDir`. `resolveBackend` must
     // cache them by `repository.worktree`, or the second linked worktree would

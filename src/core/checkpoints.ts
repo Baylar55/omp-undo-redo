@@ -18,6 +18,10 @@ const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-
 const REF_ROOT = "refs/omp-undo-redo";
 const WORKTREE_PATHSPEC = ":(top)";
 
+/** Commit-message line naming a nested repository a snapshot left out. */
+const NESTED_REPOSITORY_LINE = "Nested repository outside snapshot: ";
+const NO_COMMIT_ERROR = /^error: '(.+?)\/?' does not have a commit checked out$/;
+
 /** Single spelling of the retained-history ref namespace. Takes an
  *  already-hashed session (`checkpointNamespace(sessionId)`), never a raw id. */
 export const HISTORY_REF_ROOT = `${REF_ROOT}/history/`;
@@ -214,6 +218,32 @@ async function pruneIgnoredEntries(git: GitRunner, env: Record<string, string>):
   return removed.code === 0;
 }
 
+/** `git add -A` of the whole worktree. An embedded repository with no commit
+ *  checked out cannot be recorded even as a gitlink, and would otherwise abort
+ *  every snapshot — one `git init` in a subfolder would disable capture. Such
+ *  repositories are left out and returned; any other error still fails the
+ *  snapshot, since silently omitting an unreadable file would let a restore
+ *  treat it as deleted. `LC_ALL=C` pins the message being matched. */
+async function addWorktree(git: GitRunner, env: Record<string, string>): Promise<string[] | null> {
+  const added = await invoke(git, ["add", "-A", "--ignore-errors", "--", WORKTREE_PATHSPEC], {
+    env: { ...env, LC_ALL: "C" },
+  });
+  if (added.code === 0) return [];
+  if (added.error || added.code !== 1) return null;
+  const skipped: string[] = [];
+  for (const line of added.stderr.split(/\r?\n/)) {
+    const match = NO_COMMIT_ERROR.exec(line);
+    if (match) skipped.push(match[1]!);
+    else if (line.startsWith("error:") || line.startsWith("fatal:")) return null;
+  }
+  return skipped.length > 0 ? skipped : null;
+}
+
+function snapshotMessage(message: string, skipped: readonly string[]): string {
+  if (skipped.length === 0) return message;
+  return `${message}\n\n${skipped.map((path) => `${NESTED_REPOSITORY_LINE}${path}`).join("\n")}`;
+}
+
 async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined): Promise<boolean> {
   if (!lease) return true;
   for (const [key, value] of persistentSnapshotIndices) {
@@ -242,13 +272,13 @@ export async function createSnapshotCommit(
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
-    if (added.code !== 0) return { reason: "snapshot_failed" };
+    const skipped = await addWorktree(git, addEnv);
+    if (!skipped) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     if (tree.code !== 0) return { reason: "snapshot_failed" };
     const treeHash = tree.stdout.trim();
     if (!treeHash) return { reason: "snapshot_failed" };
-    const commit = await createCommitForTree(git, treeHash, message);
+    const commit = await createCommitForTree(git, treeHash, snapshotMessage(message, skipped));
     if (!("hash" in commit)) return commit;
     if (retainIndex && (seeded.status === "seeded" || seeded.status === "empty")) {
       const snapshotIndexLease: SnapshotIndexLease =
@@ -323,8 +353,8 @@ async function createSnapshotCommitFromLease(
 
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
-    if (added.code !== 0) return { reason: "snapshot_failed" };
+    const skipped = await addWorktree(git, addEnv);
+    if (!skipped) return { reason: "snapshot_failed" };
     // An unborn baseline's fresh equivalent is `read-tree --empty` + `add -A`,
     // which never holds an ignored path. `add -A` cannot drop an entry that
     // became ignored after it was staged, so prune those explicitly.
@@ -336,7 +366,7 @@ async function createSnapshotCommitFromLease(
     if (tree.code !== 0 || !treeHash) return { reason: "snapshot_failed" };
 
     if (!(await leaseBaselineCurrent(git, lease))) return { reason: "snapshot_failed" };
-    return createCommitForTree(git, treeHash, message);
+    return createCommitForTree(git, treeHash, snapshotMessage(message, skipped));
   } catch {
     return { reason: "snapshot_failed" };
   } finally {
@@ -597,7 +627,10 @@ export async function retainCheckpointForResume(
   return { ...checkpoint, beforeRef, afterRef };
 }
 
-export type CheckpointApplyResult = "applied" | "conflict" | "failed";
+/** `nestedRepositories`: repositories whose contents the restore could not
+ *  touch, relative to the worktree root (see `nestedRepositoriesOutside`). */
+export type CheckpointApplyResult =
+  { status: "applied"; nestedRepositories: string[] } | { status: "conflict" | "failed" };
 
 /** Restore invocations get a far larger ceiling than the runner's default:
  *  diffing and applying a multi-GB binary change is slow but legitimate, and
@@ -710,10 +743,54 @@ async function shieldIgnoredPaths(
   return tree.code === 0 && treeHash ? treeHash : null;
 }
 
+/** Nested repositories whose contents none of `commits` hold: gitlinks (a
+ *  submodule or committed nested repository is recorded as its HEAD commit
+ *  only, and `git apply` without an index skips gitlink hunks) plus the ones a
+ *  snapshot left out for having no commit. Null when a commit is unreadable.
+ *  ponytail: lists every tree entry per restore; record gitlinks at capture
+ *  time if undo in million-file trees gets slow. */
+async function nestedRepositoriesOutside(
+  git: GitRunner,
+  commits: readonly string[],
+): Promise<string[] | null> {
+  const paths = new Set<string>();
+  for (const commit of commits) {
+    const tree = await invoke(git, ["ls-tree", "-r", "-z", "--full-tree", commit], {
+      timeoutMs: RESTORE_TIMEOUT_MS,
+    });
+    const object = await invoke(git, ["cat-file", "commit", commit]);
+    if (tree.error || tree.code !== 0 || object.error || object.code !== 0) return null;
+    // Entries: "<mode> <type> <object>\t<path>".
+    for (const entry of tree.stdout.split("\0")) {
+      if (entry.startsWith("160000 ")) paths.add(entry.slice(entry.indexOf("\t") + 1));
+    }
+    const message = object.stdout.slice(object.stdout.indexOf("\n\n") + 2);
+    for (const line of message.split("\n")) {
+      if (line.startsWith(NESTED_REPOSITORY_LINE)) {
+        paths.add(line.slice(NESTED_REPOSITORY_LINE.length));
+      }
+    }
+  }
+  return [...paths].sort();
+}
+
 /** Restores `targetHash`'s content over a worktree that currently matches
  *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
- *
- *  Every flag pins the plumbing contract against the user's own
+ *  Nested repositories are outside every snapshot: an `applied` result lists
+ *  them so the caller never reports their contents as restored. */
+export async function applyCheckpoint(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+): Promise<CheckpointApplyResult> {
+  // Read first: failing after the patch landed would misreport a restore.
+  const nestedRepositories = await nestedRepositoriesOutside(git, [sourceHash, targetHash]);
+  if (!nestedRepositories) return { status: "failed" };
+  const status = await applyPatch(git, sourceHash, targetHash);
+  return status === "applied" ? { status, nestedRepositories } : { status };
+}
+
+/** Every flag pins the plumbing contract against the user's own
  *  configuration, each of which otherwise kills restoration outright on that
  *  machine: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` produce a patch
  *  `git apply -p1` cannot resolve; `color.diff=always` prefixes it with ANSI
@@ -723,11 +800,11 @@ async function shieldIgnoredPaths(
  *  patch; `diff.context=0` yields hunks `git apply` refuses without
  *  `--unidiff-zero`; `apply.whitespace=error` rejects content git itself
  *  snapshotted. */
-export async function applyCheckpoint(
+async function applyPatch(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
-): Promise<CheckpointApplyResult> {
+): Promise<CheckpointApplyResult["status"]> {
   let tempDirectory: string | null = null;
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
