@@ -13,8 +13,10 @@ import {
 import { createGitRunner } from "../src/core/git-runner.js";
 import {
   finishAfterTurn,
+  HISTORY_REF_ROOT,
   prepareBeforeTurn,
   releasePendingCheckpoint,
+  retainCheckpointForResume,
 } from "../src/core/checkpoints.js";
 import { SessionNavigation } from "../src/core/session-navigation.js";
 import type { GitRepository, GitRunner, NavigationPort } from "../src/core/types.js";
@@ -25,6 +27,7 @@ const hostA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const sessionHash = "a".repeat(64);
 const runtimeScope = "c".repeat(64);
 const checkpointId = "33333333-3333-4333-8333-333333333333";
+const compactId = "0123456789abcdef";
 const objectHash = "b".repeat(40);
 
 function lease(ownerId: string, hostId = hostA, pid = 1234): string {
@@ -39,13 +42,13 @@ function lease(ownerId: string, hostId = hostA, pid = 1234): string {
   });
 }
 
-async function makeRepository(): Promise<{
+async function makeRepository(parent = tmpdir()): Promise<{
   cwd: string;
   commonDir: string;
   git: GitRunner;
   repository: GitRepository;
 }> {
-  const cwd = await mkdtemp(join(tmpdir(), "omp-owner-repo-"));
+  const cwd = await mkdtemp(join(parent, "omp-owner-repo-"));
   const git = createGitRunner(cwd);
   expect((await git(["init", "-q"])).code).toBe(0);
   expect((await git(["config", "core.autocrlf", "false"])).code).toBe(0);
@@ -77,11 +80,22 @@ async function makeRepository(): Promise<{
 
 describe("checkpoint owner boundaries", () => {
   it("accepts only canonical v2 refs and full object IDs", () => {
+    expect(parseCheckpointOwnerRef(`refs/omp-undo-redo/v2/${ownerA}/${compactId}/before`)).toEqual({
+      ownerId: ownerA,
+      checkpointId: compactId,
+      phase: "before",
+    });
     expect(
       parseCheckpointOwnerRef(
         `refs/omp-undo-redo/v2/${ownerA}/${sessionHash}/${checkpointId}/before`,
       ),
-    ).toEqual({ ownerId: ownerA, sessionHash, checkpointId, phase: "before" });
+    ).toEqual({ ownerId: ownerA, checkpointId, phase: "before" });
+    expect(
+      parseCheckpointOwnerRef(`refs/omp-undo-redo/v2/${ownerA}/${checkpointId}/after`),
+    ).toBeNull();
+    expect(
+      parseCheckpointOwnerRef(`refs/omp-undo-redo/v2/${ownerA}/${sessionHash}/${compactId}/after`),
+    ).toBeNull();
     expect(
       parseCheckpointOwnerRef(`refs/omp-undo-redo/${sessionHash}/${checkpointId}/before`),
     ).toBeNull();
@@ -93,6 +107,7 @@ describe("checkpoint owner boundaries", () => {
     expect(
       parseCheckpointOwnerRef(`refs/omp-undo-redo/v2/${ownerA}/../${checkpointId}/before`),
     ).toBeNull();
+    expect(parseCheckpointOwnerRef(`refs/omp-undo-redo/v2/${ownerA}/../before`)).toBeNull();
   });
 
   it("rejects malformed or mismatched lease metadata", () => {
@@ -247,13 +262,14 @@ describe("checkpoint owner boundaries", () => {
   it("reaps only v2 owner refs and preserves legacy and future versions", async () => {
     const { cwd, commonDir, git, repository } = await makeRepository();
     const ownersDir = join(commonDir, "omp-undo-redo", "owners");
-    const staleV2 = `refs/omp-undo-redo/v2/${ownerA}/${sessionHash}/${checkpointId}/before`;
+    const staleV2 = `refs/omp-undo-redo/v2/${ownerA}/${compactId}/before`;
+    const staleOldV2 = `refs/omp-undo-redo/v2/${ownerA}/${sessionHash}/${checkpointId}/before`;
     const legacy = `refs/omp-undo-redo/${sessionHash}/${checkpointId}/before`;
     const future = `refs/omp-undo-redo/v3/${ownerA}/${sessionHash}/${checkpointId}/before`;
     try {
       await mkdir(ownersDir, { recursive: true });
       await writeFile(join(ownersDir, `${ownerA}.json`), lease(ownerA, hostA, 9999));
-      for (const ref of [staleV2, legacy, future]) {
+      for (const ref of [staleV2, staleOldV2, legacy, future]) {
         expect((await git(["update-ref", ref, "HEAD"])).code).toBe(0);
       }
       const registry = new CheckpointOwnerRegistry({
@@ -271,6 +287,7 @@ describe("checkpoint owner boundaries", () => {
       await registry.shutdown();
 
       expect((await git(["show-ref", "--verify", staleV2])).code).not.toBe(0);
+      expect((await git(["show-ref", "--verify", staleOldV2])).code).not.toBe(0);
       expect((await git(["show-ref", "--verify", legacy])).code).toBe(0);
       expect((await git(["show-ref", "--verify", future])).code).toBe(0);
     } finally {
@@ -348,6 +365,68 @@ describe("checkpoint owner boundaries", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  // Measured limits for the repository path: old layout 79 (v2) / 111 (history),
+  // compact layout 164 / 131. Loose refs past MAX_PATH would also be invisible
+  // to the user's git (and its gc), so they must fit without longpaths.
+  it.skipIf(process.platform !== "win32")(
+    "captures, retains, and restores at a 130-character Windows repository path",
+    async (context) => {
+      const root = await mkdtemp(join(tmpdir(), "omp-long-"));
+      const padding = 130 - "\\omp-owner-repo-XXXXXX".length - root.length - 1;
+      if (padding < 1) {
+        await rm(root, { recursive: true, force: true });
+        return context.skip();
+      }
+      const parent = join(root, "p".repeat(padding));
+      await mkdir(parent);
+      const { cwd, git } = await makeRepository(parent);
+      expect(cwd.length).toBe(130);
+      // Local config beats a global `core.longpaths=true`, so the refs must fit MAX_PATH.
+      expect((await git(["config", "core.longpaths", "false"])).code).toBe(0);
+      const ownerRegistry = new CheckpointOwnerRegistry({
+        ownerId: ownerA,
+        hostIdentity: { id: hostA, persistent: true },
+        hostname: "test-host",
+        runtimeScope,
+      });
+      try {
+        const prepared = await prepareBeforeTurn(git, "long-path", ownerRegistry);
+        expect(prepared).toMatchObject({ status: "git" });
+        if (prepared.status !== "git") return;
+        expect(prepared.checkpoint.beforeRef).toContain("/v2/");
+        await writeFile(join(cwd, "tracked.txt"), "after\n");
+        const finished = await finishAfterTurn(git, prepared.checkpoint, "parent", "leaf");
+        expect(finished).toMatchObject({ status: "git" });
+        if (finished.status !== "git") return;
+        const retained = await retainCheckpointForResume(git, "long-path", finished.checkpoint);
+        expect(retained.beforeRef.startsWith(HISTORY_REF_ROOT)).toBe(true);
+
+        const listed = await git(["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"]);
+        expect(listed.stdout.split("\n")).toEqual(
+          expect.arrayContaining([retained.beforeRef, retained.afterRef]),
+        );
+
+        let leaf = "leaf";
+        const port: NavigationPort = {
+          getLeafId: () => leaf,
+          getBranch: () => [],
+          getEntry: () => undefined,
+          navigateTree: async (targetId) => {
+            leaf = targetId;
+            return { cancelled: false };
+          },
+        };
+        const navigation = new SessionNavigation(port, git);
+        await navigation.recordTurnEnd(retained);
+        expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("before\n");
+      } finally {
+        await ownerRegistry.shutdown();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("owner liveness", () => {

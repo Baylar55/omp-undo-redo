@@ -149,8 +149,8 @@ Checkpoint capture never blocks the prompt: `before_agent_start`, `agent_end`, `
 Pending full-mode checkpoints initially use owner-scoped v2 refs:
 
 ```text
-refs/omp-undo-redo/v2/<ownerId>/<sessionHash>/<checkpointId>/before
-refs/omp-undo-redo/v2/<ownerId>/<sessionHash>/<checkpointId>/after
+refs/omp-undo-redo/v2/<ownerId>/<checkpointId>/before
+refs/omp-undo-redo/v2/<ownerId>/<checkpointId>/after
 ```
 
 After a turn completes, both refs are atomically promoted to the resumable namespace:
@@ -159,6 +159,8 @@ After a turn completes, both refs are atomically promoted to the resumable names
 refs/omp-undo-redo/history/<sessionHash>/<checkpointId>/before
 refs/omp-undo-redo/history/<sessionHash>/<checkpointId>/after
 ```
+
+`<checkpointId>` is 16 hex characters. Refs are loose files under `.git/refs/`, so on Windows (without a user-set `core.longpaths`) the repository path is limited to about 164 characters for capture and in-session undo, and about 131 for history that survives resume. The extension never forces `core.longpaths` for your repository: refs past MAX_PATH would be invisible to your own Git, and its `gc` would prune the snapshots. Older versions used `v2/<ownerId>/<sessionHash>/<uuid>` (about 79 characters); those refs are still recognized and cleaned up.
 
 The extension publishes a repository-local lease before it creates a v2 ref. A later runtime automatically removes temporary v2 refs only when the lease is valid, has the same persistent host ID, hostname, and runtime scope, and its PID probe returns `ESRCH`. On Linux, the runtime scope binds cleanup to both the current kernel boot ID and PID namespace, preventing a container or WSL process outside that namespace from being mistaken for a dead local process. If that scope cannot be resolved, automatic cleanup is disabled while v2 checkpointing and graceful cleanup continue. Current, live, remote, malformed, future-version, unreadable, and otherwise uncertain owners are preserved. Existing ownerless refs and completed history refs are never stale-runtime cleanup candidates. Automatic maintenance runs once per runtime and repository, in the background, with bounded Git operations; maintenance failure does not block checkpoint creation or commands.
 

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -50,6 +50,15 @@ export function checkpointNamespace(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex");
 }
 
+/** Ref paths are loose files under `.git/refs/`, so on Windows the repository
+ *  path plus the ref must fit MAX_PATH. `core.longpaths` is deliberately not
+ *  forced: refs written past MAX_PATH are invisible to the user's own git, whose
+ *  `gc` would then prune the snapshot objects. Hence 16-hex checkpoint ids
+ *  (64 random bits) and no session hash in v2 refs. */
+function newCheckpointId(): string {
+  return randomBytes(8).toString("hex");
+}
+
 function checkpointRefs(
   sessionId: string,
   checkpointId: string,
@@ -58,7 +67,7 @@ function checkpointRefs(
 ): { beforeRef: string; afterRef: string } {
   const prefix =
     ownership === "v2" && ownerId
-      ? `${REF_ROOT}/v2/${ownerId}/${checkpointNamespace(sessionId)}/${checkpointId}`
+      ? `${REF_ROOT}/v2/${ownerId}/${checkpointId}`
       : `${REF_ROOT}/${checkpointNamespace(sessionId)}/${checkpointId}`;
   return { beforeRef: `${prefix}/before`, afterRef: `${prefix}/after` };
 }
@@ -448,7 +457,7 @@ export async function prepareBeforeTurn(
   const ownership = ownerRegistry
     ? await ownerRegistry.ensureInitialized(resolved.repository, git)
     : "legacy";
-  const checkpointId = randomUUID();
+  const checkpointId = newCheckpointId();
   const indexKey = persistentIndexKey(resolved.repository, sessionId);
   const priorLease = persistentSnapshotIndices.get(indexKey);
   let snapshot: SnapshotResult;
@@ -573,7 +582,7 @@ export async function retainCheckpointForResume(
   sessionId: string,
   checkpoint: GitCheckpoint,
 ): Promise<GitCheckpoint> {
-  const checkpointId = randomUUID();
+  const checkpointId = newCheckpointId();
   const prefix = `${historyRefPrefix(checkpointNamespace(sessionId))}${checkpointId}`;
   const beforeRef = `${prefix}/before`;
   const afterRef = `${prefix}/after`;

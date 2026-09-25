@@ -13,12 +13,12 @@ const MAX_CONCURRENT_OWNERS = 4;
 const DEFAULT_SHUTDOWN_WAIT_MS = 1_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const CHECKPOINT_ID_PATTERN = /^[0-9a-f]{16}$/;
 const OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const RUNTIME_SCOPE_PATTERN = /^[0-9a-f]{64}$/;
 
 export interface ParsedCheckpointRef {
   ownerId: string;
-  sessionHash: string;
   checkpointId: string;
   phase: "before" | "after";
 }
@@ -73,20 +73,26 @@ function isCanonicalUuid(value: string): boolean {
   return UUID_PATTERN.test(value);
 }
 
+/** Current layout `v2/<owner>/<16-hex id>/<phase>`; the older
+ *  `v2/<owner>/<session sha256>/<uuid>/<phase>` (too long for Windows
+ *  MAX_PATH) is still accepted so stale owners from older versions are reaped. */
 export function parseCheckpointOwnerRef(ref: string): ParsedCheckpointRef | null {
   const parts = ref.split("/");
-  if (parts.length !== 7) return null;
   if (parts.slice(0, 3).join("/") !== CHECKPOINT_OWNER_REF_ROOT) return null;
-  const [, , , ownerId, sessionHash, checkpointId, phase] = parts;
-  if (
-    !isCanonicalUuid(ownerId) ||
-    !SHA256_PATTERN.test(sessionHash) ||
-    !isCanonicalUuid(checkpointId)
-  ) {
+  let ownerId: string, checkpointId: string, phase: string;
+  if (parts.length === 6) {
+    [, , , ownerId, checkpointId, phase] = parts;
+    if (!CHECKPOINT_ID_PATTERN.test(checkpointId)) return null;
+  } else if (parts.length === 7) {
+    let sessionHash: string;
+    [, , , ownerId, sessionHash, checkpointId, phase] = parts;
+    if (!SHA256_PATTERN.test(sessionHash) || !isCanonicalUuid(checkpointId)) return null;
+  } else {
     return null;
   }
+  if (!isCanonicalUuid(ownerId)) return null;
   if (phase !== "before" && phase !== "after") return null;
-  return { ownerId, sessionHash, checkpointId, phase };
+  return { ownerId, checkpointId, phase };
 }
 
 export function ownerCheckpointPrefix(ownerId: string): string | null {
