@@ -1,3 +1,4 @@
+import { reconstructSessionHistory } from "../src/core/history-store.js";
 import { SessionNavigation } from "../src/core/session-navigation.js";
 import { describe, expect, it, vi } from "vitest";
 import type {
@@ -144,6 +145,31 @@ describe("session navigation", () => {
 
     expect((await navigation.undo()).status).toBe("moved");
     expect((await navigation.redo()).status).toBe("moved");
+    expect((await navigation.redo()).status).toBe("empty");
+  });
+
+  it("preserves redo when the host lands on the parent of a user-message target", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    // OMP/Pi rule: a user-message target leaves the leaf on its parent.
+    navigation.setNavigateTree(async (targetId) => {
+      const oldLeafId = session.leaf;
+      const target = session.getEntry(targetId)!;
+      session.leaf = (target.message?.role === "user" ? target.parentId : targetId) as string;
+      await navigation.handleSessionTreeNavigation(oldLeafId, session.leaf);
+      return { cancelled: false };
+    });
+    // Resumed without usable history: checkpoints target the user entries.
+    navigation.restoreState(reconstructSessionHistory(session));
+
+    expect((await navigation.undo()).status).toBe("moved");
+    expect(session.leaf).toBe("a1");
+    expect((await navigation.undo()).status).toBe("moved");
+    expect(session.leaf).toBeNull();
+    expect((await navigation.redo()).status).toBe("moved");
+    expect(session.leaf).toBe("a1");
+    expect((await navigation.redo()).status).toBe("moved");
+    expect(session.leaf).toBe("a2");
     expect((await navigation.redo()).status).toBe("empty");
   });
 

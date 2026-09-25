@@ -294,6 +294,8 @@ describe("temp-directory failure resilience", () => {
       const nav = new SessionNavigation(
         {
           getLeafId: () => currentLeaf,
+          getBranch: () => [],
+          getEntry: () => undefined,
           navigateTree: async (targetId) => {
             currentLeaf = targetId;
             return { cancelled: false };
@@ -406,6 +408,8 @@ describe("temp-directory failure resilience", () => {
       const nav = new SessionNavigation(
         {
           getLeafId: () => currentLeaf,
+          getBranch: () => [],
+          getEntry: () => undefined,
           navigateTree: async (targetId) => {
             currentLeaf = targetId;
             return { cancelled: false };

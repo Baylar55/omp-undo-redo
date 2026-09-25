@@ -456,6 +456,57 @@ describe("navigation invalidation lifecycle", () => {
     }
   });
 
+  it("keeps redo when undo of a turn started on a custom_message lands on its parent", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "custom-message-session");
+      await pi.emit("session_start", ctx);
+      // pi.sendMessage while idle appends a custom_message; the next prompt
+      // starts on it.
+      ctx.entries = [
+        { id: "custom", parentId: "leaf", type: "custom_message", customType: "note" },
+        { id: "prompt", parentId: "custom", type: "message", message: { role: "user" } },
+        { id: "turn", parentId: "prompt", type: "message", message: { role: "assistant" } },
+      ];
+      ctx.leaf = "custom";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      // OMP rule: user and non-skill custom_message targets land on the parent.
+      ctx.navigateTree = async (targetId) => {
+        const oldLeafId = ctx.leaf;
+        const target = ctx.sessionManager.getEntry(targetId);
+        const landsOnParent =
+          target?.type === "custom_message" ||
+          (target?.type === "message" && target.message?.role === "user");
+        ctx.leaf = landsOnParent ? (target.parentId as string) : targetId;
+        await pi.emit("session_tree", ctx, {
+          type: "session_tree",
+          oldLeafId,
+          newLeafId: ctx.leaf,
+        });
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      await pi.runCommand("redo", ctx);
+      expect(ctx.leaf).toBe("turn");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
   it("clears redo for successful source session switches and branches", async () => {
     for (const event of ["session_switch", "session_branch"] as const) {
       const cwd = await makeRepository();

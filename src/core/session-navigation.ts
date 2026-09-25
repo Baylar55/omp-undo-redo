@@ -19,7 +19,8 @@ import {
 
 type ExpectedTreeNavigation = {
   oldLeafId: string | null;
-  newLeafId: string | null;
+  /** Every leaf the host may land on for this target. */
+  landingLeafIds: ReadonlyArray<string | null>;
 };
 
 type ApplyCheckpoint = (
@@ -89,9 +90,18 @@ export class SessionNavigation {
   }
 
   private async navigateTo(targetId: string): Promise<TreeNavigationResult> {
+    // Hosts (OMP, Pi) never leave the leaf on a user or custom_message entry:
+    // they land on its parent and move the text to the editor. Accepting the
+    // parent for any custom_message covers hosts that exempt skill prompts
+    // (those land on the target, which is accepted too).
+    const target = this.port.getEntry(targetId);
+    const landsOnParent =
+      target !== undefined &&
+      ((target.type === "message" && target.message?.role === "user") ||
+        target.type === "custom_message");
     this.expectedTreeNavigation = {
       oldLeafId: this.port.getLeafId(),
-      newLeafId: targetId,
+      landingLeafIds: landsOnParent ? [targetId, target.parentId] : [targetId],
     };
     try {
       return await this.navigateTree(targetId);
@@ -110,7 +120,11 @@ export class SessionNavigation {
     // navigateTree call, so an undo/redo's own navigation has to be recognized
     // synchronously or it would deadlock against itself on navigationTail.
     const expected = this.expectedTreeNavigation;
-    if (expected && expected.oldLeafId === oldLeafId && expected.newLeafId === newLeafId) {
+    if (
+      expected &&
+      expected.oldLeafId === oldLeafId &&
+      expected.landingLeafIds.includes(newLeafId)
+    ) {
       this.expectedTreeNavigation = null;
       return;
     }
