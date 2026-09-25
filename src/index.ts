@@ -81,9 +81,13 @@ export type OmpUndoRedoDependencies = {
    *  for an in-flight checkpoint capture before returning without it. The
    *  capture keeps running and the turn is finalized when it settles. */
   captureDeadlineMs?: number;
+  /** How long a `tool_call` waits for the turn's before-snapshot. Must stay
+   *  under the host's 30 s `tool_call` cap, which blocks the tool on timeout. */
+  toolCallDeadlineMs?: number;
 };
 
 export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
+export const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
 
 function defaultGitRunnerFactory(cwd: string, env?: Record<string, string>): GitRunner {
   return createGitRunner(cwd, { env });
@@ -306,6 +310,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const privateRepositories = new Map<string, PrivateRepoEntry>();
   const gitRunnerFactory = deps.gitRunnerFactory ?? defaultGitRunnerFactory;
   const captureDeadlineMs = deps.captureDeadlineMs ?? DEFAULT_CAPTURE_DEADLINE_MS;
+  const toolCallDeadlineMs = deps.toolCallDeadlineMs ?? DEFAULT_TOOL_CALL_DEADLINE_MS;
   function gitRunnerFor(repository: GitRepository): GitRunner {
     const entry =
       privateRepositories.get(repository.worktree) ?? privateRepositories.get(repository.commonDir);
@@ -345,6 +350,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  only after the next turn already started snapshotted that turn's edits
    *  too, which is what makes such a checkpoint unrestorable. */
   const turnSequenceBySession = new Map<string, number>();
+  /** The current turn's in-flight before-snapshot, per session. `before_agent_start`
+   *  stops waiting at the handler deadline, so the agent's tools can run while
+   *  git is still reading the workspace. Tool calls wait on `complete`; one
+   *  that gives up sets `late`, and the capture then discards its snapshot
+   *  (it may hold the turn's own edits) instead of recording a wrong baseline. */
+  const beforeSnapshotGates = new Map<string, { complete: Promise<void>; late: boolean }>();
 
   /** True when `gitDir` belongs to one of our private per-workspace repos.
    *  Guards gc/prune triggers so they can never touch a user's own repo:
@@ -865,6 +876,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // An in-flight capture for this session no longer belongs to a live turn:
       // it self-releases on completion via the identity check in beginCapture.
       pendingCaptures.delete(sessionId);
+      beforeSnapshotGates.delete(sessionId);
       if (closing) return;
       await initializeNavigation(typed, true);
     }),
@@ -914,6 +926,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       const sessionId = typed.sessionManager.getSessionId();
       const oldPending = pending.get(sessionId);
       pending.delete(sessionId);
+      beforeSnapshotGates.delete(sessionId);
       if (oldPending) await releasePending(oldPending);
 
       // Record the leaf this turn starts from, then bound concurrent captures:
@@ -942,6 +955,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (backend.kind === "session") {
         notifySessionOnly(typed, sessionId, backend.reason);
       }
+      const gate = { complete: Promise.resolve(), late: false };
       const capture = beginCapture(sessionId, async () => {
         const prepared =
           backend.kind === "git"
@@ -954,11 +968,32 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           prepared.status === "git"
             ? { ...prepared.checkpoint, parentLeafId: turnStartLeaf }
             : { kind: "session", reason: prepared.reason, parentLeafId: turnStartLeaf };
+        // A tool ran before this snapshot finished, so it may contain the
+        // turn's own edits: undo would "restore" them and report success.
+        if (checkpoint.kind === "git" && gate.late) {
+          await releasePending(checkpoint).catch(() => undefined);
+          return { kind: "session", reason: "before_snapshot_failed", parentLeafId: turnStartLeaf };
+        }
         return checkpoint;
+      });
+      gate.complete = capture.complete;
+      beforeSnapshotGates.set(sessionId, gate);
+      void capture.complete.then(() => {
+        if (beforeSnapshotGates.get(sessionId) === gate) beforeSnapshotGates.delete(sessionId);
       });
       await timedOutAfter(capture.complete, captureDeadlineMs);
     }),
   );
+
+  // Every tool (built-in, custom, MCP, subagent) passes through the host's
+  // `tool_call` gate before executing. Returning undefined never blocks it.
+  pi.on("tool_call", async (_event, ctx) => {
+    const gate = beforeSnapshotGates.get(
+      (ctx as unknown as AnyContext).sessionManager.getSessionId(),
+    );
+    if (!gate || gate.late || closing) return;
+    if (await timedOutAfter(gate.complete, toolCallDeadlineMs)) gate.late = true;
+  });
 
   function beginFinalizeTurn(
     typed: AnyContext,
