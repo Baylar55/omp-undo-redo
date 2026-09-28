@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { CwdGitRunnerFactory, GitRepository } from "./types.js";
+import type { CwdGitRunnerFactory, DiscoveredRepository, GitRepository } from "./types.js";
 
 export const DEFAULT_EXCLUDES = [
   ".git",
@@ -90,13 +90,12 @@ export function storeRootDirectory(): string {
   return canonicalCwd(join(homedir(), ".omp", "omp-undo-redo"));
 }
 
-/** The private git dir for a workspace: `<storeRoot>/repos/<sha256(cwd)>.git`.
+/** The store git dir for a path: `<storeRoot>/repos/<sha256(path)>.git` — a
+ *  workspace (Private-Git) or a repository's `commonDir` (Git mode).
  *  Both inputs are canonicalized here (realpath) so the result is one
  *  deterministic long-form path regardless of how the caller spelled either
- *  argument. Without this, a store root or cwd spelled in 8.3 short form
- *  (e.g. `C:\Users\BAYLAR~1.SAD\...`) would yield a gitDir string that
- *  differs from the realpath-canonicalized form recorded on checkpoints,
- *  so `isPrivateRepository` string comparisons would silently fail. */
+ *  argument: a store root or cwd spelled in 8.3 short form
+ *  (e.g. `C:\Users\BAYLAR~1.SAD\...`) must name the same store. */
 export function privateRepositoryPath(storeRoot: string, cwd: string): string {
   return join(canonicalCwd(storeRoot), "repos", `${sha256Hex(canonicalCwd(cwd))}.git`);
 }
@@ -184,7 +183,65 @@ export async function ensurePrivateGitRepository(
       await envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined);
     }
     await ensureExclude(gitDir, worktree, storeRoot);
-    return { worktree, gitDir, commonDir: gitDir, private: true };
+    return { worktree, gitDir, commonDir: gitDir, storeDir: gitDir };
+  } catch {
+    return null;
+  }
+}
+
+/** Config key naming the repository a Git-mode store belongs to (its
+ *  `commonDir`); eviction treats the store as abandoned once that path is gone. */
+export const GIT_STORE_SOURCE_KEY = "omp-undo-redo.commondir";
+
+/** Ensures the bare snapshot store for a Git repository:
+ *  `<storeRoot>/repos/<sha256(commonDir)>.git`, shared by linked worktrees the
+ *  way their `.git` is. Snapshot commands still run against the user's
+ *  repository (its HEAD, config, ignore and attribute rules) with
+ *  `GIT_OBJECT_DIRECTORY` pointed here, so new objects land in the store,
+ *  and `GIT_ALTERNATE_OBJECT_DIRECTORIES` pointed at the user's objects,
+ *  which are borrowed rather than copied (see `snapshotRunnerEnv`). No
+ *  `objects/info/alternates` file: a command run without that env sees only
+ *  the store's own objects, which is how capture finds what it must copy.
+ *  Refs are written with `GIT_DIR` set to the store. Returns the store path,
+ *  or null when it cannot be created. */
+export async function ensureGitSnapshotStore(
+  gitRunnerFactory: CwdGitRunnerFactory,
+  repository: DiscoveredRepository,
+  storeRoot: string,
+): Promise<string | null> {
+  const storeDir = privateRepositoryPath(storeRoot, repository.commonDir);
+  const storeGit = gitRunnerFactory(repository.worktree, { GIT_DIR: storeDir });
+  try {
+    await mkdir(dirname(storeDir), { recursive: true, mode: 0o700 });
+    if (process.platform !== "win32") {
+      await chmod(dirname(storeDir), 0o700).catch(() => undefined);
+      await chmod(canonicalCwd(storeRoot), 0o700).catch(() => undefined);
+    }
+    if (!(await repoExists(storeDir))) {
+      // Objects written against the user's repository use its hash, so the
+      // store must too or its refs could not name them.
+      const format = await gitRunnerFactory(repository.worktree, {
+        GIT_DIR: repository.commonDir,
+      })(["config", "--get", "extensions.objectformat"]);
+      const objectFormat = format.code === 0 ? format.stdout.trim() : "";
+      const init = await storeGit([
+        "init",
+        "--bare",
+        "-q",
+        ...(objectFormat ? [`--object-format=${objectFormat}`] : []),
+      ]);
+      if (init.code !== 0) return null;
+      for (const [key, value] of [
+        ["core.sharedRepository", "0600"],
+        // Only the extension's own git reads these refs, so paths past
+        // MAX_PATH cannot hide them from anyone's gc.
+        ["core.longpaths", "true"],
+        [GIT_STORE_SOURCE_KEY, repository.commonDir],
+      ] as const) {
+        if ((await storeGit(["config", key, value])).code !== 0) return null;
+      }
+    }
+    return storeDir;
   } catch {
     return null;
   }

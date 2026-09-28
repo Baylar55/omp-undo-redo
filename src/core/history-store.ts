@@ -69,7 +69,7 @@ type StoredHistory = {
 };
 
 export function historyDirectory(repository: GitRepository): string {
-  return join(repository.commonDir, "omp-undo-redo", "history");
+  return join(repository.storeDir, "omp-undo-redo", "history");
 }
 
 export function historyPath(repository: GitRepository, sessionId: string): string {
@@ -205,9 +205,15 @@ function parseHistory(
   };
 }
 
-async function existingRefs(git: GitRunner, prefix: string): Promise<Map<string, string> | null> {
+async function existingRefs(
+  git: GitRunner,
+  repository: GitRepository,
+  prefix: string,
+): Promise<Map<string, string> | null> {
   try {
-    const result = await git(["for-each-ref", "--format=%(refname)%00%(objectname)", prefix]);
+    const result = await git(["for-each-ref", "--format=%(refname)%00%(objectname)", prefix], {
+      env: { GIT_DIR: repository.storeDir },
+    });
     if (result.code !== 0 || result.error) return null;
     const refs = parseRefLines(result.stdout);
     return refs && new Map(refs.map(({ ref, expectedHash }) => [ref, expectedHash]));
@@ -318,7 +324,7 @@ export async function expireGitSessionHistories(
     if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
 
     const refPrefix = historyRefPrefix(sessionHash);
-    const refsMap = await existingRefs(git, refPrefix);
+    const refsMap = await existingRefs(git, repository, refPrefix);
     if (refsMap === null) continue;
 
     if (refsMap.size > 0) {
@@ -327,6 +333,7 @@ export async function expireGitSessionHistories(
         .join("\n");
       try {
         const updateResult = await git(["update-ref", "--stdin"], {
+          env: { GIT_DIR: repository.storeDir },
           stdin: `${deleteCommands}\n`,
         });
         if (updateResult.code !== 0 || updateResult.error) continue;
@@ -393,7 +400,7 @@ export class SessionHistoryStore {
       const parsed = parseHistory(value, this.sessionId, this.repository);
       if (!parsed) return { status: "unavailable", reason: "unusable" };
       const refPrefix = historyRefPrefix(parsed.sessionHash);
-      const refs = await existingRefs(this.git, refPrefix);
+      const refs = await existingRefs(this.git, this.repository, refPrefix);
       if (refs === null) return { status: "unavailable", reason: "unusable" };
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
         if (checkpoint.kind === "session") return checkpoint;
@@ -402,7 +409,9 @@ export class SessionHistoryStore {
           refs.get(checkpoint.afterRef) === checkpoint.afterHash &&
           sameRepository(checkpoint.repository, this.repository)
         )
-          return checkpoint;
+          // The live repository carries the store; histories written before
+          // snapshots moved out of the user's `.git` do not.
+          return { ...checkpoint, repository: this.repository };
         return {
           kind: "session",
           reason: "resumed_checkpoint_unavailable",

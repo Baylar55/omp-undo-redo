@@ -7,7 +7,14 @@ import { createGitRunner } from "../src/core/git-runner.js";
 import { ensurePrivateGitRepository } from "../src/core/private-repo.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
-import { context, FakeExtensionApi, makeRepository, rmRetry, type TestContext } from "./helpers.js";
+import {
+  context,
+  FakeExtensionApi,
+  gitRepository,
+  makeRepository,
+  rmRetry,
+  type TestContext,
+} from "./helpers.js";
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-gc-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -104,20 +111,20 @@ describe("private-repo housekeeping", () => {
     }
   }, 120000);
 
-  it("never runs git gc against the user's own repository", async () => {
+  it("gcs a Git workspace's snapshot store, never the user's own repository", async () => {
     // Regression: `isPrivateRepository` used to answer "yes" for any repo in
     // the shared `privateRepositories` map — which caches the user's own repo
     // in Git mode — so 20 turns triggered `gc --prune=now` with GIT_DIR
     // pointing at the workspace's .git.
     const cwd = await makeRepository("omp-undo-redo-gc-usergit-");
-    const commands: string[][] = [];
+    const gcs: { args: string[]; gitDir?: string }[] = [];
     try {
       const pi = new FakeExtensionApi();
       ompUndoRedo(pi as never, {
         gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
           const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
           const wrapped: GitRunner = async (args, options) => {
-            commands.push(args);
+            if (args[0] === "gc") gcs.push({ args, gitDir: env?.GIT_DIR });
             return inner(args, options);
           };
           wrapped.cwd = cwd2;
@@ -129,13 +136,14 @@ describe("private-repo housekeeping", () => {
       await runTurns(pi, ctx, 20, "tracked.txt");
       await pi.emit("session_shutdown", ctx);
       // Shutdown housekeeping is detached, so a gc would appear after the
-      // handler resolves: poll the recorded commands instead of trusting the
-      // handler's return, and require the window to lapse with none.
-      const scheduledGc = await waitFor(
-        async () => commands.some((command) => command[0] === "gc"),
-        20,
-      );
-      expect(scheduledGc).toBe(false);
+      // handler resolves: poll the recorded commands.
+      expect(await waitFor(async () => gcs.length > 0, 20)).toBe(true);
+      const { storeDir } = await gitRepository(cwd);
+      for (const gc of gcs) {
+        expect(gc.gitDir).toBe(storeDir);
+        // Shared by every process in the repository: never `--prune=now`.
+        expect(gc.args).toContain("--prune=1.hour.ago");
+      }
     } finally {
       await rmRetry(cwd);
     }

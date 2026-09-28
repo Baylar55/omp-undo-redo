@@ -33,7 +33,12 @@ afterEach(async () => {
 describe("expireGitSessionHistories", () => {
   it("cleans up an expired session (refs deleted, history JSON deleted, tombstone written)", async () => {
     const gitDir = await temporaryDirectory("git-expire-1-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "expired-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -95,7 +100,12 @@ describe("expireGitSessionHistories", () => {
 
   it("preserves active sessions", async () => {
     const gitDir = await temporaryDirectory("git-expire-active-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "active-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -124,7 +134,12 @@ describe("expireGitSessionHistories", () => {
 
   it("preserves recent sessions", async () => {
     const gitDir = await temporaryDirectory("git-expire-recent-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "recent-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -153,7 +168,12 @@ describe("expireGitSessionHistories", () => {
 
   it("skips malformed history JSON without deleting or crashing", async () => {
     const gitDir = await temporaryDirectory("git-expire-malformed-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "malformed-session";
     const historyFile = historyPath(repository, sessionId);
 
@@ -170,7 +190,12 @@ describe("expireGitSessionHistories", () => {
 
   it("falls back to file mtime when lastAccessedAt is missing (v1 schema)", async () => {
     const gitDir = await temporaryDirectory("git-expire-v1-fallback-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "v1-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -204,7 +229,12 @@ describe("expireGitSessionHistories", () => {
 
   it("preserves history JSON if ref deletion fails (fail closed)", async () => {
     const gitDir = await temporaryDirectory("git-expire-ref-fail-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "ref-fail-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -245,7 +275,12 @@ describe("expireGitSessionHistories", () => {
 
   it("skips age expiration when retentionDays=0", async () => {
     const gitDir = await temporaryDirectory("git-expire-zero-retention-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "zero-retention-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -274,7 +309,12 @@ describe("expireGitSessionHistories", () => {
 
   it("preserves sessions with a fresh cross-process heartbeat marker", async () => {
     const gitDir = await temporaryDirectory("git-expire-heartbeat-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "heartbeat-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -321,7 +361,12 @@ describe("expireGitSessionHistories", () => {
 
   it("expires sessions once their cross-process heartbeat goes stale", async () => {
     const gitDir = await temporaryDirectory("git-expire-beat-stale-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "stale-heartbeat-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -360,7 +405,12 @@ describe("expireGitSessionHistories", () => {
 
   it("keeps original git checkpoint coordinates on disk when refs are missing at resume", async () => {
     const gitDir = await temporaryDirectory("git-resume-nopersist-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "nopersist-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -449,7 +499,12 @@ describe("expireGitSessionHistories", () => {
 
   it("removes a history JSON that coexists with its tombstone (residue cleanup)", async () => {
     const gitDir = await temporaryDirectory("git-residue-cleanup-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "residue-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -489,7 +544,12 @@ describe("expireGitSessionHistories", () => {
 
   it("clears a superseded tombstone when the session saves again", async () => {
     const gitDir = await temporaryDirectory("git-tombstone-clear-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "revived-session";
     const hash = sessionHash(sessionId);
 
@@ -550,7 +610,12 @@ describe("expireGitSessionHistories", () => {
 
   it("prunes tombstones older than 2x retentionDays", async () => {
     const gitDir = await temporaryDirectory("git-prune-tombstone-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const historyDir = join(gitDir, "omp-undo-redo", "history");
     await mkdir(historyDir, { recursive: true });
 

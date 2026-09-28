@@ -1,10 +1,11 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
 import { deleteRefsBatched } from "./git-refs.js";
 import type {
+  DiscoveredRepository,
   FileCheckpointUnavailableReason,
   GitCheckpoint,
   GitRepository,
@@ -55,13 +56,123 @@ export function checkpointNamespace(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex");
 }
 
-/** Ref paths are loose files under `.git/refs/`, so on Windows the repository
- *  path plus the ref must fit MAX_PATH. `core.longpaths` is deliberately not
- *  forced: refs written past MAX_PATH are invisible to the user's own git, whose
- *  `gc` would then prune the snapshot objects. Hence 16-hex checkpoint ids
- *  (64 random bits) and no session hash in v2 refs. */
+/** 16-hex checkpoint ids (64 random bits) and no session hash in v2 refs
+ *  keep ref paths short: they are loose files under the store's `refs/`. */
 function newCheckpointId(): string {
   return randomBytes(8).toString("hex");
+}
+
+/** A Git-mode store borrows the user's objects instead of copying them. */
+function borrowsObjects(repository: GitRepository): boolean {
+  return repository.storeDir !== repository.gitDir;
+}
+
+function userObjects(repository: GitRepository): string {
+  return join(repository.commonDir, "objects");
+}
+
+/** Env binding a runner to `repository`'s snapshot store. Private-Git runs
+ *  every command inside the private repo; Git mode keeps the user's
+ *  repository (HEAD, config, ignore rules), writes objects to the store and
+ *  reads the user's through `GIT_ALTERNATE_OBJECT_DIRECTORIES`, so snapshot
+ *  objects never enter the user's object store. */
+export function snapshotRunnerEnv(repository: GitRepository): Record<string, string> {
+  return borrowsObjects(repository)
+    ? {
+        GIT_OBJECT_DIRECTORY: join(repository.storeDir, "objects"),
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: userObjects(repository),
+      }
+    : { GIT_DIR: repository.storeDir };
+}
+
+/** Inverse of `snapshotRunnerEnv`: the store `git` is bound to, if any. */
+function boundStore(git: GitRunner): string | undefined {
+  const objects = git.env?.GIT_OBJECT_DIRECTORY;
+  return objects ? dirname(objects) : git.env?.GIT_DIR;
+}
+
+/** Env for commands run inside the store: snapshot refs, and its `gc`,
+ *  which must read the objects a Git-mode store borrows. */
+export function storeEnv(repository: GitRepository): Record<string, string> {
+  return borrowsObjects(repository)
+    ? { GIT_DIR: repository.storeDir, GIT_ALTERNATE_OBJECT_DIRECTORIES: userObjects(repository) }
+    : { GIT_DIR: repository.storeDir };
+}
+
+/** Copies into a Git-mode store every object of a snapshot that the store
+ *  only borrows and the user's HEAD does not reach: content of a reset or
+ *  amended commit, a blob staged and then dropped, an old version a file was
+ *  reverted to. Those survive the user's `gc` only for its grace periods,
+ *  and `reflog expire --expire=now` + `gc --prune=now` would break the
+ *  snapshot at once. What HEAD reaches stays shared, so capture never copies
+ *  the repository: a user who rewrites history and prunes it on purpose
+ *  loses the checkpoints that need it, and restoring them reports a failure.
+ *  An unborn HEAD reaches nothing: every staged blob the store lacks is
+ *  copied (the index is where an unborn repository's snapshot content can
+ *  already exist). A clean worktree costs one `diff-tree`; objects the
+ *  capture itself wrote are loose in the store and cost a `stat` each. */
+async function pinBorrowedObjects(
+  git: GitRunner,
+  repository: GitRepository,
+  tree: string,
+): Promise<boolean> {
+  if (!borrowsObjects(repository)) return true;
+  const env = snapshotRunnerEnv(repository);
+  const changed = await invoke(
+    git,
+    ["diff-tree", "-r", "-t", "-z", "--no-renames", "--no-relative", "HEAD", tree, "--"],
+    { env },
+  );
+  const candidates = new Set<string>();
+  if (changed.code === 0) {
+    // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
+    const fields = changed.stdout.split("\0");
+    for (let index = 0; index + 1 < fields.length; index += 2) {
+      const [, mode, , sha] = fields[index]!.slice(1).split(" ");
+      if (mode !== "160000" && sha && !/^0+$/.test(sha)) candidates.add(sha);
+    }
+    // No difference means the snapshot is HEAD's own tree.
+    if (candidates.size > 0) candidates.add(tree);
+  } else {
+    if (changed.error) return false;
+    const head = await invoke(git, ["rev-parse", "--verify", "-q", "HEAD"], { env });
+    if (head.code === 0 || head.error) return false;
+    const staged = await invoke(git, ["ls-files", "-s", "-z"], { env });
+    if (staged.code !== 0) return false;
+    // Entries: "<mode> <object> <stage>\t<path>".
+    for (const entry of staged.stdout.split("\0")) {
+      const [mode, sha] = entry.split(" ");
+      if (sha && mode !== "160000") candidates.add(sha);
+    }
+    candidates.add(tree);
+  }
+  const objects = join(repository.storeDir, "objects");
+  const loose = await Promise.all(
+    [...candidates].map((id) =>
+      stat(join(objects, id.slice(0, 2), id.slice(2))).then(
+        () => true,
+        () => false,
+      ),
+    ),
+  );
+  const unknown = [...candidates].filter((_, index) => !loose[index]);
+  if (unknown.length === 0) return true;
+  // Without the alternates env only the store's own objects are visible.
+  const local = await invoke(git, ["cat-file", "--batch-check=%(objectname)"], {
+    env: { ...env, GIT_ALTERNATE_OBJECT_DIRECTORIES: "" },
+    stdin: `${unknown.join("\n")}\n`,
+  });
+  if (local.code !== 0) return false;
+  const borrowed = local.stdout
+    .split("\n")
+    .filter((line) => line.endsWith(" missing"))
+    .map((line) => line.slice(0, line.indexOf(" ")));
+  if (borrowed.length === 0) return true;
+  const packed = await invoke(git, ["pack-objects", "-q", join(objects, "pack", "pack")], {
+    env,
+    stdin: `${borrowed.join("\n")}\n`,
+  });
+  return packed.code === 0;
 }
 
 function checkpointRefs(
@@ -91,8 +202,12 @@ async function invoke(
   }
 }
 
-async function run(git: GitRunner, args: string[]): Promise<boolean> {
-  return (await invoke(git, args)).code === 0;
+async function run(
+  git: GitRunner,
+  args: string[],
+  options?: Parameters<GitRunner>[1],
+): Promise<boolean> {
+  return (await invoke(git, args, options)).code === 0;
 }
 
 async function canonicalPath(value: string, base: string): Promise<string> {
@@ -105,7 +220,7 @@ async function canonicalPath(value: string, base: string): Promise<string> {
 }
 
 export type RepositoryResolution =
-  | { repository: GitRepository }
+  | { repository: DiscoveredRepository }
   | { reason: "git_unavailable" | "not_repository" | "repository_unresolvable" };
 
 export async function resolveRepository(git: GitRunner): Promise<RepositoryResolution> {
@@ -153,7 +268,7 @@ export async function resolveRepository(git: GitRunner): Promise<RepositoryResol
 }
 
 type SnapshotResult =
-  | { hash: string; snapshotIndexLease?: SnapshotIndexLease }
+  | { hash: string; tree: string; snapshotIndexLease?: SnapshotIndexLease }
   | { reason: "invalid_head" | "snapshot_failed" };
 
 type SeedSnapshotIndexResult =
@@ -190,7 +305,7 @@ async function createCommitForTree(
   const commit = await invoke(git, [...GIT_AUTHOR, "commit-tree", treeHash, "-m", message]);
   if (commit.code !== 0) return { reason: "snapshot_failed" };
   const commitHash = commit.stdout.trim();
-  return commitHash ? { hash: commitHash } : { reason: "snapshot_failed" };
+  return commitHash ? { hash: commitHash, tree: treeHash } : { reason: "snapshot_failed" };
 }
 
 /** A lease is usable only while its baseline still describes HEAD: the same
@@ -296,7 +411,7 @@ export async function createSnapshotCommit(
             // lease is simply reseeded.
             { directory: tempDirectory, indexPath, baseTree: treeHash, unborn: true };
       tempDirectory = null;
-      return { hash: commit.hash, snapshotIndexLease };
+      return { ...commit, snapshotIndexLease };
     }
     return commit;
   } catch {
@@ -392,7 +507,7 @@ async function releaseLooseRef(
   expectedHash: string,
 ): Promise<boolean> {
   if (!ref.startsWith("refs/") || ref.includes("..")) return false;
-  const path = join(repository.commonDir, ref);
+  const path = join(repository.storeDir, ref);
   try {
     if ((await readFile(path, "utf8")).trim() !== expectedHash) return false;
     await rm(path, { force: true });
@@ -408,9 +523,9 @@ export async function releaseRefs(
 ): Promise<boolean> {
   const grouped = new Map<string, RefRelease[]>();
   for (const ref of refs) {
-    const list = grouped.get(ref.repository.commonDir);
+    const list = grouped.get(ref.repository.storeDir);
     if (list) list.push(ref);
-    else grouped.set(ref.repository.commonDir, [ref]);
+    else grouped.set(ref.repository.storeDir, [ref]);
   }
   const results = await Promise.allSettled(
     [...grouped.values()].map(async (groupedRefs) => {
@@ -418,7 +533,7 @@ export async function releaseRefs(
       const { repository } = groupedRefs[0];
       try {
         const outcome = await deleteRefsBatched(gitForRepository(repository), groupedRefs, {
-          env: { GIT_DIR: repository.commonDir },
+          env: storeEnv(repository),
           onSingleFailure: ({ ref, expectedHash }) =>
             releaseLooseRef(repository, ref, expectedHash),
         });
@@ -465,7 +580,7 @@ export async function releasePendingCheckpoint(
 ): Promise<boolean> {
   const [releasedRef, releasedLease] = await Promise.all([
     deleteRefsBatched(git, [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }], {
-      env: { GIT_DIR: pending.repository.commonDir },
+      env: storeEnv(pending.repository),
       onSingleFailure: ({ ref, expectedHash }) =>
         releaseLooseRef(pending.repository, ref, expectedHash),
     }),
@@ -482,19 +597,30 @@ export type FinishAfterTurnResult =
   | { status: "git"; checkpoint: GitCheckpoint }
   | { status: "session_only"; reason: FileCheckpointUnavailableReason };
 
+/** `store`: the snapshot store `git` is bound to. Callers holding the
+ *  backend pass it, so a host runner factory that wraps runners without
+ *  re-exposing `runner.env` still captures. */
 export async function prepareBeforeTurn(
   git: GitRunner,
   sessionId: string,
   ownerRegistry?: CheckpointOwnerRegistry,
+  store: string | undefined = boundStore(git),
 ): Promise<PrepareBeforeTurnResult> {
   const resolved = await resolveRepository(git);
   if ("reason" in resolved) return { status: "session_only", reason: resolved.reason };
+  // Fail closed: without a store, snapshot objects and refs would land in
+  // the user's repository, where all-refs operations export them.
+  if (!store) return { status: "session_only", reason: "repository_unresolvable" };
+  const repository: GitRepository = {
+    ...resolved.repository,
+    storeDir: await canonicalPath(store, resolved.repository.worktree),
+  };
 
   const ownership = ownerRegistry
-    ? await ownerRegistry.ensureInitialized(resolved.repository, git)
+    ? await ownerRegistry.ensureInitialized(repository, git)
     : "legacy";
   const checkpointId = newCheckpointId();
-  const indexKey = persistentIndexKey(resolved.repository, sessionId);
+  const indexKey = persistentIndexKey(repository, sessionId);
   const priorLease = persistentSnapshotIndices.get(indexKey);
   let snapshot: SnapshotResult;
   let lease: SnapshotIndexLease | undefined;
@@ -522,15 +648,17 @@ export async function prepareBeforeTurn(
       reason: snapshot.reason === "invalid_head" ? "invalid_head" : "before_snapshot_failed",
     };
   }
+  if (!(await pinBorrowedObjects(git, repository, snapshot.tree))) {
+    await releaseSnapshotIndexLease(lease);
+    return { status: "session_only", reason: "before_snapshot_failed" };
+  }
   const { beforeRef } = checkpointRefs(sessionId, checkpointId, ownership, ownerRegistry?.ownerId);
   if (
-    !(await run(git, [
-      "update-ref",
-      "-m",
-      "omp-undo-redo: retain before checkpoint",
-      beforeRef,
-      snapshot.hash,
-    ]))
+    !(await run(
+      git,
+      ["update-ref", "-m", "omp-undo-redo: retain before checkpoint", beforeRef, snapshot.hash],
+      { env: storeEnv(repository) },
+    ))
   ) {
     await releaseSnapshotIndexLease(lease);
     return {
@@ -543,7 +671,7 @@ export async function prepareBeforeTurn(
     status: "git",
     checkpoint: {
       kind: "git",
-      repository: resolved.repository,
+      repository,
       beforeHash: snapshot.hash,
       beforeRef,
       checkpointId,
@@ -585,15 +713,17 @@ export async function finishAfterTurn(
       reason: snapshot.reason === "invalid_head" ? "invalid_head" : "after_snapshot_failed",
     };
   }
+  if (!(await pinBorrowedObjects(git, before.repository, snapshot.tree))) {
+    await releasePendingCheckpoint(git, before);
+    return { status: "session_only", reason: "after_snapshot_failed" };
+  }
   const afterRef = before.beforeRef.replace(/\/before$/, "/after");
   if (
-    !(await run(git, [
-      "update-ref",
-      "-m",
-      "omp-undo-redo: retain after checkpoint",
-      afterRef,
-      snapshot.hash,
-    ]))
+    !(await run(
+      git,
+      ["update-ref", "-m", "omp-undo-redo: retain after checkpoint", afterRef, snapshot.hash],
+      { env: storeEnv(before.repository) },
+    ))
   ) {
     await releasePendingCheckpoint(git, before);
     return { status: "session_only", reason: "after_ref_failed" };
@@ -628,7 +758,10 @@ export async function retainCheckpointForResume(
     `delete ${checkpoint.beforeRef} ${checkpoint.beforeHash}`,
     `delete ${checkpoint.afterRef} ${checkpoint.afterHash}`,
   ].join("\n");
-  const retained = await invoke(git, ["update-ref", "--stdin"], { stdin: `${input}\n` });
+  const retained = await invoke(git, ["update-ref", "--stdin"], {
+    env: storeEnv(checkpoint.repository),
+    stdin: `${input}\n`,
+  });
   if (retained.code !== 0) return checkpoint;
   return { ...checkpoint, beforeRef, afterRef };
 }

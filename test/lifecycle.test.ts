@@ -9,6 +9,7 @@ import {
   context,
   FakeExtensionApi,
   git,
+  gitRepository,
   makeRepository,
   privateRefs,
   rmRetry as rmRetryTimes,
@@ -906,11 +907,7 @@ describe("resumed session history", () => {
       // Corrupt the durable history file so the next resume hits the
       // unavailable path (distinct from the expired tombstone path).
       const { historyPath } = await import("../src/core/history-store.js");
-      const repo = {
-        worktree: cwd,
-        gitDir: join(cwd, ".git"),
-        commonDir: join(cwd, ".git"),
-      };
+      const repo = await gitRepository(cwd);
       await writeFile(historyPath(repo, sessionId), "{corrupted history");
 
       const secondApi = new FakeExtensionApi();
@@ -985,11 +982,7 @@ describe("resumed session history", () => {
 
       // 2. Overwrite history file timestamp for session 1 to 40 days ago
       const { historyPath } = await import("../src/core/history-store.js");
-      const repo = {
-        worktree: cwd,
-        gitDir: join(cwd, ".git"),
-        commonDir: join(cwd, ".git"),
-      };
+      const repo = await gitRepository(cwd);
       const hPath = historyPath(repo, sessionId1);
       const content = JSON.parse(await readFile(hPath, "utf8"));
       content.lastAccessedAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
@@ -999,7 +992,7 @@ describe("resumed session history", () => {
       const { activeHeartbeatPath } = await import("../src/core/history-liveness.js");
       await rm(
         activeHeartbeatPath(
-          join(repo.commonDir, "omp-undo-redo", "history"),
+          join(repo.storeDir, "omp-undo-redo", "history"),
           checkpointNamespace(sessionId1),
         ),
         { force: true },

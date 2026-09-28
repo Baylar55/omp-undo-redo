@@ -27,6 +27,7 @@ import {
   releaseRefs,
   releasePendingCheckpoint,
   resolveRepository,
+  storeEnv,
 } from "../src/core/checkpoints.js";
 import type {
   GitCheckpoint,
@@ -35,7 +36,10 @@ import type {
   PendingGitCheckpoint,
   SessionEntryLike,
   SessionReader,
+  TurnCheckpoint,
 } from "../src/core/types.js";
+import { historyDirectory } from "../src/core/history-store.js";
+import { gitRepository, snapshotEnv } from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -56,12 +60,14 @@ function reader(entries: SessionEntryLike[], leafId: string | null): SessionRead
   };
 }
 
-function gitRunner(cwd: string): GitRunner {
+function gitRunner(cwd: string, env?: Record<string, string>): GitRunner {
   const runner: GitRunner = async (args, options) => {
+    const mergedEnv =
+      env || options?.env ? { ...process.env, ...env, ...options?.env } : process.env;
     if (options?.stdin !== undefined) {
       const child = spawn("git", args, {
         cwd,
-        env: { ...process.env, ...options.env },
+        env: mergedEnv,
         windowsHide: true,
       });
       let stdout = "";
@@ -86,7 +92,7 @@ function gitRunner(cwd: string): GitRunner {
     try {
       const result = await execFileAsync("git", args, {
         cwd,
-        env: { ...process.env, ...options?.env },
+        env: mergedEnv,
         windowsHide: true,
       });
       return { stdout: result.stdout, stderr: result.stderr, code: 0 };
@@ -100,17 +106,19 @@ function gitRunner(cwd: string): GitRunner {
     }
   };
   runner.cwd = cwd;
+  if (env) runner.env = env;
   return runner;
 }
 
-async function makeRepo(): Promise<{ cwd: string; git: GitRunner }> {
+async function makeRepo(): Promise<{ cwd: string; git: GitRunner; snap: GitRunner }> {
   const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-repo-"));
   const git = gitRunner(cwd);
   await git(["init", "-q"]);
   await git(["config", "user.name", "test"]);
   await git(["config", "user.email", "test@example.com"]);
   await git(["config", "core.autocrlf", "false"]);
-  return { cwd, git };
+  const snap = gitRunner(cwd, await snapshotEnv(cwd));
+  return { cwd, git, snap };
 }
 
 async function initializeBranch(git: GitRunner, cwd: string): Promise<void> {
@@ -215,11 +223,11 @@ describe("repository resolution", () => {
 
 describe("history-safe Git checkpoints", () => {
   it("keeps an intervening agent commit and preserves refs, index, undo, and redo", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
       const beforeIndex = await indexState(git, cwd);
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "intervening-commit"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "intervening-commit"));
       expect(before).not.toBeNull();
       if (!before) return;
       expect(await indexState(git, cwd)).toEqual(beforeIndex);
@@ -231,7 +239,7 @@ describe("history-safe Git checkpoints", () => {
       const branchTip = await text(git, ["rev-parse", "refs/heads/A"]);
       const afterAgentIndex = await indexState(git, cwd);
       await writeFile(join(cwd, "turn.txt"), "uncommitted turn change\n");
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
@@ -239,17 +247,22 @@ describe("history-safe Git checkpoints", () => {
       expect(await text(git, ["rev-parse", "refs/heads/A"])).toBe(branchTip);
       expect(await text(git, ["log", "--first-parent", "--format=%H"])).toContain(agentCommit);
       expect(await indexState(git, cwd)).toEqual(afterAgentIndex);
-      expect(await text(git, ["rev-parse", `${after.beforeRef}^{commit}`])).toBe(after.beforeHash);
-      expect(await text(git, ["rev-parse", `${after.afterRef}^{commit}`])).toBe(after.afterHash);
+      const storeRunner = gitRunner(cwd, storeEnv(after.repository));
+      expect(await text(storeRunner, ["rev-parse", `${after.beforeRef}^{commit}`])).toBe(
+        after.beforeHash,
+      );
+      expect(await text(storeRunner, ["rev-parse", `${after.afterRef}^{commit}`])).toBe(
+        after.afterHash,
+      );
 
-      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       await expect(readFile(join(cwd, "agent.txt"))).rejects.toThrow();
       await expect(readFile(join(cwd, "turn.txt"))).rejects.toThrow();
-      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -262,16 +275,16 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("preserves staged turn state while undoing and redoing the worktree", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "staged-turn-divergence"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "staged-turn-divergence"));
       expect(before).not.toBeNull();
       if (!before) return;
 
       await writeFile(join(cwd, "tracked.txt"), "turn\n");
       await git(["add", "tracked.txt"]);
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
@@ -281,7 +294,7 @@ describe("history-safe Git checkpoints", () => {
         "M  tracked.txt",
       );
 
-      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -301,7 +314,7 @@ describe("history-safe Git checkpoints", () => {
       ).toContain("-turn\n+base");
       const indexBeforeRedo = await readFile(savedIndexPath);
 
-      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -322,7 +335,7 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("navigates a completed turn with no file changes", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
       const beforeHead = await text(git, ["rev-parse", "HEAD"]);
@@ -330,14 +343,14 @@ describe("history-safe Git checkpoints", () => {
       const beforeIndex = await indexState(git, cwd);
       const beforeContents = await readFile(join(cwd, "tracked.txt"), "utf8");
 
-      const pending = pendingCheckpoint(await prepareBeforeTurn(git, "empty-turn"));
+      const pending = pendingCheckpoint(await prepareBeforeTurn(snap, "empty-turn"));
       expect(pending).not.toBeNull();
       if (!pending) return;
-      const checkpoint = completedCheckpoint(await finishAfterTurn(git, pending, "u1", "a1"));
+      const checkpoint = completedCheckpoint(await finishAfterTurn(snap, pending, "u1", "a1"));
       expect(checkpoint).not.toBeNull();
       if (!checkpoint) return;
-      expect(await text(git, ["rev-parse", `${checkpoint.beforeHash}^{tree}`])).toBe(
-        await text(git, ["rev-parse", `${checkpoint.afterHash}^{tree}`]),
+      expect(await text(snap, ["rev-parse", `${checkpoint.beforeHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${checkpoint.afterHash}^{tree}`]),
       );
 
       const navigated: string[] = [];
@@ -350,7 +363,7 @@ describe("history-safe Git checkpoints", () => {
           return { cancelled: false };
         },
       };
-      const navigation = new SessionNavigation(navigationPort, git);
+      const navigation = new SessionNavigation(navigationPort, snap);
       await navigation.recordTurnEnd(checkpoint);
 
       expect((await navigation.undo()).status).toBe("moved");
@@ -368,7 +381,7 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("navigates a turn that changes only ignored files", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     const ignoredPath = join(cwd, "ignored.txt");
     try {
       await initializeBranch(git, cwd);
@@ -380,15 +393,15 @@ describe("history-safe Git checkpoints", () => {
       const beforeIndex = await indexState(git, cwd);
       const beforeContents = await readFile(join(cwd, "tracked.txt"), "utf8");
 
-      const pending = pendingCheckpoint(await prepareBeforeTurn(git, "ignored-turn"));
+      const pending = pendingCheckpoint(await prepareBeforeTurn(snap, "ignored-turn"));
       expect(pending).not.toBeNull();
       if (!pending) return;
       await writeFile(ignoredPath, "ignored after turn\n");
-      const checkpoint = completedCheckpoint(await finishAfterTurn(git, pending, "u1", "a1"));
+      const checkpoint = completedCheckpoint(await finishAfterTurn(snap, pending, "u1", "a1"));
       expect(checkpoint).not.toBeNull();
       if (!checkpoint) return;
-      expect(await text(git, ["rev-parse", `${checkpoint.beforeHash}^{tree}`])).toBe(
-        await text(git, ["rev-parse", `${checkpoint.afterHash}^{tree}`]),
+      expect(await text(snap, ["rev-parse", `${checkpoint.beforeHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${checkpoint.afterHash}^{tree}`]),
       );
 
       const navigated: string[] = [];
@@ -401,7 +414,7 @@ describe("history-safe Git checkpoints", () => {
           return { cancelled: false };
         },
       };
-      const navigation = new SessionNavigation(navigationPort, git);
+      const navigation = new SessionNavigation(navigationPort, snap);
       await navigation.recordTurnEnd(checkpoint);
 
       expect((await navigation.undo()).status).toBe("moved");
@@ -420,7 +433,7 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("keeps a pre-existing ignored file across undo/redo of a turn that un-ignores it", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     const envPath = join(cwd, ".env");
     try {
       await initializeBranch(git, cwd);
@@ -429,23 +442,23 @@ describe("history-safe Git checkpoints", () => {
       await git(["commit", "-qm", "ignore fixture"]);
       await writeFile(envPath, "SECRET=1\n");
 
-      const pending = pendingCheckpoint(await prepareBeforeTurn(git, "unignore-turn"));
+      const pending = pendingCheckpoint(await prepareBeforeTurn(snap, "unignore-turn"));
       await writeFile(join(cwd, ".gitignore"), "# cleaned\n");
-      const checkpoint = completedCheckpoint(await finishAfterTurn(git, pending, null, null));
+      const checkpoint = completedCheckpoint(await finishAfterTurn(snap, pending, null, null));
 
       await expect(
-        applyCheckpoint(git, checkpoint.afterHash, checkpoint.beforeHash),
+        applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
       ).resolves.toEqual({ status: "applied", nestedRepositories: [] });
       expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe(".env\n");
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
       await expect(
-        applyCheckpoint(git, checkpoint.beforeHash, checkpoint.afterHash),
+        applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
       ).resolves.toEqual({ status: "applied", nestedRepositories: [] });
       expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe("# cleaned\n");
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
-      await releaseCheckpoint(git, checkpoint);
+      await releaseCheckpoint(snap, checkpoint);
       await releaseAllPersistentSnapshotIndices();
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -453,24 +466,24 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("reuses and normalizes the alternate index without changing fresh snapshot semantics", async () => {
-    const { cwd, git: baseGit } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
-      await initializeBranch(baseGit, cwd);
+      await initializeBranch(git, cwd);
       await writeFile(join(cwd, "headonly.txt"), "tracked before deletion\n");
-      await baseGit(["add", "headonly.txt"]);
-      await baseGit(["commit", "-qm", "tracked deletion fixture"]);
+      await git(["add", "headonly.txt"]);
+      await git(["commit", "-qm", "tracked deletion fixture"]);
       await rm(join(cwd, "headonly.txt"));
       await writeFile(join(cwd, "candidate.txt"), "untracked before turn\n");
 
       const commands: string[][] = [];
-      const git = Object.assign(
+      const gitWrapper = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) => {
           commands.push(args);
-          return baseGit(args, options);
+          return snap(args, options);
         },
-        { cwd },
+        { cwd, env: snap.env },
       ) satisfies GitRunner;
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "normalized-index"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, "normalized-index"));
       const leaseDirectory = before.snapshotIndexLease?.directory;
       expect(leaseDirectory).toBeDefined();
       if (!leaseDirectory) return;
@@ -478,27 +491,27 @@ describe("history-safe Git checkpoints", () => {
 
       await writeFile(join(cwd, ".gitignore"), "candidate.txt\nheadonly.txt\n");
       await writeFile(join(cwd, "headonly.txt"), "tracked after recreation\n");
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
       expect(commands.some((args) => args[0] === "diff-index")).toBe(true);
       // With cross-turn index reuse the lease is retained after the after-snapshot
       // (not deleted) so the next turn can reuse it for a cheap before snapshot.
       await expect(stat(leaseDirectory)).resolves.toBeDefined();
-      const fresh = pendingCheckpoint(await prepareBeforeTurn(baseGit, "fresh-ground-truth"));
-      expect(await text(baseGit, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
-        await text(baseGit, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "fresh-ground-truth"));
+      expect(await text(snap, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
       );
-      expect(await text(baseGit, ["ls-tree", "-r", "--name-only", after.afterHash])).toContain(
+      expect(await text(snap, ["ls-tree", "-r", "--name-only", after.afterHash])).toContain(
         "headonly.txt",
       );
-      expect(await text(baseGit, ["ls-tree", "-r", "--name-only", after.afterHash])).not.toContain(
+      expect(await text(snap, ["ls-tree", "-r", "--name-only", after.afterHash])).not.toContain(
         "candidate.txt",
       );
 
       const freshLeaseDirectory = fresh.snapshotIndexLease?.directory;
-      await releasePendingCheckpoint(baseGit, fresh);
+      await releasePendingCheckpoint(snap, fresh);
       if (freshLeaseDirectory) await expect(stat(freshLeaseDirectory)).rejects.toThrow();
-      await releaseCheckpoint(baseGit, after);
+      await releaseCheckpoint(snap, after);
       // Clean up the persisted lease from this test's session.
       await releaseAllPersistentSnapshotIndices();
     } finally {
@@ -507,41 +520,41 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("skips index reset when retained membership already matches HEAD", async () => {
-    const { cwd, git: baseGit } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
-      await initializeBranch(baseGit, cwd);
+      await initializeBranch(git, cwd);
       const commands: string[][] = [];
-      const git = Object.assign(
+      const gitWrapper = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) => {
           commands.push(args);
-          return baseGit(args, options);
+          return snap(args, options);
         },
-        { cwd },
+        { cwd, env: snap.env },
       ) satisfies GitRunner;
 
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "empty-normalization"));
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const before = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, "empty-normalization"));
+      const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
       expect(commands.some((args) => args[0] === "diff-index")).toBe(true);
       expect(commands.some((args) => args.includes("reset"))).toBe(false);
-      await releaseCheckpoint(baseGit, after);
+      await releaseCheckpoint(snap, after);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
   it("reuses the persisted alternate index across consecutive turns to avoid a full re-hash", async () => {
-    const { cwd, git: baseGit } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     const sessionId = "cross-turn-reuse";
     try {
-      await initializeBranch(baseGit, cwd);
+      await initializeBranch(git, cwd);
       await writeFile(join(cwd, "tracked.txt"), "initial\n");
-      await baseGit(["add", "tracked.txt"]);
-      await baseGit(["commit", "-qm", "initial"]);
+      await git(["add", "tracked.txt"]);
+      await git(["commit", "-qm", "initial"]);
 
       // First turn: seeds the persistent index (full add -A) and retains it.
-      const before1 = pendingCheckpoint(await prepareBeforeTurn(baseGit, sessionId));
-      const after1 = completedCheckpoint(await finishAfterTurn(baseGit, before1, null, null));
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
+      const after1 = completedCheckpoint(await finishAfterTurn(snap, before1, null, null));
       const leaseDirectory1 = before1.snapshotIndexLease?.directory;
       expect(leaseDirectory1).toBeDefined();
       if (!leaseDirectory1) return;
@@ -550,28 +563,28 @@ describe("history-safe Git checkpoints", () => {
       // Second turn, same session, no file changes: the before snapshot must
       // reuse the same index (no fresh read-tree seeding) and reflect the
       // unchanged worktree, so its tree equals the previous after tree.
-      const before2 = pendingCheckpoint(await prepareBeforeTurn(baseGit, sessionId));
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
       expect(before2.snapshotIndexLease?.directory).toBe(leaseDirectory1);
       // Commit hashes embed the message + timestamp, so compare the captured
       // trees: with an unchanged worktree the reused index must reproduce the
       // previous turn's after-tree exactly.
-      const tree = (hash: string) => text(baseGit, ["rev-parse", `${hash}^{tree}`]);
+      const tree = (hash: string) => text(snap, ["rev-parse", `${hash}^{tree}`]);
       expect(await tree(before2.beforeHash)).toBe(await tree(after1.afterHash));
-      const after2 = completedCheckpoint(await finishAfterTurn(baseGit, before2, null, null));
+      const after2 = completedCheckpoint(await finishAfterTurn(snap, before2, null, null));
       expect(await tree(after2.afterHash)).toBe(await tree(after1.afterHash));
 
       // A change made between turns is still captured on the next before pass.
       await writeFile(join(cwd, "tracked.txt"), "mutated between turns\n");
-      const before3 = pendingCheckpoint(await prepareBeforeTurn(baseGit, sessionId));
+      const before3 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
       expect(before3.snapshotIndexLease?.directory).toBe(leaseDirectory1);
-      const after3 = completedCheckpoint(await finishAfterTurn(baseGit, before3, null, null));
-      expect(await text(baseGit, ["show", `${after3.afterHash}:tracked.txt`])).toBe(
+      const after3 = completedCheckpoint(await finishAfterTurn(snap, before3, null, null));
+      expect(await text(snap, ["show", `${after3.afterHash}:tracked.txt`])).toBe(
         "mutated between turns",
       );
 
-      await releaseCheckpoint(baseGit, after1);
-      await releaseCheckpoint(baseGit, after2);
-      await releaseCheckpoint(baseGit, after3);
+      await releaseCheckpoint(snap, after1);
+      await releaseCheckpoint(snap, after2);
+      await releaseCheckpoint(snap, after3);
     } finally {
       await rm(cwd, { recursive: true, force: true });
       await releaseAllPersistentSnapshotIndices();
@@ -581,7 +594,7 @@ describe("history-safe Git checkpoints", () => {
   it.skipIf(process.platform === "win32")(
     "matches fresh snapshots across regular-file and symlink transitions",
     async () => {
-      const { cwd, git } = await makeRepo();
+      const { cwd, git, snap } = await makeRepo();
       try {
         await initializeBranch(git, cwd);
         await writeFile(join(cwd, "target.txt"), "target\n");
@@ -589,34 +602,34 @@ describe("history-safe Git checkpoints", () => {
         await git(["add", "."]);
         await git(["commit", "-qm", "type transition fixture"]);
 
-        const regularBefore = pendingCheckpoint(await prepareBeforeTurn(git, "regular-before"));
+        const regularBefore = pendingCheckpoint(await prepareBeforeTurn(snap, "regular-before"));
         await rm(join(cwd, "node"));
         await symlink("target.txt", join(cwd, "node"));
         const symlinkAfter = completedCheckpoint(
-          await finishAfterTurn(git, regularBefore, null, null),
+          await finishAfterTurn(snap, regularBefore, null, null),
         );
         const symlinkFresh = pendingCheckpoint(
-          await prepareBeforeTurn(git, "symlink-fresh-ground-truth"),
+          await prepareBeforeTurn(snap, "symlink-fresh-ground-truth"),
         );
-        expect(await text(git, ["rev-parse", `${symlinkAfter.afterHash}^{tree}`])).toBe(
-          await text(git, ["rev-parse", `${symlinkFresh.beforeHash}^{tree}`]),
+        expect(await text(snap, ["rev-parse", `${symlinkAfter.afterHash}^{tree}`])).toBe(
+          await text(snap, ["rev-parse", `${symlinkFresh.beforeHash}^{tree}`]),
         );
 
         await rm(join(cwd, "node"));
         await writeFile(join(cwd, "node"), "regular again\n");
         const regularAfter = completedCheckpoint(
-          await finishAfterTurn(git, symlinkFresh, null, null),
+          await finishAfterTurn(snap, symlinkFresh, null, null),
         );
         const regularFresh = pendingCheckpoint(
-          await prepareBeforeTurn(git, "regular-fresh-ground-truth"),
+          await prepareBeforeTurn(snap, "regular-fresh-ground-truth"),
         );
-        expect(await text(git, ["rev-parse", `${regularAfter.afterHash}^{tree}`])).toBe(
-          await text(git, ["rev-parse", `${regularFresh.beforeHash}^{tree}`]),
+        expect(await text(snap, ["rev-parse", `${regularAfter.afterHash}^{tree}`])).toBe(
+          await text(snap, ["rev-parse", `${regularFresh.beforeHash}^{tree}`]),
         );
 
-        await releasePendingCheckpoint(git, regularFresh);
-        await releaseCheckpoint(git, symlinkAfter);
-        await releaseCheckpoint(git, regularAfter);
+        await releasePendingCheckpoint(snap, regularFresh);
+        await releaseCheckpoint(snap, symlinkAfter);
+        await releaseCheckpoint(snap, regularAfter);
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -626,7 +639,7 @@ describe("history-safe Git checkpoints", () => {
   it.skipIf(process.platform === "win32")(
     "preserves literal and non-UTF-8 paths while normalizing the retained index",
     async () => {
-      const { cwd, git } = await makeRepo();
+      const { cwd, git, snap } = await makeRepo();
       try {
         await initializeBranch(git, cwd);
         await writeFile(join(cwd, ":(top)-literal\tline\n.txt"), "literal path\n");
@@ -637,15 +650,15 @@ describe("history-safe Git checkpoints", () => {
         ]);
         await writeFile(nonUtf8Path, "raw path\n");
 
-        const before = pendingCheckpoint(await prepareBeforeTurn(git, "raw-paths"));
-        const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
-        const fresh = pendingCheckpoint(await prepareBeforeTurn(git, "raw-paths-fresh"));
+        const before = pendingCheckpoint(await prepareBeforeTurn(snap, "raw-paths"));
+        const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+        const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "raw-paths-fresh"));
 
-        expect(await text(git, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
-          await text(git, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+        expect(await text(snap, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
+          await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
         );
-        await releasePendingCheckpoint(git, fresh);
-        await releaseCheckpoint(git, after);
+        await releasePendingCheckpoint(snap, fresh);
+        await releaseCheckpoint(snap, after);
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -653,9 +666,10 @@ describe("history-safe Git checkpoints", () => {
   );
 
   it("preserves pre-existing changes outside a subdirectory session across undo and redo", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     const nested = join(cwd, "nested");
-    const nestedGit = gitRunner(nested);
+    const env = await snapshotEnv(cwd);
+    const nestedGit = gitRunner(nested, env);
     try {
       await initializeBranch(git, cwd);
       await mkdir(nested);
@@ -681,11 +695,11 @@ describe("history-safe Git checkpoints", () => {
       expect(before).not.toBeNull();
       if (!before) return;
       await writeFile(join(nested, "inside.txt"), "inside after turn\n");
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
-      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -701,7 +715,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await branchRefs(git)).toBe(refs);
       expect(await readFile(await indexPath(git, cwd))).toEqual(beforeIndex.raw);
 
-      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -723,9 +737,10 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("creates the same snapshot tree regardless of runner cwd", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     const nested = join(cwd, "nested");
-    const nestedGit = gitRunner(nested);
+    const env = await snapshotEnv(cwd);
+    const nestedGit = gitRunner(nested, env);
     try {
       await initializeBranch(git, cwd);
       await mkdir(nested);
@@ -734,13 +749,13 @@ describe("history-safe Git checkpoints", () => {
       await git(["add", "."]);
       await git(["commit", "-qm", "tree equivalence fixtures"]);
 
-      const rootCheckpoint = pendingCheckpoint(await prepareBeforeTurn(git, "root-tree"));
+      const rootCheckpoint = pendingCheckpoint(await prepareBeforeTurn(snap, "root-tree"));
       expect(rootCheckpoint).not.toBeNull();
       if (!rootCheckpoint) return;
       const nestedCheckpoint = pendingCheckpoint(await prepareBeforeTurn(nestedGit, "nested-tree"));
 
-      expect(await text(git, ["rev-parse", `${rootCheckpoint.beforeHash}^{tree}`])).toBe(
-        await text(git, ["rev-parse", `${nestedCheckpoint.beforeHash}^{tree}`]),
+      expect(await text(snap, ["rev-parse", `${rootCheckpoint.beforeHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${nestedCheckpoint.beforeHash}^{tree}`]),
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -748,10 +763,10 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("keeps symbolic HEAD and both branch tips unchanged across a branch switch", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "branch-switch"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "branch-switch"));
       expect(before).not.toBeNull();
       if (!before) return;
       await git(["switch", "-c", "B"]);
@@ -759,7 +774,7 @@ describe("history-safe Git checkpoints", () => {
       const branchBTip = await text(git, ["rev-parse", "B"]);
       const refsAfterSwitch = await branchRefs(git);
       await writeFile(join(cwd, "tracked.txt"), "branch B after\n");
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
@@ -769,12 +784,12 @@ describe("history-safe Git checkpoints", () => {
       expect(await branchRefs(git)).toBe(refsAfterSwitch);
       expect(refsAfterSwitch).not.toContain(after.beforeHash);
 
-      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
       await git(["switch", "A"]);
-      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -786,40 +801,40 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("falls back to a fresh index when the HEAD tree changes during the turn", async () => {
-    const { cwd, git: baseGit } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
-      await initializeBranch(baseGit, cwd);
-      const before = pendingCheckpoint(await prepareBeforeTurn(baseGit, "head-tree-change"));
+      await initializeBranch(git, cwd);
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "head-tree-change"));
       await writeFile(join(cwd, "committed.txt"), "committed during turn\n");
-      await baseGit(["add", "committed.txt"]);
-      await baseGit(["commit", "-qm", "move HEAD tree"]);
+      await git(["add", "committed.txt"]);
+      await git(["commit", "-qm", "move HEAD tree"]);
       await writeFile(join(cwd, "tracked.txt"), "uncommitted after HEAD move\n");
 
       const commands: string[][] = [];
-      const git = Object.assign(
+      const gitWrapper = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) => {
           commands.push(args);
-          return baseGit(args, options);
+          return snap(args, options);
         },
-        { cwd },
+        { cwd, env: snap.env },
       ) satisfies GitRunner;
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
       expect(commands.some((args) => args[0] === "diff-index")).toBe(false);
       expect(commands.some((args) => args[0] === "read-tree")).toBe(true);
-      const fresh = pendingCheckpoint(await prepareBeforeTurn(baseGit, "head-change-fresh"));
-      expect(await text(baseGit, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
-        await text(baseGit, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "head-change-fresh"));
+      expect(await text(snap, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
       );
-      await releasePendingCheckpoint(baseGit, fresh);
-      await releaseCheckpoint(baseGit, after);
+      await releasePendingCheckpoint(snap, fresh);
+      await releaseCheckpoint(snap, after);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
   it("does not mutate a mixed real index during capture, restoration, or cleanup", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
       await writeFile(join(cwd, "staged.txt"), "base\n");
@@ -841,7 +856,7 @@ describe("history-safe Git checkpoints", () => {
 
       const saved = await indexState(git, cwd);
       const beforeStatus = await text(git, ["status", "--porcelain=v2"]);
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "index-preservation"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "index-preservation"));
       expect(before).not.toBeNull();
       if (!before) return;
       expect(await indexState(git, cwd)).toEqual(saved);
@@ -849,21 +864,21 @@ describe("history-safe Git checkpoints", () => {
 
       await writeFile(join(cwd, "staged.txt"), "after turn\n");
       await writeFile(join(cwd, "after-only.txt"), "after only\n");
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
       expect(await indexState(git, cwd)).toEqual(saved);
-      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
       expect(await indexState(git, cwd)).toEqual(saved);
-      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
       expect(await indexState(git, cwd)).toEqual(saved);
-      expect(await releaseCheckpoint(git, after)).toBe(true);
+      expect(await releaseCheckpoint(snap, after)).toBe(true);
       expect(await indexState(git, cwd)).toEqual(saved);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -871,30 +886,30 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("changes only private refs through the complete checkpoint lifecycle", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
       const refs = await branchRefs(git);
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "ref-invariant"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "ref-invariant"));
       expect(before).not.toBeNull();
       if (!before) return;
       expect(await branchRefs(git)).toBe(refs);
       await writeFile(join(cwd, "tracked.txt"), "changed\n");
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
       expect(await branchRefs(git)).toBe(refs);
-      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
       expect(await branchRefs(git)).toBe(refs);
-      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
       expect(await branchRefs(git)).toBe(refs);
-      expect(await releaseCheckpoint(git, after)).toBe(true);
+      expect(await releaseCheckpoint(snap, after)).toBe(true);
       expect(await branchRefs(git)).toBe(refs);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -902,7 +917,7 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("restores additions, deletions, rename-as-delete/add, binary data, and Unicode names", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
       await writeFile(join(cwd, "old name.txt"), "old\n");
@@ -927,7 +942,7 @@ describe("history-safe Git checkpoints", () => {
         symlinkMode && symlinkConfig.code === 0 && symlinkConfig.stdout.trim() === "true";
       await writeFile(join(cwd, "before-only.txt"), "before only\n");
       const executableBefore = (await stat(join(cwd, "executable.sh"))).mode & 0o111;
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "restoration-matrix"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "restoration-matrix"));
       expect(before).not.toBeNull();
       if (!before) return;
       await rm(join(cwd, "old name.txt"));
@@ -940,11 +955,11 @@ describe("history-safe Git checkpoints", () => {
         await writeFile(join(cwd, "link to old.txt"), "regular file\n");
       }
       await writeFile(join(cwd, "after-only Ω.txt"), "after only\n");
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
 
-      expect(await applyCheckpoint(git, after.afterHash, after.beforeHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -962,7 +977,7 @@ describe("history-safe Git checkpoints", () => {
         expect(await readlink(join(cwd, "link to old.txt"))).toBe("old name.txt");
       }
 
-      expect(await applyCheckpoint(git, after.beforeHash, after.afterHash)).toEqual({
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -977,14 +992,14 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("fails safely on a conflicting reverse patch and leaves navigation unchanged", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "conflict"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "conflict"));
       expect(before).not.toBeNull();
       if (!before) return;
       await writeFile(join(cwd, "tracked.txt"), "after\n");
-      const after = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(after).not.toBeNull();
       if (!after) return;
       const checkpoint = checkpointWithRepository(
@@ -1002,7 +1017,7 @@ describe("history-safe Git checkpoints", () => {
         getEntry: () => undefined,
         navigateTree: async () => ({ cancelled: false }),
       };
-      const navigation = new SessionNavigation(navigationPort, git);
+      const navigation = new SessionNavigation(navigationPort, snap);
       await navigation.recordTurnEnd(checkpoint);
 
       expect(await navigation.undo()).toEqual({ status: "git_failed", failure: "conflict" });
@@ -1016,7 +1031,7 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("keeps active checkpoints reachable after reflog expiry and aggressive GC", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
       await writeFile(join(cwd, "tracked.txt"), "before\n");
@@ -1026,40 +1041,55 @@ describe("history-safe Git checkpoints", () => {
       await git(["reset", "--mixed", "HEAD^"]);
       await writeFile(join(cwd, "untracked.txt"), "before-only\n");
 
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "gc"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "gc"));
       expect(before).not.toBeNull();
       if (!before) return;
       await writeFile(join(cwd, "tracked.txt"), "after\n");
       await writeFile(join(cwd, "untracked.txt"), "after-only\n");
-      const checkpoint = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const checkpoint = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(checkpoint).not.toBeNull();
       if (!checkpoint) return;
-      await git(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"]);
-      await git(["gc", "--prune=now"]);
-      expect((await git(["cat-file", "-e", `${checkpoint.beforeHash}^{commit}`])).code).toBe(0);
-      expect((await git(["cat-file", "-e", `${checkpoint.afterHash}^{commit}`])).code).toBe(0);
+      await text(git, ["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"]);
+      await text(git, ["gc", "--prune=now"]);
+      // Every object, not just the commits: the before-snapshot's tracked.txt
+      // and deleted.txt blobs were only reachable from the reset commit.
+      for (const hash of [checkpoint.beforeHash, checkpoint.afterHash]) {
+        expect(await text(snap, ["rev-list", "--objects", "--missing=print", hash])).not.toMatch(
+          /^\?/m,
+        );
+      }
       expect(await releaseCheckpoint(git, checkpoint)).toBe(true);
-      await git(["reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"]);
-      await git(["gc", "--prune=now"]);
-      expect((await git(["cat-file", "-e", `${checkpoint.beforeHash}^{commit}`])).code).not.toBe(0);
-      expect((await git(["cat-file", "-e", `${checkpoint.afterHash}^{commit}`])).code).not.toBe(0);
+      const storeRunner = gitRunner(cwd, storeEnv(checkpoint.repository));
+      await text(storeRunner, [
+        "reflog",
+        "expire",
+        "--expire=now",
+        "--expire-unreachable=now",
+        "--all",
+      ]);
+      await text(storeRunner, ["gc", "--prune=now"]);
+      expect((await snap(["cat-file", "-e", `${checkpoint.beforeHash}^{commit}`])).code).not.toBe(
+        0,
+      );
+      expect((await snap(["cat-file", "-e", `${checkpoint.afterHash}^{commit}`])).code).not.toBe(0);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
   it("isolates a changed private ref without blocking valid cleanup", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const before = pendingCheckpoint(await prepareBeforeTurn(git, "batch"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "batch"));
       expect(before).not.toBeNull();
       if (!before) return;
       await writeFile(join(cwd, "tracked.txt"), "after\n");
-      const checkpoint = completedCheckpoint(await finishAfterTurn(git, before, null, null));
+      const checkpoint = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
       expect(checkpoint).not.toBeNull();
       if (!checkpoint) return;
       await git(["update-ref", "refs/keep", "HEAD"]);
-      await git(["update-ref", checkpoint.afterRef, checkpoint.beforeHash]);
+      const storeRunner = gitRunner(cwd, storeEnv(checkpoint.repository));
+      await storeRunner(["update-ref", checkpoint.afterRef, checkpoint.beforeHash]);
 
       const released = await releaseRefs(
         () => git,
@@ -1078,8 +1108,8 @@ describe("history-safe Git checkpoints", () => {
       );
 
       expect(released).toBe(false);
-      expect((await git(["show-ref", "--verify", checkpoint.beforeRef])).code).not.toBe(0);
-      expect((await git(["rev-parse", checkpoint.afterRef])).stdout.trim()).toBe(
+      expect((await storeRunner(["show-ref", "--verify", checkpoint.beforeRef])).code).not.toBe(0);
+      expect((await storeRunner(["rev-parse", checkpoint.afterRef])).stdout.trim()).toBe(
         checkpoint.beforeHash,
       );
       expect((await git(["rev-parse", "refs/keep"])).stdout.trim()).toBe(
@@ -1090,28 +1120,28 @@ describe("history-safe Git checkpoints", () => {
     }
   });
   it("supports full checkpoints in an unborn repository", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await writeFile(join(cwd, "before.txt"), "before\n");
-      const prepared = await prepareBeforeTurn(git, "unborn");
+      const prepared = await prepareBeforeTurn(snap, "unborn");
       expect(prepared.status).toBe("git");
       if (prepared.status !== "git") return;
       expect(prepared.checkpoint.snapshotIndexLease).toBeDefined();
 
       await rm(join(cwd, "before.txt"));
       await writeFile(join(cwd, "after.txt"), "after\n");
-      const finished = await finishAfterTurn(git, prepared.checkpoint, "u1", "a1");
+      const finished = await finishAfterTurn(snap, prepared.checkpoint, "u1", "a1");
       expect(finished.status).toBe("git");
       if (finished.status !== "git") return;
 
       expect(
-        await applyCheckpoint(git, finished.checkpoint.afterHash, finished.checkpoint.beforeHash),
+        await applyCheckpoint(snap, finished.checkpoint.afterHash, finished.checkpoint.beforeHash),
       ).toEqual({ status: "applied", nestedRepositories: [] });
       await expect(readFile(join(cwd, "before.txt"), "utf8")).resolves.toBe("before\n");
       await expect(readFile(join(cwd, "after.txt"))).rejects.toThrow();
 
       expect(
-        await applyCheckpoint(git, finished.checkpoint.beforeHash, finished.checkpoint.afterHash),
+        await applyCheckpoint(snap, finished.checkpoint.beforeHash, finished.checkpoint.afterHash),
       ).toEqual({ status: "applied", nestedRepositories: [] });
       await expect(readFile(join(cwd, "after.txt"), "utf8")).resolves.toBe("after\n");
       expect((await git(["rev-parse", "HEAD"])).code).not.toBe(0);
@@ -1122,31 +1152,31 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("reuses and normalizes the alternate index in an unborn repository", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, snap } = await makeRepo();
     const sessionId = "unborn-reuse";
     try {
       await writeFile(join(cwd, "tracked.txt"), "initial\n");
       await writeFile(join(cwd, "candidate.txt"), "untracked before ignore\n");
-      const before1 = pendingCheckpoint(await prepareBeforeTurn(git, sessionId));
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
       const leaseDirectory = before1.snapshotIndexLease?.directory;
       expect(leaseDirectory).toBeDefined();
       if (!leaseDirectory) return;
-      const after1 = completedCheckpoint(await finishAfterTurn(git, before1, null, null));
+      const after1 = completedCheckpoint(await finishAfterTurn(snap, before1, null, null));
 
       await writeFile(join(cwd, ".gitignore"), "candidate.txt\n");
       await writeFile(join(cwd, "tracked.txt"), "mutated between turns\n");
-      const before2 = pendingCheckpoint(await prepareBeforeTurn(git, sessionId));
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
       expect(before2.snapshotIndexLease?.directory).toBe(leaseDirectory);
-      const after2 = completedCheckpoint(await finishAfterTurn(git, before2, null, null));
+      const after2 = completedCheckpoint(await finishAfterTurn(snap, before2, null, null));
 
-      const names = await text(git, ["ls-tree", "-r", "--name-only", after2.afterHash]);
+      const names = await text(snap, ["ls-tree", "-r", "--name-only", after2.afterHash]);
       expect(names).not.toContain("candidate.txt");
-      expect(await text(git, ["show", `${after2.afterHash}:tracked.txt`])).toBe(
+      expect(await text(snap, ["show", `${after2.afterHash}:tracked.txt`])).toBe(
         "mutated between turns",
       );
 
-      await releaseCheckpoint(git, after1);
-      await releaseCheckpoint(git, after2);
+      await releaseCheckpoint(snap, after1);
+      await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
       await releaseAllPersistentSnapshotIndices();
@@ -1154,45 +1184,45 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("keeps files created mid-session in the unborn index instead of resetting them", async () => {
-    const { cwd, git: baseGit } = await makeRepo();
+    const { cwd, snap } = await makeRepo();
     const sessionId = "unborn-midsession";
     const commands: string[][] = [];
-    const git = Object.assign(
+    const gitWrapper = Object.assign(
       async (args: string[], options?: Parameters<GitRunner>[1]) => {
         commands.push(args);
-        return baseGit(args, options);
+        return snap(args, options);
       },
-      { cwd },
+      { cwd, env: snap.env },
     ) satisfies GitRunner;
     try {
       // Seed the lease against an empty workspace: its baseline tree is empty,
       // so every later file is "added" relative to it.
-      const before1 = pendingCheckpoint(await prepareBeforeTurn(git, sessionId));
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId));
       await writeFile(join(cwd, "created.txt"), "created during turn 1\n");
       await writeFile(join(cwd, "ignored-later.txt"), "created during turn 1\n");
-      const after1 = completedCheckpoint(await finishAfterTurn(git, before1, null, null));
+      const after1 = completedCheckpoint(await finishAfterTurn(gitWrapper, before1, null, null));
 
       commands.length = 0;
-      const before2 = pendingCheckpoint(await prepareBeforeTurn(git, sessionId));
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId));
       expect(commands.some((args) => args.includes("reset"))).toBe(false);
-      expect(await text(git, ["show", `${before2.beforeHash}:created.txt`])).toBe(
+      expect(await text(snap, ["show", `${before2.beforeHash}:created.txt`])).toBe(
         "created during turn 1",
       );
 
       // A mid-session file that becomes ignored must still leave the tree.
       await writeFile(join(cwd, ".gitignore"), "ignored-later.txt\n");
-      const after2 = completedCheckpoint(await finishAfterTurn(git, before2, null, null));
-      const fresh = pendingCheckpoint(await prepareBeforeTurn(baseGit, "unborn-ground-truth"));
-      expect(await text(baseGit, ["rev-parse", `${after2.afterHash}^{tree}`])).toBe(
-        await text(baseGit, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+      const after2 = completedCheckpoint(await finishAfterTurn(gitWrapper, before2, null, null));
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "unborn-ground-truth"));
+      expect(await text(snap, ["rev-parse", `${after2.afterHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
       );
-      const names = await text(baseGit, ["ls-tree", "-r", "--name-only", after2.afterHash]);
+      const names = await text(snap, ["ls-tree", "-r", "--name-only", after2.afterHash]);
       expect(names).toContain("created.txt");
       expect(names).not.toContain("ignored-later.txt");
 
-      await releasePendingCheckpoint(baseGit, fresh);
-      await releaseCheckpoint(baseGit, after1);
-      await releaseCheckpoint(baseGit, after2);
+      await releasePendingCheckpoint(snap, fresh);
+      await releaseCheckpoint(snap, after1);
+      await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
       await releaseAllPersistentSnapshotIndices();
@@ -1200,18 +1230,17 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("creates valid empty snapshots in an unborn repository", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, snap } = await makeRepo();
     try {
-      const prepared = await prepareBeforeTurn(git, "empty-unborn");
+      const prepared = await prepareBeforeTurn(snap, "empty-unborn");
       expect(prepared.status).toBe("git");
       if (prepared.status !== "git") return;
-      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
-      expect(finished.status).toBe("git");
+      const finished = await finishAfterTurn(snap, prepared.checkpoint, null, null);
       if (finished.status !== "git") return;
-      expect(await text(git, ["rev-parse", `${finished.checkpoint.beforeHash}^{tree}`])).toMatch(
+      expect(await text(snap, ["rev-parse", `${finished.checkpoint.beforeHash}^{tree}`])).toMatch(
         /^[0-9a-f]{40}$/,
       );
-      expect(await text(git, ["rev-parse", `${finished.checkpoint.afterHash}^{tree}`])).toMatch(
+      expect(await text(snap, ["rev-parse", `${finished.checkpoint.afterHash}^{tree}`])).toMatch(
         /^[0-9a-f]{40}$/,
       );
     } finally {
@@ -1230,11 +1259,11 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("classifies a malformed HEAD instead of treating it as unborn", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
       await writeFile(join(cwd, ".git", "HEAD"), "not-a-head\n");
-      expect(await prepareBeforeTurn(git, "invalid-head")).toEqual({
+      expect(await prepareBeforeTurn(snap, "invalid-head")).toEqual({
         status: "session_only",
         reason: "invalid_head",
       });
@@ -1245,11 +1274,7 @@ describe("history-safe Git checkpoints", () => {
 
   it("distinguishes missing from unusable history in SessionHistoryStore.load", async () => {
     const { cwd, git } = await makeRepo();
-    const repository = {
-      worktree: cwd,
-      gitDir: join(cwd, ".git"),
-      commonDir: join(cwd, ".git"),
-    };
+    const repository = await gitRepository(cwd);
     const sessionId = "chk-missing-vs-unusable";
     const prompt: SessionEntryLike = {
       id: "p1",
@@ -1269,7 +1294,7 @@ describe("history-safe Git checkpoints", () => {
       });
 
       const hPath = historyPath(repository, sessionId);
-      await mkdir(join(repository.commonDir, "omp-undo-redo", "history"), { recursive: true });
+      await mkdir(historyDirectory(repository), { recursive: true });
       await writeFile(hPath, "{corrupted history");
       await expect(store.load(r)).resolves.toEqual({
         status: "unavailable",
@@ -1282,11 +1307,7 @@ describe("history-safe Git checkpoints", () => {
 
   it("rejects prototype-polluting session checkpoint reasons as unusable", async () => {
     const { cwd, git } = await makeRepo();
-    const repository = {
-      worktree: cwd,
-      gitDir: join(cwd, ".git"),
-      commonDir: join(cwd, ".git"),
-    };
+    const repository = await gitRepository(cwd);
     const sessionId = "chk-proto-reason";
     const prompt: SessionEntryLike = {
       id: "p1",
@@ -1299,7 +1320,7 @@ describe("history-safe Git checkpoints", () => {
       const { SessionHistoryStore, historyPath } = await import("../src/core/history-store.js");
       const store = new SessionHistoryStore(sessionId, repository, git);
       const hPath = historyPath(repository, sessionId);
-      await mkdir(join(repository.commonDir, "omp-undo-redo", "history"), { recursive: true });
+      await mkdir(historyDirectory(repository), { recursive: true });
       await writeFile(
         hPath,
         JSON.stringify({
@@ -1321,11 +1342,7 @@ describe("history-safe Git checkpoints", () => {
 
   it("handles HistoryLoadResult, tombstone detection, and schema v1 to v2 upgrade in SessionHistoryStore", async () => {
     const { cwd, git } = await makeRepo();
-    const repository = {
-      worktree: cwd,
-      gitDir: join(cwd, ".git"),
-      commonDir: join(cwd, ".git"),
-    };
+    const repository = await gitRepository(cwd);
     const sessionId = "chk-schema-session";
     const prompt: SessionEntryLike = {
       id: "p1",
@@ -1355,7 +1372,7 @@ describe("history-safe Git checkpoints", () => {
 
       // 2. Write schema v1 file without lastAccessedAt
       const hPath = historyPath(repository, sessionId);
-      await mkdir(join(repository.commonDir, "omp-undo-redo", "history"), { recursive: true });
+      await mkdir(historyDirectory(repository), { recursive: true });
       await writeFile(
         hPath,
         JSON.stringify({
@@ -1415,11 +1432,7 @@ describe("history-safe Git checkpoints", () => {
 
   it("loads multi-turn Git session history when active leaf is at undone prompt boundary", async () => {
     const { cwd, git } = await makeRepo();
-    const repository = {
-      worktree: cwd,
-      gitDir: join(cwd, ".git"),
-      commonDir: join(cwd, ".git"),
-    };
+    const repository = await gitRepository(cwd);
     const sessionId = "chk-multi-undo-session";
     const sessionHash = checkpointNamespace(sessionId);
 
@@ -1456,10 +1469,11 @@ describe("history-safe Git checkpoints", () => {
       // Create valid refs for two checkpoints
       const head = (await git(["rev-parse", "HEAD"])).stdout.trim();
       const refPrefix = `refs/omp-undo-redo/history/${sessionHash}/`;
-      await git(["update-ref", `${refPrefix}c1/before`, head]);
-      await git(["update-ref", `${refPrefix}c1/after`, head]);
-      await git(["update-ref", `${refPrefix}c2/before`, head]);
-      await git(["update-ref", `${refPrefix}c2/after`, head]);
+      const storeRunner = gitRunner(cwd, storeEnv(repository));
+      await storeRunner(["update-ref", `${refPrefix}c1/before`, head]);
+      await storeRunner(["update-ref", `${refPrefix}c1/after`, head]);
+      await storeRunner(["update-ref", `${refPrefix}c2/before`, head]);
+      await storeRunner(["update-ref", `${refPrefix}c2/after`, head]);
 
       const c1: TurnCheckpoint = {
         kind: "git",
@@ -1513,7 +1527,7 @@ describe("history-safe Git checkpoints", () => {
     // so `diff.noprefix` (a common dotfile setting) or `diff.external` made
     // every `git apply --check` fail and every /undo report "Worktree
     // changed; nothing was undone" — file restoration was dead per-machine.
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
       for (const [key, value] of [
@@ -1528,22 +1542,22 @@ describe("history-safe Git checkpoints", () => {
       ]) {
         expect((await git(["config", key, value])).code).toBe(0);
       }
-      const prepared = await prepareBeforeTurn(git, "hostile-config-session");
+      const prepared = await prepareBeforeTurn(snap, "hostile-config-session");
       expect(prepared.status).toBe("git");
       if (prepared.status !== "git") return;
       // Trailing whitespace so `apply.whitespace=error` would also reject.
       await writeFile(join(cwd, "tracked.txt"), "turn   \n");
-      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
+      const finished = await finishAfterTurn(snap, prepared.checkpoint, null, null);
       expect(finished.status).toBe("git");
       if (finished.status !== "git") return;
       const { beforeHash, afterHash } = finished.checkpoint;
 
-      expect(await applyCheckpoint(git, afterHash, beforeHash)).toEqual({
+      expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
-      expect(await applyCheckpoint(git, beforeHash, afterHash)).toEqual({
+      expect(await applyCheckpoint(snap, beforeHash, afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
       });
@@ -1554,14 +1568,14 @@ describe("history-safe Git checkpoints", () => {
   });
 
   it("blames the patch, not the worktree, when the worktree still matches the snapshot", async () => {
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const prepared = await prepareBeforeTurn(git, "drift-probe-session");
+      const prepared = await prepareBeforeTurn(snap, "drift-probe-session");
       expect(prepared.status).toBe("git");
       if (prepared.status !== "git") return;
       await writeFile(join(cwd, "tracked.txt"), "turn\n");
-      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
+      const finished = await finishAfterTurn(snap, prepared.checkpoint, null, null);
       expect(finished.status).toBe("git");
       if (finished.status !== "git") return;
       const { beforeHash, afterHash } = finished.checkpoint;
@@ -1575,15 +1589,13 @@ describe("history-safe Git checkpoints", () => {
       expect((await git(["update-index", "--force-remove", "tracked.txt"])).code).toBe(0);
 
       // Force the check to fail the way an unparsable patch would.
-      const failingCheck: GitRunner = async (args, options) =>
-        args[0] === "apply" && args.includes("--check")
-          ? { stdout: "", stderr: "error: unrecognized input", code: 1 }
-          : git(args, options);
-      failingCheck.cwd = git.cwd;
-
-      expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toEqual({
-        status: "failed",
-      });
+      const failingCheck: GitRunner = Object.assign(
+        async (args: string[], options?: Parameters<GitRunner>[1]) =>
+          args[0] === "apply" && args.includes("--check")
+            ? { stdout: "", stderr: "error: unrecognized input", code: 1 }
+            : snap(args, options),
+        { cwd: snap.cwd, env: snap.env },
+      );
 
       // Real drift still reports a conflict.
       await writeFile(join(cwd, "tracked.txt"), "drifted\n");
@@ -1601,15 +1613,17 @@ describe("history-safe Git checkpoints", () => {
 
       // An actual collision (reported by git apply as 'already exists in working directory')
       // IS a worktree conflict.
-      const collisionCheck: GitRunner = async (args, options) =>
-        args[0] === "apply" && args.includes("--check")
-          ? {
-              stdout: "",
-              stderr: "error: new-file.txt: already exists in working directory",
-              code: 1,
-            }
-          : git(args, options);
-      collisionCheck.cwd = git.cwd;
+      const collisionCheck: GitRunner = Object.assign(
+        async (args: string[], options?: Parameters<GitRunner>[1]) =>
+          args[0] === "apply" && args.includes("--check")
+            ? {
+                stdout: "",
+                stderr: "error: new-file.txt: already exists in working directory",
+                code: 1,
+              }
+            : snap(args, options),
+        { cwd: snap.cwd, env: snap.env },
+      );
       expect(await applyCheckpoint(collisionCheck, beforeHash, afterHash)).toEqual({
         status: "conflict",
       });
@@ -1622,28 +1636,29 @@ describe("history-safe Git checkpoints", () => {
     // Regression: a killed `git diff` exits 1, which is also --exit-code's
     // "there were differences", so the truncated patch that --output already
     // wrote was applied and reported as a complete restore.
-    const { cwd, git } = await makeRepo();
+    const { cwd, git, snap } = await makeRepo();
     try {
       await initializeBranch(git, cwd);
-      const prepared = await prepareBeforeTurn(git, "diff-timeout-session");
+      const prepared = await prepareBeforeTurn(snap, "diff-timeout-session");
       expect(prepared.status).toBe("git");
       if (prepared.status !== "git") return;
       await writeFile(join(cwd, "tracked.txt"), "turn\n");
-      const finished = await finishAfterTurn(git, prepared.checkpoint, null, null);
+      const finished = await finishAfterTurn(snap, prepared.checkpoint, null, null);
       expect(finished.status).toBe("git");
       if (finished.status !== "git") return;
 
-      const timedOutDiff: GitRunner = async (args, options) => {
-        if (args[0] === "diff") {
-          // What runGit returns for a child it had to terminate, after
-          // `--output` already wrote a valid patch prefix.
-          await git(args, options);
-          return { stdout: "", stderr: "", code: 1, error: "timeout" };
-        }
-        return git(args, options);
-      };
-      timedOutDiff.cwd = git.cwd;
-
+      const timedOutDiff: GitRunner = Object.assign(
+        async (args: string[], options?: Parameters<GitRunner>[1]) => {
+          if (args[0] === "diff") {
+            // What runGit returns for a child it had to terminate, after
+            // `--output` already wrote a valid patch prefix.
+            await snap(args, options);
+            return { stdout: "", stderr: "", code: 1, error: "timeout" };
+          }
+          return snap(args, options);
+        },
+        { cwd: snap.cwd, env: snap.env },
+      );
       const { afterHash, beforeHash } = finished.checkpoint;
       expect(await applyCheckpoint(timedOutDiff, afterHash, beforeHash)).toEqual({
         status: "failed",

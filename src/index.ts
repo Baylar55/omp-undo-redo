@@ -14,12 +14,15 @@ import {
 import { createGitRunner } from "./core/git-runner.js";
 import {
   canonicalCwd,
+  ensureGitSnapshotStore,
   ensurePrivateGitRepository,
+  GIT_STORE_SOURCE_KEY,
   storeRootDirectory,
 } from "./core/private-repo.js";
+import { migrateLegacySnapshots } from "./core/legacy-snapshot-migration.js";
 import { SessionNavigation } from "./core/session-navigation.js";
-import { checkpointNamespace } from "./core/checkpoints.js";
 import {
+  checkpointNamespace,
   finishAfterTurn,
   prepareBeforeTurn,
   releaseAllPersistentSnapshotIndices,
@@ -27,6 +30,8 @@ import {
   releasePendingCheckpoint,
   resolveRepository,
   retainCheckpointForResume,
+  snapshotRunnerEnv,
+  storeEnv,
 } from "./core/checkpoints.js";
 import {
   expireGitSessionHistories,
@@ -38,6 +43,7 @@ import { touchSessionHeartbeat } from "./core/history-liveness.js";
 import type {
   ActionId,
   CwdGitRunnerFactory,
+  DiscoveredRepository,
   GitRepository,
   GitRunner,
   NavigationState,
@@ -108,11 +114,11 @@ async function timedOutAfter(promise: Promise<unknown>, ms: number): Promise<boo
   }
 }
 
-/** Per-controller private-repo state: a ready entry carries the repository and
- *  the env runner (GIT_DIR fixed), with `ready` resolving true once init
- *  completes; a `failure` entry records a failed init so session fallback is
- *  reused without retrying. Keyed by canonical cwd (private) or worktree
- *  (git mode). */
+/** Per-controller snapshot-store state: a ready entry carries the repository
+ *  and the store-bound runner, with `ready` resolving true once init
+ *  completes; a `failure` entry records a failed Private-Git init so session
+ *  fallback is reused without retrying. Keyed by canonical cwd (private) or
+ *  worktree (git mode). */
 type ActivePrivateRepoEntry = {
   repository?: GitRepository;
   git?: GitRunner;
@@ -170,6 +176,35 @@ async function resolvePrivateGit(
   return { repository: entry.repository, git: entry.git };
 }
 
+/** Git mode: binds the worktree to its snapshot store, moving any snapshots an
+ *  earlier version left in the user's `.git` into it first. */
+function startGitStore(
+  found: DiscoveredRepository,
+  gitRunnerFactory: CwdGitRunnerFactory,
+): ActivePrivateRepoEntry {
+  const entry: ActivePrivateRepoEntry = { ready: Promise.resolve(false) };
+  entry.ready = (async (): Promise<boolean> => {
+    try {
+      const storeDir = await ensureGitSnapshotStore(gitRunnerFactory, found, storeRootDirectory());
+      if (!storeDir) return false;
+      const repository: GitRepository = { ...found, storeDir };
+      await migrateLegacySnapshots(gitRunnerFactory(found.worktree), repository).catch(
+        () => undefined,
+      );
+      entry.repository = repository;
+      // Rooted at the worktree, not at `cwd`: `git apply` silently ignores
+      // patched paths outside its working directory, so a session started in
+      // a subdirectory would restore only that subtree and still report
+      // success. (`diff.relative=true` truncates the patch the same way.)
+      entry.git = gitRunnerFactory(found.worktree, snapshotRunnerEnv(repository));
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+  return entry;
+}
+
 export async function resolveBackend(
   cwd: string,
   privateRepositories: Map<string, PrivateRepoEntry> = new Map(),
@@ -178,31 +213,27 @@ export async function resolveBackend(
   const git = gitRunnerFactory(cwd);
   const resolved = await resolveRepository(git);
   if ("repository" in resolved) {
-    const repository = resolved.repository;
-    const existing = privateRepositories.get(repository.worktree);
+    const found = resolved.repository;
+    // Keyed by `repository.worktree`, not `repository.commonDir`: linked
+    // worktrees of the same repository share commonDir (and its store), so
+    // keying by commonDir would make the second worktree reuse the first's
+    // runner and run git operations in the wrong directory.
+    let entry = privateRepositories.get(found.worktree);
     if (
-      existing &&
-      "git" in existing &&
-      existing.git &&
-      existing.repository?.gitDir === repository.gitDir
+      !entry ||
+      "failure" in entry ||
+      !(await entry.ready) ||
+      entry.repository?.gitDir !== found.gitDir
     ) {
-      return { kind: "git", repository, git: existing.git };
+      entry = startGitStore(found, gitRunnerFactory);
+      privateRepositories.set(found.worktree, entry);
     }
-    // Rooted at the worktree, not at `cwd`: `git apply` silently ignores
-    // patched paths outside its working directory, so a session started in a
-    // subdirectory would restore only that subtree and still report success.
-    // (`diff.relative=true` truncates the patch the same way.) Keyed by
-    // `repository.worktree`, not `repository.commonDir`: linked worktrees of
-    // the same repository share commonDir, so keying by commonDir would make
-    // the second worktree reuse the first's runner and run git operations in
-    // the wrong directory.
-    const worktreeGit = gitRunnerFactory(repository.worktree);
-    privateRepositories.set(repository.worktree, {
-      repository,
-      git: worktreeGit,
-      ready: Promise.resolve(true),
-    });
-    return { kind: "git", repository, git: worktreeGit };
+    if ((await entry.ready) && entry.repository && entry.git) {
+      return { kind: "git", repository: entry.repository, git: entry.git };
+    }
+    if (privateRepositories.get(found.worktree) === entry)
+      privateRepositories.delete(found.worktree);
+    return { kind: "session", reason: "private_repository_unavailable" };
   }
   if (resolved.reason !== "not_repository") return { kind: "session", reason: resolved.reason };
   const priv = await resolvePrivateGit(cwd, privateRepositories, gitRunnerFactory);
@@ -317,7 +348,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     if (entry && "git" in entry && entry.git && entry.repository?.gitDir === repository.gitDir) {
       return entry.git;
     }
-    return gitRunnerFactory(repository.worktree);
+    return gitRunnerFactory(repository.worktree, snapshotRunnerEnv(repository));
   }
   const ownerRegistry = new CheckpointOwnerRegistry({
     resolveHostIdentity: resolvePersistentHostId,
@@ -357,31 +388,18 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  (it may hold the turn's own edits) instead of recording a wrong baseline. */
   const beforeSnapshotGates = new Map<string, { complete: Promise<void>; late: boolean }>();
 
-  /** True when `gitDir` belongs to one of our private per-workspace repos.
-   *  Guards gc/prune triggers so they can never touch a user's own repo:
-   *  `privateRepositories` also caches the user's repository in Git mode
-   *  (resolveBackend), so only the `private` flag stamped by
-   *  ensurePrivateGitRepository proves ownership — never map membership.
-   *  The incoming gitDir is realpath-canonicalized before comparing so a
-   *  checkpoint recorded with a long-form path still matches a repository
-   *  whose gitDir was built from a short-form (8.3) store root or cwd —
-   *  otherwise the string compare silently fails and the gc counter never
-   *  increments (repo growth stays unbounded on such machines). */
-  function isPrivateRepository(gitDir: string): boolean {
-    const canonicalGitDir = canonicalCwd(gitDir);
-    for (const entry of privateRepositories.values()) {
-      if ("failure" in entry) continue;
-      if (entry.repository?.private !== true || !entry.repository.gitDir) continue;
-      const canonicalEntry = canonicalCwd(entry.repository.gitDir);
-      if (canonicalEntry === canonicalGitDir) return true;
-    }
-    return false;
-  }
-
-  // Private-repo housekeeping: captures between gc runs (per repo) and the
-  // threshold that triggers a background `git gc`.
+  // Snapshot-store housekeeping: captures between gc runs (per store) and the
+  // threshold that triggers a background `git gc`. Every store is the
+  // extension's own (`storeDir` never names the user's `.git`), so gc can
+  // never touch a user repository.
   const PRIVATE_GC_AFTER_CAPTURES = 20;
-  const capturesSinceGcByGitDir = new Map<string, number>();
+  const capturesSinceGcByStore = new Map<string, number>();
+
+  /** Counter key: realpath-canonical, so a store spelled in long form on a
+   *  checkpoint and in 8.3 short form on its backend still count as one. */
+  function gcKey(repository: GitRepository): string {
+    return canonicalCwd(repository.storeDir);
+  }
 
   /** Repacking a large snapshot repo legitimately outruns the runner's
    *  default per-child deadline, so gc gets its own ceiling: long enough that
@@ -395,18 +413,27 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  them. Expired sessions' objects are days old, so an hour loses nothing. */
   const PRIVATE_SWEEP_PRUNE = "1.hour.ago";
 
-  /** Best-effort `git gc` over a private repo. Runs outside the handler
+  /** Capture-threshold prune window. A Git-mode store is shared by every OMP
+   *  process working in that repository or its linked worktrees, so another
+   *  process may be mid-capture there and it gets the sweep's window; a
+   *  Private-Git repo drops unreferenced objects at once. */
+  function capturePrune(repository: GitRepository): string {
+    return repository.storeDir === repository.gitDir ? "now" : PRIVATE_SWEEP_PRUNE;
+  }
+
+  /** Best-effort `git gc` over a snapshot store. Runs outside the handler
    *  deadline accounting (never awaited by a handler) so a slow gc can never
-   *  hit the host's timeout. `--prune=now` drops unreferenced objects
-   *  immediately: expiring sessions would otherwise leave recoverable file
-   *  content behind indefinitely. */
-  async function schedulePrivateGc(gitDir: string, prune = "now"): Promise<void> {
+   *  hit the host's timeout. The prune drops unreferenced objects: expiring
+   *  sessions would otherwise leave recoverable file content behind
+   *  indefinitely. */
+  async function schedulePrivateGc(repository: GitRepository, prune: string): Promise<void> {
     try {
       // Run from a neutral cwd so a slow gc never holds a handle on either the
       // user's workspace or the snapshot repo itself (Windows keeps a child's
       // cwd handle until it exits, which would race teardown rms and the
-      // eviction sweep). GIT_DIR is set, so the repo operations work anywhere.
-      await gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir })(["gc", `--prune=${prune}`], {
+      // eviction sweep). GIT_DIR is set, so the repo operations work anywhere;
+      // a Git store also needs the objects it borrows to walk its snapshots.
+      await gitRunnerFactory(tmpdir(), storeEnv(repository))(["gc", `--prune=${prune}`], {
         timeoutMs: PRIVATE_GC_TIMEOUT_MS,
       });
     } catch {
@@ -494,25 +521,34 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return newest;
   }
 
-  /** `core.worktree` of a private repo, or null when unset/unreadable. Git
-   *  decodes the value: it quotes values containing `#`/`;` and escapes
-   *  `\`/`"`, so a raw regex over the file yields a path that never stats
-   *  (e.g. "C:\\…\\C# Projects") and evicts live history. */
-  async function privateWorktree(reposDir: string, gitDir: string): Promise<string | null> {
-    const result = await gitRunnerFactory(reposDir)([
-      "config",
-      "--file",
-      join(gitDir, "config"),
-      "--get",
-      "core.worktree",
-    ]);
-    if (result.code !== 0) return null;
-    return result.stdout.replace(/\r?\n$/, "") || null;
+  /** Path whose disappearance means a store is abandoned: a private repo's
+   *  `core.worktree` (its workspace) or a Git store's source `commonDir`; null
+   *  when neither is readable. Git decodes the value: it quotes values
+   *  containing `#`/`;` and escapes `\`/`"`, so a raw regex over the file
+   *  yields a path that never stats (e.g. "C:\\…\\C# Projects") and evicts
+   *  live history. */
+  async function storeSource(
+    reposDir: string,
+    gitDir: string,
+  ): Promise<{ path: string; gitStore: boolean } | null> {
+    for (const key of ["core.worktree", GIT_STORE_SOURCE_KEY]) {
+      const result = await gitRunnerFactory(reposDir)([
+        "config",
+        "--file",
+        join(gitDir, "config"),
+        "--get",
+        key,
+      ]);
+      const path = result.code === 0 ? result.stdout.replace(/\r?\n$/, "") : "";
+      if (path) return { path, gitStore: key === GIT_STORE_SOURCE_KEY };
+    }
+    return null;
   }
 
-  /** Removes private repos whose workspace no longer exists. Runs at boot and
-   *  on shutdown so vanished workspaces cannot leave their snapshot repos
-   *  (and the file contents inside them) behind forever.
+  /** Removes snapshot stores whose workspace (Private-Git) or repository (Git
+   *  mode) no longer exists. Runs at boot and on shutdown so vanished
+   *  workspaces cannot leave their snapshots (and the file contents inside
+   *  them) behind forever.
    *
    *  Deliberately conservative: eviction requires the workspace stat to fail
    *  with ENOENT/ENOTDIR twice (re-checked after a delay, so a single mount
@@ -566,11 +602,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         } catch {
           // No pidfile.
         }
-        const worktree = await privateWorktree(reposDir, path);
-        if (!worktree) continue;
+        const source = (await storeSource(reposDir, path))?.path;
+        if (!source) continue;
         const vanished = async (): Promise<boolean> => {
           try {
-            await stat(worktree);
+            await stat(source);
             return false;
           } catch (err) {
             const code = (err as NodeJS.ErrnoException | undefined)?.code;
@@ -617,36 +653,37 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   }
 
   /** Expires dormant histories in `repository`, once per process. Deleting
-   *  refs alone leaves the snapshots' plaintext file contents on disk, so a
-   *  private repo then gets a background gc. A cruft pack (`.mtimes`) holds
-   *  objects an earlier sweep gc kept inside its prune window; it triggers a
-   *  gc too, else they would outlive retention until some later expiry. */
+   *  refs alone leaves the snapshots' plaintext file contents on disk, so the
+   *  store then gets a background gc. A cruft pack (`.mtimes`) holds objects
+   *  an earlier sweep gc kept inside its prune window; it triggers a gc too,
+   *  else they would outlive retention until some later expiry. */
   function expireRepository(repository: GitRepository, git: GitRunner): Promise<void> {
-    const key = `git:${repository.commonDir}`;
+    const key = `git:${repository.storeDir}`;
     const existing = expirationPromises.get(key);
     if (existing) return existing;
     const expiration = (async () => {
       const refsRemoved = await expireGitSessionHistories(repository, git, retentionDays, () =>
         activeSessionHashes(),
       );
-      if (repository.private !== true || closing) return;
+      if (closing) return;
       if (refsRemoved === 0) {
-        const packs = await readdir(join(repository.commonDir, "objects", "pack")).catch(() => []);
+        const packs = await readdir(join(repository.storeDir, "objects", "pack")).catch(() => []);
         if (!packs.some((name) => name.endsWith(".mtimes"))) return;
       }
       // Detached from the expiration promise: shutdown awaits expirations,
       // and must not wait out a gc.
-      void track(() => schedulePrivateGc(repository.commonDir, PRIVATE_SWEEP_PRUNE));
+      void track(() => schedulePrivateGc(repository, PRIVATE_SWEEP_PRUNE));
     })().catch(() => undefined);
     expirationPromises.set(key, expiration);
     return expiration;
   }
 
-  /** Retention for every private repo, not only those a session opens here:
-   *  a workspace that is never reopened would otherwise keep its snapshots
+  /** Retention for every store, not only those a session opens here: a
+   *  workspace that is never reopened would otherwise keep its snapshots
    *  (`.env`, keys) forever. Started by the first session initialization,
    *  once that session is registered active, so the session being resumed
-   *  is protected exactly as in the per-repo path. */
+   *  is protected exactly as in the per-repo path. Expiry needs only the
+   *  store; a Git store's `commonDir` supplies the objects its gc reads. */
   async function sweepPrivateRepoRetention(): Promise<void> {
     if (retentionDays <= 0) return;
     const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
@@ -655,10 +692,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (closing) return;
       if (!entry.endsWith(".git")) continue;
       const gitDir = join(reposDir, entry);
-      const worktree = await privateWorktree(reposDir, gitDir).catch(() => null);
-      if (!worktree) continue;
+      const source = await storeSource(reposDir, gitDir).catch(() => null);
+      if (!source) continue;
+      const { path } = source;
       await expireRepository(
-        { worktree, gitDir, commonDir: gitDir, private: true },
+        source.gitStore
+          ? { worktree: path, gitDir: path, commonDir: path, storeDir: gitDir }
+          : { worktree: path, gitDir, commonDir: gitDir, storeDir: gitDir },
         gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir }),
       );
     }
@@ -857,27 +897,24 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           // would let the next turn's `before_agent_start` release it while
           // its finalize is still deferred.
           if (ownTurn && !capture.owned) pending.set(sessionId, checkpoint);
-          if (
-            checkpoint.kind === "git" &&
-            checkpoint.repository.gitDir &&
-            isPrivateRepository(checkpoint.repository.gitDir)
-          ) {
-            const gitDir = checkpoint.repository.gitDir;
-            const count = (capturesSinceGcByGitDir.get(gitDir) ?? 0) + 1;
+          if (checkpoint.kind === "git") {
+            const { repository } = checkpoint;
+            const key = gcKey(repository);
+            const count = (capturesSinceGcByStore.get(key) ?? 0) + 1;
             if (count >= PRIVATE_GC_AFTER_CAPTURES) {
-              capturesSinceGcByGitDir.delete(gitDir);
+              capturesSinceGcByStore.delete(key);
               // The current capture's git work is done (this runs after its
               // snapshot); only defer when another session's capture is still
               // mid-flight — a concurrent `git gc --prune=now` could prune an
               // unreferenced-but-pending object it just wrote. The counter
               // reset below prevents gc runs from stacking.
               if (pendingCaptures.size <= 1) {
-                void track(() => schedulePrivateGc(gitDir));
+                void track(() => schedulePrivateGc(repository, capturePrune(repository)));
               } else {
-                capturesSinceGcByGitDir.set(gitDir, PRIVATE_GC_AFTER_CAPTURES - 1);
+                capturesSinceGcByStore.set(key, PRIVATE_GC_AFTER_CAPTURES - 1);
               }
             } else {
-              capturesSinceGcByGitDir.set(gitDir, count);
+              capturesSinceGcByStore.set(key, count);
             }
           }
         }
@@ -1013,7 +1050,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       const capture = beginCapture(sessionId, async () => {
         const prepared =
           backend.kind === "git"
-            ? await prepareBeforeTurn(backend.git, sessionId, ownerRegistry)
+            ? await prepareBeforeTurn(
+                backend.git,
+                sessionId,
+                ownerRegistry,
+                backend.repository.storeDir,
+              )
             : { status: "session_only" as const, reason: backend.reason };
         // Bound to the leaf recorded above, never a fresh getLeafId(): the
         // finalize identity check and the pending-slot check both compare
@@ -1269,8 +1311,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       await releaseAllPersistentSnapshotIndices();
       await drainState();
       await ownerRegistry.shutdown();
-      // Private-repo housekeeping on the way out: evict repos whose
-      // workspaces vanished, then gc repos that crossed the capture
+      // Store housekeeping on the way out: evict stores whose workspaces
+      // vanished, then gc stores that crossed the capture
       // threshold. Runs detached so an overrunning sweep cannot delay
       // shutdown, but internally sequenced: a gc racing the sweep would
       // both hold handles through the rename and bump mtimes past the idle
@@ -1282,16 +1324,17 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         .then(() =>
           Promise.allSettled(
             [...privateRepositories.values()].map(async (entry) => {
-              if ("failure" in entry || entry.repository?.private !== true || !entry.git) return;
-              const gitDir = entry.repository.gitDir;
-              if (!capturesSinceGcByGitDir.has(gitDir)) return;
-              capturesSinceGcByGitDir.delete(gitDir);
+              if ("failure" in entry || !entry.repository || !entry.git) return;
+              const { repository } = entry;
+              const key = gcKey(repository);
+              if (!capturesSinceGcByStore.has(key)) return;
+              capturesSinceGcByStore.delete(key);
               try {
-                await stat(gitDir);
+                await stat(repository.storeDir);
               } catch {
                 return;
               }
-              await schedulePrivateGc(gitDir);
+              await schedulePrivateGc(repository, capturePrune(repository));
             }),
           ),
         );

@@ -16,6 +16,7 @@ import {
   git as rawGit,
   makeRepository,
   privateRefs,
+  snapshotEnv,
 } from "./helpers.js";
 
 const execFileAsync = promisify(execFile);
@@ -56,8 +57,12 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-function makeGitRunner(cwd: string, options?: { failCommand?: string }): GitRunner {
-  return async (args, runOpts) => {
+function makeGitRunner(
+  cwd: string,
+  options?: { failCommand?: string; env?: Record<string, string> },
+): GitRunner {
+  const runner: GitRunner = async (args, callOpts) => {
+    const runOpts = { ...callOpts, env: { ...options?.env, ...callOpts?.env } };
     if (options?.failCommand && args.includes(options.failCommand)) {
       return { code: 1, stdout: "", stderr: "simulated git failure", error: null };
     }
@@ -89,7 +94,7 @@ function makeGitRunner(cwd: string, options?: { failCommand?: string }): GitRunn
     try {
       const { stdout, stderr } = await execFileAsync("git", args, {
         cwd: runOpts?.cwd ?? cwd,
-        env: runOpts?.env ? { ...process.env, ...runOpts.env } : undefined,
+        env: { ...process.env, ...runOpts.env },
         windowsHide: true,
       });
       return { code: 0, stdout, stderr, error: null };
@@ -103,6 +108,8 @@ function makeGitRunner(cwd: string, options?: { failCommand?: string }): GitRunn
       };
     }
   };
+  if (options?.env) runner.env = options.env;
+  return runner;
 }
 
 describe("temp-directory failure resilience", () => {
@@ -275,7 +282,7 @@ describe("temp-directory failure resilience", () => {
   it("C. snapshot cleanup failure cannot override successful capture", async () => {
     const cwd = await makeRepository();
     try {
-      const gitRunner = makeGitRunner(cwd);
+      const gitRunner = makeGitRunner(cwd, { env: await snapshotEnv(cwd) });
       mockState.failRmForMockDirs = true;
 
       const beforeRes = await prepareBeforeTurn(gitRunner, "sess-cleanup-fail");
@@ -320,13 +327,14 @@ describe("temp-directory failure resilience", () => {
   it("D. snapshot cleanup failure does not hide an operation failure", async () => {
     const cwd = await makeRepository();
     try {
-      const gitRunner = makeGitRunner(cwd);
+      const env = await snapshotEnv(cwd);
+      const gitRunner = makeGitRunner(cwd, { env });
 
       const beforeRes = await prepareBeforeTurn(gitRunner, "sess-op-and-cleanup-fail");
       expect(beforeRes.status).toBe("git");
       if (beforeRes.status !== "git") return;
 
-      const failingGitRunner = makeGitRunner(cwd, { failCommand: "write-tree" });
+      const failingGitRunner = makeGitRunner(cwd, { failCommand: "write-tree", env });
       mockState.failRmForMockDirs = true;
 
       const afterRes = await finishAfterTurn(
@@ -391,7 +399,7 @@ describe("temp-directory failure resilience", () => {
   it("F. patch cleanup failure preserves the primary apply result", async () => {
     const cwd = await makeRepository();
     try {
-      const gitRunner = makeGitRunner(cwd);
+      const gitRunner = makeGitRunner(cwd, { env: await snapshotEnv(cwd) });
 
       const beforeRes = await prepareBeforeTurn(gitRunner, "sess-patch-cleanup");
       expect(beforeRes.status).toBe("git");
