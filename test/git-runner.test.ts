@@ -146,4 +146,16 @@ describe("Git runner", () => {
     child.emit("close", null);
     await expect(resultPromise).resolves.toMatchObject({ code: 1, error: "timeout" });
   });
+
+  it("settles a timed-out git whose descendants still hold its stdio", async () => {
+    // Regression: on Windows `git` is a launcher that spawns the real git.exe;
+    // killing only the launcher left the pipes open, so `close` never fired and
+    // the timeout did nothing. The `!sleep` alias gives the same shape
+    // everywhere: git -> sh -> sleep, with sleep inheriting stdout/stderr.
+    const git = await runnerInTempRepo();
+    const started = Date.now();
+    const result = await git(["-c", "alias.wedge=!sleep 30", "wedge"], { timeoutMs: 300 });
+    expect(result.error).toBe("timeout");
+    expect(Date.now() - started).toBeLessThan(10_000);
+  }, 15_000);
 });

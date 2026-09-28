@@ -1,5 +1,5 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
@@ -17,6 +17,11 @@ import type {
 const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-redo@local"];
 const REF_ROOT = "refs/omp-undo-redo";
 const WORKTREE_PATHSPEC = ":(top)";
+
+/** Commit-message line naming a nested repository a snapshot left out. */
+const NESTED_REPOSITORY_LINE = "Nested repository outside snapshot: ";
+const NO_COMMIT_ERROR = /^error: '(.+?)\/?' does not have a commit checked out$/;
+const UNABLE_TO_INDEX_ERROR = /^error: unable to index file '(.+?)\/?'$/;
 
 /** Single spelling of the retained-history ref namespace. Takes an
  *  already-hashed session (`checkpointNamespace(sessionId)`), never a raw id. */
@@ -50,6 +55,15 @@ export function checkpointNamespace(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex");
 }
 
+/** Ref paths are loose files under `.git/refs/`, so on Windows the repository
+ *  path plus the ref must fit MAX_PATH. `core.longpaths` is deliberately not
+ *  forced: refs written past MAX_PATH are invisible to the user's own git, whose
+ *  `gc` would then prune the snapshot objects. Hence 16-hex checkpoint ids
+ *  (64 random bits) and no session hash in v2 refs. */
+function newCheckpointId(): string {
+  return randomBytes(8).toString("hex");
+}
+
 function checkpointRefs(
   sessionId: string,
   checkpointId: string,
@@ -58,7 +72,7 @@ function checkpointRefs(
 ): { beforeRef: string; afterRef: string } {
   const prefix =
     ownership === "v2" && ownerId
-      ? `${REF_ROOT}/v2/${ownerId}/${checkpointNamespace(sessionId)}/${checkpointId}`
+      ? `${REF_ROOT}/v2/${ownerId}/${checkpointId}`
       : `${REF_ROOT}/${checkpointNamespace(sessionId)}/${checkpointId}`;
   return { beforeRef: `${prefix}/before`, afterRef: `${prefix}/after` };
 }
@@ -205,6 +219,37 @@ async function pruneIgnoredEntries(git: GitRunner, env: Record<string, string>):
   return removed.code === 0;
 }
 
+/** `git add -A` of the whole worktree. An embedded repository with no commit
+ *  checked out cannot be recorded even as a gitlink, and would otherwise abort
+ *  every snapshot — one `git init` in a subfolder would disable capture. Such
+ *  repositories are left out and returned; any other error still fails the
+ *  snapshot, since silently omitting an unreadable file would let a restore
+ *  treat it as deleted. `LC_ALL=C` pins the message being matched. */
+async function addWorktree(git: GitRunner, env: Record<string, string>): Promise<string[] | null> {
+  const added = await invoke(git, ["add", "-A", "--ignore-errors", "--", WORKTREE_PATHSPEC], {
+    env: { ...env, LC_ALL: "C" },
+  });
+  if (added.code === 0) return [];
+  if (added.error || added.code !== 1) return null;
+  const skipped: string[] = [];
+  for (const line of added.stderr.split(/\r?\n/)) {
+    const match = NO_COMMIT_ERROR.exec(line);
+    if (match) {
+      skipped.push(match[1]!);
+      continue;
+    }
+    const unable = UNABLE_TO_INDEX_ERROR.exec(line);
+    if (unable && unable[1] === skipped.at(-1)) continue;
+    if (line.startsWith("error:") || line.startsWith("fatal:")) return null;
+  }
+  return skipped.length > 0 ? skipped : null;
+}
+
+function snapshotMessage(message: string, skipped: readonly string[]): string {
+  if (skipped.length === 0) return message;
+  return `${message}\n\n${skipped.map((path) => `${NESTED_REPOSITORY_LINE}${path}`).join("\n")}`;
+}
+
 async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined): Promise<boolean> {
   if (!lease) return true;
   for (const [key, value] of persistentSnapshotIndices) {
@@ -233,13 +278,13 @@ export async function createSnapshotCommit(
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
-    if (added.code !== 0) return { reason: "snapshot_failed" };
+    const skipped = await addWorktree(git, addEnv);
+    if (!skipped) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     if (tree.code !== 0) return { reason: "snapshot_failed" };
     const treeHash = tree.stdout.trim();
     if (!treeHash) return { reason: "snapshot_failed" };
-    const commit = await createCommitForTree(git, treeHash, message);
+    const commit = await createCommitForTree(git, treeHash, snapshotMessage(message, skipped));
     if (!("hash" in commit)) return commit;
     if (retainIndex && (seeded.status === "seeded" || seeded.status === "empty")) {
       const snapshotIndexLease: SnapshotIndexLease =
@@ -314,8 +359,8 @@ async function createSnapshotCommitFromLease(
 
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const added = await invoke(git, ["add", "-A", "--", WORKTREE_PATHSPEC], { env: addEnv });
-    if (added.code !== 0) return { reason: "snapshot_failed" };
+    const skipped = await addWorktree(git, addEnv);
+    if (!skipped) return { reason: "snapshot_failed" };
     // An unborn baseline's fresh equivalent is `read-tree --empty` + `add -A`,
     // which never holds an ignored path. `add -A` cannot drop an entry that
     // became ignored after it was staged, so prune those explicitly.
@@ -327,7 +372,7 @@ async function createSnapshotCommitFromLease(
     if (tree.code !== 0 || !treeHash) return { reason: "snapshot_failed" };
 
     if (!(await leaseBaselineCurrent(git, lease))) return { reason: "snapshot_failed" };
-    return createCommitForTree(git, treeHash, message);
+    return createCommitForTree(git, treeHash, snapshotMessage(message, skipped));
   } catch {
     return { reason: "snapshot_failed" };
   } finally {
@@ -448,7 +493,7 @@ export async function prepareBeforeTurn(
   const ownership = ownerRegistry
     ? await ownerRegistry.ensureInitialized(resolved.repository, git)
     : "legacy";
-  const checkpointId = randomUUID();
+  const checkpointId = newCheckpointId();
   const indexKey = persistentIndexKey(resolved.repository, sessionId);
   const priorLease = persistentSnapshotIndices.get(indexKey);
   let snapshot: SnapshotResult;
@@ -573,7 +618,7 @@ export async function retainCheckpointForResume(
   sessionId: string,
   checkpoint: GitCheckpoint,
 ): Promise<GitCheckpoint> {
-  const checkpointId = randomUUID();
+  const checkpointId = newCheckpointId();
   const prefix = `${historyRefPrefix(checkpointNamespace(sessionId))}${checkpointId}`;
   const beforeRef = `${prefix}/before`;
   const afterRef = `${prefix}/after`;
@@ -588,7 +633,10 @@ export async function retainCheckpointForResume(
   return { ...checkpoint, beforeRef, afterRef };
 }
 
-export type CheckpointApplyResult = "applied" | "conflict" | "failed";
+/** `nestedRepositories`: repositories whose contents the restore could not
+ *  touch, relative to the worktree root (see `nestedRepositoriesOutside`). */
+export type CheckpointApplyResult =
+  { status: "applied"; nestedRepositories: string[] } | { status: "conflict" | "failed" };
 
 /** Restore invocations get a far larger ceiling than the runner's default:
  *  diffing and applying a multi-GB binary change is slow but legitimate, and
@@ -596,10 +644,159 @@ export type CheckpointApplyResult = "applied" | "conflict" | "failed";
  *  exists only so a wedged child cannot hang the process forever. */
 const RESTORE_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** Paths of `paths` that `tree`'s own ignore rules exclude. The rules are
+ *  materialized into a scratch worktree (`tree`'s `.gitignore` files only) so
+ *  `check-ignore` evaluates them exactly as git would have when that tree was
+ *  snapshotted, alongside the repository's `info/exclude` and global excludes. */
+async function ignoredUnder(
+  git: GitRunner,
+  tree: string,
+  paths: readonly string[],
+  directory: string,
+  label: string,
+): Promise<string[] | null> {
+  if (paths.length === 0) return [];
+  const rules = join(directory, `${label}-rules`);
+  await mkdir(rules);
+  const env = { GIT_INDEX_FILE: join(directory, `${label}-index`), GIT_WORK_TREE: rules };
+  if ((await invoke(git, ["read-tree", tree], { env })).code !== 0) return null;
+  const files = await invoke(git, ["ls-files", "-z", "--", ":(glob)**/.gitignore"], { env });
+  if (files.code !== 0) return null;
+  if (files.stdout) {
+    const written = await invoke(git, ["checkout-index", "-z", "--stdin"], {
+      env,
+      stdin: files.stdout,
+    });
+    if (written.code !== 0) return null;
+  }
+  const ignored = await invoke(git, ["check-ignore", "--no-index", "-z", "--stdin"], {
+    env,
+    stdin: paths.join("\0"),
+  });
+  if (ignored.error || (ignored.code !== 0 && ignored.code !== 1)) return null;
+  return ignored.stdout.split("\0").filter(Boolean);
+}
+
+/** Snapshots omit ignored paths, so a path can be missing from a tree only
+ *  because that tree's rules ignored it while the file stayed on disk.
+ *  Restoring must leave such a path alone: deleting it destroys the user's
+ *  ignored file (undoing a turn that un-ignored `.env`), and creating it
+ *  collides with the file still on disk (redoing that turn). Returns a tree
+ *  equal to `targetHash` with those paths pinned to their `sourceHash` state,
+ *  or `targetHash` itself when nothing needs pinning. Only a `.gitignore`
+ *  change between the two trees can produce such a path, so every other
+ *  restore costs one `diff-tree`. */
+async function shieldIgnoredPaths(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+  directory: string,
+): Promise<string | null> {
+  const changes = await invoke(git, ["diff-tree", "-r", "-z", sourceHash, targetHash], {
+    timeoutMs: RESTORE_TIMEOUT_MS,
+  });
+  if (changes.error || changes.code !== 0) return null;
+  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
+  // The source mode/sha of an added path are zeros, which `--index-info` reads
+  // as "remove", so one entry format pins both directions.
+  const fields = changes.stdout.split("\0");
+  const deleted = new Map<string, string>();
+  const added = new Map<string, string>();
+  let rulesChanged = false;
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const [sourceMode, , sourceSha, , status] = fields[index]!.slice(1).split(" ");
+    const path = fields[index + 1]!;
+    if (path === ".gitignore" || path.endsWith("/.gitignore")) rulesChanged = true;
+    if (status === "D") deleted.set(path, `${sourceMode} ${sourceSha}`);
+    else if (status === "A") added.set(path, `${sourceMode} ${sourceSha}`);
+  }
+  if (!rulesChanged || (deleted.size === 0 && added.size === 0)) return targetHash;
+
+  const keptOnDisk = await ignoredUnder(git, targetHash, [...deleted.keys()], directory, "target");
+  const hiddenInSource = await ignoredUnder(
+    git,
+    sourceHash,
+    [...added.keys()],
+    directory,
+    "source",
+  );
+  if (!keptOnDisk || !hiddenInSource) return null;
+  const pinned = keptOnDisk.map((path) => `${deleted.get(path)}\t${path}\0`);
+  if (hiddenInSource.length > 0) {
+    const top = await invoke(git, ["rev-parse", "--show-toplevel"]);
+    if (top.code !== 0) return null;
+    const worktree = top.stdout.trim();
+    for (const path of hiddenInSource) {
+      // Absent on disk means nothing to collide with: let the patch create it.
+      const onDisk = await lstat(join(worktree, path)).then(
+        () => true,
+        () => false,
+      );
+      if (onDisk) pinned.push(`${added.get(path)}\t${path}\0`);
+    }
+  }
+  if (pinned.length === 0) return targetHash;
+
+  const env = { GIT_INDEX_FILE: join(directory, "shield-index") };
+  if ((await invoke(git, ["read-tree", targetHash], { env })).code !== 0) return null;
+  const updated = await invoke(git, ["update-index", "-z", "--index-info"], {
+    env,
+    stdin: pinned.join(""),
+  });
+  if (updated.code !== 0) return null;
+  const tree = await invoke(git, ["write-tree"], { env });
+  const treeHash = tree.stdout.trim();
+  return tree.code === 0 && treeHash ? treeHash : null;
+}
+
+/** Nested repositories whose contents none of `commits` hold: gitlinks (a
+ *  submodule or committed nested repository is recorded as its HEAD commit
+ *  only, and `git apply` without an index skips gitlink hunks) plus the ones a
+ *  snapshot left out for having no commit. Null when a commit is unreadable.
+ *  ponytail: lists every tree entry per restore; record gitlinks at capture
+ *  time if undo in million-file trees gets slow. */
+async function nestedRepositoriesOutside(
+  git: GitRunner,
+  commits: readonly string[],
+): Promise<string[] | null> {
+  const paths = new Set<string>();
+  for (const commit of commits) {
+    const tree = await invoke(git, ["ls-tree", "-r", "-z", "--full-tree", commit], {
+      timeoutMs: RESTORE_TIMEOUT_MS,
+    });
+    const object = await invoke(git, ["cat-file", "commit", commit]);
+    if (tree.error || tree.code !== 0 || object.error || object.code !== 0) return null;
+    // Entries: "<mode> <type> <object>\t<path>".
+    for (const entry of tree.stdout.split("\0")) {
+      if (entry.startsWith("160000 ")) paths.add(entry.slice(entry.indexOf("\t") + 1));
+    }
+    const message = object.stdout.slice(object.stdout.indexOf("\n\n") + 2);
+    for (const line of message.split("\n")) {
+      if (line.startsWith(NESTED_REPOSITORY_LINE)) {
+        paths.add(line.slice(NESTED_REPOSITORY_LINE.length));
+      }
+    }
+  }
+  return [...paths].sort();
+}
+
 /** Restores `targetHash`'s content over a worktree that currently matches
  *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
- *
- *  Every flag pins the plumbing contract against the user's own
+ *  Nested repositories are outside every snapshot: an `applied` result lists
+ *  them so the caller never reports their contents as restored. */
+export async function applyCheckpoint(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+): Promise<CheckpointApplyResult> {
+  // Read first: failing after the patch landed would misreport a restore.
+  const nestedRepositories = await nestedRepositoriesOutside(git, [sourceHash, targetHash]);
+  if (!nestedRepositories) return { status: "failed" };
+  const status = await applyPatch(git, sourceHash, targetHash);
+  return status === "applied" ? { status, nestedRepositories } : { status };
+}
+
+/** Every flag pins the plumbing contract against the user's own
  *  configuration, each of which otherwise kills restoration outright on that
  *  machine: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` produce a patch
  *  `git apply -p1` cannot resolve; `color.diff=always` prefixes it with ANSI
@@ -609,16 +806,18 @@ const RESTORE_TIMEOUT_MS = 10 * 60 * 1000;
  *  patch; `diff.context=0` yields hunks `git apply` refuses without
  *  `--unidiff-zero`; `apply.whitespace=error` rejects content git itself
  *  snapshotted. */
-export async function applyCheckpoint(
+async function applyPatch(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
-): Promise<CheckpointApplyResult> {
+): Promise<CheckpointApplyResult["status"]> {
   let tempDirectory: string | null = null;
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
     const patchPath = join(tempDirectory, "checkpoint.patch");
     const restore = { timeoutMs: RESTORE_TIMEOUT_MS };
+    const effectiveTarget = await shieldIgnoredPaths(git, sourceHash, targetHash, tempDirectory);
+    if (!effectiveTarget) return "failed";
     const diff = await invoke(
       git,
       [
@@ -635,7 +834,7 @@ export async function applyCheckpoint(
         "--exit-code",
         "--binary",
         sourceHash,
-        targetHash,
+        effectiveTarget,
         `--output=${patchPath}`,
       ],
       restore,

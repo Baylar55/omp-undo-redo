@@ -294,6 +294,8 @@ describe("temp-directory failure resilience", () => {
       const nav = new SessionNavigation(
         {
           getLeafId: () => currentLeaf,
+          getBranch: () => [],
+          getEntry: () => undefined,
           navigateTree: async (targetId) => {
             currentLeaf = targetId;
             return { cancelled: false };
@@ -406,6 +408,8 @@ describe("temp-directory failure resilience", () => {
       const nav = new SessionNavigation(
         {
           getLeafId: () => currentLeaf,
+          getBranch: () => [],
+          getEntry: () => undefined,
           navigateTree: async (targetId) => {
             currentLeaf = targetId;
             return { cancelled: false };
@@ -432,7 +436,7 @@ describe("temp-directory failure resilience", () => {
         afterRes.checkpoint.afterHash,
         afterRes.checkpoint.afterHash,
       );
-      expect(emptyApplyRes).toBe("applied");
+      expect(emptyApplyRes).toEqual({ status: "applied", nestedRepositories: [] });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

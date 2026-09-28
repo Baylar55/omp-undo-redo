@@ -1,11 +1,19 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { afterAll, describe, expect, it } from "vitest";
 import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
-import { context, FakeExtensionApi, makeRepository, privateRefs, rmRetry } from "./helpers.js";
+import {
+  context,
+  FakeExtensionApi,
+  makeRepository,
+  privateRefs,
+  rmRetry,
+  type TestContext,
+} from "./helpers.js";
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-test-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -251,6 +259,99 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
+  /** git-add waits `delayMs` BEFORE reading the worktree, so a write landing
+   *  in that window leaks into the snapshot (the slow-cold-capture case).
+   *  Real delays: the race is between real git children and the handlers'
+   *  wall-clock deadlines, which fake timers cannot drive. */
+  function lateReadRunnerFactory(delayMs: number): {
+    runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]>;
+    adds: () => number;
+  } {
+    let count = 0;
+    const runner = (cwd: string, env?: Record<string, string>): GitRunner => {
+      const inner = env ? createGitRunner(cwd, { env }) : createGitRunner(cwd);
+      const slow: GitRunner = async (args, options) => {
+        if (!args.includes("add")) return inner(args, options);
+        await sleep(delayMs);
+        const result = await inner(args, options);
+        count += 1;
+        return result;
+      };
+      slow.cwd = cwd;
+      return slow;
+    };
+    return { runner, adds: () => count };
+  }
+
+  async function undoWhenSettled(pi: FakeExtensionApi, ctx: TestContext) {
+    ctx.navigateTree = async (targetId) => {
+      ctx.leaf = targetId;
+      return { cancelled: false };
+    };
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      await pi.runCommand("undo", ctx);
+      const message = ctx.ui.notifications.at(-1)?.message ?? "";
+      if (!/Nothing to undo|still being captured|still being finalized/.test(message))
+        return message;
+      await sleep(100);
+    }
+    throw new Error("undo never settled");
+  }
+
+  it("holds the first tool call until an overrunning before-snapshot finishes", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-late-"));
+    const { runner, adds } = lateReadRunnerFactory(800);
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: runner,
+        captureDeadlineMs: 200,
+        toolCallDeadlineMs: 10_000,
+      });
+      const ctx = context(cwd, "late-session");
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await pi.emit("before_agent_start", ctx);
+      expect(adds()).toBe(0);
+      await pi.emit("tool_call", ctx);
+      expect(adds()).toBe(1);
+      await writeFile(join(cwd, "tracked.txt"), "agent-edit\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      expect(await undoWhenSettled(pi, ctx)).toContain("file snapshot restored");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("records a session-only turn when a tool call outwaits the before-snapshot", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-late-"));
+    const { runner } = lateReadRunnerFactory(1_000);
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: runner,
+        captureDeadlineMs: 200,
+        toolCallDeadlineMs: 200,
+      });
+      const ctx = context(cwd, "late-session");
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await pi.emit("before_agent_start", ctx);
+      await pi.emit("tool_call", ctx);
+      // The tool runs while git has not read the worktree yet.
+      await writeFile(join(cwd, "tracked.txt"), "agent-edit\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      expect(await undoWhenSettled(pi, ctx)).toContain("files were not restored");
+      expect(ctx.leaf).toBe("leaf");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("agent-edit\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
   it("warns instead of navigating while the before-capture is still in flight", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-bounded-"));
     const { runner, waitForAdds } = slowAddRunnerFactory(500);
@@ -385,6 +486,63 @@ describe("bounded capture lifecycle", () => {
       expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
     } finally {
       releaseUpdateRef?.();
+      await rmRetry(cwd);
+    }
+  });
+
+  it("reads the finalize guard after the idle wait when undo is issued mid-stream", async () => {
+    // The host runs commands during streaming and stops waiting on an
+    // agent_end handler after its cap, while the finalize keeps running.
+    // A guard snapshotted before the idle wait misses that finalize and undoes
+    // against a history that does not contain the turn yet.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-midstream-"));
+    const gate = Promise.withResolvers<void>();
+    const beforeSnapshot = Promise.withResolvers<void>();
+    const finalizeParked = Promise.withResolvers<void>();
+    let updateRefCount = 0;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        if (args[0] !== "update-ref") return inner(args, options);
+        updateRefCount += 1;
+        // Park the after-snapshot so the finalize outlives the host's wait.
+        if (updateRefCount >= 2) {
+          finalizeParked.resolve();
+          await gate.promise;
+        }
+        const result = await inner(args, options);
+        if (updateRefCount === 1) beforeSnapshot.resolve();
+        return result;
+      };
+      gated.cwd = workCwd;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
+      const ctx = context(cwd, "midstream-session");
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await pi.emit("before_agent_start", ctx);
+      await beforeSnapshot.promise;
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      const idle = Promise.withResolvers<void>();
+      ctx.waitForIdle = () => idle.promise;
+
+      // Issued mid-stream: no finalize is registered yet.
+      const undoRun = pi.runCommand("undo", ctx);
+      const agentEnd = pi.emit("agent_end", ctx);
+      // Host cap elapsed: idle resolves while the finalize is still parked.
+      await finalizeParked.promise;
+      idle.resolve();
+      await undoRun;
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("still being finalized");
+      expect(ctx.leaf).toBe("turn");
+      gate.resolve();
+      await agentEnd;
+    } finally {
+      gate.resolve();
       await rmRetry(cwd);
     }
   });

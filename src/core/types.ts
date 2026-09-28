@@ -34,6 +34,9 @@ export type TreeNavigationResult = {
 
 export type NavigationResult =
   | { status: "moved"; files: "restored" }
+  /** Restored everything the snapshot holds; `nestedRepositories` (worktree
+   *  root relative) are outside it and were not restored. */
+  | { status: "moved"; files: "partial"; nestedRepositories: string[] }
   | {
       status: "moved";
       files: "unavailable";
