@@ -21,6 +21,7 @@ const WORKTREE_PATHSPEC = ":(top)";
 /** Commit-message line naming a nested repository a snapshot left out. */
 const NESTED_REPOSITORY_LINE = "Nested repository outside snapshot: ";
 const NO_COMMIT_ERROR = /^error: '(.+?)\/?' does not have a commit checked out$/;
+const UNABLE_TO_INDEX_ERROR = /^error: unable to index file '(.+?)\/?'$/;
 
 /** Single spelling of the retained-history ref namespace. Takes an
  *  already-hashed session (`checkpointNamespace(sessionId)`), never a raw id. */
@@ -233,8 +234,13 @@ async function addWorktree(git: GitRunner, env: Record<string, string>): Promise
   const skipped: string[] = [];
   for (const line of added.stderr.split(/\r?\n/)) {
     const match = NO_COMMIT_ERROR.exec(line);
-    if (match) skipped.push(match[1]!);
-    else if (line.startsWith("error:") || line.startsWith("fatal:")) return null;
+    if (match) {
+      skipped.push(match[1]!);
+      continue;
+    }
+    const unable = UNABLE_TO_INDEX_ERROR.exec(line);
+    if (unable && unable[1] === skipped.at(-1)) continue;
+    if (line.startsWith("error:") || line.startsWith("fatal:")) return null;
   }
   return skipped.length > 0 ? skipped : null;
 }
