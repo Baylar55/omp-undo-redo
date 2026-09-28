@@ -2,7 +2,7 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
-## [Unreleased]
+## [1.6.4] - 2026-09-28
 
 ### Fixed
 
@@ -501,6 +501,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - OMP plugin-manifest registration through the `omp.extensions` package field.
 - TypeScript build, type-check, lint, format-check, and test tooling.
 
+[1.6.4]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.6.4
 [1.6.3]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.6.3
 [1.6.2]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.6.2
 [1.6.1]: https://github.com/Baylar55/omp-undo-redo/releases/tag/v1.6.1
