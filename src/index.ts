@@ -389,18 +389,24 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  a tracked operation (and with it the eviction sweep) forever. */
   const PRIVATE_GC_TIMEOUT_MS = 15 * 60 * 1000;
 
+  /** Retention-sweep gc prune window. Unlike the capture-threshold gc, the
+   *  sweep runs while this or another process may be mid-capture in the same
+   *  repo, writing objects no ref reaches yet; `--prune=now` would delete
+   *  them. Expired sessions' objects are days old, so an hour loses nothing. */
+  const PRIVATE_SWEEP_PRUNE = "1.hour.ago";
+
   /** Best-effort `git gc` over a private repo. Runs outside the handler
    *  deadline accounting (never awaited by a handler) so a slow gc can never
    *  hit the host's timeout. `--prune=now` drops unreferenced objects
    *  immediately: expiring sessions would otherwise leave recoverable file
    *  content behind indefinitely. */
-  async function schedulePrivateGc(gitDir: string): Promise<void> {
+  async function schedulePrivateGc(gitDir: string, prune = "now"): Promise<void> {
     try {
       // Run from a neutral cwd so a slow gc never holds a handle on either the
       // user's workspace or the snapshot repo itself (Windows keeps a child's
       // cwd handle until it exits, which would race teardown rms and the
       // eviction sweep). GIT_DIR is set, so the repo operations work anywhere.
-      await gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir })(["gc", "--prune=now"], {
+      await gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir })(["gc", `--prune=${prune}`], {
         timeoutMs: PRIVATE_GC_TIMEOUT_MS,
       });
     } catch {
@@ -488,6 +494,22 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return newest;
   }
 
+  /** `core.worktree` of a private repo, or null when unset/unreadable. Git
+   *  decodes the value: it quotes values containing `#`/`;` and escapes
+   *  `\`/`"`, so a raw regex over the file yields a path that never stats
+   *  (e.g. "C:\\…\\C# Projects") and evicts live history. */
+  async function privateWorktree(reposDir: string, gitDir: string): Promise<string | null> {
+    const result = await gitRunnerFactory(reposDir)([
+      "config",
+      "--file",
+      join(gitDir, "config"),
+      "--get",
+      "core.worktree",
+    ]);
+    if (result.code !== 0) return null;
+    return result.stdout.replace(/\r?\n$/, "") || null;
+  }
+
   /** Removes private repos whose workspace no longer exists. Runs at boot and
    *  on shutdown so vanished workspaces cannot leave their snapshot repos
    *  (and the file contents inside them) behind forever.
@@ -544,18 +566,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         } catch {
           // No pidfile.
         }
-        // Let git decode the value: it quotes values containing `#`/`;` and
-        // escapes `\`/`"`, so a raw regex over the file yields a path that
-        // never stats (e.g. "C:\\…\\C# Projects") and evicts live history.
-        const worktreeConfig = await gitRunnerFactory(reposDir)([
-          "config",
-          "--file",
-          join(path, "config"),
-          "--get",
-          "core.worktree",
-        ]);
-        if (worktreeConfig.code !== 0) continue;
-        const worktree = worktreeConfig.stdout.replace(/\r?\n$/, "");
+        const worktree = await privateWorktree(reposDir, path);
         if (!worktree) continue;
         const vanished = async (): Promise<boolean> => {
           try {
@@ -594,6 +605,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   let shutdownPromise: Promise<void> | null = null;
   let pendingNavigationSourceSessionId: string | null = null;
   const expirationPromises = new Map<string, Promise<void>>();
+  let privateRetentionSweep: Promise<void> | null = null;
   const explicitActiveHashes = new Set<string>();
 
   function activeSessionHashes(): ReadonlySet<string> {
@@ -602,6 +614,54 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       hashes.add(checkpointNamespace(sessionId));
     }
     return hashes;
+  }
+
+  /** Expires dormant histories in `repository`, once per process. Deleting
+   *  refs alone leaves the snapshots' plaintext file contents on disk, so a
+   *  private repo then gets a background gc. A cruft pack (`.mtimes`) holds
+   *  objects an earlier sweep gc kept inside its prune window; it triggers a
+   *  gc too, else they would outlive retention until some later expiry. */
+  function expireRepository(repository: GitRepository, git: GitRunner): Promise<void> {
+    const key = `git:${repository.commonDir}`;
+    const existing = expirationPromises.get(key);
+    if (existing) return existing;
+    const expiration = (async () => {
+      const refsRemoved = await expireGitSessionHistories(repository, git, retentionDays, () =>
+        activeSessionHashes(),
+      );
+      if (repository.private !== true || closing) return;
+      if (refsRemoved === 0) {
+        const packs = await readdir(join(repository.commonDir, "objects", "pack")).catch(() => []);
+        if (!packs.some((name) => name.endsWith(".mtimes"))) return;
+      }
+      // Detached from the expiration promise: shutdown awaits expirations,
+      // and must not wait out a gc.
+      void track(() => schedulePrivateGc(repository.commonDir, PRIVATE_SWEEP_PRUNE));
+    })().catch(() => undefined);
+    expirationPromises.set(key, expiration);
+    return expiration;
+  }
+
+  /** Retention for every private repo, not only those a session opens here:
+   *  a workspace that is never reopened would otherwise keep its snapshots
+   *  (`.env`, keys) forever. Started by the first session initialization,
+   *  once that session is registered active, so the session being resumed
+   *  is protected exactly as in the per-repo path. */
+  async function sweepPrivateRepoRetention(): Promise<void> {
+    if (retentionDays <= 0) return;
+    const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
+    const entries = await readdir(reposDir).catch(() => [] as string[]);
+    for (const entry of entries) {
+      if (closing) return;
+      if (!entry.endsWith(".git")) continue;
+      const gitDir = join(reposDir, entry);
+      const worktree = await privateWorktree(reposDir, gitDir).catch(() => null);
+      if (!worktree) continue;
+      await expireRepository(
+        { worktree, gitDir, commonDir: gitDir, private: true },
+        gitRunnerFactory(tmpdir(), { GIT_DIR: gitDir }),
+      );
+    }
   }
 
   // Cross-process liveness beats: load/save touch .active markers, but a
@@ -672,18 +732,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         notifySessionOnly(ctx, sessionId, backend.reason);
       }
 
-      if (
-        backend.kind === "git" &&
-        !expirationPromises.has(`git:${backend.repository.commonDir}`)
-      ) {
-        const expiration = expireGitSessionHistories(
-          backend.repository,
-          backend.git,
-          retentionDays,
-          () => activeSessionHashes(),
-        ).catch(() => undefined);
-        expirationPromises.set(`git:${backend.repository.commonDir}`, expiration);
-      }
+      if (backend.kind === "git") void expireRepository(backend.repository, backend.git);
+      // After boot eviction, which it would otherwise race (a gc holds
+      // handles through eviction's rename and refreshes the idle mtimes).
+      privateRetentionSweep ??= bootEviction
+        .then(() => (closing ? undefined : track(sweepPrivateRepoRetention)))
+        .catch(() => undefined);
 
       const store =
         backend.kind === "git"
@@ -1292,7 +1346,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   });
 
   // Boot-time housekeeping (all fire-and-forget, unref'd — 0ms handler latency)
-  void evictStalePrivateRepos().catch(() => undefined);
+  const bootEviction = evictStalePrivateRepos().catch(() => undefined);
   void cleanLegacyGitIndexes().catch(() => undefined);
   {
     const t = setTimeout(() => {

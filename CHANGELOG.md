@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Private-Git snapshots (`.env`, keys) outlived the retention window.** Expiry ran only for the repository of a session being opened, and deleting its refs did not delete the objects: `git gc` ran only after 20 captures or at shutdown when captures were due. A workspace that still existed but was never reopened kept its snapshots in `<storeRoot>/repos/<hash>.git` forever, and a reopened workspace with no new capture kept its expired objects. The first session start of each process now sweeps every private repository with the same liveness guards (local active set, cross-process heartbeats), and any private repository that lost refs gets a background `git gc --prune=1.hour.ago`; the hour spares objects a concurrent capture has written but not yet referenced. Cruft packs left inside that window are reclaimed by the next sweep.
+
 ## [1.6.4] - 2026-09-28
 
 ### Fixed

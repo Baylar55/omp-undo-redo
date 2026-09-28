@@ -2,7 +2,9 @@ import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
+import { checkpointNamespace, historyRefPrefix } from "../src/core/checkpoints.js";
 import { createGitRunner } from "../src/core/git-runner.js";
+import { ensurePrivateGitRepository } from "../src/core/private-repo.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
 import { context, FakeExtensionApi, makeRepository, rmRetry, type TestContext } from "./helpers.js";
@@ -334,4 +336,67 @@ describe("private-repo housekeeping", () => {
       await rmRetry(cwd);
     }
   });
+
+  it("expires and prunes aged history in a private repo no session reopens", async () => {
+    await withHermeticStore(async (reposDir) => {
+      const dormant = await mkdtemp(join(tmpdir(), "omp-undo-redo-retention-dormant-"));
+      const current = await mkdtemp(join(tmpdir(), "omp-undo-redo-retention-current-"));
+      try {
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, env ? { env } : undefined),
+          dormant,
+          join(reposDir, ".."),
+        );
+        if (!repository) throw new Error("private repo init failed");
+        const git = createGitRunner(dormant, { env: { GIT_DIR: repository.gitDir } });
+        const out = async (args: string[], stdin?: string): Promise<string> =>
+          (await git(args, stdin === undefined ? undefined : { stdin })).stdout.trim();
+        const historyDir = join(repository.gitDir, "omp-undo-redo", "history");
+        await mkdir(historyDir, { recursive: true });
+        const seedSession = async (id: string, content: string, accessedAt: Date) => {
+          const blob = await out(["hash-object", "-w", "--stdin"], content);
+          const tree = await out(["mktree"], `100644 blob ${blob}\tsecret.env\n`);
+          const commit = await out(
+            ["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-m", id],
+            "",
+          );
+          const hash = checkpointNamespace(id);
+          await git(["update-ref", `${historyRefPrefix(hash)}c1/before`, commit]);
+          await writeFile(
+            join(historyDir, `${hash}.json`),
+            JSON.stringify({ lastAccessedAt: accessedAt.toISOString() }),
+          );
+          return { blob, prefix: historyRefPrefix(hash) };
+        };
+        const aged = await seedSession("aged", "SECRET=aged\n", new Date(Date.now() - 3 * 864e5));
+        const live = await seedSession("live", "SECRET=live\n", new Date());
+        // Snapshot objects are days old by the time their session expires.
+        const old = new Date(Date.now() - 3 * 864e5);
+        const objectsDir = join(repository.gitDir, "objects");
+        for (const fanout of await readdir(objectsDir)) {
+          if (!/^[0-9a-f]{2}$/.test(fanout)) continue;
+          for (const name of await readdir(join(objectsDir, fanout))) {
+            await utimes(join(objectsDir, fanout, name), old, old);
+          }
+        }
+        // Unreferenced and fresh: what an in-flight capture has written.
+        const inFlight = await out(["hash-object", "-w", "--stdin"], "SECRET=in-flight\n");
+        const exists = async (object: string) => (await git(["cat-file", "-e", object])).code === 0;
+
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {});
+        const ctx = context(current, "retention-current-session");
+        await pi.emit("session_start", ctx);
+        expect(await waitFor(async () => !(await exists(aged.blob)), 150)).toBe(true);
+        expect(await out(["for-each-ref", aged.prefix])).toBe("");
+        expect(await out(["for-each-ref", live.prefix])).not.toBe("");
+        expect(await exists(live.blob)).toBe(true);
+        expect(await exists(inFlight)).toBe(true);
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(dormant);
+        await rmRetry(current);
+      }
+    });
+  }, 60000);
 });

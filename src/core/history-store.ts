@@ -243,20 +243,23 @@ export function reconstructSessionHistory(reader: SessionReader): NavigationStat
   return { checkpoints, currentIndex: checkpoints.length - 1 };
 }
 
+/** Expires dormant session histories. Returns how many sessions had refs
+ *  deleted, so callers can reclaim the now-unreachable objects. */
 export async function expireGitSessionHistories(
   repository: GitRepository,
   git: GitRunner,
   retentionDays: number,
   activeSessionHashes: ReadonlySet<string> | (() => ReadonlySet<string>),
-): Promise<void> {
-  if (retentionDays <= 0) return;
+): Promise<number> {
+  if (retentionDays <= 0) return 0;
   const dir = historyDirectory(repository);
   let files: string[];
   try {
     files = await readdir(dir);
   } catch {
-    return;
+    return 0;
   }
+  let refsRemoved = 0;
   const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
   const getActive = () =>
     typeof activeSessionHashes === "function" ? activeSessionHashes() : activeSessionHashes;
@@ -327,6 +330,7 @@ export async function expireGitSessionHistories(
           stdin: `${deleteCommands}\n`,
         });
         if (updateResult.code !== 0 || updateResult.error) continue;
+        refsRemoved += 1;
       } catch {
         continue;
       }
@@ -354,6 +358,7 @@ export async function expireGitSessionHistories(
     (hash) => sessionHeartbeatIsFresh(dir, hash),
   );
   await pruneStaleHeartbeats(dir);
+  return refsRemoved;
 }
 
 export class SessionHistoryStore {
