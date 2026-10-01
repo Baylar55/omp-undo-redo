@@ -929,6 +929,80 @@ export async function applyCheckpoint(
   return status === "applied" ? { status, nestedRepositories } : { status };
 }
 
+/** `git apply` without an index first deletes every path it modifies, then
+ *  writes them back, so a failed write (locked file, full disk, killed child)
+ *  leaves paths missing and the rest at target content. Undoes exactly what
+ *  apply did, from `sourceHash` through a scratch index: paths it removed,
+ *  paths it wrote (content equals the target blob) and paths it created. A
+ *  path still holding other content is left alone: `apply --check` accepts
+ *  drift outside the hunks, and overwriting it would destroy that edit. The
+ *  hash runs the clean filters because apply smudges what it writes (CRLF
+ *  under `core.autocrlf`, LFS content), while tree blobs hold the cleaned form.
+ *  Best effort: gitlinks are never touched by apply; a path with a newline in
+ *  its name cannot be hashed; symlinks, typechanges and a directory sitting
+ *  where a deleted file was are left as found. The hash-then-checkout window
+ *  cannot be locked, so an edit landing inside it is overwritten. */
+async function rollbackPartialApply(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+  directory: string,
+): Promise<void> {
+  const worktree = git.cwd;
+  if (!worktree) return;
+  const timeoutMs = RESTORE_TIMEOUT_MS;
+  const changes = await invoke(
+    git,
+    ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
+    { timeoutMs },
+  );
+  if (changes.error || changes.code !== 0) return;
+
+  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
+  const restore: string[] = [];
+  const written = new Map<string, string>();
+  const fields = changes.stdout.split("\0");
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const [sourceMode, targetMode, , targetSha, status] = fields[index]!.slice(1).split(" ");
+    const path = fields[index + 1]!;
+    if (sourceMode === "160000" || targetMode === "160000") continue;
+    const present = await lstat(join(worktree, path)).catch(() => null);
+    if (status === "A") {
+      // `apply --check` proved the path absent, so anything there is apply's.
+      if (present && !present.isDirectory()) {
+        await rm(join(worktree, path), { force: true }).catch(() => undefined);
+      }
+    } else if (!present) {
+      restore.push(path);
+    } else if (status !== "D" && present.isFile() && !path.includes("\n")) {
+      written.set(path, targetSha!);
+    }
+  }
+  if (written.size > 0) {
+    const paths = [...written.keys()];
+    const hashed = await invoke(git, ["hash-object", "--stdin-paths"], {
+      stdin: `${paths.join("\n")}\n`,
+      timeoutMs,
+    });
+    if (hashed.code === 0 && !hashed.error) {
+      const ids = hashed.stdout.split("\n");
+      paths.forEach((path, index) => {
+        if (ids[index] === written.get(path)) restore.push(path);
+      });
+    }
+  }
+  if (restore.length === 0) return;
+
+  const env: Record<string, string> = { GIT_INDEX_FILE: join(directory, "rollback-index") };
+  if (git.env?.GIT_DIR) env.GIT_WORK_TREE = worktree;
+  if ((await invoke(git, ["read-tree", sourceHash], { env })).code !== 0) return;
+  await invoke(git, ["checkout-index", "-f", "-z", "--stdin"], {
+    env,
+    stdin: restore.map((path) => `${path}\0`).join(""),
+    timeoutMs,
+  });
+}
+
 /** Every flag pins the plumbing contract against the user's own
  *  configuration, each of which otherwise kills restoration outright on that
  *  machine: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` produce a patch
@@ -1025,7 +1099,11 @@ async function applyPatch(
     }
 
     const applied = await invoke(git, ["apply", "--whitespace=nowarn", patchPath], restore);
-    return applied.code === 0 ? "applied" : "failed";
+    if (applied.code === 0) return "applied";
+    await rollbackPartialApply(git, sourceHash, effectiveTarget, tempDirectory).catch(
+      () => undefined,
+    );
+    return "failed";
   } catch {
     return "failed";
   } finally {

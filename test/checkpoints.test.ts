@@ -1668,4 +1668,97 @@ describe("history-safe Git checkpoints", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("rolls back what a failed git apply deleted or wrote, and spares drifted files", async () => {
+    // Regression: `git apply` without an index deletes every patched path
+    // before writing any, so a failed write left them missing.
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const lines = (first: string, last = "l10") =>
+        `${[first, "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", last].join("\n")}\n`;
+      await writeFile(join(cwd, "second.txt"), lines("l1"));
+      await git(["add", "."]);
+      await git(["commit", "-qm", "second"]);
+      const prepared = await prepareBeforeTurn(snap, "apply-rollback-session");
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      await writeFile(join(cwd, "second.txt"), lines("L1"));
+      await writeFile(join(cwd, "created.txt"), "created\n");
+      const finished = await finishAfterTurn(snap, prepared.checkpoint, null, null);
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+      const { afterHash, beforeHash } = finished.checkpoint;
+      const read = async (name: string) =>
+        (await readFile(join(cwd, name), "utf8")).replaceAll("\r\n", "\n");
+
+      const failingApply = (mutate: () => Promise<void>): GitRunner =>
+        Object.assign(
+          async (args: string[], options?: Parameters<GitRunner>[1]) => {
+            if (args[0] !== "apply" || args.includes("--check")) return snap(args, options);
+            await mutate();
+            return { stdout: "", stderr: "error: cannot write", code: 1 };
+          },
+          { cwd: snap.cwd, env: snap.env },
+        );
+
+      // Undo: apply deleted every patched path, then failed.
+      expect(
+        await applyCheckpoint(
+          failingApply(async () => {
+            await rm(join(cwd, "tracked.txt"));
+            await rm(join(cwd, "second.txt"));
+            await rm(join(cwd, "created.txt"));
+          }),
+          afterHash,
+          beforeHash,
+        ),
+      ).toEqual({ status: "failed" });
+      expect(await read("tracked.txt")).toBe("turn\n");
+      expect(await read("second.txt")).toBe(lines("L1"));
+      expect(await read("created.txt")).toBe("created\n");
+
+      // Redo: apply created a partial file and deleted another.
+      await rm(join(cwd, "created.txt"));
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await writeFile(join(cwd, "second.txt"), lines("l1"));
+      expect(
+        await applyCheckpoint(
+          failingApply(async () => {
+            await writeFile(join(cwd, "created.txt"), "partial");
+            await rm(join(cwd, "tracked.txt"));
+          }),
+          beforeHash,
+          afterHash,
+        ),
+      ).toEqual({ status: "failed" });
+      expect(await read("tracked.txt")).toBe("base\n");
+      expect(await read("second.txt")).toBe(lines("l1"));
+      await expect(lstat(join(cwd, "created.txt"))).rejects.toThrow();
+
+      // Undo under CRLF conversion: apply smudges what it writes. One file it
+      // wrote must revert, one it never touched carries a user edit outside
+      // the hunks (so `apply --check` passes) and must survive.
+      await git(["config", "core.autocrlf", "true"]);
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      await writeFile(join(cwd, "second.txt"), lines("L1", "mine"));
+      await writeFile(join(cwd, "created.txt"), "created\n");
+      expect(
+        await applyCheckpoint(
+          failingApply(async () => {
+            await writeFile(join(cwd, "tracked.txt"), "base\r\n");
+            await rm(join(cwd, "created.txt"));
+          }),
+          afterHash,
+          beforeHash,
+        ),
+      ).toEqual({ status: "failed" });
+      expect(await read("tracked.txt")).toBe("turn\n");
+      expect(await read("created.txt")).toBe("created\n");
+      expect(await read("second.txt")).toBe(lines("L1", "mine"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
