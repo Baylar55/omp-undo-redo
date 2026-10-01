@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   expireGitSessionHistories,
   historyPath,
+  SessionHistoryStore,
   tombstonePath,
 } from "../src/core/history-store.js";
 import type { GitRepository, GitRunner } from "../src/core/types.js";
@@ -540,6 +541,63 @@ describe("expireGitSessionHistories", () => {
 
     await expect(stat(historyFile)).rejects.toThrow();
     expect((await stat(tombstoneFile)).isFile()).toBe(true);
+  });
+
+  it("keeps a tombstoned history JSON while its owner has a fresh heartbeat", async () => {
+    const gitDir = await temporaryDirectory("git-residue-live-");
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    const sessionId = "residue-live-session";
+    const hash = sessionHash(sessionId);
+    const historyFile = historyPath(repository, sessionId);
+    const dir = join(gitDir, "omp-undo-redo", "history");
+
+    await mkdir(dir, { recursive: true });
+    await writeFile(historyFile, JSON.stringify({ schemaVersion: 2, sessionHash: hash }));
+    await writeFile(join(dir, `.active.${hash}`), "");
+    await writeFile(
+      tombstonePath(repository, sessionId),
+      JSON.stringify({
+        expired: true,
+        sessionHash: hash,
+        expiredAt: new Date().toISOString(),
+        reason: "age",
+      }),
+    );
+
+    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+    await expireGitSessionHistories(repository, dummyGit, 30, new Set());
+
+    expect((await stat(historyFile)).isFile()).toBe(true);
+  });
+
+  it("first save leaves a heartbeat so a sweep cannot expire the new history", async () => {
+    const gitDir = await temporaryDirectory("git-save-heartbeat-");
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    const sessionId = "save-heartbeat-session";
+    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+    await new SessionHistoryStore(sessionId, repository, dummyGit).save({
+      checkpoints: [
+        {
+          kind: "session",
+          reason: "resumed_checkpoint_unavailable",
+          parentLeafId: null,
+          leafId: null,
+        },
+      ],
+      currentIndex: 0,
+    });
+    const marker = join(gitDir, "omp-undo-redo", "history", `.active.${sessionHash(sessionId)}`);
+    expect((await stat(marker)).isFile()).toBe(true);
   });
 
   it("clears a superseded tombstone when the session saves again", async () => {

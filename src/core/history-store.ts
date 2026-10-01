@@ -278,18 +278,21 @@ export async function expireGitSessionHistories(
     // A tombstoned history JSON is residue from a concurrent load rewriting
     // the file mid-sweep (or a load racing the rm). The marker stays
     // authoritative until a live owner saves anew — which clears it — so the
-    // JSON must go regardless of its timestamp. Re-checked immediately before
-    // the rm to stay out of a save()'s clear-and-rewrite path.
+    // JSON must go regardless of its timestamp, unless a live owner exists:
+    // save() beats the heartbeat, then clears the tombstone, then rewrites
+    // the JSON, so a fresh heartbeat or the tombstone vanishing means the
+    // JSON is new live state and must survive.
     const existingTombstone = tombstonePath(repository, sessionHash);
-    let tombstoned = false;
-    try {
-      await stat(existingTombstone);
-      tombstoned = true;
-    } catch {
-      // No marker: normal candidate path.
-    }
+    const tombstoned = await stat(existingTombstone)
+      .then(() => true)
+      .catch(() => false);
     if (tombstoned) {
-      await rm(filePath, { force: true }).catch(() => undefined);
+      if (getActive().has(sessionHash)) continue;
+      if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
+      const stillTombstoned = await stat(existingTombstone)
+        .then(() => true)
+        .catch(() => false);
+      if (stillTombstoned) await rm(filePath, { force: true }).catch(() => undefined);
       continue;
     }
 
@@ -498,14 +501,17 @@ export class SessionHistoryStore {
       currentIndex: state.currentIndex,
       lastAccessedAt: new Date().toISOString(),
     };
-    await writeJsonAtomic(directory, path, stored);
     // A live owner saving new history supersedes any earlier expiration
-    // marker, so clear it — otherwise every future resume would discard the
-    // freshly saved checkpoints until the marker aged out of the tombstone
-    // prune window.
+    // marker. Order matters against a concurrent sweep: beat the heartbeat
+    // first (sweeps skip fresh sessions), clear the tombstone next, and write
+    // the JSON last — so a sweep that saw the tombstone can never delete JSON
+    // written after this point, and a cleared marker never precedes a write
+    // the sweep could still undo.
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await touchSessionHeartbeat(directory, sessionHash);
     await rm(tombstonePath(this.repository, this.sessionId), { force: true }).catch(
       () => undefined,
     );
-    await touchSessionHeartbeat(directory, sessionHash);
+    await writeJsonAtomic(directory, path, stored);
   }
 }
