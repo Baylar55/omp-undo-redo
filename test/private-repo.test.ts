@@ -283,6 +283,44 @@ describe("private per-workspace git repositories", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("does not grow info/exclude across repeated launches and heals a bloated file", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-private-exclude-idem-"));
+    try {
+      const storeRoot = join(cwd, ".omp");
+      const factory = (cwd2: string, env?: NodeJS.ProcessEnv) => createGitRunner(cwd2, { env });
+      const repository = await ensurePrivateGitRepository(factory, cwd, storeRoot);
+      expect(repository).not.toBeNull();
+      if (!repository) return;
+      const excludePath = join(repository.gitDir, "info", "exclude");
+      const fresh = await readFile(excludePath, "utf8");
+
+      await ensurePrivateGitRepository(factory, cwd, storeRoot);
+      await ensurePrivateGitRepository(factory, cwd, storeRoot);
+      expect(await readFile(excludePath, "utf8")).toBe(fresh);
+
+      // Bloated by an older version, plus a user line that must survive.
+      await writeFile(excludePath, `${fresh}my-secret-dir/\n${fresh}${fresh}`, "utf8");
+      await ensurePrivateGitRepository(factory, cwd, storeRoot);
+      const healed = (await readFile(excludePath, "utf8")).split("\n").filter(Boolean);
+      expect(healed.filter((line) => line === "node_modules")).toHaveLength(1);
+      expect(healed).toContain("my-secret-dir/");
+      for (const ignored of DEFAULT_EXCLUDES) expect(healed).toContain(ignored);
+
+      // Store-root entry also collapses to one copy.
+      expect(healed.filter((line) => line === ".omp/")).toHaveLength(1);
+
+      // With a negation line, order is significant: no dedupe, but missing entries still land.
+      await writeFile(excludePath, "node_modules\n!keep-me\nnode_modules\n", "utf8");
+      await ensurePrivateGitRepository(factory, cwd, storeRoot);
+      const negated = (await readFile(excludePath, "utf8")).split("\n").filter(Boolean);
+      expect(negated.slice(0, 3)).toEqual(["node_modules", "!keep-me", "node_modules"]);
+      for (const ignored of DEFAULT_EXCLUDES) expect(negated).toContain(ignored);
+      expect(negated).toContain(".omp/");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
   it("canonicalizes the store root so junction/8.3 alias spellings yield one gitDir", async () => {
     // Regression for the owner-review finding: on machines whose TEMP/user dir
     // is spelled in 8.3 short form (e.g. C:\Users\BAYLAR~1.SAD\...), the

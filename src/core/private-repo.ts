@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CwdGitRunnerFactory, DiscoveredRepository, GitRepository } from "./types.js";
@@ -126,24 +126,44 @@ async function ensureExclude(gitDir: string, worktree: string, storeRoot: string
   } catch {
     content = "";
   }
-  const entries = new Set(
-    content
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0 && !line.startsWith("#")),
-  );
+  const managed: string[] = [];
   const canonicalStoreRoot = canonicalCwd(storeRoot);
   const canonicalWorktree = canonicalCwd(worktree);
   const rel = relative(canonicalWorktree, canonicalStoreRoot);
   if (rel && rel !== "." && !rel.startsWith("..") && !isAbsolute(rel)) {
-    entries.add(`${rel.replace(/\\/g, "/")}/`);
+    managed.push(`${rel.replace(/\\/g, "/")}/`);
   }
-  for (const ignored of DEFAULT_EXCLUDES) entries.add(ignored);
-  const updated =
-    content.length > 0 && !content.endsWith("\n")
-      ? `${content}\n${[...entries].join("\n")}\n`
-      : `${content}${[...entries].join("\n")}\n`;
-  await writeFile(excludePath, updated, "utf8");
+  managed.push(...DEFAULT_EXCLUDES);
+
+  const lines = content.split(/\r?\n/);
+  // Earlier versions re-appended every managed entry on each launch. Drop the
+  // repeats, keeping the first occurrence. Skipped when a negation exists:
+  // last-match-wins makes line order significant there.
+  const dedupe = !lines.some((line) => line.trim().startsWith("!"));
+  const managedSet = new Set<string>(managed);
+  const seen = new Set<string>();
+  const kept = lines.filter((line) => {
+    const entry = line.trim();
+    if (!dedupe || !managedSet.has(entry)) return true;
+    if (seen.has(entry)) return false;
+    seen.add(entry);
+    return true;
+  });
+  const present = new Set(kept.map((line) => line.trim()));
+  const missing = managed.filter((entry) => !present.has(entry));
+  if (missing.length === 0 && kept.length === lines.length) return;
+
+  while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
+  const updated = `${[...kept, ...missing].join("\n")}\n`;
+  // Temp + rename: a crash or concurrent launch never leaves a truncated file.
+  const tempPath = `${excludePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await writeFile(tempPath, updated, "utf8");
+    await rename(tempPath, excludePath);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 /** Ensures a private git repository exists for `cwd` under `storeRoot`.

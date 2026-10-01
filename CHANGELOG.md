@@ -165,6 +165,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - Private-repo housekeeping: a background `git gc --prune=now` runs after every 20 captured snapshots per private repo (and at shutdown, when a gc is due), so unreferenced snapshot objects are reclaimed promptly; stale private repositories are evicted when their workspace disappears.
 
 ### Fixed
+- **`info/exclude` growth:** `ensureExclude` (`src/core/private-repo.ts`) re-appended the full entry set on every launch (12 defaults × N launches). It now appends only missing entries, skips the write when nothing changed, dedupes existing bloated files (unless they contain `!` negations), and writes via temp file + rename.
 
 - Bound checkpoint capture: `before_agent_start`, `agent_end`, and the undo/redo commands now wait at most ~3 s for an in-flight capture and finalize an overrunning capture in the background, so extension handlers can never hit the host's 30 s handler timeout on huge non-Git workspaces (previously the whole workspace walk ran inside the handler).
 - Keep a deferred (overrunning) capture's finalize bound to its own turn: it records the checkpoint captured at that turn's start with the leaf captured at that turn's end, and a later turn that starts while the capture is still settling gets no new capture instead of stacking overlapping `git add` runs — so a slow capture can never be recorded against the wrong turn's leaf or pre-turn state.
