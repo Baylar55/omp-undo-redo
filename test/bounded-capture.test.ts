@@ -490,6 +490,75 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
+  it("records a late-finalizing turn in its own session after the session switched", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-switch-"));
+    const gate = Promise.withResolvers<void>();
+    const parked = Promise.withResolvers<void>();
+    const finalizeStarted = Promise.withResolvers<void>();
+    let released = false;
+    let updateRefCount = 0;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        // Only the after-snapshot's `add` (inside finalizeTurn) runs post-release.
+        if (released && args.includes("add")) finalizeStarted.resolve();
+        if (args[0] === "update-ref" && ++updateRefCount === 1) {
+          parked.resolve();
+          await gate.promise;
+        }
+        return inner(args, options);
+      };
+      gated.cwd = workCwd;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
+      // One live manager whose id changes in place, as on /new.
+      const ctx = context(cwd, "switch-a");
+      let liveId = "switch-a";
+      ctx.sessionManager.getSessionId = () => liveId;
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      // Park the before-snapshot so the turn's finalize is deferred past the
+      // capture deadline and starts only after the session switched.
+      await pi.emit("before_agent_start", ctx);
+      await parked.promise;
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+
+      liveId = "switch-b";
+      await pi.emit("session_start", ctx);
+      released = true;
+      gate.resolve();
+      // Hold the live id on B until finalizeTurn has begun under it.
+      await finalizeStarted.promise;
+
+      // Undo waits a bounded time on A's finalize; retry until it has settled.
+      liveId = "switch-a";
+      let message = "";
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        await pi.runCommand("undo", ctx);
+        message = ctx.ui.notifications.at(-1)?.message ?? "";
+        if (!message.includes("still being finalized")) break;
+      }
+      expect(message).toMatch(/^Undid/);
+
+      // The turn belongs to A: B must hold no history (nothing to redo).
+      liveId = "switch-b";
+      await pi.runCommand("redo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
+    } finally {
+      gate.resolve();
+      await rmRetry(cwd);
+    }
+  });
+
   it("reads the finalize guard after the idle wait when undo is issued mid-stream", async () => {
     // The host runs commands during streaming and stops waiting on an
     // agent_end handler after its cap, while the finalize keeps running.

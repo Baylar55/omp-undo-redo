@@ -1131,10 +1131,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           // it finalizes its own checkpoint instead of a later turn's.
           handlerRelease();
           await ready;
-          await finalizeTurn(typed, capture, leafId, turnStartLeaf, turnSequence);
+          await finalizeTurn(typed, sessionId, capture, leafId, turnStartLeaf, turnSequence);
           return;
         }
-        await finalizeTurn(typed, capture, leafId, turnStartLeaf, turnSequence);
+        await finalizeTurn(typed, sessionId, capture, leafId, turnStartLeaf, turnSequence);
       } finally {
         handlerRelease();
       }
@@ -1155,12 +1155,18 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return handlerDone;
   }
 
-  /** The live navigation for `sessionId`, creating and publishing one when the
-   *  session has none (a turn can finalize before any navigation was built). */
+  /** The navigation for `sessionId`, creating and publishing one when the
+   *  session has none (a turn can finalize before any navigation was built).
+   *  `typed.sessionManager` is live: a deferred finalize can outlive a `/new` or
+   *  `/resume`, and then a navigation built from it would belong to the wrong
+   *  session. Null means the session cannot be resolved safely. */
   async function resolveNavigation(
     typed: AnyContext,
     sessionId: string,
-  ): Promise<SessionNavigation> {
+  ): Promise<SessionNavigation | null> {
+    const known = navigations.get(sessionId) ?? (await initializations.get(sessionId));
+    if (known) return known;
+    if (typed.sessionManager.getSessionId() !== sessionId) return null;
     const nav =
       (await ensureNavigation(typed)) ??
       createNavigation(
@@ -1178,12 +1184,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
   async function finalizeTurn(
     typed: AnyContext,
+    sessionId: string,
     capture: PendingCapture,
     leafId: string | null,
     turnStartLeaf: string | null,
     turnSequence: number | undefined,
   ): Promise<void> {
-    const sessionId = typed.sessionManager.getSessionId();
     await capture.complete;
     const before = capture.checkpoint;
     if (!before) return;
@@ -1233,7 +1239,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         if (turnSequenceBySession.get(sessionId) !== turnSequence) {
           await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
           const gapped = await resolveNavigation(typed, sessionId);
-          await gapped.recordTurnEnd({
+          await gapped?.recordTurnEnd({
             kind: "session",
             reason: "file_history_gap",
             parentLeafId: before.parentLeafId,
@@ -1241,12 +1247,16 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           });
           return;
         }
+        const nav = await resolveNavigation(typed, sessionId);
+        if (!nav) {
+          await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
+          return;
+        }
         const retained = await retainCheckpointForResume(
           gitRunnerFor(result.checkpoint.repository),
           sessionId,
           result.checkpoint,
         );
-        const nav = await resolveNavigation(typed, sessionId);
         await nav.recordTurnEnd(retained);
         return;
       }
@@ -1258,7 +1268,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       };
     }
     const nav = await resolveNavigation(typed, sessionId);
-    await nav.recordTurnEnd(completed);
+    await nav?.recordTurnEnd(completed);
   }
 
   pi.on("agent_end", (_event, ctx) =>
