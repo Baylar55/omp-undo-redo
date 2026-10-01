@@ -40,15 +40,22 @@ export function historyRefPrefix(sessionHash: string): string {
 // changes, and evicted whenever its directory is released. With an unborn HEAD
 // there is no baseline commit, so the seeding snapshot's own tree is the
 // baseline and the lease goes stale once HEAD becomes born.
+//
+// The map holds only IDLE leases. A run takes its lease out for the whole
+// before→after span (`leasesInUse`) and hands it back when the after-snapshot
+// succeeds, so two overlapping turns never share one GIT_INDEX_FILE: a turn that
+// starts while the previous after-snapshot still runs seeds its own index.
 const persistentSnapshotIndices = new Map<string, SnapshotIndexLease>();
+const leasesInUse = new Map<SnapshotIndexLease, string>();
 
 function persistentIndexKey(repository: GitRepository, sessionId: string): string {
   return `${repository.worktree}\u0000${checkpointNamespace(sessionId)}`;
 }
 
 export async function releaseAllPersistentSnapshotIndices(): Promise<void> {
-  const leases = [...persistentSnapshotIndices.values()];
+  const leases = [...persistentSnapshotIndices.values(), ...leasesInUse.keys()];
   persistentSnapshotIndices.clear();
+  leasesInUse.clear();
   await Promise.all(leases.map((lease) => releaseSnapshotIndexLease(lease)));
 }
 
@@ -367,6 +374,7 @@ function snapshotMessage(message: string, skipped: readonly string[]): string {
 
 async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined): Promise<boolean> {
   if (!lease) return true;
+  leasesInUse.delete(lease);
   for (const [key, value] of persistentSnapshotIndices) {
     if (value === lease) persistentSnapshotIndices.delete(key);
   }
@@ -376,6 +384,17 @@ async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined):
   } catch {
     return false;
   }
+}
+
+/** Hands a finished run's lease back to the idle pool. No-op when the lease was
+ *  released meanwhile (shutdown, stale baseline); when another run already
+ *  pooled a lease for this key, the surplus one is deleted. */
+async function returnLeaseToPool(lease: SnapshotIndexLease | undefined): Promise<void> {
+  const key = lease && leasesInUse.get(lease);
+  if (!lease || key === undefined) return;
+  leasesInUse.delete(lease);
+  if (persistentSnapshotIndices.has(key)) await releaseSnapshotIndexLease(lease);
+  else persistentSnapshotIndices.set(key, lease);
 }
 
 export async function createSnapshotCommit(
@@ -622,6 +641,10 @@ export async function prepareBeforeTurn(
   const checkpointId = newCheckpointId();
   const indexKey = persistentIndexKey(repository, sessionId);
   const priorLease = persistentSnapshotIndices.get(indexKey);
+  if (priorLease) {
+    persistentSnapshotIndices.delete(indexKey);
+    leasesInUse.set(priorLease, indexKey);
+  }
   let snapshot: SnapshotResult;
   let lease: SnapshotIndexLease | undefined;
   if (priorLease) {
@@ -642,6 +665,7 @@ export async function prepareBeforeTurn(
     snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn", true);
     if ("hash" in snapshot) lease = snapshot.snapshotIndexLease;
   }
+  if (lease) leasesInUse.set(lease, indexKey);
   if (!("hash" in snapshot)) {
     return {
       status: "session_only",
@@ -666,7 +690,7 @@ export async function prepareBeforeTurn(
       reason: "before_ref_failed",
     };
   }
-  if (lease) persistentSnapshotIndices.set(indexKey, lease);
+  // The lease stays checked out (`leasesInUse`) until finishAfterTurn returns it.
   return {
     status: "git",
     checkpoint: {
@@ -728,6 +752,7 @@ export async function finishAfterTurn(
     await releasePendingCheckpoint(git, before);
     return { status: "session_only", reason: "after_ref_failed" };
   }
+  await returnLeaseToPool(before.snapshotIndexLease);
   return {
     status: "git",
     checkpoint: {

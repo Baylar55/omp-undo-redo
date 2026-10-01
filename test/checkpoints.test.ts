@@ -591,6 +591,38 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("never shares one alternate index between a running turn and the next turn's before snapshot", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const sessionId = "overlapping-turns";
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "tracked.txt"), "initial\n");
+      await git(["add", "tracked.txt"]);
+      await git(["commit", "-qm", "initial"]);
+
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
+      // Turn 1's after-snapshot has not run: its lease is still checked out.
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
+      expect(before2.snapshotIndexLease?.directory).toBeDefined();
+      expect(before2.snapshotIndexLease?.directory).not.toBe(before1.snapshotIndexLease?.directory);
+
+      const after1 = completedCheckpoint(await finishAfterTurn(snap, before1, null, null));
+      const after2 = completedCheckpoint(await finishAfterTurn(snap, before2, null, null));
+
+      // One lease is pooled, the surplus deleted; the pooled one is reused.
+      const before3 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
+      expect(before3.snapshotIndexLease?.directory).toBe(before1.snapshotIndexLease?.directory);
+      await expect(stat(before2.snapshotIndexLease!.directory)).rejects.toThrow();
+
+      await releasePendingCheckpoint(snap, before3);
+      await releaseCheckpoint(snap, after1);
+      await releaseCheckpoint(snap, after2);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releaseAllPersistentSnapshotIndices();
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
     "matches fresh snapshots across regular-file and symlink transitions",
     async () => {
