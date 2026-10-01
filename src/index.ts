@@ -407,35 +407,33 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  a tracked operation (and with it the eviction sweep) forever. */
   const PRIVATE_GC_TIMEOUT_MS = 15 * 60 * 1000;
 
-  /** Retention-sweep gc prune window. Unlike the capture-threshold gc, the
-   *  sweep runs while this or another process may be mid-capture in the same
-   *  repo, writing objects no ref reaches yet; `--prune=now` would delete
-   *  them. Expired sessions' objects are days old, so an hour loses nothing. */
+  /** gc prune window, for every trigger (retention sweep, capture threshold,
+   *  shutdown). A store is shared by every OMP process in the same workspace
+   *  (Private-Git: keyed only by sha256(cwd); Git mode: by the repository), and
+   *  another process may be mid-capture, writing objects no ref reaches yet.
+   *  `--prune=now` would delete them; the in-process `pendingCaptures` check
+   *  cannot see other processes. Expired objects are days old, so an hour
+   *  loses nothing. */
   const PRIVATE_SWEEP_PRUNE = "1.hour.ago";
-
-  /** Capture-threshold prune window. A Git-mode store is shared by every OMP
-   *  process working in that repository or its linked worktrees, so another
-   *  process may be mid-capture there and it gets the sweep's window; a
-   *  Private-Git repo drops unreferenced objects at once. */
-  function capturePrune(repository: GitRepository): string {
-    return repository.storeDir === repository.gitDir ? "now" : PRIVATE_SWEEP_PRUNE;
-  }
 
   /** Best-effort `git gc` over a snapshot store. Runs outside the handler
    *  deadline accounting (never awaited by a handler) so a slow gc can never
    *  hit the host's timeout. The prune drops unreferenced objects: expiring
    *  sessions would otherwise leave recoverable file content behind
    *  indefinitely. */
-  async function schedulePrivateGc(repository: GitRepository, prune: string): Promise<void> {
+  async function schedulePrivateGc(repository: GitRepository): Promise<void> {
     try {
       // Run from a neutral cwd so a slow gc never holds a handle on either the
       // user's workspace or the snapshot repo itself (Windows keeps a child's
       // cwd handle until it exits, which would race teardown rms and the
       // eviction sweep). GIT_DIR is set, so the repo operations work anywhere;
       // a Git store also needs the objects it borrows to walk its snapshots.
-      await gitRunnerFactory(tmpdir(), storeEnv(repository))(["gc", `--prune=${prune}`], {
-        timeoutMs: PRIVATE_GC_TIMEOUT_MS,
-      });
+      await gitRunnerFactory(tmpdir(), storeEnv(repository))(
+        ["gc", `--prune=${PRIVATE_SWEEP_PRUNE}`],
+        {
+          timeoutMs: PRIVATE_GC_TIMEOUT_MS,
+        },
+      );
     } catch {
       // Best-effort: a failed gc leaves more work for the next trigger.
     }
@@ -672,7 +670,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       }
       // Detached from the expiration promise: shutdown awaits expirations,
       // and must not wait out a gc.
-      void track(() => schedulePrivateGc(repository, PRIVATE_SWEEP_PRUNE));
+      void track(() => schedulePrivateGc(repository));
     })().catch(() => undefined);
     expirationPromises.set(key, expiration);
     return expiration;
@@ -905,11 +903,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
               capturesSinceGcByStore.delete(key);
               // The current capture's git work is done (this runs after its
               // snapshot); only defer when another session's capture is still
-              // mid-flight — a concurrent `git gc --prune=now` could prune an
-              // unreferenced-but-pending object it just wrote. The counter
-              // reset below prevents gc runs from stacking.
+              // mid-flight, to avoid repacking under it. The counter reset
+              // below prevents gc runs from stacking.
               if (pendingCaptures.size <= 1) {
-                void track(() => schedulePrivateGc(repository, capturePrune(repository)));
+                void track(() => schedulePrivateGc(repository));
               } else {
                 capturesSinceGcByStore.set(key, PRIVATE_GC_AFTER_CAPTURES - 1);
               }
@@ -1344,7 +1341,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
               } catch {
                 return;
               }
-              await schedulePrivateGc(repository, capturePrune(repository));
+              await schedulePrivateGc(repository);
             }),
           ),
         );

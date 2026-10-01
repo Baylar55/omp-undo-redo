@@ -104,7 +104,7 @@ describe("private-repo housekeeping", () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
       expect(
-        commands.some((command) => command[0] === "gc" && command.includes("--prune=now")),
+        commands.some((command) => command[0] === "gc" && command.includes("--prune=1.hour.ago")),
       ).toBe(true);
     } finally {
       await rmRetry(cwd);
@@ -137,13 +137,13 @@ describe("private-repo housekeeping", () => {
       await pi.emit("session_shutdown", ctx);
       // Shutdown housekeeping is detached, so a gc would appear after the
       // handler resolves: poll the recorded commands.
-      expect(await waitFor(async () => gcs.length > 0, 20)).toBe(true);
-      const { storeDir } = await gitRepository(cwd);
-      for (const gc of gcs) {
-        expect(gc.gitDir).toBe(storeDir);
-        // Shared by every process in the repository: never `--prune=now`.
-        expect(gc.args).toContain("--prune=1.hour.ago");
-      }
+      const { storeDir, gitDir } = await gitRepository(cwd);
+      expect(await waitFor(async () => gcs.some((gc) => gc.gitDir === storeDir), 20)).toBe(true);
+      // Other stores under the shared root (earlier tests' repos) may be gc'd
+      // by the retention sweep; the user's own repository never is.
+      expect(gcs.some((gc) => gc.gitDir === gitDir)).toBe(false);
+      // Shared by every process in the repository: never `--prune=now`.
+      for (const gc of gcs) expect(gc.args).toContain("--prune=1.hour.ago");
     } finally {
       await rmRetry(cwd);
     }
