@@ -470,4 +470,75 @@ describe("private-repo housekeeping", () => {
       }
     });
   }, 60000);
+
+  it("runs the retention sweep's gcs one at a time, never concurrently", async () => {
+    // Regression: every expired store's gc was detached on its own, so a boot
+    // sweep over many stores started one full repack per store at once.
+    await withHermeticStore(async (reposDir) => {
+      const workspaces = await Promise.all(
+        [0, 1, 2, 3].map(() => mkdtemp(join(tmpdir(), "omp-undo-redo-gc-serial-"))),
+      );
+      try {
+        const seeded = new Set<string>();
+        for (const workspace of workspaces.slice(0, 3)) {
+          const repository = await ensurePrivateGitRepository(
+            (cwd2, env) => createGitRunner(cwd2, env ? { env } : undefined),
+            workspace,
+            join(reposDir, ".."),
+          );
+          if (!repository) throw new Error("private repo init failed");
+          // A cruft-pack marker alone makes the sweep schedule this store's gc.
+          const packDir = join(repository.gitDir, "objects", "pack");
+          await mkdir(packDir, { recursive: true });
+          await writeFile(join(packDir, "pack-cruft.mtimes"), "");
+          // Basename: the sweep's GIT_DIR may spell the root differently (8.3).
+          seeded.add(basename(repository.gitDir));
+        }
+        // Every gc is held until the sweep has started expiring every seeded
+        // store. The sweep expires stores in turn and schedules each gc before
+        // moving on, so by then every gc but the last is scheduled: unserialized
+        // they would all be inside the runner at once.
+        const expiring = new Set<string>();
+        const allExpiring = Promise.withResolvers<void>();
+        const allFinished = Promise.withResolvers<void>();
+        let running = 0;
+        let maxRunning = 0;
+        let finished = 0;
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {
+          gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
+            const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
+            const store = env?.GIT_DIR ? basename(env.GIT_DIR) : "";
+            const wrapped: GitRunner = async (args, options) => {
+              if (args[0] !== "gc") {
+                if (seeded.has(store)) expiring.add(store);
+                if (expiring.size === seeded.size) allExpiring.resolve();
+                return inner(args, options);
+              }
+              running += 1;
+              maxRunning = Math.max(maxRunning, running);
+              try {
+                await allExpiring.promise;
+                return await inner(args, options);
+              } finally {
+                running -= 1;
+                finished += 1;
+                if (finished === seeded.size) allFinished.resolve();
+              }
+            };
+            wrapped.cwd = cwd2;
+            if (env) wrapped.env = env;
+            return wrapped;
+          },
+        });
+        const ctx = context(workspaces[3], "gc-serial-session");
+        await pi.emit("session_start", ctx);
+        await allFinished.promise;
+        expect(maxRunning).toBe(1);
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        for (const workspace of workspaces) await rmRetry(workspace);
+      }
+    });
+  }, 60000);
 });

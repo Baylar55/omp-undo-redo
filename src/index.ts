@@ -423,12 +423,27 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  loses nothing. */
   const PRIVATE_SWEEP_PRUNE = "1.hour.ago";
 
+  /** Tail of the process-wide gc queue. Every trigger (retention sweep,
+   *  capture threshold, shutdown) routes through `schedulePrivateGc`, so at
+   *  most one repack runs at a time: a boot sweep over many expired stores
+   *  would otherwise start one full `git gc` per store at once. Never
+   *  rejects (`runPrivateGc` swallows every failure), so one bad store
+   *  cannot stall the queue. */
+  let privateGcQueue: Promise<void> = Promise.resolve();
+
+  /** Queues a gc of `repository` behind every gc already scheduled; resolves
+   *  once this one has run. */
+  function schedulePrivateGc(repository: GitRepository): Promise<void> {
+    privateGcQueue = privateGcQueue.then(() => runPrivateGc(repository));
+    return privateGcQueue;
+  }
+
   /** Best-effort `git gc` over a snapshot store. Runs outside the handler
    *  deadline accounting (never awaited by a handler) so a slow gc can never
    *  hit the host's timeout. The prune drops unreferenced objects: expiring
    *  sessions would otherwise leave recoverable file content behind
    *  indefinitely. */
-  async function schedulePrivateGc(repository: GitRepository): Promise<void> {
+  async function runPrivateGc(repository: GitRepository): Promise<void> {
     try {
       // Run from a neutral cwd so a slow gc never holds a handle on either the
       // user's workspace or the snapshot repo itself (Windows keeps a child's
