@@ -169,7 +169,7 @@ describe("expireGitSessionHistories", () => {
     expect(metadata.isFile()).toBe(true);
   });
 
-  it("skips malformed history JSON without deleting or crashing", async () => {
+  it("keeps a recent malformed history JSON without crashing", async () => {
     const gitDir = await temporaryDirectory("git-expire-malformed-");
     const repository: GitRepository = {
       worktree: gitDir,
@@ -189,6 +189,35 @@ describe("expireGitSessionHistories", () => {
 
     const metadata = await stat(historyFile);
     expect(metadata.isFile()).toBe(true);
+  });
+
+  it.each([
+    ["invalid JSON", "{ invalid json..."],
+    ["non-object JSON", "null"],
+    ["unparseable lastAccessedAt", JSON.stringify({ lastAccessedAt: "not-a-date" })],
+  ])("expires %s by file mtime once stale", async (_name, content) => {
+    const gitDir = await temporaryDirectory("git-expire-stale-corrupt-");
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    const historyFile = historyPath(repository, "stale-corrupt");
+    await mkdir(join(gitDir, "omp-undo-redo", "history"), { recursive: true });
+    await writeFile(historyFile, content);
+    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+
+    // Fresh mtime: kept.
+    await expireGitSessionHistories(repository, dummyGit, 30, new Set());
+    expect((await stat(historyFile)).isFile()).toBe(true);
+
+    // Stale mtime: expired with tombstone.
+    const fortyDaysAgo = (Date.now() - 40 * 24 * 60 * 60 * 1000) / 1000;
+    await utimes(historyFile, fortyDaysAgo, fortyDaysAgo);
+    await expireGitSessionHistories(repository, dummyGit, 30, new Set());
+    await expect(stat(historyFile)).rejects.toThrow();
+    expect((await stat(tombstonePath(repository, "stale-corrupt"))).isFile()).toBe(true);
   });
 
   it("falls back to file mtime when lastAccessedAt is missing (v1 schema)", async () => {
@@ -764,7 +793,7 @@ describe("expireGitSessionHistories", () => {
       const hash = sessionHash("has-json");
       const historyDir = join(repository.storeDir, "omp-undo-redo", "history");
       await mkdir(historyDir, { recursive: true });
-      // Unparseable JSON: the sweep skips it, and its refs are not orphans.
+      // Unparseable JSON with a fresh mtime: not yet expired, and its refs are not orphans.
       await writeFile(join(historyDir, `${hash}.json`), "{");
       await expireGitSessionHistories(repository, run([line(hash, 40)]), 30, new Set());
       expect(deleted).toEqual([]);

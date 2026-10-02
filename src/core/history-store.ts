@@ -372,21 +372,25 @@ export async function expireGitSessionHistories(
     // without this process knowing. A fresh heartbeat protects it here.
     if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
 
-    let lastAccessedAtMs: number;
+    // Unparseable, non-object, or undated metadata ages by file mtime so a
+    // corrupt file cannot pin its refs forever. A stat failure keeps the session.
+    let lastAccessedAtMs = Number.NaN;
     try {
-      const content = await readFile(filePath, "utf8");
-      const parsed = JSON.parse(content) as unknown;
-      if (!parsed || typeof parsed !== "object") continue;
-      const candidate = parsed as Record<string, unknown>;
-      if (typeof candidate.lastAccessedAt === "string") {
-        lastAccessedAtMs = Date.parse(candidate.lastAccessedAt);
-        if (Number.isNaN(lastAccessedAtMs)) continue;
-      } else {
-        const metadata = await stat(filePath);
-        lastAccessedAtMs = metadata.mtimeMs;
-      }
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as unknown;
+      const accessedAt =
+        parsed && typeof parsed === "object"
+          ? (parsed as Record<string, unknown>).lastAccessedAt
+          : undefined;
+      if (typeof accessedAt === "string") lastAccessedAtMs = Date.parse(accessedAt);
     } catch {
-      continue;
+      // fall through to mtime
+    }
+    if (Number.isNaN(lastAccessedAtMs)) {
+      try {
+        lastAccessedAtMs = (await stat(filePath)).mtimeMs;
+      } catch {
+        continue;
+      }
     }
 
     if (lastAccessedAtMs > cutoff) continue;
