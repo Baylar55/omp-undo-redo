@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,6 +10,7 @@ import {
   SessionHistoryStore,
   tombstonePath,
 } from "../src/core/history-store.js";
+import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRepository, GitRunner } from "../src/core/types.js";
 
 const temporaryDirectories: string[] = [];
@@ -689,5 +691,160 @@ describe("expireGitSessionHistories", () => {
     const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
     await expireGitSessionHistories(repository, dummyGit, 2, () => new Set());
     await expect(stat(tombFile)).rejects.toThrow();
+  });
+
+  describe("refs with no history JSON", () => {
+    const OLD = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+    const day = 24 * 60 * 60;
+
+    async function setup(prefix: string) {
+      const gitDir = await temporaryDirectory(prefix);
+      const repository: GitRepository = {
+        worktree: gitDir,
+        gitDir,
+        commonDir: gitDir,
+        storeDir: gitDir,
+      };
+      const deleted: string[] = [];
+      const run =
+        (refs: string[]): GitRunner =>
+        async (args, options) => {
+          if (args[0] === "for-each-ref") return { stdout: refs.join("\n"), stderr: "", code: 0 };
+          if (args[0] === "update-ref") deleted.push(options?.stdin ?? "");
+          return { stdout: "", stderr: "", code: 0 };
+        };
+      return { repository, deleted, run };
+    }
+
+    const line = (hash: string, ageDays: number) =>
+      `refs/omp-undo-redo/history/${hash}/c1/before\0${OLD}\0${Math.floor(Date.now() / 1000 - ageDays * day)} +0000`;
+
+    it("deletes refs whose newest commit is past retention, even with no history directory", async () => {
+      const { repository, deleted, run } = await setup("orphan-old-");
+      const hash = sessionHash("orphan");
+      const removed = await expireGitSessionHistories(
+        repository,
+        run([line(hash, 40), line(hash, 35)]),
+        30,
+        new Set(),
+      );
+      expect(removed).toBe(1);
+      expect(deleted.join("")).toContain(
+        `delete refs/omp-undo-redo/history/${hash}/c1/before ${OLD}`,
+      );
+    });
+
+    it("keeps a set with any recent ref, an unknown date, a live heartbeat or an active session", async () => {
+      const { repository, deleted, run } = await setup("orphan-keep-");
+      const recent = sessionHash("recent");
+      const undated = sessionHash("undated");
+      const beating = sessionHash("beating");
+      const active = sessionHash("active");
+      const historyDir = join(repository.storeDir, "omp-undo-redo", "history");
+      await mkdir(historyDir, { recursive: true });
+      await writeFile(join(historyDir, `.active.${beating}`), "");
+      const removed = await expireGitSessionHistories(
+        repository,
+        run([
+          line(recent, 40),
+          line(recent, 1),
+          `refs/omp-undo-redo/history/${undated}/c1/before\0${OLD}\0`,
+          line(beating, 40),
+          line(active, 40),
+        ]),
+        30,
+        new Set([active]),
+      );
+      expect(removed).toBe(0);
+      expect(deleted).toEqual([]);
+    });
+
+    it("leaves refs alone when a history JSON exists", async () => {
+      const { repository, deleted, run } = await setup("orphan-json-");
+      const hash = sessionHash("has-json");
+      const historyDir = join(repository.storeDir, "omp-undo-redo", "history");
+      await mkdir(historyDir, { recursive: true });
+      // Unparseable JSON: the sweep skips it, and its refs are not orphans.
+      await writeFile(join(historyDir, `${hash}.json`), "{");
+      await expireGitSessionHistories(repository, run([line(hash, 40)]), 30, new Set());
+      expect(deleted).toEqual([]);
+    });
+
+    it("deletes nothing when any listing entry is malformed, even for an otherwise old session", async () => {
+      const { repository, deleted, run } = await setup("orphan-malformed-");
+      const hash = sessionHash("malformed");
+      const prefix = `refs/omp-undo-redo/history/${hash}/c2/before`;
+      const date = `${Math.floor(Date.now() / 1000 - 40 * day)} +0000`;
+      for (const bad of [
+        `${prefix}`, // no object name field
+        `${prefix}\0\0${date}`, // empty object name
+        `${prefix}\0not-a-hash\0${date}`,
+        `${prefix}\0${OLD}\0${date}\0extra`,
+      ]) {
+        const removed = await expireGitSessionHistories(
+          repository,
+          run([line(hash, 40), bad]),
+          30,
+          new Set(),
+        );
+        expect(removed).toBe(0);
+      }
+      expect(deleted).toEqual([]);
+    });
+
+    it("works against real git: old snapshot commit swept, fresh one kept", async () => {
+      const gitDir = await temporaryDirectory("orphan-real-");
+      const repository: GitRepository = {
+        worktree: gitDir,
+        gitDir,
+        commonDir: gitDir,
+        storeDir: gitDir,
+      };
+      execFileSync("git", ["init", "--bare", "-q", gitDir]);
+      const git = createGitRunner(gitDir, { env: { GIT_DIR: gitDir } });
+      const commit = async (message: string, ageDays: number) => {
+        const date = `${Math.floor(Date.now() / 1000 - ageDays * day)} +0000`;
+        return execFileSync(
+          "git",
+          [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit-tree",
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "-m",
+            message,
+          ],
+          {
+            env: {
+              ...process.env,
+              GIT_DIR: gitDir,
+              GIT_COMMITTER_DATE: date,
+              GIT_AUTHOR_DATE: date,
+            },
+          },
+        )
+          .toString()
+          .trim();
+      };
+      const stale = sessionHash("real-stale");
+      const fresh = sessionHash("real-fresh");
+      await git([
+        "update-ref",
+        `refs/omp-undo-redo/history/${stale}/c1/before`,
+        await commit("s", 40),
+      ]);
+      await git([
+        "update-ref",
+        `refs/omp-undo-redo/history/${fresh}/c1/before`,
+        await commit("f", 1),
+      ]);
+
+      expect(await expireGitSessionHistories(repository, git, 30, new Set())).toBe(1);
+      const left = (await git(["for-each-ref", "--format=%(refname)"])).stdout;
+      expect(left).not.toContain(stale);
+      expect(left).toContain(fresh);
+    });
   });
 });

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { writeFileAtomic } from "./atomic-write.js";
-import { checkpointNamespace, historyRefPrefix } from "./checkpoints.js";
+import { checkpointNamespace, HISTORY_REF_ROOT, historyRefPrefix } from "./checkpoints.js";
 import { parseRefLines } from "./git-refs.js";
 import {
   pruneStaleHeartbeats,
@@ -249,6 +249,73 @@ export function reconstructSessionHistory(reader: SessionReader): NavigationStat
   return { checkpoints, currentIndex: checkpoints.length - 1 };
 }
 
+type HistoryRef = { ref: string; expectedHash: string; committedAtMs: number | null };
+
+/** One listing of every session's history refs, grouped by session hash.
+ *  `committedAtMs` is the snapshot commit's date (null when unknown, which
+ *  callers treat as "recent"; `creatordate:raw` is empty for a missing or
+ *  non-commit object, so such a session is kept, never swept). Null result:
+ *  the listing is unusable, so the caller must touch nothing — a malformed
+ *  listing is never "no refs", and an object id that is not a full hex id
+ *  must never reach `update-ref`, where an omitted old value deletes
+ *  unconditionally. */
+async function listHistoryRefs(
+  git: GitRunner,
+  repository: GitRepository,
+): Promise<Map<string, HistoryRef[]> | null> {
+  try {
+    const result = await git(
+      [
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)%00%(creatordate:raw)",
+        HISTORY_REF_ROOT,
+      ],
+      { env: { GIT_DIR: repository.storeDir } },
+    );
+    if (result.code !== 0 || result.error) return null;
+    const bySession = new Map<string, HistoryRef[]>();
+    for (const line of result.stdout.split(/\r?\n/)) {
+      if (!line) continue;
+      const fields = line.split("\0");
+      if (fields.length < 2 || fields.length > 3) return null;
+      const [ref, expectedHash, date = ""] = fields;
+      if (!GIT_OBJECT_ID.test(expectedHash)) return null;
+      if (!ref.startsWith(HISTORY_REF_ROOT)) continue;
+      const sessionHash = ref.slice(HISTORY_REF_ROOT.length).split("/", 1)[0];
+      if (!HASH.test(sessionHash)) continue;
+      const seconds = Number.parseInt(date, 10);
+      const entry = {
+        ref,
+        expectedHash,
+        committedAtMs: Number.isNaN(seconds) ? null : seconds * 1000,
+      };
+      const list = bySession.get(sessionHash);
+      if (list) list.push(entry);
+      else bySession.set(sessionHash, [entry]);
+    }
+    return bySession;
+  } catch {
+    return null;
+  }
+}
+
+async function deleteHistoryRefs(
+  git: GitRunner,
+  repository: GitRepository,
+  refs: readonly HistoryRef[],
+): Promise<boolean> {
+  try {
+    const commands = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`);
+    const result = await git(["update-ref", "--stdin"], {
+      env: { GIT_DIR: repository.storeDir },
+      stdin: `${commands.join("\n")}\n`,
+    });
+    return result.code === 0 && !result.error;
+  } catch {
+    return false;
+  }
+}
+
 /** Expires dormant session histories. Returns how many sessions had refs
  *  deleted, so callers can reclaim the now-unreachable objects. */
 export async function expireGitSessionHistories(
@@ -263,8 +330,11 @@ export async function expireGitSessionHistories(
   try {
     files = await readdir(dir);
   } catch {
-    return 0;
+    // No history directory: refs may still exist with no JSON (crash residue).
+    files = [];
   }
+  const refsBySession = await listHistoryRefs(git, repository);
+  const jsonHashes = new Set<string>();
   let refsRemoved = 0;
   const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
   const getActive = () =>
@@ -273,6 +343,7 @@ export async function expireGitSessionHistories(
     if (!file.endsWith(".json") || file.endsWith(".expired.json") || file.startsWith(".")) continue;
     const sessionHash = file.slice(0, -5);
     if (!HASH.test(sessionHash)) continue;
+    jsonHashes.add(sessionHash);
     const filePath = join(dir, file);
 
     // A tombstoned history JSON is residue from a concurrent load rewriting
@@ -326,24 +397,12 @@ export async function expireGitSessionHistories(
     // another process may have touched while the timestamp was being read.
     if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
 
-    const refPrefix = historyRefPrefix(sessionHash);
-    const refsMap = await existingRefs(git, repository, refPrefix);
-    if (refsMap === null) continue;
-
-    if (refsMap.size > 0) {
-      const deleteCommands = Array.from(refsMap.entries())
-        .map(([ref, hash]) => `delete ${ref} ${hash}`)
-        .join("\n");
-      try {
-        const updateResult = await git(["update-ref", "--stdin"], {
-          env: { GIT_DIR: repository.storeDir },
-          stdin: `${deleteCommands}\n`,
-        });
-        if (updateResult.code !== 0 || updateResult.error) continue;
-        refsRemoved += 1;
-      } catch {
-        continue;
-      }
+    // Unusable listing: leave the session for a later sweep.
+    if (refsBySession === null) continue;
+    const sessionRefs = refsBySession.get(sessionHash) ?? [];
+    if (sessionRefs.length > 0) {
+      if (!(await deleteHistoryRefs(git, repository, sessionRefs))) continue;
+      refsRemoved += 1;
     }
 
     // Write tombstone first, then delete history JSON
@@ -358,6 +417,25 @@ export async function expireGitSessionHistories(
     await writeJsonAtomic(dir, tombstoneFile, tombstoneData).catch(() => undefined);
 
     await rm(filePath, { force: true }).catch(() => undefined);
+  }
+
+  // Refs with no history JSON at all (crash, failed save): the loop above
+  // never sees them. They go once every one is older than the retention
+  // window — a fresh set may belong to a first save still in flight — and no
+  // live owner holds the session. Expected hashes make a concurrent ref
+  // update fail the batch instead of losing the new ref.
+  if (refsBySession) {
+    for (const [sessionHash, refs] of refsBySession) {
+      if (jsonHashes.has(sessionHash) || getActive().has(sessionHash)) continue;
+      if (refs.some(({ committedAtMs }) => committedAtMs === null || committedAtMs > cutoff))
+        continue;
+      if (await sessionHeartbeatIsFresh(dir, sessionHash)) continue;
+      const jsonAppeared = await stat(join(dir, `${sessionHash}.json`))
+        .then(() => true)
+        .catch(() => false);
+      if (jsonAppeared || getActive().has(sessionHash)) continue;
+      if (await deleteHistoryRefs(git, repository, refs)) refsRemoved += 1;
+    }
   }
 
   await pruneExpiredTombstones(
