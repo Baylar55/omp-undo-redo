@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
@@ -324,19 +324,40 @@ async function leaseBaselineCurrent(git: GitRunner, lease: SnapshotIndexLease): 
   return lease.unborn ? tree === "" : tree === lease.baseTree;
 }
 
-/** Drops index entries that the current ignore rules exclude. Index-only: no
- *  worktree file is re-read, so the retained stat cache survives. */
-async function pruneIgnoredEntries(git: GitRunner, env: Record<string, string>): Promise<boolean> {
+/** Drops index entries that the current ignore rules exclude. With `baseTree`,
+ *  entries the baseline tracks are kept: `read-tree HEAD` holds them in a fresh
+ *  snapshot whatever the ignore rules say. Index-only: no worktree file is
+ *  re-read, so the retained stat cache survives. */
+async function pruneIgnoredEntries(
+  git: GitRunner,
+  env: Record<string, string>,
+  baseTree?: string,
+): Promise<boolean> {
   const ignored = await invoke(
     git,
     ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
     { env },
   );
   if (ignored.code !== 0) return false;
-  if (!ignored.stdout) return true;
+  let paths = ignored.stdout;
+  if (paths && baseTree) {
+    const added = await invoke(
+      git,
+      ["diff-index", "--cached", "--no-renames", "--diff-filter=A", "--name-only", "-z", baseTree, "--"],
+      { env },
+    );
+    if (added.code !== 0) return false;
+    const untracked = new Set(added.stdout.split("\0"));
+    paths = paths
+      .split("\0")
+      .filter((path) => path && untracked.has(path))
+      .map((path) => `${path}\0`)
+      .join("");
+  }
+  if (!paths) return true;
   const removed = await invoke(git, ["update-index", "--force-remove", "-z", "--stdin"], {
     env,
-    stdin: ignored.stdout,
+    stdin: paths,
   });
   return removed.code === 0;
 }
@@ -442,6 +463,30 @@ export async function createSnapshotCommit(
   }
 }
 
+/** Paths a reused index restores from its baseline, from `diff-index --raw -z
+ *  --diff-filter=ADT` output, as a NUL-separated pathspec file. Deletions and
+ *  typechanges: `add -A` never re-adds an ignored path that a fresh `read-tree`
+ *  would hold. Added gitlinks: `add -A` keeps a gitlink whose nested `.git` is
+ *  gone, which would hide the directory's files from every later snapshot.
+ *  Other added entries stay, so untracked files keep their stat cache instead of
+ *  being re-hashed each snapshot; `pruneIgnoredEntries` drops the ones that
+ *  became ignored. Bytes are sliced, never decoded, so any path survives.
+ *  Null on malformed output. */
+function normalizationPaths(raw: Buffer): Buffer | null {
+  const paths: Buffer[] = [];
+  let offset = 0;
+  while (offset < raw.length) {
+    const metaEnd = raw.indexOf(0, offset);
+    const pathEnd = metaEnd < 0 ? -1 : raw.indexOf(0, metaEnd + 1);
+    if (pathEnd < 0) return null;
+    // `:<srcmode> <dstmode> <srcsha> <dstsha> <status>`
+    const [, dstMode, , , status] = raw.toString("latin1", offset, metaEnd).split(" ");
+    if (status !== "A" || dstMode === "160000") paths.push(raw.subarray(metaEnd + 1, pathEnd + 1));
+    offset = pathEnd + 1;
+  }
+  return Buffer.concat(paths);
+}
+
 async function createSnapshotCommitFromLease(
   git: GitRunner,
   lease: SnapshotIndexLease,
@@ -458,13 +503,8 @@ async function createSnapshotCommitFromLease(
         "diff-index",
         "--cached",
         "--no-renames",
-        // Added entries are normalized away only for a real HEAD baseline, where
-        // `reset` restores a tracked path cheaply. An unborn baseline never grows,
-        // so every file created during the session would be flagged `A` and
-        // re-hashed each turn; `pruneIgnoredEntries` covers the one case the drop
-        // exists for (a staged path that later became ignored).
-        `--diff-filter=${lease.unborn ? "DT" : "ADT"}`,
-        "--name-only",
+        "--diff-filter=ADT",
+        "--raw",
         "-z",
         `--output=${normalizationPath}`,
         lease.baseTree,
@@ -474,8 +514,10 @@ async function createSnapshotCommitFromLease(
     );
     if (differences.code !== 0) return { reason: "snapshot_failed" };
 
-    const normalization = await stat(normalizationPath);
-    if (normalization.size > 0) {
+    const restored = normalizationPaths(await readFile(normalizationPath));
+    if (!restored) return { reason: "snapshot_failed" };
+    if (restored.length > 0) {
+      await writeFile(normalizationPath, restored);
       const reset = await invoke(
         git,
         [
@@ -495,10 +537,10 @@ async function createSnapshotCommitFromLease(
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
     const skipped = await addWorktree(git, addEnv);
     if (!skipped) return { reason: "snapshot_failed" };
-    // An unborn baseline's fresh equivalent is `read-tree --empty` + `add -A`,
-    // which never holds an ignored path. `add -A` cannot drop an entry that
-    // became ignored after it was staged, so prune those explicitly.
-    if (lease.unborn && !(await pruneIgnoredEntries(git, addEnv))) {
+    // `add -A` cannot drop an entry that became ignored after it was staged, so
+    // prune those explicitly; a fresh snapshot never holds one unless HEAD
+    // tracks it (an unborn baseline tracks nothing).
+    if (!(await pruneIgnoredEntries(git, addEnv, lease.unborn ? undefined : lease.baseTree))) {
       return { reason: "snapshot_failed" };
     }
     const tree = await invoke(git, ["write-tree"], { env });

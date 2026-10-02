@@ -543,6 +543,92 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("keeps untracked files in the HEAD-based index instead of resetting them", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const sessionId = "born-untracked";
+    const commands: string[][] = [];
+    const gitWrapper = Object.assign(
+      async (args: string[], options?: Parameters<GitRunner>[1]) => {
+        commands.push(args);
+        return snap(args, options);
+      },
+      { cwd, env: snap.env },
+    ) satisfies GitRunner;
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "tracked-ignored.txt"), "tracked\n");
+      await git(["add", "tracked-ignored.txt"]);
+      await git(["commit", "-qm", "tracked fixture"]);
+      await writeFile(join(cwd, "untracked.txt"), "untracked\n");
+      await writeFile(join(cwd, "ignored-later.txt"), "untracked\n");
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId));
+      const after1 = completedCheckpoint(await finishAfterTurn(gitWrapper, before1, null, null));
+      expect(commands.some((args) => args.includes("reset"))).toBe(false);
+
+      commands.length = 0;
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId));
+      expect(before2.snapshotIndexLease?.directory).toBe(before1.snapshotIndexLease?.directory);
+      expect(commands.some((args) => args.includes("reset"))).toBe(false);
+
+      // An untracked file that becomes ignored leaves the tree; a HEAD-tracked
+      // one stays, exactly as in a fresh snapshot.
+      await writeFile(join(cwd, ".gitignore"), "ignored-later.txt\ntracked-ignored.txt\n");
+      const after2 = completedCheckpoint(await finishAfterTurn(gitWrapper, before2, null, null));
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "born-ground-truth"));
+      expect(await text(snap, ["rev-parse", `${after2.afterHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+      );
+      const names = await text(snap, ["ls-tree", "-r", "--name-only", after2.afterHash]);
+      expect(names).toContain("untracked.txt");
+      expect(names).toContain("tracked-ignored.txt");
+      expect(names).not.toContain("ignored-later.txt");
+
+      await releasePendingCheckpoint(snap, fresh);
+      await releaseCheckpoint(snap, after1);
+      await releaseCheckpoint(snap, after2);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releaseAllPersistentSnapshotIndices();
+    }
+  });
+
+  it("captures a nested repository's files once its .git is removed", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const sessionId = "stale-gitlink";
+    const sub = join(cwd, "sub");
+    const subGit = gitRunner(sub);
+    try {
+      await initializeBranch(git, cwd);
+      await mkdir(sub);
+      await subGit(["init", "-q"]);
+      await writeFile(join(sub, "f.txt"), "nested\n");
+      await subGit(["add", "f.txt"]);
+      await subGit(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "s"]);
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
+      const after1 = completedCheckpoint(await finishAfterTurn(snap, before1, null, null));
+      expect(await text(snap, ["ls-tree", after1.afterHash, "sub"])).toMatch(/^160000 /);
+
+      // The folder stops being a repository: its files must be captured again,
+      // or a later turn's edits inside it could not be undone.
+      await rm(join(sub, ".git"), { recursive: true, force: true });
+      await writeFile(join(sub, "f.txt"), "edited\n");
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
+      expect(before2.snapshotIndexLease?.directory).toBe(before1.snapshotIndexLease?.directory);
+      expect(await text(snap, ["show", `${before2.beforeHash}:sub/f.txt`])).toBe("edited");
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "stale-gitlink-truth"));
+      expect(await text(snap, ["rev-parse", `${before2.beforeHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+      );
+
+      await releasePendingCheckpoint(snap, fresh);
+      await releasePendingCheckpoint(snap, before2);
+      await releaseCheckpoint(snap, after1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releaseAllPersistentSnapshotIndices();
+    }
+  });
+
   it("reuses the persisted alternate index across consecutive turns to avoid a full re-hash", async () => {
     const { cwd, git, snap } = await makeRepo();
     const sessionId = "cross-turn-reuse";
