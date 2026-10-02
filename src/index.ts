@@ -737,9 +737,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   // TTL while its owner process is still running. A slow unref'd interval
   // re-asserts liveness for exactly the locally active sessions (the same
   // set the sweeps already treat as protected), so foreign sweepers never
-  // see a live session as expired. Deliberately not `backends`: that map
-  // retains every session ever initialized here, and beating abandoned ones
-  // would shield them from retention for the process's lifetime.
+  // see a live session as expired. Sessions left via a switch drop out of
+  // that set (releaseLeftSession). Deliberately not `backends`: membership
+  // there is a cache entry, not liveness.
   const HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000;
   const heartbeatTimer = setInterval(() => {
     const tracked = new Set<string>([
@@ -981,6 +981,33 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     await suspendDetached(detachedNavigations, detachedPending);
   }
 
+  /** `/new`, `/resume`, fork and handoff leave `sessionId`. Keeping it in the
+   *  local active set would beat its heartbeat and shield it from retention
+   *  for the process's lifetime; a later resume reloads it from its persisted
+   *  history, as after a restart. Its in-flight work settles first so the
+   *  last turn still lands in that history. */
+  async function releaseLeftSession(typed: AnyContext, sessionId: string): Promise<void> {
+    for (;;) {
+      const busy =
+        pendingFinalizations.get(sessionId) ??
+        initializations.get(sessionId) ??
+        pendingCaptures.get(sessionId)?.complete;
+      if (!busy) break;
+      await Promise.allSettled([busy]);
+    }
+    // Resumed (or reloaded) again meanwhile: it is live.
+    if (closing || typed.sessionManager.getSessionId() === sessionId) return;
+    const navigation = navigations.get(sessionId);
+    const left = pending.get(sessionId);
+    navigations.delete(sessionId);
+    pending.delete(sessionId);
+    backends.delete(sessionId);
+    turnStartLeafBySession.delete(sessionId);
+    turnSequenceBySession.delete(sessionId);
+    explicitActiveHashes.delete(checkpointNamespace(sessionId));
+    await suspendDetached(navigation ? [navigation] : [], left ? [left] : []);
+  }
+
   pi.on("session_start", (_event, ctx) =>
     track(async () => {
       if (closing) return;
@@ -1012,7 +1039,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
   // Switch and branch share one slot; if it is empty (never set, or clobbered by
   // an interleaved navigation) the post-event invalidates every session's redo,
-  // which is a safe superset.
+  // which is a safe superset, and releases no session (unknown source).
   const rememberNavigationSource = (_event: unknown, ctx: unknown) =>
     track(async () => {
       if (closing) return;
@@ -1020,13 +1047,15 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       pendingNavigationSourceSessionId = typed.sessionManager.getSessionId();
     });
 
-  const invalidateNavigationSourceRedo = () =>
+  const invalidateNavigationSourceRedo = (_event: unknown, ctx: unknown) =>
     track(async () => {
       if (closing) return;
       const sourceSessionId = pendingNavigationSourceSessionId;
       pendingNavigationSourceSessionId = null;
       if (sourceSessionId) {
         await navigations.get(sourceSessionId)?.invalidateRedo();
+        // Detached: the switch must not wait out the source's deferred finalize.
+        void track(() => releaseLeftSession(ctx as AnyContext, sourceSessionId));
       } else {
         await invalidateAllRedo();
       }
