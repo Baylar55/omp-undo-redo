@@ -266,11 +266,14 @@ describe("bounded capture lifecycle", () => {
   function lateReadRunnerFactory(delayMs: number): {
     runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]>;
     adds: () => number;
+    seeds: () => number;
   } {
     let count = 0;
+    let seedCount = 0;
     const runner = (cwd: string, env?: Record<string, string>): GitRunner => {
       const inner = env ? createGitRunner(cwd, { env }) : createGitRunner(cwd);
       const slow: GitRunner = async (args, options) => {
+        if (args[0] === "read-tree") seedCount += 1;
         if (!args.includes("add")) return inner(args, options);
         await sleep(delayMs);
         const result = await inner(args, options);
@@ -280,7 +283,7 @@ describe("bounded capture lifecycle", () => {
       slow.cwd = cwd;
       return slow;
     };
-    return { runner, adds: () => count };
+    return { runner, adds: () => count, seeds: () => seedCount };
   }
 
   async function undoWhenSettled(pi: FakeExtensionApi, ctx: TestContext) {
@@ -327,7 +330,7 @@ describe("bounded capture lifecycle", () => {
 
   it("records a session-only turn when a tool call outwaits the before-snapshot", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-late-"));
-    const { runner } = lateReadRunnerFactory(1_000);
+    const { runner, adds, seeds } = lateReadRunnerFactory(1_000);
     try {
       const pi = new FakeExtensionApi();
       ompUndoRedo(pi as never, {
@@ -347,6 +350,18 @@ describe("bounded capture lifecycle", () => {
       expect(await undoWhenSettled(pi, ctx)).toContain("files were not restored");
       expect(ctx.leaf).toBe("leaf");
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("agent-edit\n");
+
+      // The late snapshot's ref is dropped but its warmed index is kept: the
+      // next turn reuses it instead of re-hashing the workspace from scratch.
+      const seeded = seeds();
+      expect(seeded).toBeGreaterThan(0);
+      await pi.emit("before_agent_start", ctx);
+      for (let attempt = 0; attempt < 50 && adds() < 2; attempt += 1) await sleep(100);
+      expect(adds()).toBe(2);
+      expect(seeds()).toBe(seeded);
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+      expect(await undoWhenSettled(pi, ctx)).toContain("file snapshot restored");
     } finally {
       await rmRetry(cwd);
     }

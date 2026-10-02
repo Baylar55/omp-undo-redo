@@ -590,12 +590,17 @@ export function releaseCheckpoint(git: GitRunner, checkpoint: GitCheckpoint): Pr
   return releaseCheckpoints(() => git, [checkpoint]);
 }
 
+/** `keepIndex`: hand the run's index lease back to the idle pool instead of
+ *  deleting it. Only for a run that finished with the lease consistent (its
+ *  index matches a real worktree read), e.g. a before-snapshot discarded for
+ *  timing reasons; the next reuse re-reads the worktree and checks the baseline. */
 export async function releasePendingCheckpoint(
   git: GitRunner,
   pending: Pick<
     PendingGitCheckpoint,
     "repository" | "beforeHash" | "beforeRef" | "snapshotIndexLease"
   >,
+  keepIndex = false,
 ): Promise<boolean> {
   const [releasedRef, releasedLease] = await Promise.all([
     deleteRefsBatched(git, [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }], {
@@ -603,7 +608,9 @@ export async function releasePendingCheckpoint(
       onSingleFailure: ({ ref, expectedHash }) =>
         releaseLooseRef(pending.repository, ref, expectedHash),
     }),
-    releaseSnapshotIndexLease(pending.snapshotIndexLease),
+    keepIndex
+      ? returnLeaseToPool(pending.snapshotIndexLease).then(() => true)
+      : releaseSnapshotIndexLease(pending.snapshotIndexLease),
   ]);
   return releasedRef === "ok" && releasedLease;
 }

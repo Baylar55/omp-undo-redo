@@ -902,9 +902,16 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     );
   }
 
-  async function releasePending(pendingCheckpoint: PendingTurnCheckpoint): Promise<void> {
+  async function releasePending(
+    pendingCheckpoint: PendingTurnCheckpoint,
+    keepIndex = false,
+  ): Promise<void> {
     if (pendingCheckpoint.kind === "git") {
-      await releasePendingCheckpoint(gitRunnerFor(pendingCheckpoint.repository), pendingCheckpoint);
+      await releasePendingCheckpoint(
+        gitRunnerFor(pendingCheckpoint.repository),
+        pendingCheckpoint,
+        keepIndex,
+      );
     }
   }
 
@@ -1128,8 +1135,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
             : { kind: "session", reason: prepared.reason, parentLeafId: turnStartLeaf };
         // A tool ran before this snapshot finished, so it may contain the
         // turn's own edits: undo would "restore" them and report success.
+        // Only the ref is wrong; the index is a valid stat cache of a real
+        // worktree read. Deleting it would make the next turn re-hash from
+        // scratch, overrun again, and never get a checkpoint.
         if (checkpoint.kind === "git" && gate.late) {
-          await releasePending(checkpoint).catch(() => undefined);
+          await releasePending(checkpoint, true).catch(() => undefined);
           return { kind: "session", reason: "before_snapshot_failed", parentLeafId: turnStartLeaf };
         }
         return checkpoint;
