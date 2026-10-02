@@ -1,9 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { CwdGitRunnerFactory, DiscoveredRepository, GitRepository } from "./types.js";
+import type {
+  CwdGitRunnerFactory,
+  DiscoveredRepository,
+  GitRepository,
+  GitRunner,
+} from "./types.js";
 
 export const DEFAULT_EXCLUDES = [
   ".git",
@@ -26,6 +31,10 @@ export const DEFAULT_EXCLUDES = [
  *  workspace via `core.worktree`, so `git add` reads the real workspace while
  *  all objects, refs, and the index live outside it. */
 
+/** Applied once, when a store is set up or its abandoned setup is redone (see
+ *  `setupState`). A key added here reaches only stores set up afterwards:
+ *  existing stores need a migration like the `core.sharedRepository` re-apply
+ *  in `ensurePrivateGitRepository`. */
 const PRIVATE_REPO_CONFIG: ReadonlyArray<readonly [string, string]> = [
   // `git init` with GIT_DIR set creates a bare repository; flip it to a
   // non-bare repo so `core.worktree` is honored and the index/worktree
@@ -100,13 +109,79 @@ export function privateRepositoryPath(storeRoot: string, cwd: string): string {
   return join(canonicalCwd(storeRoot), "repos", `${sha256Hex(canonicalCwd(cwd))}.git`);
 }
 
-async function repoExists(gitDir: string): Promise<boolean> {
+/** Config keys each store kind writes last, so either one proves setup ran. */
+const SETUP_MARKERS: ReadonlyArray<readonly [section: string, key: string]> = [
+  ["core", "worktree"],
+  ["omp-undo-redo", "commondir"],
+];
+
+/** Whether `gitDir`'s setup finished, read from its config file without a git
+ *  process: true when a setup marker is present, false when absent (a missing
+ *  file included), null when the file cannot be read. Only the plain
+ *  `[section]` headers and `key = value` lines git writes are recognised. */
+export async function setupFinished(gitDir: string): Promise<boolean | null> {
+  let text: string;
   try {
-    await readFile(join(gitDir, "HEAD"));
-    return true;
-  } catch {
-    return false;
+    text = await readFile(join(gitDir, "config"), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : null;
   }
+  let section = "";
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    const header = /^\[([^\]]*)\]/.exec(line);
+    if (header) {
+      section = header[1].trim().toLowerCase();
+      continue;
+    }
+    const key = /^[A-Za-z][A-Za-z0-9-]*/.exec(line)?.[0].toLowerCase();
+    if (SETUP_MARKERS.some(([s, k]) => s === section && k === key)) return true;
+  }
+  return false;
+}
+
+/** How long a store must sit untouched before an unfinished setup counts as
+ *  abandoned: a running setup touches its config every few tens of ms. */
+const SETUP_QUIET_MS = 10_000;
+
+/** Where an existing store's setup stands. HEAD alone proves nothing: `git
+ *  init` writes it before the config calls, older gits before their own config
+ *  and `objects/`. "new": no HEAD. "done": a setup marker is present. "busy":
+ *  no marker, but touched within SETUP_QUIET_MS (a concurrent launch may still
+ *  be setting it up), or unreadable. "init": abandoned before `objects/`, the
+ *  last thing `git init` creates, so git rejects the directory. "config":
+ *  abandoned after `git init`. A `config.lock` as quiet as the rest is debris
+ *  from a killed git, which git never removes, so it is deleted here. */
+async function setupState(gitDir: string): Promise<"new" | "done" | "busy" | "init" | "config"> {
+  const [head, config, lock] = await Promise.all(
+    ["HEAD", "config", "config.lock"].map((name) =>
+      stat(join(gitDir, name)).then(
+        (info) => info.mtimeMs,
+        () => 0,
+      ),
+    ),
+  );
+  if (head === 0) return "new";
+  const finished = await setupFinished(gitDir);
+  if (finished !== false) return finished ? "done" : "busy";
+  if (Date.now() - Math.max(head, config, lock) < SETUP_QUIET_MS) return "busy";
+  if (lock !== 0) await rm(join(gitDir, "config.lock"), { force: true }).catch(() => undefined);
+  const hasObjects = await stat(join(gitDir, "objects")).then(
+    () => true,
+    () => false,
+  );
+  return hasObjects ? "config" : "init";
+}
+
+/** Applies `entries` in order and stops at the first failure. */
+async function applyConfig(
+  git: GitRunner,
+  entries: ReadonlyArray<readonly [string, string]>,
+): Promise<boolean> {
+  for (const [key, value] of entries) {
+    if ((await git(["config", key, value])).code !== 0) return false;
+  }
+  return true;
 }
 
 export { canonicalCwd };
@@ -167,8 +242,11 @@ async function ensureExclude(gitDir: string, worktree: string, storeRoot: string
 }
 
 /** Ensures a private git repository exists for `cwd` under `storeRoot`.
- *  Idempotent: an existing repo (HEAD present) skips init/config but still
- *  gets the exclude entries. Returns null when init/config fails. */
+ *  Idempotent: a finished store skips init/config but still gets the exclude
+ *  entries. One whose setup was abandoned (see `setupState`) is redone; `git
+ *  init` is repeated only when it never finished, because a second one resets
+ *  `core.bare`. Returns null when init/config fails for a new store; an
+ *  existing one is used as found. */
 export async function ensurePrivateGitRepository(
   gitRunnerFactory: CwdGitRunnerFactory,
   cwd: string,
@@ -189,17 +267,22 @@ export async function ensurePrivateGitRepository(
       await chmod(dirname(gitDir), 0o700).catch(() => undefined);
       await chmod(canonicalCwd(storeRoot), 0o700).catch(() => undefined);
     }
-    if (!(await repoExists(gitDir))) {
+    const state = await setupState(gitDir);
+    if (state === "new" || state === "init") {
       const init = await envGit(["init", "-q"]);
-      if (init.code !== 0) return null;
-      for (const [key, value] of PRIVATE_REPO_CONFIG) {
-        const result = await envGit(["config", key, value]);
-        if (result.code !== 0) return null;
-      }
-      const worktreeConfig = await envGit(["config", "core.worktree", worktree]);
-      if (worktreeConfig.code !== 0) return null;
-    } else {
-      // Ensure repositories created by earlier versions write future objects owner-only
+      if (init.code !== 0 && state === "new") return null;
+    }
+    if (state === "new" || state === "init" || state === "config") {
+      // `core.worktree` goes last: `setupFinished` reads it as proof the rest ran.
+      const configured = await applyConfig(envGit, [
+        ...PRIVATE_REPO_CONFIG,
+        ["core.worktree", worktree],
+      ]);
+      if (!configured && state === "new") return null;
+    } else if (state === "done") {
+      // Ensure repositories created by earlier versions write future objects
+      // owner-only. Not while "busy": the write would contend for the
+      // config.lock a running setup needs.
       await envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined);
     }
     await ensureExclude(gitDir, worktree, storeRoot);
@@ -222,8 +305,9 @@ export const GIT_STORE_SOURCE_KEY = "omp-undo-redo.commondir";
  *  which are borrowed rather than copied (see `snapshotRunnerEnv`). No
  *  `objects/info/alternates` file: a command run without that env sees only
  *  the store's own objects, which is how capture finds what it must copy.
- *  Refs are written with `GIT_DIR` set to the store. Returns the store path,
- *  or null when it cannot be created. */
+ *  Refs are written with `GIT_DIR` set to the store. A store whose setup was
+ *  abandoned is redone (see `setupState`); one that cannot be is used as
+ *  found. Returns the store path, or null when a new one cannot be created. */
 export async function ensureGitSnapshotStore(
   gitRunnerFactory: CwdGitRunnerFactory,
   repository: DiscoveredRepository,
@@ -237,7 +321,8 @@ export async function ensureGitSnapshotStore(
       await chmod(dirname(storeDir), 0o700).catch(() => undefined);
       await chmod(canonicalCwd(storeRoot), 0o700).catch(() => undefined);
     }
-    if (!(await repoExists(storeDir))) {
+    const state = await setupState(storeDir);
+    if (state === "new" || state === "init") {
       // Objects written against the user's repository use its hash, so the
       // store must too or its refs could not name them.
       const format = await gitRunnerFactory(repository.worktree, {
@@ -250,16 +335,18 @@ export async function ensureGitSnapshotStore(
         "-q",
         ...(objectFormat ? [`--object-format=${objectFormat}`] : []),
       ]);
-      if (init.code !== 0) return null;
-      for (const [key, value] of [
+      if (init.code !== 0 && state === "new") return null;
+    }
+    if (state === "new" || state === "init" || state === "config") {
+      const configured = await applyConfig(storeGit, [
         ["core.sharedRepository", "0600"],
         // Only the extension's own git reads these refs, so paths past
         // MAX_PATH cannot hide them from anyone's gc.
         ["core.longpaths", "true"],
+        // Last: `setupFinished` reads it as proof the rest ran.
         [GIT_STORE_SOURCE_KEY, repository.commonDir],
-      ] as const) {
-        if ((await storeGit(["config", key, value])).code !== 0) return null;
-      }
+      ]);
+      if (!configured && state === "new") return null;
     }
     return storeDir;
   } catch {

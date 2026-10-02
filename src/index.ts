@@ -1,7 +1,7 @@
 import "./core/compat.js";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import { readdir, rename, rm, stat } from "node:fs/promises";
+import { readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionEntryLike } from "./core/types.js";
@@ -17,6 +17,7 @@ import {
   ensureGitSnapshotStore,
   ensurePrivateGitRepository,
   GIT_STORE_SOURCE_KEY,
+  setupFinished,
   storeRootDirectory,
 } from "./core/private-repo.js";
 import { migrateLegacySnapshots } from "./core/legacy-snapshot-migration.js";
@@ -543,6 +544,24 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return null;
   }
 
+  /** Whether a store holds any ref, loose or packed. Errors other than ENOENT
+   *  propagate, which the sweep reads as "keep". */
+  async function storeHasRefs(gitDir: string): Promise<boolean> {
+    try {
+      const loose = await readdir(join(gitDir, "refs"), { recursive: true, withFileTypes: true });
+      if (loose.some((entry) => entry.isFile())) return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    try {
+      const packed = await readFile(join(gitDir, "packed-refs"), "utf8");
+      return packed.split(/\r?\n/).some((line) => line !== "" && !line.startsWith("#"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return false;
+    }
+  }
+
   /** Removes snapshot stores whose workspace (Private-Git) or repository (Git
    *  mode) no longer exists. Runs at boot and on shutdown so vanished
    *  workspaces cannot leave their snapshots (and the file contents inside
@@ -553,7 +572,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  or AV hiccup cannot trigger it), the repo to be idle past
    *  EVICTION_IDLE_CUTOFF_MS, nothing touching snapshot repos to be in
    *  flight, and even then the repo is only renamed aside as `.evicted-<ts>`
-   *  trash for EVICTION_TRASH_RETENTION_MS instead of being deleted outright. */
+   *  trash for EVICTION_TRASH_RETENTION_MS instead of being deleted outright.
+   *  A store whose setup never finished names no source; it is evicted on
+   *  idleness alone, and only while it holds no refs. */
   async function evictStalePrivateRepos(): Promise<void> {
     const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
     let entries: string[];
@@ -601,21 +622,30 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           // No pidfile.
         }
         const source = (await storeSource(reposDir, path))?.path;
-        if (!source) continue;
-        const vanished = async (): Promise<boolean> => {
-          try {
-            await stat(source);
-            return false;
-          } catch (err) {
-            const code = (err as NodeJS.ErrnoException | undefined)?.code;
-            // Anything else (EACCES, EBUSY, EIO, EMFILE...) means "cannot
-            // tell", which must never be read as "gone".
-            return code === "ENOENT" || code === "ENOTDIR";
-          }
-        };
-        if (!(await vanished())) continue;
-        await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
-        if (!(await vanished())) continue;
+        if (source) {
+          const vanished = async (): Promise<boolean> => {
+            try {
+              await stat(source);
+              return false;
+            } catch (err) {
+              const code = (err as NodeJS.ErrnoException | undefined)?.code;
+              // Anything else (EACCES, EBUSY, EIO, EMFILE...) means "cannot
+              // tell", which must never be read as "gone".
+              return code === "ENOENT" || code === "ENOTDIR";
+            }
+          };
+          if (!(await vanished())) continue;
+          await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
+          if (!(await vanished())) continue;
+        } else if ((await setupFinished(path)) !== false || (await storeHasRefs(path))) {
+          // No source to stat. Only a setup that never wrote its marker (a
+          // crash or stale config.lock after `git init`) and holds no
+          // snapshots is evicted: nothing else would ever name it again if
+          // its workspace never relaunches.
+          // ponytail: an unfinished Git-mode store that already has refs is
+          // kept until its repository relaunches; its source is unknowable.
+          continue;
+        }
         const lastActivity = await lastActivityMs(path);
         if (lastActivity === null || now - lastActivity < EVICTION_IDLE_CUTOFF_MS) continue;
         const trashPath = `${path}.evicted-${now}`;

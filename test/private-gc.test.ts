@@ -1,10 +1,14 @@
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { checkpointNamespace, historyRefPrefix } from "../src/core/checkpoints.js";
 import { createGitRunner } from "../src/core/git-runner.js";
-import { ensurePrivateGitRepository } from "../src/core/private-repo.js";
+import {
+  ensurePrivateGitRepository,
+  privateRepositoryPath,
+  storeRootDirectory,
+} from "../src/core/private-repo.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
 import {
@@ -192,6 +196,65 @@ describe("private-repo housekeeping", () => {
     } finally {
       await rmRetry(cwd);
     }
+  });
+
+  it("evicts the repo of a vanished workspace whose setup was abandoned after git init", async () => {
+    // A crash between `git init` and the config calls left HEAD without
+    // `core.worktree`, the only way the sweep learns a store's workspace, and
+    // later launches trusted the store as it was: it was skipped forever.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-abandoned-"));
+    try {
+      await withHermeticStore(async (reposDir) => {
+        const gitDir = privateRepositoryPath(storeRootDirectory(), cwd);
+        await mkdir(reposDir, { recursive: true });
+        const init = await createGitRunner(cwd, { env: { GIT_DIR: gitDir } })(["init", "-q"]);
+        expect(init.code).toBe(0);
+        // Quiet for a day: HEAD and config both, as a crashed launch leaves them.
+        await backdateRepo(gitDir);
+
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {});
+        const ctx = context(cwd, "evict-abandoned-session");
+        await runTurns(pi, ctx, 1, "tracked.txt");
+        await rmRetry(cwd);
+        await backdateRepo(gitDir);
+        await pi.emit("session_shutdown", ctx);
+        expect(
+          await waitFor(async () =>
+            (await readdir(reposDir)).some((name) => /\.evicted-\d+$/.test(name)),
+          ),
+        ).toBe(true);
+      });
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("evicts an unfinished, ref-less store whose workspace never relaunched, keeping one with refs", async () => {
+    // No launch ever repairs a store whose workspace is gone, and without a
+    // setup marker the sweep had no source to stat: it was skipped forever.
+    await withHermeticStore(async (reposDir) => {
+      const empty = privateRepositoryPath(storeRootDirectory(), join(tmpdir(), "omp-gone-empty"));
+      const withRefs = privateRepositoryPath(storeRootDirectory(), join(tmpdir(), "omp-gone-refs"));
+      await mkdir(reposDir, { recursive: true });
+      for (const gitDir of [empty, withRefs]) {
+        const init = await createGitRunner(reposDir, { env: { GIT_DIR: gitDir } })(["init", "-q"]);
+        expect(init.code).toBe(0);
+      }
+      // Unfinished Git-mode stores are usable, so one may already hold snapshots.
+      await mkdir(join(withRefs, "refs", "omp-undo-redo"), { recursive: true });
+      await writeFile(join(withRefs, "refs", "omp-undo-redo", "x"), `${"0".repeat(40)}\n`);
+      await backdateRepo(empty);
+      await backdateRepo(withRefs);
+
+      ompUndoRedo(new FakeExtensionApi() as never, {});
+      expect(
+        await waitFor(async () =>
+          (await readdir(reposDir)).some((name) => name.startsWith(`${basename(empty)}.evicted-`)),
+        ),
+      ).toBe(true);
+      expect(await readdir(reposDir)).toContain(basename(withRefs));
+    });
   });
 
   it("keeps a freshly captured repo even when its workspace has vanished", async () => {
