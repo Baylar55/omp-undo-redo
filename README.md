@@ -86,6 +86,8 @@ Every completed turn remains navigable, including conversation-only turns and tu
 
 Completed Git or non-Git checkpoints and the undo/redo cursor survive a normal terminal restart. Resuming the same session in the same worktree restores both `/undo` and `/redo` history, unless the session's file history was removed by the retention policy (see [Configuration](#configuration)). If durable file metadata is missing or unusable, the extension reconstructs completed turns from the active session branch and offers session-only undo with an explicit warning. A changed worktree must still pass the normal conflict check; resuming never bypasses file-safety checks.
 
+The saved history file is capped at 4 MiB, roughly 8,000 Git turns. A session that outgrows it keeps the checkpoint at the cursor and drops the oldest turns first, so after a resume those turns can no longer be undone; their snapshots stay until the retention policy removes the session.
+
 While the extension process is running, it publishes normalized Undo/Redo action state for external clients. State lives in a private process-scoped directory at `~/.omp/omp-undo-redo/runtime/<pid>/`; set `OMP_UNDO_REDO_RUNTIME_DIR` to override the root for tests or deployments. Session filenames use SHA-256 session namespaces, and state includes action availability, selected leaf, navigation revision, and the latest action result. Per-session state writes larger than 64 KiB are skipped. Runtime publication is observational and does not add file restoration to session-only mode.
 
 ## Configuration

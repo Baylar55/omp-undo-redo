@@ -19,6 +19,7 @@ import type {
   NavigationState,
   SessionEntryLike,
   SessionReader,
+  SessionOnlyCheckpoint,
   TurnCheckpoint,
 } from "./types.js";
 import { UNAVAILABLE_REASONS } from "./types.js";
@@ -43,8 +44,11 @@ function effectiveLeaf(reader: SessionReader): string | null {
   return leafId;
 }
 
-const HISTORY_SCHEMA_CURRENT = 2;
-const ACCEPTED_SCHEMAS = new Set([1, 2]);
+const HISTORY_SCHEMA_CURRENT = 3;
+const ACCEPTED_SCHEMAS = new Set([1, 2, 3]);
+/** Schemas before this stored a full `repository` in every git checkpoint. */
+const FIRST_SCHEMA_WITHOUT_CHECKPOINT_REPOSITORY = 3;
+/** `load()` rejects larger files, so `save()` must never write one. */
 const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
 const GIT_OBJECT_ID = /^[0-9a-f]{40,64}$/;
 const HASH = /^[0-9a-f]{64}$/;
@@ -59,14 +63,69 @@ async function writeJsonAtomic(directory: string, path: string, value: unknown):
   );
 }
 
+/** A git checkpoint as stored: the repository is the live one, never persisted per row. */
+type StoredGitCheckpoint = Omit<GitCheckpoint, "repository">;
+type StoredCheckpoint = SessionOnlyCheckpoint | StoredGitCheckpoint;
+/** A git row as read from disk: schema 1 and 2 rows still carry their own repository. */
+type ReadGitCheckpoint = StoredGitCheckpoint & { repository?: GitRepository };
+
 type StoredHistory = {
   schemaVersion: number;
   sessionHash: string;
   repository: GitRepository;
-  checkpoints: TurnCheckpoint[];
+  checkpoints: StoredCheckpoint[];
   currentIndex: number;
   lastAccessedAt?: string;
 };
+
+function unavailableCheckpoint(checkpoint: StoredCheckpoint): SessionOnlyCheckpoint {
+  return {
+    kind: "session",
+    reason: "resumed_checkpoint_unavailable",
+    parentLeafId: checkpoint.parentLeafId,
+    leafId: checkpoint.leafId,
+  };
+}
+
+function storedGitCheckpoint(checkpoint: StoredGitCheckpoint): StoredGitCheckpoint {
+  return {
+    kind: "git",
+    beforeHash: checkpoint.beforeHash,
+    afterHash: checkpoint.afterHash,
+    beforeRef: checkpoint.beforeRef,
+    afterRef: checkpoint.afterRef,
+    parentLeafId: checkpoint.parentLeafId,
+    leafId: checkpoint.leafId,
+  };
+}
+
+/** Builds the document `load()` will accept. Over MAX_HISTORY_BYTES it drops
+ *  the checkpoints older than the current one first, then the newest redo
+ *  entries, and never the checkpoint at `currentIndex`, which the shifted
+ *  index keeps naming. At least one checkpoint always stays, so a single row
+ *  larger than the cap (megabyte-sized leaf ids) is still written and `load()`
+ *  reports it unusable: failing closed beats leaving an older, stale file. */
+function boundedHistory(stored: StoredHistory): StoredHistory {
+  const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
+  const sizes = stored.checkpoints.map(bytes);
+  // `[a,b]` = brackets (in the empty document) + elements + (n - 1) commas.
+  let total =
+    bytes({ ...stored, checkpoints: [] }) +
+    sizes.reduce((sum, size) => sum + size, 0) +
+    Math.max(sizes.length - 1, 0);
+  let start = 0;
+  let end = sizes.length;
+  while (total > MAX_HISTORY_BYTES && end - start > 1) {
+    if (start < stored.currentIndex) total -= sizes[start++] + 1;
+    else total -= sizes[--end] + 1;
+  }
+  if (start === 0 && end === sizes.length) return stored;
+  return {
+    ...stored,
+    checkpoints: stored.checkpoints.slice(start, end),
+    currentIndex: stored.currentIndex - start,
+  };
+}
 
 export function historyDirectory(repository: GitRepository): string {
   return join(repository.storeDir, "omp-undo-redo", "history");
@@ -137,12 +196,16 @@ function isSessionCheckpoint(value: unknown): value is TurnCheckpoint {
   );
 }
 
-function isGitCheckpoint(value: unknown, refPrefix: string): value is GitCheckpoint {
+function isGitCheckpoint(
+  value: unknown,
+  refPrefix: string,
+  legacy: boolean,
+): value is ReadGitCheckpoint {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   return (
     candidate.kind === "git" &&
-    isRepository(candidate.repository) &&
+    (!legacy || isRepository(candidate.repository)) &&
     typeof candidate.beforeHash === "string" &&
     GIT_OBJECT_ID.test(candidate.beforeHash) &&
     typeof candidate.afterHash === "string" &&
@@ -184,13 +247,25 @@ function parseHistory(
     !Number.isInteger(candidate.currentIndex)
   )
     return null;
+  const legacy = candidate.schemaVersion < FIRST_SCHEMA_WITHOUT_CHECKPOINT_REPOSITORY;
   if (
     !candidate.checkpoints.every(
-      (checkpoint) => isSessionCheckpoint(checkpoint) || isGitCheckpoint(checkpoint, refPrefix),
+      (checkpoint) =>
+        isSessionCheckpoint(checkpoint) || isGitCheckpoint(checkpoint, refPrefix, legacy),
     )
   )
     return null;
-  const checkpoints = candidate.checkpoints as TurnCheckpoint[];
+  // Legacy rows carried their own repository; one that is not the live
+  // repository can never be restored from this store.
+  const checkpoints = (candidate.checkpoints as (SessionOnlyCheckpoint | ReadGitCheckpoint)[]).map(
+    (checkpoint): StoredCheckpoint => {
+      if (checkpoint.kind === "session") return checkpoint;
+      const stored = storedGitCheckpoint(checkpoint);
+      return legacy && !(checkpoint.repository && sameRepository(checkpoint.repository, repository))
+        ? unavailableCheckpoint(stored)
+        : stored;
+    },
+  );
   const currentIndex = candidate.currentIndex as number;
   if (currentIndex < -1 || currentIndex >= checkpoints.length) return null;
   const lastAccessedAt =
@@ -481,7 +556,6 @@ export class SessionHistoryStore {
         return { status: "unavailable", reason: "unusable" };
       }
       const value = JSON.parse(await readFile(path, "utf8")) as unknown;
-      const candidate = value as Record<string, unknown>;
       const parsed = parseHistory(value, this.sessionId, this.repository);
       if (!parsed) return { status: "unavailable", reason: "unusable" };
       const refPrefix = historyRefPrefix(parsed.sessionHash);
@@ -491,18 +565,10 @@ export class SessionHistoryStore {
         if (checkpoint.kind === "session") return checkpoint;
         if (
           refs.get(checkpoint.beforeRef) === checkpoint.beforeHash &&
-          refs.get(checkpoint.afterRef) === checkpoint.afterHash &&
-          sameRepository(checkpoint.repository, this.repository)
+          refs.get(checkpoint.afterRef) === checkpoint.afterHash
         )
-          // The live repository carries the store; histories written before
-          // snapshots moved out of the user's `.git` do not.
           return { ...checkpoint, repository: this.repository };
-        return {
-          kind: "session",
-          reason: "resumed_checkpoint_unavailable",
-          parentLeafId: checkpoint.parentLeafId,
-          leafId: checkpoint.leafId,
-        };
+        return unavailableCheckpoint(checkpoint);
       });
       const state = { checkpoints, currentIndex: parsed.currentIndex };
       if (
@@ -522,7 +588,7 @@ export class SessionHistoryStore {
       // checkpoints: a concurrent expiration that deleted refs mid-load would
       // otherwise be written back as permanent session-only rows, destroying
       // recoverable git coordinates. The mapping is re-derived on every load.
-      await this.refreshStoredTimestamp(candidate).catch(() => undefined);
+      await this.refreshStoredTimestamp(parsed).catch(() => undefined);
       return { status: "loaded", state };
     } catch {
       return { status: "unavailable", reason: "unusable" };
@@ -533,22 +599,29 @@ export class SessionHistoryStore {
    *  and a fresh lastAccessedAt, preserving schema migration. Skips the write
    *  when a tombstone appeared mid-load so a completed expiration is never
    *  resurrected. */
-  private async refreshStoredTimestamp(candidate: Record<string, unknown>): Promise<void> {
+  private async refreshStoredTimestamp(parsed: StoredHistory): Promise<void> {
     const tombstoneFile = tombstonePath(this.repository, this.sessionId);
     const claimed = await stat(tombstoneFile)
       .then(() => true)
       .catch(() => false);
     if (claimed) return;
-    const directory = historyDirectory(this.repository);
-    const stored: StoredHistory = {
+    await this.write(parsed.checkpoints, parsed.currentIndex);
+  }
+
+  private async write(checkpoints: StoredCheckpoint[], currentIndex: number): Promise<void> {
+    const stored = boundedHistory({
       schemaVersion: HISTORY_SCHEMA_CURRENT,
       sessionHash: checkpointNamespace(this.sessionId),
       repository: this.repository,
-      checkpoints: candidate.checkpoints as TurnCheckpoint[],
-      currentIndex: candidate.currentIndex as number,
+      checkpoints,
+      currentIndex,
       lastAccessedAt: new Date().toISOString(),
-    };
-    await writeJsonAtomic(directory, historyPath(this.repository, this.sessionId), stored);
+    });
+    await writeJsonAtomic(
+      historyDirectory(this.repository),
+      historyPath(this.repository, this.sessionId),
+      stored,
+    );
   }
 
   async save(state: NavigationState): Promise<void> {
@@ -560,29 +633,14 @@ export class SessionHistoryStore {
     }
     const sessionHash = checkpointNamespace(this.sessionId);
     const refPrefix = historyRefPrefix(sessionHash);
-    const checkpoints = state.checkpoints.map((checkpoint): TurnCheckpoint => {
-      if (
-        checkpoint.kind === "session" ||
-        (checkpoint.kind === "git" &&
-          checkpoint.beforeRef.startsWith(refPrefix) &&
-          sameRepository(checkpoint.repository, this.repository))
-      )
-        return checkpoint;
-      return {
-        kind: "session",
-        reason: "resumed_checkpoint_unavailable",
-        parentLeafId: checkpoint.parentLeafId,
-        leafId: checkpoint.leafId,
-      };
+    const checkpoints = state.checkpoints.map((checkpoint): StoredCheckpoint => {
+      if (checkpoint.kind === "session") return checkpoint;
+      const stored = storedGitCheckpoint(checkpoint);
+      return checkpoint.beforeRef.startsWith(refPrefix) &&
+        sameRepository(checkpoint.repository, this.repository)
+        ? stored
+        : unavailableCheckpoint(stored);
     });
-    const stored: StoredHistory = {
-      schemaVersion: HISTORY_SCHEMA_CURRENT,
-      sessionHash,
-      repository: this.repository,
-      checkpoints,
-      currentIndex: state.currentIndex,
-      lastAccessedAt: new Date().toISOString(),
-    };
     // A live owner saving new history supersedes any earlier expiration
     // marker. Order matters against a concurrent sweep: beat the heartbeat
     // first (sweeps skip fresh sessions), clear the tombstone next, and write
@@ -594,6 +652,6 @@ export class SessionHistoryStore {
     await rm(tombstonePath(this.repository, this.sessionId), { force: true }).catch(
       () => undefined,
     );
-    await writeJsonAtomic(directory, path, stored);
+    await this.write(checkpoints, state.currentIndex);
   }
 }

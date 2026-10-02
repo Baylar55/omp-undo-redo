@@ -506,15 +506,15 @@ describe("expireGitSessionHistories", () => {
       },
     ]);
 
-    // ...but the stored document keeps the original coordinates so the loss
+    // ...but the stored document keeps the original coordinates (minus the
+    // per-row repository, which load always supplies) so the loss
     // never becomes durable through load itself.
     const raw = JSON.parse(await readFile(historyFile, "utf8"));
-    expect(raw.schemaVersion).toBe(2);
+    expect(raw.schemaVersion).toBe(3);
     expect(typeof raw.lastAccessedAt).toBe("string");
     expect(raw.checkpoints).toEqual([
       {
         kind: "git",
-        repository,
         beforeHash,
         afterHash,
         beforeRef: `${refPrefix}chk1/before`,
@@ -875,5 +875,143 @@ describe("expireGitSessionHistories", () => {
       expect(left).not.toContain(stale);
       expect(left).toContain(fresh);
     });
+  });
+});
+
+describe("SessionHistoryStore size bound and checkpoint shape", () => {
+  const entry = (id: string) => ({ id, parentId: null, type: "message" });
+  const reader = (ids: string[]) => ({
+    getLeafId: () => ids.at(-1) ?? null,
+    getBranch: () => [],
+    getEntry: (id: string) => (ids.includes(id) ? entry(id) : undefined),
+  });
+  const noGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+
+  async function setup(prefix: string, sessionId: string) {
+    const gitDir = await temporaryDirectory(prefix);
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    return { repository, hash: sessionHash(sessionId) };
+  }
+
+  it("saves git checkpoints without a repository and load supplies the live one", async () => {
+    const sessionId = "shape-session";
+    const { repository, hash } = await setup("git-shape-", sessionId);
+    const refPrefix = `refs/omp-undo-redo/history/${hash}/`;
+    const beforeHash = "a".repeat(40);
+    const afterHash = "b".repeat(40);
+    const git: GitRunner = async (args) => ({
+      stdout:
+        args[0] === "for-each-ref"
+          ? `${refPrefix}c/before\0${beforeHash}\n${refPrefix}c/after\0${afterHash}\n`
+          : "",
+      stderr: "",
+      code: 0,
+    });
+    const store = new SessionHistoryStore(sessionId, repository, git);
+    const checkpoint = {
+      kind: "git" as const,
+      repository,
+      beforeHash,
+      afterHash,
+      beforeRef: `${refPrefix}c/before`,
+      afterRef: `${refPrefix}c/after`,
+      parentLeafId: null,
+      leafId: "r",
+    };
+    await store.save({ checkpoints: [checkpoint], currentIndex: 0 });
+
+    const raw = JSON.parse(await readFile(historyPath(repository, sessionId), "utf8"));
+    expect(raw.checkpoints[0]).not.toHaveProperty("repository");
+    const loaded = await store.load(reader(["r"]));
+    expect(loaded).toEqual({
+      status: "loaded",
+      state: { checkpoints: [checkpoint], currentIndex: 0 },
+    });
+  });
+
+  it.each([-1, 0, 50, 99])(
+    "trims to the cap and keeps the current checkpoint loadable (currentIndex %i)",
+    async (currentIndex) => {
+      const sessionId = `cap-session-${currentIndex}`;
+      const { repository } = await setup("git-cap-", sessionId);
+      const store = new SessionHistoryStore(sessionId, repository, noGit);
+      // ~100 KB per row: only about 40 of the 100 fit under the 4 MiB cap.
+      const padding = "x".repeat(50_000);
+      const checkpoints = Array.from({ length: 100 }, (_, index) => ({
+        kind: "session" as const,
+        reason: "resumed_checkpoint_unavailable" as const,
+        parentLeafId: `p${index}-${padding}`,
+        leafId: `l${index}-${padding}`,
+      }));
+      await store.save({ checkpoints, currentIndex });
+
+      expect((await stat(historyPath(repository, sessionId))).size).toBeLessThanOrEqual(
+        4 * 1024 * 1024,
+      );
+      const loaded = await store.load(
+        reader(checkpoints.flatMap((checkpoint) => [checkpoint.parentLeafId, checkpoint.leafId])),
+      );
+      expect(loaded.status).toBe("loaded");
+      if (loaded.status !== "loaded") return;
+      const { checkpoints: kept, currentIndex: keptIndex } = loaded.state;
+      expect(kept.length).toBeLessThan(checkpoints.length);
+      // The kept rows are one contiguous run of the originals...
+      const offset = checkpoints.findIndex((checkpoint) => checkpoint.leafId === kept[0].leafId);
+      expect(kept).toEqual(checkpoints.slice(offset, offset + kept.length));
+      // ...whose index still names the same current checkpoint (or "all undone").
+      expect(offset + keptIndex).toBe(currentIndex);
+      if (currentIndex >= 0) expect(kept[keptIndex]).toEqual(checkpoints[currentIndex]);
+    },
+  );
+
+  it("does not adopt a legacy checkpoint recorded for another repository", async () => {
+    const sessionId = "legacy-foreign-session";
+    const { repository, hash } = await setup("git-legacy-foreign-", sessionId);
+    const refPrefix = `refs/omp-undo-redo/history/${hash}/`;
+    const beforeHash = "a".repeat(40);
+    const afterHash = "b".repeat(40);
+    const git: GitRunner = async (args) => ({
+      stdout:
+        args[0] === "for-each-ref"
+          ? `${refPrefix}c/before\0${beforeHash}\n${refPrefix}c/after\0${afterHash}\n`
+          : "",
+      stderr: "",
+      code: 0,
+    });
+    await mkdir(join(repository.storeDir, "omp-undo-redo", "history"), { recursive: true });
+    await writeFile(
+      historyPath(repository, sessionId),
+      JSON.stringify({
+        schemaVersion: 2,
+        sessionHash: hash,
+        repository,
+        checkpoints: [
+          {
+            kind: "git",
+            repository: { ...repository, worktree: join(repository.worktree, "other") },
+            beforeHash,
+            afterHash,
+            beforeRef: `${refPrefix}c/before`,
+            afterRef: `${refPrefix}c/after`,
+            parentLeafId: null,
+            leafId: "r",
+          },
+        ],
+        currentIndex: 0,
+      }),
+    );
+    const store = new SessionHistoryStore(sessionId, repository, git);
+    for (let pass = 0; pass < 2; pass++) {
+      const loaded = await store.load(reader(["r"]));
+      expect(loaded).toMatchObject({
+        status: "loaded",
+        state: { checkpoints: [{ kind: "session" }] },
+      });
+    }
   });
 });

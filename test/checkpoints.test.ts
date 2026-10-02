@@ -1372,7 +1372,7 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
-  it("handles HistoryLoadResult, tombstone detection, and schema v1 to v2 upgrade in SessionHistoryStore", async () => {
+  it("handles HistoryLoadResult, tombstone detection, and schema v1 upgrade in SessionHistoryStore", async () => {
     const { cwd, git } = await makeRepo();
     const repository = await gitRepository(cwd);
     const sessionId = "chk-schema-session";
@@ -1423,7 +1423,7 @@ describe("history-safe Git checkpoints", () => {
         }),
       );
 
-      // 3. Load accepts schema v1, returns status: "loaded", and re-saves as v2 with lastAccessedAt
+      // 3. Load accepts schema v1, returns status: "loaded", and re-saves as the current schema with lastAccessedAt
       const loaded = await store.load(r);
       expect(loaded).toMatchObject({
         status: "loaded",
@@ -1440,9 +1440,9 @@ describe("history-safe Git checkpoints", () => {
         },
       });
 
-      // Verify JSON was upgraded to schemaVersion 2 with lastAccessedAt
+      // Verify JSON was upgraded to the current schema with lastAccessedAt
       const upgradedContent = JSON.parse(await readFile(hPath, "utf8"));
-      expect(upgradedContent.schemaVersion).toBe(2);
+      expect(upgradedContent.schemaVersion).toBe(3);
       expect(typeof upgradedContent.lastAccessedAt).toBe("string");
 
       // 4. Tombstone detection -> load() returns status: "expired"
