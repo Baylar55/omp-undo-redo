@@ -764,30 +764,36 @@ export async function finishAfterTurn(
   leafId: string | null,
 ): Promise<FinishAfterTurnResult> {
   let snapshot: SnapshotResult;
-  if (before.snapshotIndexLease) {
-    const lease = before.snapshotIndexLease;
+  let lease = before.snapshotIndexLease;
+  if (lease) {
     snapshot = await createSnapshotCommitFromLease(git, lease, "omp-undo-redo: after turn");
     if (!("hash" in snapshot)) {
       // HEAD moved (or another failure occurred) since the turn began: the
       // retained alternate index is stale, so drop it and fall back to a fresh
-      // snapshot. The next turn will reseed the persistent index from HEAD.
+      // snapshot whose index replaces it in the pool, sparing the next turn a
+      // second full re-hash. No pool key means the lease was released meanwhile
+      // (shutdown): nothing to retain then.
+      const key = leasesInUse.get(lease);
       await releaseSnapshotIndexLease(lease);
-      snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
+      snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn", key !== undefined);
+      lease = "hash" in snapshot ? snapshot.snapshotIndexLease : undefined;
+      if (lease && key !== undefined) leasesInUse.set(lease, key);
     }
     // On success the lease index now reflects the after-state and stays in the
     // persistent cache for the next turn's before snapshot.
   } else {
     snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
   }
+  const pending = { ...before, snapshotIndexLease: lease };
   if (!("hash" in snapshot)) {
-    await releasePendingCheckpoint(git, before);
+    await releasePendingCheckpoint(git, pending);
     return {
       status: "session_only",
       reason: snapshot.reason === "invalid_head" ? "invalid_head" : "after_snapshot_failed",
     };
   }
   if (!(await pinBorrowedObjects(git, before.repository, snapshot.tree))) {
-    await releasePendingCheckpoint(git, before);
+    await releasePendingCheckpoint(git, pending);
     return { status: "session_only", reason: "after_snapshot_failed" };
   }
   const afterRef = before.beforeRef.replace(/\/before$/, "/after");
@@ -798,10 +804,10 @@ export async function finishAfterTurn(
       { env: storeEnv(before.repository) },
     ))
   ) {
-    await releasePendingCheckpoint(git, before);
+    await releasePendingCheckpoint(git, pending);
     return { status: "session_only", reason: "after_ref_failed" };
   }
-  await returnLeaseToPool(before.snapshotIndexLease);
+  await returnLeaseToPool(lease);
   return {
     status: "git",
     checkpoint: {

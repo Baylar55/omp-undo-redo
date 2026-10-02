@@ -677,6 +677,50 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("pools the fallback after-snapshot's index when HEAD moves during a turn", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const sessionId = "head-moved-fallback";
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "tracked.txt"), "initial\n");
+      await git(["add", "tracked.txt"]);
+      await git(["commit", "-qm", "initial"]);
+
+      const before1 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
+      const staleDirectory = before1.snapshotIndexLease?.directory;
+      expect(staleDirectory).toBeDefined();
+      // The turn commits: the lease baseline no longer matches HEAD.
+      await writeFile(join(cwd, "tracked.txt"), "committed in turn\n");
+      await git(["commit", "-qam", "turn commit"]);
+      await writeFile(join(cwd, "untracked.txt"), "untracked\n");
+      const after1 = completedCheckpoint(await finishAfterTurn(snap, before1, null, null));
+      await expect(stat(staleDirectory!)).rejects.toThrow();
+
+      const commands: string[][] = [];
+      const gitWrapper = Object.assign(
+        async (args: string[], options?: Parameters<GitRunner>[1]) => {
+          commands.push(args);
+          return snap(args, options);
+        },
+        { cwd, env: snap.env },
+      ) satisfies GitRunner;
+      // Next turn reuses the fallback's index instead of reseeding from HEAD.
+      const before2 = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId));
+      expect(commands.some((args) => args[0] === "read-tree")).toBe(false);
+      expect(before2.snapshotIndexLease?.directory).toBeDefined();
+      expect(before2.snapshotIndexLease?.directory).not.toBe(staleDirectory);
+      const tree = (hash: string) => text(snap, ["rev-parse", `${hash}^{tree}`]);
+      expect(await tree(before2.beforeHash)).toBe(await tree(after1.afterHash));
+
+      await releasePendingCheckpoint(snap, before2);
+      await expect(stat(before2.snapshotIndexLease!.directory)).rejects.toThrow();
+      await releaseCheckpoint(snap, after1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releaseAllPersistentSnapshotIndices();
+    }
+  });
+
   it("never shares one alternate index between a running turn and the next turn's before snapshot", async () => {
     const { cwd, git, snap } = await makeRepo();
     const sessionId = "overlapping-turns";
