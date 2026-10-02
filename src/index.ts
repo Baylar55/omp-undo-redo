@@ -551,18 +551,26 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     reposDir: string,
     gitDir: string,
   ): Promise<{ path: string; gitStore: boolean } | null> {
-    for (const key of ["core.worktree", GIT_STORE_SOURCE_KEY]) {
-      const result = await gitRunnerFactory(reposDir)([
-        "config",
-        "--file",
-        join(gitDir, "config"),
-        "--get",
-        key,
-      ]);
-      const path = result.code === 0 ? result.stdout.replace(/\r?\n$/, "") : "";
-      if (path) return { path, gitStore: key === GIT_STORE_SOURCE_KEY };
+    // One spawn for both keys; `-z` keeps decoded values intact. Last value
+    // wins, as with `--get`; `core.worktree` wins over the source key.
+    const result = await gitRunnerFactory(reposDir)([
+      "config",
+      "--file",
+      join(gitDir, "config"),
+      "-z",
+      "--get-regexp",
+      `^(core\\.worktree|${GIT_STORE_SOURCE_KEY.replaceAll(".", "\\.")})$`,
+    ]);
+    if (result.code !== 0) return null;
+    const values = new Map<string, string>();
+    for (const entry of result.stdout.split("\0")) {
+      const newline = entry.indexOf("\n");
+      if (newline > 0) values.set(entry.slice(0, newline), entry.slice(newline + 1));
     }
-    return null;
+    const worktree = values.get("core.worktree");
+    if (worktree) return { path: worktree, gitStore: false };
+    const source = values.get(GIT_STORE_SOURCE_KEY);
+    return source ? { path: source, gitStore: true } : null;
   }
 
   /** Whether a store holds any ref, loose or packed. Errors other than ENOENT
@@ -1134,12 +1142,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       const capture = beginCapture(sessionId, async () => {
         const prepared =
           backend.kind === "git"
-            ? await prepareBeforeTurn(
-                backend.git,
-                sessionId,
-                ownerRegistry,
-                backend.repository.storeDir,
-              )
+            ? await prepareBeforeTurn(backend.git, sessionId, ownerRegistry, backend.repository)
             : { status: "session_only" as const, reason: backend.reason };
         // Bound to the leaf recorded above, never a fresh getLeafId(): the
         // finalize identity check and the pending-slot check both compare

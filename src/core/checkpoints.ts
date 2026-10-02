@@ -316,7 +316,10 @@ async function createCommitForTree(
 }
 
 /** A lease is usable only while its baseline still describes HEAD: the same
- *  HEAD tree for a born HEAD, and a still-unborn HEAD for an unborn lease. */
+ *  HEAD tree for a born HEAD, and a still-unborn HEAD for an unborn lease.
+ *  Checked once, after the tree is written: a check before the run would only
+ *  fail a stale lease faster, and one spawn per snapshot costs more than the
+ *  incremental pass a stale lease wastes before its caller reseeds. */
 async function leaseBaselineCurrent(git: GitRunner, lease: SnapshotIndexLease): Promise<boolean> {
   const head = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
   if (head.error === "unavailable") return false;
@@ -492,8 +495,6 @@ async function createSnapshotCommitFromLease(
   lease: SnapshotIndexLease,
   message: string,
 ): Promise<SnapshotResult> {
-  if (!(await leaseBaselineCurrent(git, lease))) return { reason: "snapshot_failed" };
-
   const normalizationPath = join(lease.directory, `normalize-${randomUUID()}.nul`);
   const env = { GIT_INDEX_FILE: lease.indexPath };
   try {
@@ -665,24 +666,36 @@ export type FinishAfterTurnResult =
   | { status: "git"; checkpoint: GitCheckpoint }
   | { status: "session_only"; reason: FileCheckpointUnavailableReason };
 
-/** `store`: the snapshot store `git` is bound to. Callers holding the
- *  backend pass it, so a host runner factory that wraps runners without
- *  re-exposing `runner.env` still captures. */
+/** `known`: the store-bound repository `git` was created for. Callers holding
+ *  the backend pass it, which spares a `rev-parse` per turn and lets a host
+ *  runner factory that wraps runners without re-exposing `runner.env` still
+ *  capture. Without it the repository is resolved from `git`. */
 export async function prepareBeforeTurn(
   git: GitRunner,
   sessionId: string,
   ownerRegistry?: CheckpointOwnerRegistry,
-  store: string | undefined = boundStore(git),
+  known?: GitRepository,
 ): Promise<PrepareBeforeTurnResult> {
-  const resolved = await resolveRepository(git);
-  if ("reason" in resolved) return { status: "session_only", reason: resolved.reason };
-  // Fail closed: without a store, snapshot objects and refs would land in
-  // the user's repository, where all-refs operations export them.
-  if (!store) return { status: "session_only", reason: "repository_unresolvable" };
-  const repository: GitRepository = {
-    ...resolved.repository,
-    storeDir: await canonicalPath(store, resolved.repository.worktree),
-  };
+  let repository: GitRepository;
+  if (known) {
+    // A git dir removed mid-session must not let discovery fall through to an
+    // enclosing repository; a stat keeps the turn spawn-free.
+    if (!(await stat(known.gitDir).catch(() => null))) {
+      return { status: "session_only", reason: "not_repository" };
+    }
+    repository = known;
+  } else {
+    const resolved = await resolveRepository(git);
+    if ("reason" in resolved) return { status: "session_only", reason: resolved.reason };
+    // Fail closed: without a store, snapshot objects and refs would land in
+    // the user's repository, where all-refs operations export them.
+    const store = boundStore(git);
+    if (!store) return { status: "session_only", reason: "repository_unresolvable" };
+    repository = {
+      ...resolved.repository,
+      storeDir: await canonicalPath(store, resolved.repository.worktree),
+    };
+  }
 
   const ownership = ownerRegistry
     ? await ownerRegistry.ensureInitialized(repository, git)

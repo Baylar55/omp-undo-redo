@@ -982,7 +982,6 @@ describe("history-safe Git checkpoints", () => {
       ) satisfies GitRunner;
       const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
-      expect(commands.some((args) => args[0] === "diff-index")).toBe(false);
       expect(commands.some((args) => args[0] === "read-tree")).toBe(true);
       const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "head-change-fresh"));
       expect(await text(snap, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
