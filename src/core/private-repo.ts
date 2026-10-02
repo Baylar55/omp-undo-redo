@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CwdGitRunnerFactory, GitRepository } from "./types.js";
@@ -188,4 +188,84 @@ export async function ensurePrivateGitRepository(
   } catch {
     return null;
   }
+}
+
+/** How long a git temp file must sit untouched before it counts as an
+ *  orphan. A live gc rewrites its temp file continuously while packing, and
+ *  the gc runner's own ceiling (15 min in the extension host) is far below
+ *  this, so anything older is by construction a killed child's leftover. */
+export const GIT_TEMP_REAP_CUTOFF_MS = 60 * 60 * 1000;
+
+/** A `gc.pid` younger than this is treated as a gc running right now: its
+ *  temp files are in use and must not be touched. Mirrors the eviction
+ *  sweep's freshness rule — only a recent pidfile is trusted as "live";
+ *  an older one is crash debris from a killed child. */
+const GC_PID_LIVE_MS = 24 * 60 * 60 * 1000;
+
+/** Deletes git temp files orphaned by a hard-killed child: `tmp_pack_*`
+ *  (pack-objects during repack) under `objects/pack/` and `tmp_obj_*`
+ *  (unpack-objects) under `objects/<xx>/`. Git cleans its temps on graceful
+ *  exit only — SIGKILL / Windows TerminateProcess / a force-killed timed-out
+ *  child bypass that cleanup, and nothing (not even `git gc`) ever removes
+ *  the leftovers, so they accumulate unbounded. Reaping is mtime-gated and
+ *  skips the whole repo while a `gc.pid` is fresh; best-effort, returns the
+ *  number of files removed. */
+export async function reapStaleGitTempFiles(
+  gitDir: string,
+  options: { cutoffMs?: number; now?: () => number } = {},
+): Promise<number> {
+  const cutoff = (options.now ?? Date.now)() - (options.cutoffMs ?? GIT_TEMP_REAP_CUTOFF_MS);
+  try {
+    const gcPidStat = await stat(join(gitDir, "gc.pid"));
+    if (Date.now() - gcPidStat.mtimeMs < GC_PID_LIVE_MS) return 0;
+  } catch {
+    // No pidfile: no gc is running.
+  }
+
+  const candidates: string[] = [];
+  const packDir = join(gitDir, "objects", "pack");
+  try {
+    for (const name of await readdir(packDir)) {
+      if (name.startsWith("tmp_")) candidates.push(join(packDir, name));
+    }
+  } catch {
+    // No pack dir: nothing to reap.
+  }
+  try {
+    const objectsDir = join(gitDir, "objects");
+    for (const entry of await readdir(objectsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^[0-9a-f]{2}$/.test(entry.name)) continue;
+      const fanout = join(objectsDir, entry.name);
+      for (const name of await readdir(fanout)) {
+        if (name.startsWith("tmp_obj_")) candidates.push(join(fanout, name));
+      }
+    }
+  } catch {
+    // No objects dir: nothing to reap.
+  }
+
+  let reaped = 0;
+  for (const path of candidates) {
+    try {
+      const statResult = await stat(path);
+      if (statResult.mtimeMs > cutoff) continue;
+    } catch {
+      continue;
+    }
+    try {
+      await rm(path, { force: true });
+      reaped += 1;
+    } catch {
+      // Git marks pack files read-only; on Windows the read-only attribute
+      // makes unlink fail with EPERM. Clear it and retry once.
+      try {
+        await chmod(path, 0o644);
+        await rm(path, { force: true });
+        reaped += 1;
+      } catch {
+        // Stranded until a later sweep.
+      }
+    }
+  }
+  return reaped;
 }
