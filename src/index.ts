@@ -15,6 +15,7 @@ import { createGitRunner } from "./core/git-runner.js";
 import {
   canonicalCwd,
   ensurePrivateGitRepository,
+  reapStaleGitTempFiles,
   storeRootDirectory,
 } from "./core/private-repo.js";
 import { SessionNavigation } from "./core/session-navigation.js";
@@ -396,6 +397,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  content behind indefinitely. */
   async function schedulePrivateGc(gitDir: string): Promise<void> {
     try {
+      // A previous gc that was killed hard (timeout force-kill, terminal
+      // closed, process exit) left its temp pack behind; every cycle would
+      // otherwise stack another multi-gigabyte orphan (observed in the wild:
+      // 126 files / 456 GB). Reap first — cheap, mtime-gated, and a live gc
+      // is protected by the gc.pid freshness guard inside the reaper.
+      await reapStaleGitTempFiles(gitDir).catch(() => undefined);
       // Run from a neutral cwd so a slow gc never holds a handle on either the
       // user's workspace or the snapshot repo itself (Windows keeps a child's
       // cwd handle until it exits, which would race teardown rms and the
@@ -439,6 +446,25 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           // Ignore
         }
       }),
+    );
+  }
+
+  /** Reaps stale git temp files across every private repo. gc scheduling
+   *  reaps its own repo each cycle, but a repo that never reaches the gc
+   *  threshold again would keep its last orphan forever — the boot sweep
+   *  bounds that. Runs fire-and-forget at boot; never on the handler path. */
+  async function reapStaleGitTempsAcrossRepos(): Promise<void> {
+    const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
+    let entries: string[];
+    try {
+      entries = await readdir(reposDir);
+    } catch {
+      return;
+    }
+    await Promise.all(
+      entries
+        .filter((e) => e.endsWith(".git"))
+        .map((e) => reapStaleGitTempFiles(join(reposDir, e)).catch(() => undefined)),
     );
   }
 
@@ -1292,12 +1318,14 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   });
 
   // Boot-time housekeeping (all fire-and-forget, unref'd — 0ms handler latency)
+
   void evictStalePrivateRepos().catch(() => undefined);
   void cleanLegacyGitIndexes().catch(() => undefined);
   {
     const t = setTimeout(() => {
       void sweepOrphanTempIndexes().catch(() => undefined);
       void purgeLegacyBlobStore().catch(() => undefined);
+      void reapStaleGitTempsAcrossRepos().catch(() => undefined);
     }, 2_000);
     t.unref?.();
   }

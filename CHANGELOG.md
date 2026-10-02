@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Killed `git gc` runs leaked unbounded temp packs in Private-Git repositories.** A `git gc --prune=now` that never finishes — force-killed at the 15-minute runner timeout, or killed with the terminal/process on hard exit — leaves its in-progress `objects/pack/tmp_pack_*` (and `objects/<xx>/tmp_obj_*`) behind. Git cleans its temps on graceful exit only, nothing else ever removes them, and every subsequent gc cycle stacked another orphan: one Windows machine accumulated 126 files / 456 GB from repack attempts of an ~8 GB snapshot repo, several per hour, with `git count-objects` reporting `packs: 0`. The extension now reaps these temp files when they are clearly dead: files untouched for over an hour (a live gc rewrites its temp continuously, and the runner ceiling is 15 minutes), skipped entirely while a fresh `gc.pid` says a gc is running, read-only attribute handled on Windows. Reaping runs before each scheduled private-repo gc and once across all repos at boot.
+
 ## [1.6.4] - 2026-09-28
 
 ### Fixed
