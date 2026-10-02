@@ -490,6 +490,56 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
+  it("returns from agent_end when the finalize overruns its deadline, still recording the turn", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-finalize-deadline-"));
+    const gate = Promise.withResolvers<void>();
+    const parked = Promise.withResolvers<void>();
+    let updateRefCount = 0;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        // The second update-ref is the after-snapshot: park the finalize there.
+        if (args[0] === "update-ref" && ++updateRefCount >= 2) {
+          parked.resolve();
+          await gate.promise;
+        }
+        return inner(args, options);
+      };
+      gated.cwd = workCwd;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: runner,
+        captureDeadlineMs: 5_000,
+        finalizeDeadlineMs: 200,
+      });
+      const ctx = context(cwd, "finalize-deadline-session");
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      const agentEnd = pi.emit("agent_end", ctx);
+      await parked.promise;
+      // Handler returns while the after-snapshot is still parked.
+      await agentEnd;
+
+      gate.resolve();
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+    } finally {
+      gate.resolve();
+      await rmRetry(cwd);
+    }
+  });
+
   it.each(["session_start", "session_switch"] as const)(
     "records a late-finalizing turn in its own session after the session switched (%s)",
     async (switchEvent) => {

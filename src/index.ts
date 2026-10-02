@@ -91,10 +91,15 @@ export type OmpUndoRedoDependencies = {
   /** How long a `tool_call` waits for the turn's before-snapshot. Must stay
    *  under the host's 30 s `tool_call` cap, which blocks the tool on timeout. */
   toolCallDeadlineMs?: number;
+  /** How long `agent_end` waits for the turn's finalize (after-snapshot and
+   *  history write) before returning. Must stay under the host's 30 s handler
+   *  cap; the finalize keeps running and undo/redo still wait on it. */
+  finalizeDeadlineMs?: number;
 };
 
 export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
 export const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
+export const DEFAULT_FINALIZE_DEADLINE_MS = 25_000;
 
 function defaultGitRunnerFactory(cwd: string, env?: Record<string, string>): GitRunner {
   return createGitRunner(cwd, { env });
@@ -343,6 +348,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const gitRunnerFactory = deps.gitRunnerFactory ?? defaultGitRunnerFactory;
   const captureDeadlineMs = deps.captureDeadlineMs ?? DEFAULT_CAPTURE_DEADLINE_MS;
   const toolCallDeadlineMs = deps.toolCallDeadlineMs ?? DEFAULT_TOOL_CALL_DEADLINE_MS;
+  const finalizeDeadlineMs = deps.finalizeDeadlineMs ?? DEFAULT_FINALIZE_DEADLINE_MS;
   function gitRunnerFor(repository: GitRepository): GitRunner {
     const entry =
       privateRepositories.get(repository.worktree) ?? privateRepositories.get(repository.commonDir);
@@ -1205,6 +1211,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       (error) => console.error("[omp-undo-redo] finalize failed", error),
     );
     pendingFinalizations.set(sessionId, tracked);
+    // A slow after-snapshot must not hold the handler past the host cap. The
+    // early return is the same state as the deferred path above: the work
+    // stays in `pendingFinalizations`, and overlapping turns are safe (index
+    // leases are checked out per run; `turnSequence` flags the gap).
+    void timedOutAfter(tracked, finalizeDeadlineMs).then(() => handlerRelease());
     void tracked.then(() => {
       if (pendingFinalizations.get(sessionId) === tracked) pendingFinalizations.delete(sessionId);
     });
