@@ -1,5 +1,8 @@
 import "./compat.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { GitRunner } from "./types.js";
 
 const TERMINATION_GRACE_MS = 250;
@@ -30,6 +33,70 @@ export interface GitRunnerDependencies {
   terminationGraceMs?: number;
 }
 
+/** The real git.exe and the environment Git for Windows' launcher
+ *  (`Git\cmd\git.exe`) would hand it. */
+type DirectGit = { exe: string; pathPrefix: string; env: Record<string, string> };
+
+/** Variables the launcher sets before starting the real git.exe
+ *  (git-wrapper.c: `setup_environment`, `maybe_read_config`). */
+const LAUNCHER_ENV = ["PATH", "HOME", "MSYSTEM", "PLINK_PROTOCOL", "MSYS"];
+
+let directGit: Promise<DirectGit | null> | undefined;
+
+/** On Windows `git` on PATH is usually a launcher that starts the real
+ *  git.exe, so every invocation costs two processes. One probe through the
+ *  launcher learns, via trace2, the environment the real git.exe received;
+ *  later invocations start `<exec-path>\git.exe` (the binary git itself runs
+ *  for its own subcommands) with that environment. Any surprise in the probe
+ *  keeps the launcher. */
+async function probeDirectGit(): Promise<DirectGit | null> {
+  const probe = await runGit(
+    tmpdir(),
+    ["--exec-path"],
+    {
+      env: { GIT_TRACE2_EVENT: "2", GIT_TRACE2_ENV_VARS: LAUNCHER_ENV.join(",") },
+      timeoutMs: 10_000,
+    },
+    {},
+    null,
+  );
+  if (probe.code !== 0 || probe.error) return null;
+  const traced = new Map<string, string>();
+  for (const line of probe.stderr.split("\n")) {
+    try {
+      const event = JSON.parse(line) as { event?: unknown; param?: unknown; value?: unknown };
+      if (
+        event.event === "def_param" &&
+        typeof event.param === "string" &&
+        typeof event.value === "string"
+      ) {
+        traced.set(event.param, event.value);
+      }
+    } catch {
+      // Not a trace2 event line.
+    }
+  }
+  // `--exec-path` exits before git prepends its exec-path, so the traced PATH
+  // is the launcher's: its own entries, then the inherited PATH.
+  const execPath = probe.stdout.trim();
+  const path = traced.get("PATH");
+  const inherited = process.env.PATH ?? "";
+  if (!execPath || path === undefined || !path.endsWith(inherited)) return null;
+  const exe = join(execPath, "git.exe");
+  if (!(await stat(exe).catch(() => null))?.isFile()) return null;
+  const env: Record<string, string> = {};
+  for (const name of LAUNCHER_ENV) {
+    const value = traced.get(name);
+    if (name !== "PATH" && value !== undefined && value !== process.env[name]) env[name] = value;
+  }
+  return { exe, pathPrefix: path.slice(0, path.length - inherited.length), env };
+}
+
+function resolveDirectGit(): Promise<DirectGit | null> {
+  directGit ??= process.platform === "win32" ? probeDirectGit() : Promise.resolve(null);
+  return directGit;
+}
+
 /** Every git invocation goes through `spawn`: it handles the stdin-fed
  *  `update-ref --stdin` batches and, unlike `execFile`, imposes no output
  *  buffer cap on large `for-each-ref`/`status` reads. */
@@ -38,13 +105,21 @@ function runGit(
   args: string[],
   options: Parameters<GitRunner>[1],
   dependencies: GitRunnerDependencies,
+  direct: DirectGit | null,
 ): Promise<ChildResult> {
   const { promise, resolve } = Promise.withResolvers<ChildResult>();
   let child: ChildProcessWithoutNullStreams;
   try {
-    child = (dependencies.spawnGit ?? spawn)("git", args, {
+    const env: NodeJS.ProcessEnv = { ...process.env, ...direct?.env, ...options?.env };
+    if (direct) {
+      // Windows env names are case-insensitive; extend the existing key
+      // (often `Path`) rather than adding a second one.
+      const pathKey = Object.keys(env).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+      env[pathKey] = direct.pathPrefix + (env[pathKey] ?? "");
+    }
+    child = (dependencies.spawnGit ?? spawn)(direct?.exe ?? "git", args, {
       cwd,
-      env: { ...process.env, ...options?.env },
+      env,
       windowsHide: true,
     });
   } catch (error) {
@@ -88,9 +163,10 @@ function runGit(
   const terminate = () => {
     if (settled) return;
     timedOut = true;
-    // Windows `git` is a launcher (Git\cmd\git.exe) that spawns the real
-    // mingw64 git.exe with inherited pipes; `kill()` would end only the
-    // launcher. Kill the tree while the launcher is alive so /T can walk it.
+    // Kill the tree: the child may be the launcher (Git\cmd\git.exe), which
+    // starts the real git.exe with inherited pipes, and git itself may run
+    // hooks or alias shells; `kill()` would end only the direct child. /T
+    // must walk the tree while that child is alive.
     if (process.platform === "win32" && child.pid !== undefined && !exited) {
       spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
         stdio: "ignore",
@@ -139,7 +215,14 @@ function runGit(
 export function createGitRunner(cwd: string, dependencies: GitRunnerDependencies = {}): GitRunner {
   const { env } = dependencies;
   const runner: GitRunner = async (args, options) =>
-    runGit(cwd, args, { ...options, env: { ...env, ...options?.env } }, dependencies);
+    runGit(
+      cwd,
+      args,
+      { ...options, env: { ...env, ...options?.env } },
+      dependencies,
+      // An injected spawn is a test double; give it the plain command.
+      dependencies.spawnGit ? null : await resolveDirectGit(),
+    );
   runner.cwd = cwd;
   if (env) runner.env = env;
   return runner;

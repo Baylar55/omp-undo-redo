@@ -253,7 +253,7 @@ export function classifyCheckpointOwner(
 }
 
 function leaseDirectory(repository: GitRepository): string {
-  return join(repository.commonDir, "omp-undo-redo", "owners");
+  return join(repository.storeDir, "omp-undo-redo", "owners");
 }
 
 function leasePath(repository: GitRepository, ownerId: string): string {
@@ -318,7 +318,7 @@ async function enumerateOwnerRefs(
   let result: GitCommandResult;
   try {
     result = await git(["for-each-ref", "--format=%(refname)%00%(objectname)", prefix], {
-      env: { GIT_DIR: repository.commonDir },
+      env: { GIT_DIR: repository.storeDir },
       timeoutMs,
     });
   } catch {
@@ -345,7 +345,7 @@ async function cleanupStaleOwner(
   const first = await enumerateOwnerRefs(git, repository, ownerId, timeoutMs);
   if (!first.ok) return;
   const deletion = await deleteRefsBatched(git, first.refs, {
-    env: { GIT_DIR: repository.commonDir },
+    env: { GIT_DIR: repository.storeDir },
     timeoutMs,
   });
   if (deletion === "timeout") return;
@@ -386,7 +386,7 @@ export class CheckpointOwnerRegistry {
   }
 
   async ensureInitialized(repository: GitRepository, git: GitRunner): Promise<OwnershipMode> {
-    const key = repository.commonDir;
+    const key = repository.storeDir;
     if (this.initialized.has(key)) return "v2";
     const existing = this.initializations.get(key);
     if (existing) return existing;
@@ -418,7 +418,7 @@ export class CheckpointOwnerRegistry {
       ))
     )
       return "legacy";
-    this.initialized.set(repository.commonDir, { repository, git });
+    this.initialized.set(repository.storeDir, { repository, git });
     if (host.persistent && resolvedRuntimeScope)
       this.startScan(repository, git, hostId, resolvedRuntimeScope);
     return "v2";

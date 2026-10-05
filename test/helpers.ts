@@ -2,9 +2,17 @@ import "../src/core/compat.js";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
+import { resolveRepository, snapshotRunnerEnv } from "../src/core/checkpoints.js";
+import { createGitRunner } from "../src/core/git-runner.js";
+import {
+  ensureGitSnapshotStore,
+  privateRepositoryPath,
+  storeRootDirectory,
+} from "../src/core/private-repo.js";
+import type { GitRepository } from "../src/core/types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -128,7 +136,37 @@ export async function makeRepository(prefix = "omp-undo-redo-repo-"): Promise<st
   return cwd;
 }
 
+/** Snapshot refs of the workspace at `cwd`, read from its store. Also
+ *  asserts the invariant every caller relies on: none are in the user's own
+ *  repository, where all-refs operations (`push --mirror`) would export them. */
 export async function privateRefs(cwd: string): Promise<string[]> {
-  const output = await git(cwd, ["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"]);
+  const list = ["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"];
+  let store = privateRepositoryPath(storeRootDirectory(), cwd);
+  const commonDir = await git(cwd, ["rev-parse", "--git-common-dir"]).catch(() => null);
+  if (commonDir !== null) {
+    const leaked = await git(cwd, list);
+    if (leaked) throw new Error(`snapshot refs in the user's repository:\n${leaked}`);
+    store = privateRepositoryPath(storeRootDirectory(), resolve(cwd, commonDir));
+  }
+  const output = await git(cwd, [`--git-dir=${store}`, ...list]).catch(() => "");
   return output ? output.split("\n") : [];
+}
+
+/** The repository at `cwd` bound to its snapshot store (created on first
+ *  use), exactly as the extension's Git-mode backend resolves it. */
+export async function gitRepository(cwd: string): Promise<GitRepository> {
+  const resolved = await resolveRepository(createGitRunner(cwd));
+  if (!("repository" in resolved)) throw new Error(`not a repository: ${cwd}`);
+  const storeDir = await ensureGitSnapshotStore(
+    (dir, env) => createGitRunner(dir, { env }),
+    resolved.repository,
+    storeRootDirectory(),
+  );
+  if (!storeDir) throw new Error(`no snapshot store for ${cwd}`);
+  return { ...resolved.repository, storeDir };
+}
+
+/** Env binding a runner for the repository at `cwd` to its snapshot store. */
+export async function snapshotEnv(cwd: string): Promise<Record<string, string>> {
+  return snapshotRunnerEnv(await gitRepository(cwd));
 }

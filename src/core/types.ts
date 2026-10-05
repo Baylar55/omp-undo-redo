@@ -95,12 +95,18 @@ export interface GitRepository {
   worktree: string;
   gitDir: string;
   commonDir: string;
-  /** Set only by `ensurePrivateGitRepository`: this repository is the
-   *  extension's own snapshot store, not the user's. Ownership is marked at
-   *  construction because it can never be inferred from a shared map that
-   *  holds user repositories too (gc/prune must never touch those). */
-  private?: true;
+  /** The extension's own snapshot repository under the store root: every
+   *  snapshot ref, the objects no user ref reaches, history files, and owner
+   *  leases live here, never in the user's `.git`, so all-refs operations
+   *  (`push --mirror`, `clone --mirror`, `bundle --all`, `log --all`) cannot
+   *  export snapshot content. Private-Git: the private repo itself (equal to
+   *  `gitDir`). Git mode: a bare store borrowing the user's objects through
+   *  `GIT_ALTERNATE_OBJECT_DIRECTORIES` (no `objects/info/alternates` file). */
+  storeDir: string;
 }
+
+/** A repository as `git rev-parse` reports it, before a snapshot store is bound. */
+export type DiscoveredRepository = Omit<GitRepository, "storeDir">;
 
 export interface SnapshotIndexLease {
   directory: string;

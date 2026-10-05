@@ -1,11 +1,35 @@
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
+import { checkpointNamespace, historyRefPrefix } from "../src/core/checkpoints.js";
 import { createGitRunner } from "../src/core/git-runner.js";
+import {
+  ensurePrivateGitRepository,
+  privateRepositoryPath,
+  storeRootDirectory,
+} from "../src/core/private-repo.js";
 import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../src/index.js";
-import { context, FakeExtensionApi, makeRepository, rmRetry, type TestContext } from "./helpers.js";
+import {
+  context,
+  FakeExtensionApi,
+  gitRepository,
+  makeRepository,
+  rmRetry,
+  type TestContext,
+} from "./helpers.js";
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-gc-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -95,27 +119,27 @@ describe("private-repo housekeeping", () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
       expect(
-        commands.some((command) => command[0] === "gc" && command.includes("--prune=now")),
+        commands.some((command) => command[0] === "gc" && command.includes("--prune=1.hour.ago")),
       ).toBe(true);
     } finally {
       await rmRetry(cwd);
     }
   }, 120000);
 
-  it("never runs git gc against the user's own repository", async () => {
+  it("gcs a Git workspace's snapshot store, never the user's own repository", async () => {
     // Regression: `isPrivateRepository` used to answer "yes" for any repo in
     // the shared `privateRepositories` map — which caches the user's own repo
     // in Git mode — so 20 turns triggered `gc --prune=now` with GIT_DIR
     // pointing at the workspace's .git.
     const cwd = await makeRepository("omp-undo-redo-gc-usergit-");
-    const commands: string[][] = [];
+    const gcs: { args: string[]; gitDir?: string }[] = [];
     try {
       const pi = new FakeExtensionApi();
       ompUndoRedo(pi as never, {
         gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
           const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
           const wrapped: GitRunner = async (args, options) => {
-            commands.push(args);
+            if (args[0] === "gc" || args[0] === "prune") gcs.push({ args, gitDir: env?.GIT_DIR });
             return inner(args, options);
           };
           wrapped.cwd = cwd2;
@@ -127,13 +151,15 @@ describe("private-repo housekeeping", () => {
       await runTurns(pi, ctx, 20, "tracked.txt");
       await pi.emit("session_shutdown", ctx);
       // Shutdown housekeeping is detached, so a gc would appear after the
-      // handler resolves: poll the recorded commands instead of trusting the
-      // handler's return, and require the window to lapse with none.
-      const scheduledGc = await waitFor(
-        async () => commands.some((command) => command[0] === "gc"),
-        20,
-      );
-      expect(scheduledGc).toBe(false);
+      // handler resolves: poll the recorded commands.
+      const { storeDir, gitDir } = await gitRepository(cwd);
+      expect(await waitFor(async () => gcs.some((gc) => gc.gitDir === storeDir), 20)).toBe(true);
+      // Other stores under the shared root (earlier tests' repos) may be gc'd
+      // by the retention sweep; the user's own repository never is.
+      expect(gcs.some((gc) => gc.gitDir === gitDir)).toBe(false);
+      // Shared by every process in the repository: never `--prune=now` (gc)
+      // or `--expire=now` (prune).
+      for (const gc of gcs) expect(gc.args.at(-1)).toMatch(/=1\.hour\.ago$/);
     } finally {
       await rmRetry(cwd);
     }
@@ -182,6 +208,65 @@ describe("private-repo housekeeping", () => {
     } finally {
       await rmRetry(cwd);
     }
+  });
+
+  it("evicts the repo of a vanished workspace whose setup was abandoned after git init", async () => {
+    // A crash between `git init` and the config calls left HEAD without
+    // `core.worktree`, the only way the sweep learns a store's workspace, and
+    // later launches trusted the store as it was: it was skipped forever.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-abandoned-"));
+    try {
+      await withHermeticStore(async (reposDir) => {
+        const gitDir = privateRepositoryPath(storeRootDirectory(), cwd);
+        await mkdir(reposDir, { recursive: true });
+        const init = await createGitRunner(cwd, { env: { GIT_DIR: gitDir } })(["init", "-q"]);
+        expect(init.code).toBe(0);
+        // Quiet for a day: HEAD and config both, as a crashed launch leaves them.
+        await backdateRepo(gitDir);
+
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {});
+        const ctx = context(cwd, "evict-abandoned-session");
+        await runTurns(pi, ctx, 1, "tracked.txt");
+        await rmRetry(cwd);
+        await backdateRepo(gitDir);
+        await pi.emit("session_shutdown", ctx);
+        expect(
+          await waitFor(async () =>
+            (await readdir(reposDir)).some((name) => /\.evicted-\d+$/.test(name)),
+          ),
+        ).toBe(true);
+      });
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("evicts an unfinished, ref-less store whose workspace never relaunched, keeping one with refs", async () => {
+    // No launch ever repairs a store whose workspace is gone, and without a
+    // setup marker the sweep had no source to stat: it was skipped forever.
+    await withHermeticStore(async (reposDir) => {
+      const empty = privateRepositoryPath(storeRootDirectory(), join(tmpdir(), "omp-gone-empty"));
+      const withRefs = privateRepositoryPath(storeRootDirectory(), join(tmpdir(), "omp-gone-refs"));
+      await mkdir(reposDir, { recursive: true });
+      for (const gitDir of [empty, withRefs]) {
+        const init = await createGitRunner(reposDir, { env: { GIT_DIR: gitDir } })(["init", "-q"]);
+        expect(init.code).toBe(0);
+      }
+      // Unfinished Git-mode stores are usable, so one may already hold snapshots.
+      await mkdir(join(withRefs, "refs", "omp-undo-redo"), { recursive: true });
+      await writeFile(join(withRefs, "refs", "omp-undo-redo", "x"), `${"0".repeat(40)}\n`);
+      await backdateRepo(empty);
+      await backdateRepo(withRefs);
+
+      ompUndoRedo(new FakeExtensionApi() as never, {});
+      expect(
+        await waitFor(async () =>
+          (await readdir(reposDir)).some((name) => name.startsWith(`${basename(empty)}.evicted-`)),
+        ),
+      ).toBe(true);
+      expect(await readdir(reposDir)).toContain(basename(withRefs));
+    });
   });
 
   it("keeps a freshly captured repo even when its workspace has vanished", async () => {
@@ -334,4 +419,202 @@ describe("private-repo housekeeping", () => {
       await rmRetry(cwd);
     }
   });
+
+  it("expires and prunes aged history in a private repo no session reopens", async () => {
+    await withHermeticStore(async (reposDir) => {
+      const dormant = await mkdtemp(join(tmpdir(), "omp-undo-redo-retention-dormant-"));
+      const current = await mkdtemp(join(tmpdir(), "omp-undo-redo-retention-current-"));
+      try {
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, env ? { env } : undefined),
+          dormant,
+          join(reposDir, ".."),
+        );
+        if (!repository) throw new Error("private repo init failed");
+        const git = createGitRunner(dormant, { env: { GIT_DIR: repository.gitDir } });
+        const out = async (args: string[], stdin?: string): Promise<string> =>
+          (await git(args, stdin === undefined ? undefined : { stdin })).stdout.trim();
+        const historyDir = join(repository.gitDir, "omp-undo-redo", "history");
+        await mkdir(historyDir, { recursive: true });
+        const seedSession = async (id: string, content: string, accessedAt: Date) => {
+          const blob = await out(["hash-object", "-w", "--stdin"], content);
+          const tree = await out(["mktree"], `100644 blob ${blob}\tsecret.env\n`);
+          const commit = await out(
+            ["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-m", id],
+            "",
+          );
+          const hash = checkpointNamespace(id);
+          await git(["update-ref", `${historyRefPrefix(hash)}c1/before`, commit]);
+          await writeFile(
+            join(historyDir, `${hash}.json`),
+            JSON.stringify({ lastAccessedAt: accessedAt.toISOString() }),
+          );
+          return { blob, prefix: historyRefPrefix(hash) };
+        };
+        const aged = await seedSession("aged", "SECRET=aged\n", new Date(Date.now() - 3 * 864e5));
+        const live = await seedSession("live", "SECRET=live\n", new Date());
+        // Snapshot objects are days old by the time their session expires.
+        const old = new Date(Date.now() - 3 * 864e5);
+        const objectsDir = join(repository.gitDir, "objects");
+        for (const fanout of await readdir(objectsDir)) {
+          if (!/^[0-9a-f]{2}$/.test(fanout)) continue;
+          for (const name of await readdir(join(objectsDir, fanout))) {
+            await utimes(join(objectsDir, fanout, name), old, old);
+          }
+        }
+        // Unreferenced and fresh: what an in-flight capture has written.
+        const inFlight = await out(["hash-object", "-w", "--stdin"], "SECRET=in-flight\n");
+        const exists = async (object: string) => (await git(["cat-file", "-e", object])).code === 0;
+
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {});
+        const ctx = context(current, "retention-current-session");
+        await pi.emit("session_start", ctx);
+        expect(await waitFor(async () => !(await exists(aged.blob)), 150)).toBe(true);
+        expect(await out(["for-each-ref", aged.prefix])).toBe("");
+        expect(await out(["for-each-ref", live.prefix])).not.toBe("");
+        expect(await exists(live.blob)).toBe(true);
+        expect(await exists(inFlight)).toBe(true);
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(dormant);
+        await rmRetry(current);
+      }
+    });
+  }, 60000);
+
+  it("runs the retention sweep's gcs one at a time, never concurrently", async () => {
+    // Regression: every expired store's gc was detached on its own, so a boot
+    // sweep over many stores started one full repack per store at once.
+    await withHermeticStore(async (reposDir) => {
+      const workspaces = await Promise.all(
+        [0, 1, 2, 3].map(() => mkdtemp(join(tmpdir(), "omp-undo-redo-gc-serial-"))),
+      );
+      try {
+        const seeded = new Set<string>();
+        for (const workspace of workspaces.slice(0, 3)) {
+          const repository = await ensurePrivateGitRepository(
+            (cwd2, env) => createGitRunner(cwd2, env ? { env } : undefined),
+            workspace,
+            join(reposDir, ".."),
+          );
+          if (!repository) throw new Error("private repo init failed");
+          // A cruft-pack marker alone makes the sweep schedule this store's gc.
+          const packDir = join(repository.gitDir, "objects", "pack");
+          await mkdir(packDir, { recursive: true });
+          await writeFile(join(packDir, "pack-cruft.mtimes"), "");
+          // Basename: the sweep's GIT_DIR may spell the root differently (8.3).
+          seeded.add(basename(repository.gitDir));
+        }
+        // Every gc is held until the sweep has started expiring every seeded
+        // store. The sweep expires stores in turn and schedules each gc before
+        // moving on, so by then every gc but the last is scheduled: unserialized
+        // they would all be inside the runner at once.
+        const expiring = new Set<string>();
+        const allExpiring = Promise.withResolvers<void>();
+        const allFinished = Promise.withResolvers<void>();
+        let running = 0;
+        let maxRunning = 0;
+        let finished = 0;
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {
+          gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
+            const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
+            const store = env?.GIT_DIR ? basename(env.GIT_DIR) : "";
+            const wrapped: GitRunner = async (args, options) => {
+              if (args[0] !== "gc") {
+                if (seeded.has(store)) expiring.add(store);
+                if (expiring.size === seeded.size) allExpiring.resolve();
+                return inner(args, options);
+              }
+              running += 1;
+              maxRunning = Math.max(maxRunning, running);
+              try {
+                await allExpiring.promise;
+                return await inner(args, options);
+              } finally {
+                running -= 1;
+                finished += 1;
+                if (finished === seeded.size) allFinished.resolve();
+              }
+            };
+            wrapped.cwd = cwd2;
+            if (env) wrapped.env = env;
+            return wrapped;
+          },
+        });
+        const ctx = context(workspaces[3], "gc-serial-session");
+        await pi.emit("session_start", ctx);
+        await allFinished.promise;
+        expect(maxRunning).toBe(1);
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        for (const workspace of workspaces) await rmRetry(workspace);
+      }
+    });
+  }, 60000);
+
+  it("reclaims a store whose gc never finishes", async () => {
+    // Regression (#101): gc prunes only after its repack, and a repack that
+    // outruns the ceiling is hard-killed. Every attempt then left a
+    // multi-GB tmp_pack_* behind (456 GB on one machine) and expired
+    // snapshots were never deleted.
+    await withHermeticStore(async (reposDir) => {
+      const dormant = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-killed-"));
+      const current = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-killed-current-"));
+      try {
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, env ? { env } : undefined),
+          dormant,
+          join(reposDir, ".."),
+        );
+        if (!repository) throw new Error("private repo init failed");
+        const git = createGitRunner(dormant, { env: { GIT_DIR: repository.gitDir } });
+        const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        const expired = (
+          await git(["hash-object", "-w", "--stdin"], { stdin: "SECRET=expired\n" })
+        ).stdout.trim();
+        const objects = join(repository.gitDir, "objects");
+        await utimes(join(objects, expired.slice(0, 2), expired.slice(2)), old, old);
+        const packDir = join(objects, "pack");
+        await mkdir(packDir, { recursive: true });
+        // Git creates temp packs read-only; on Windows that blocks a plain unlink.
+        const deadTemp = join(packDir, "tmp_pack_dead");
+        await writeFile(deadTemp, "x");
+        await chmod(deadTemp, 0o444);
+        await utimes(deadTemp, old, old);
+        // Another process's gc, still writing.
+        const liveTemp = join(packDir, "tmp_pack_live");
+        await writeFile(liveTemp, "x");
+        // A cruft-pack marker alone makes the sweep schedule this store's gc.
+        await writeFile(join(packDir, "pack-cruft.mtimes"), "");
+
+        let gcs = 0;
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {
+          gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
+            const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
+            const wrapped: GitRunner = async (args, options) => {
+              if (args[0] !== "gc") return inner(args, options);
+              gcs += 1;
+              return { stdout: "", stderr: "", code: 1, error: "timeout" };
+            };
+            wrapped.cwd = cwd2;
+            if (env) wrapped.env = env;
+            return wrapped;
+          },
+        });
+        const ctx = context(current, "gc-killed-session");
+        await pi.emit("session_start", ctx);
+        expect(await waitFor(async () => gcs > 0, 150)).toBe(true);
+        expect((await git(["cat-file", "-e", expired])).code).not.toBe(0);
+        await expect(stat(deadTemp)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(stat(liveTemp)).resolves.toBeDefined();
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(dormant);
+        await rmRetry(current);
+      }
+    });
+  }, 60000);
 });

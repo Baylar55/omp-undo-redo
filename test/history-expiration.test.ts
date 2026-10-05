@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,8 +7,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   expireGitSessionHistories,
   historyPath,
+  SessionHistoryStore,
   tombstonePath,
 } from "../src/core/history-store.js";
+import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRepository, GitRunner } from "../src/core/types.js";
 
 const temporaryDirectories: string[] = [];
@@ -33,7 +36,12 @@ afterEach(async () => {
 describe("expireGitSessionHistories", () => {
   it("cleans up an expired session (refs deleted, history JSON deleted, tombstone written)", async () => {
     const gitDir = await temporaryDirectory("git-expire-1-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "expired-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -95,7 +103,12 @@ describe("expireGitSessionHistories", () => {
 
   it("preserves active sessions", async () => {
     const gitDir = await temporaryDirectory("git-expire-active-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "active-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -124,7 +137,12 @@ describe("expireGitSessionHistories", () => {
 
   it("preserves recent sessions", async () => {
     const gitDir = await temporaryDirectory("git-expire-recent-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "recent-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -151,9 +169,14 @@ describe("expireGitSessionHistories", () => {
     expect(metadata.isFile()).toBe(true);
   });
 
-  it("skips malformed history JSON without deleting or crashing", async () => {
+  it("keeps a recent malformed history JSON without crashing", async () => {
     const gitDir = await temporaryDirectory("git-expire-malformed-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "malformed-session";
     const historyFile = historyPath(repository, sessionId);
 
@@ -168,9 +191,43 @@ describe("expireGitSessionHistories", () => {
     expect(metadata.isFile()).toBe(true);
   });
 
+  it.each([
+    ["invalid JSON", "{ invalid json..."],
+    ["non-object JSON", "null"],
+    ["unparseable lastAccessedAt", JSON.stringify({ lastAccessedAt: "not-a-date" })],
+  ])("expires %s by file mtime once stale", async (_name, content) => {
+    const gitDir = await temporaryDirectory("git-expire-stale-corrupt-");
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    const historyFile = historyPath(repository, "stale-corrupt");
+    await mkdir(join(gitDir, "omp-undo-redo", "history"), { recursive: true });
+    await writeFile(historyFile, content);
+    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+
+    // Fresh mtime: kept.
+    await expireGitSessionHistories(repository, dummyGit, 30, new Set());
+    expect((await stat(historyFile)).isFile()).toBe(true);
+
+    // Stale mtime: expired with tombstone.
+    const fortyDaysAgo = (Date.now() - 40 * 24 * 60 * 60 * 1000) / 1000;
+    await utimes(historyFile, fortyDaysAgo, fortyDaysAgo);
+    await expireGitSessionHistories(repository, dummyGit, 30, new Set());
+    await expect(stat(historyFile)).rejects.toThrow();
+    expect((await stat(tombstonePath(repository, "stale-corrupt"))).isFile()).toBe(true);
+  });
+
   it("falls back to file mtime when lastAccessedAt is missing (v1 schema)", async () => {
     const gitDir = await temporaryDirectory("git-expire-v1-fallback-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "v1-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -204,7 +261,12 @@ describe("expireGitSessionHistories", () => {
 
   it("preserves history JSON if ref deletion fails (fail closed)", async () => {
     const gitDir = await temporaryDirectory("git-expire-ref-fail-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "ref-fail-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -245,7 +307,12 @@ describe("expireGitSessionHistories", () => {
 
   it("skips age expiration when retentionDays=0", async () => {
     const gitDir = await temporaryDirectory("git-expire-zero-retention-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "zero-retention-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -274,7 +341,12 @@ describe("expireGitSessionHistories", () => {
 
   it("preserves sessions with a fresh cross-process heartbeat marker", async () => {
     const gitDir = await temporaryDirectory("git-expire-heartbeat-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "heartbeat-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -321,7 +393,12 @@ describe("expireGitSessionHistories", () => {
 
   it("expires sessions once their cross-process heartbeat goes stale", async () => {
     const gitDir = await temporaryDirectory("git-expire-beat-stale-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "stale-heartbeat-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -360,7 +437,12 @@ describe("expireGitSessionHistories", () => {
 
   it("keeps original git checkpoint coordinates on disk when refs are missing at resume", async () => {
     const gitDir = await temporaryDirectory("git-resume-nopersist-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "nopersist-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -424,15 +506,15 @@ describe("expireGitSessionHistories", () => {
       },
     ]);
 
-    // ...but the stored document keeps the original coordinates so the loss
+    // ...but the stored document keeps the original coordinates (minus the
+    // per-row repository, which load always supplies) so the loss
     // never becomes durable through load itself.
     const raw = JSON.parse(await readFile(historyFile, "utf8"));
-    expect(raw.schemaVersion).toBe(2);
+    expect(raw.schemaVersion).toBe(3);
     expect(typeof raw.lastAccessedAt).toBe("string");
     expect(raw.checkpoints).toEqual([
       {
         kind: "git",
-        repository,
         beforeHash,
         afterHash,
         beforeRef: `${refPrefix}chk1/before`,
@@ -449,7 +531,12 @@ describe("expireGitSessionHistories", () => {
 
   it("removes a history JSON that coexists with its tombstone (residue cleanup)", async () => {
     const gitDir = await temporaryDirectory("git-residue-cleanup-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "residue-session";
     const hash = sessionHash(sessionId);
     const historyFile = historyPath(repository, sessionId);
@@ -487,9 +574,71 @@ describe("expireGitSessionHistories", () => {
     expect((await stat(tombstoneFile)).isFile()).toBe(true);
   });
 
+  it("keeps a tombstoned history JSON while its owner has a fresh heartbeat", async () => {
+    const gitDir = await temporaryDirectory("git-residue-live-");
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    const sessionId = "residue-live-session";
+    const hash = sessionHash(sessionId);
+    const historyFile = historyPath(repository, sessionId);
+    const dir = join(gitDir, "omp-undo-redo", "history");
+
+    await mkdir(dir, { recursive: true });
+    await writeFile(historyFile, JSON.stringify({ schemaVersion: 2, sessionHash: hash }));
+    await writeFile(join(dir, `.active.${hash}`), "");
+    await writeFile(
+      tombstonePath(repository, sessionId),
+      JSON.stringify({
+        expired: true,
+        sessionHash: hash,
+        expiredAt: new Date().toISOString(),
+        reason: "age",
+      }),
+    );
+
+    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+    await expireGitSessionHistories(repository, dummyGit, 30, new Set());
+
+    expect((await stat(historyFile)).isFile()).toBe(true);
+  });
+
+  it("first save leaves a heartbeat so a sweep cannot expire the new history", async () => {
+    const gitDir = await temporaryDirectory("git-save-heartbeat-");
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    const sessionId = "save-heartbeat-session";
+    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+    await new SessionHistoryStore(sessionId, repository, dummyGit).save({
+      checkpoints: [
+        {
+          kind: "session",
+          reason: "resumed_checkpoint_unavailable",
+          parentLeafId: null,
+          leafId: null,
+        },
+      ],
+      currentIndex: 0,
+    });
+    const marker = join(gitDir, "omp-undo-redo", "history", `.active.${sessionHash(sessionId)}`);
+    expect((await stat(marker)).isFile()).toBe(true);
+  });
+
   it("clears a superseded tombstone when the session saves again", async () => {
     const gitDir = await temporaryDirectory("git-tombstone-clear-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const sessionId = "revived-session";
     const hash = sessionHash(sessionId);
 
@@ -550,7 +699,12 @@ describe("expireGitSessionHistories", () => {
 
   it("prunes tombstones older than 2x retentionDays", async () => {
     const gitDir = await temporaryDirectory("git-prune-tombstone-");
-    const repository: GitRepository = { worktree: gitDir, gitDir, commonDir: gitDir };
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
     const historyDir = join(gitDir, "omp-undo-redo", "history");
     await mkdir(historyDir, { recursive: true });
 
@@ -566,5 +720,298 @@ describe("expireGitSessionHistories", () => {
     const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
     await expireGitSessionHistories(repository, dummyGit, 2, () => new Set());
     await expect(stat(tombFile)).rejects.toThrow();
+  });
+
+  describe("refs with no history JSON", () => {
+    const OLD = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+    const day = 24 * 60 * 60;
+
+    async function setup(prefix: string) {
+      const gitDir = await temporaryDirectory(prefix);
+      const repository: GitRepository = {
+        worktree: gitDir,
+        gitDir,
+        commonDir: gitDir,
+        storeDir: gitDir,
+      };
+      const deleted: string[] = [];
+      const run =
+        (refs: string[]): GitRunner =>
+        async (args, options) => {
+          if (args[0] === "for-each-ref") return { stdout: refs.join("\n"), stderr: "", code: 0 };
+          if (args[0] === "update-ref") deleted.push(options?.stdin ?? "");
+          return { stdout: "", stderr: "", code: 0 };
+        };
+      return { repository, deleted, run };
+    }
+
+    const line = (hash: string, ageDays: number) =>
+      `refs/omp-undo-redo/history/${hash}/c1/before\0${OLD}\0${Math.floor(Date.now() / 1000 - ageDays * day)} +0000`;
+
+    it("deletes refs whose newest commit is past retention, even with no history directory", async () => {
+      const { repository, deleted, run } = await setup("orphan-old-");
+      const hash = sessionHash("orphan");
+      const removed = await expireGitSessionHistories(
+        repository,
+        run([line(hash, 40), line(hash, 35)]),
+        30,
+        new Set(),
+      );
+      expect(removed).toBe(1);
+      expect(deleted.join("")).toContain(
+        `delete refs/omp-undo-redo/history/${hash}/c1/before ${OLD}`,
+      );
+    });
+
+    it("keeps a set with any recent ref, an unknown date, a live heartbeat or an active session", async () => {
+      const { repository, deleted, run } = await setup("orphan-keep-");
+      const recent = sessionHash("recent");
+      const undated = sessionHash("undated");
+      const beating = sessionHash("beating");
+      const active = sessionHash("active");
+      const historyDir = join(repository.storeDir, "omp-undo-redo", "history");
+      await mkdir(historyDir, { recursive: true });
+      await writeFile(join(historyDir, `.active.${beating}`), "");
+      const removed = await expireGitSessionHistories(
+        repository,
+        run([
+          line(recent, 40),
+          line(recent, 1),
+          `refs/omp-undo-redo/history/${undated}/c1/before\0${OLD}\0`,
+          line(beating, 40),
+          line(active, 40),
+        ]),
+        30,
+        new Set([active]),
+      );
+      expect(removed).toBe(0);
+      expect(deleted).toEqual([]);
+    });
+
+    it("leaves refs alone when a history JSON exists", async () => {
+      const { repository, deleted, run } = await setup("orphan-json-");
+      const hash = sessionHash("has-json");
+      const historyDir = join(repository.storeDir, "omp-undo-redo", "history");
+      await mkdir(historyDir, { recursive: true });
+      // Unparseable JSON with a fresh mtime: not yet expired, and its refs are not orphans.
+      await writeFile(join(historyDir, `${hash}.json`), "{");
+      await expireGitSessionHistories(repository, run([line(hash, 40)]), 30, new Set());
+      expect(deleted).toEqual([]);
+    });
+
+    it("deletes nothing when any listing entry is malformed, even for an otherwise old session", async () => {
+      const { repository, deleted, run } = await setup("orphan-malformed-");
+      const hash = sessionHash("malformed");
+      const prefix = `refs/omp-undo-redo/history/${hash}/c2/before`;
+      const date = `${Math.floor(Date.now() / 1000 - 40 * day)} +0000`;
+      for (const bad of [
+        `${prefix}`, // no object name field
+        `${prefix}\0\0${date}`, // empty object name
+        `${prefix}\0not-a-hash\0${date}`,
+        `${prefix}\0${OLD}\0${date}\0extra`,
+      ]) {
+        const removed = await expireGitSessionHistories(
+          repository,
+          run([line(hash, 40), bad]),
+          30,
+          new Set(),
+        );
+        expect(removed).toBe(0);
+      }
+      expect(deleted).toEqual([]);
+    });
+
+    it("works against real git: old snapshot commit swept, fresh one kept", async () => {
+      const gitDir = await temporaryDirectory("orphan-real-");
+      const repository: GitRepository = {
+        worktree: gitDir,
+        gitDir,
+        commonDir: gitDir,
+        storeDir: gitDir,
+      };
+      execFileSync("git", ["init", "--bare", "-q", gitDir]);
+      const git = createGitRunner(gitDir, { env: { GIT_DIR: gitDir } });
+      const commit = async (message: string, ageDays: number) => {
+        const date = `${Math.floor(Date.now() / 1000 - ageDays * day)} +0000`;
+        return execFileSync(
+          "git",
+          [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit-tree",
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "-m",
+            message,
+          ],
+          {
+            env: {
+              ...process.env,
+              GIT_DIR: gitDir,
+              GIT_COMMITTER_DATE: date,
+              GIT_AUTHOR_DATE: date,
+            },
+          },
+        )
+          .toString()
+          .trim();
+      };
+      const stale = sessionHash("real-stale");
+      const fresh = sessionHash("real-fresh");
+      await git([
+        "update-ref",
+        `refs/omp-undo-redo/history/${stale}/c1/before`,
+        await commit("s", 40),
+      ]);
+      await git([
+        "update-ref",
+        `refs/omp-undo-redo/history/${fresh}/c1/before`,
+        await commit("f", 1),
+      ]);
+
+      expect(await expireGitSessionHistories(repository, git, 30, new Set())).toBe(1);
+      const left = (await git(["for-each-ref", "--format=%(refname)"])).stdout;
+      expect(left).not.toContain(stale);
+      expect(left).toContain(fresh);
+    });
+  });
+});
+
+describe("SessionHistoryStore size bound and checkpoint shape", () => {
+  const entry = (id: string) => ({ id, parentId: null, type: "message" });
+  const reader = (ids: string[]) => ({
+    getLeafId: () => ids.at(-1) ?? null,
+    getBranch: () => [],
+    getEntry: (id: string) => (ids.includes(id) ? entry(id) : undefined),
+  });
+  const noGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+
+  async function setup(prefix: string, sessionId: string) {
+    const gitDir = await temporaryDirectory(prefix);
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    return { repository, hash: sessionHash(sessionId) };
+  }
+
+  it("saves git checkpoints without a repository and load supplies the live one", async () => {
+    const sessionId = "shape-session";
+    const { repository, hash } = await setup("git-shape-", sessionId);
+    const refPrefix = `refs/omp-undo-redo/history/${hash}/`;
+    const beforeHash = "a".repeat(40);
+    const afterHash = "b".repeat(40);
+    const git: GitRunner = async (args) => ({
+      stdout:
+        args[0] === "for-each-ref"
+          ? `${refPrefix}c/before\0${beforeHash}\n${refPrefix}c/after\0${afterHash}\n`
+          : "",
+      stderr: "",
+      code: 0,
+    });
+    const store = new SessionHistoryStore(sessionId, repository, git);
+    const checkpoint = {
+      kind: "git" as const,
+      repository,
+      beforeHash,
+      afterHash,
+      beforeRef: `${refPrefix}c/before`,
+      afterRef: `${refPrefix}c/after`,
+      parentLeafId: null,
+      leafId: "r",
+    };
+    await store.save({ checkpoints: [checkpoint], currentIndex: 0 });
+
+    const raw = JSON.parse(await readFile(historyPath(repository, sessionId), "utf8"));
+    expect(raw.checkpoints[0]).not.toHaveProperty("repository");
+    const loaded = await store.load(reader(["r"]));
+    expect(loaded).toEqual({
+      status: "loaded",
+      state: { checkpoints: [checkpoint], currentIndex: 0 },
+    });
+  });
+
+  it.each([-1, 0, 50, 99])(
+    "trims to the cap and keeps the current checkpoint loadable (currentIndex %i)",
+    async (currentIndex) => {
+      const sessionId = `cap-session-${currentIndex}`;
+      const { repository } = await setup("git-cap-", sessionId);
+      const store = new SessionHistoryStore(sessionId, repository, noGit);
+      // ~100 KB per row: only about 40 of the 100 fit under the 4 MiB cap.
+      const padding = "x".repeat(50_000);
+      const checkpoints = Array.from({ length: 100 }, (_, index) => ({
+        kind: "session" as const,
+        reason: "resumed_checkpoint_unavailable" as const,
+        parentLeafId: `p${index}-${padding}`,
+        leafId: `l${index}-${padding}`,
+      }));
+      await store.save({ checkpoints, currentIndex });
+
+      expect((await stat(historyPath(repository, sessionId))).size).toBeLessThanOrEqual(
+        4 * 1024 * 1024,
+      );
+      const loaded = await store.load(
+        reader(checkpoints.flatMap((checkpoint) => [checkpoint.parentLeafId, checkpoint.leafId])),
+      );
+      expect(loaded.status).toBe("loaded");
+      if (loaded.status !== "loaded") return;
+      const { checkpoints: kept, currentIndex: keptIndex } = loaded.state;
+      expect(kept.length).toBeLessThan(checkpoints.length);
+      // The kept rows are one contiguous run of the originals...
+      const offset = checkpoints.findIndex((checkpoint) => checkpoint.leafId === kept[0].leafId);
+      expect(kept).toEqual(checkpoints.slice(offset, offset + kept.length));
+      // ...whose index still names the same current checkpoint (or "all undone").
+      expect(offset + keptIndex).toBe(currentIndex);
+      if (currentIndex >= 0) expect(kept[keptIndex]).toEqual(checkpoints[currentIndex]);
+    },
+  );
+
+  it("does not adopt a legacy checkpoint recorded for another repository", async () => {
+    const sessionId = "legacy-foreign-session";
+    const { repository, hash } = await setup("git-legacy-foreign-", sessionId);
+    const refPrefix = `refs/omp-undo-redo/history/${hash}/`;
+    const beforeHash = "a".repeat(40);
+    const afterHash = "b".repeat(40);
+    const git: GitRunner = async (args) => ({
+      stdout:
+        args[0] === "for-each-ref"
+          ? `${refPrefix}c/before\0${beforeHash}\n${refPrefix}c/after\0${afterHash}\n`
+          : "",
+      stderr: "",
+      code: 0,
+    });
+    await mkdir(join(repository.storeDir, "omp-undo-redo", "history"), { recursive: true });
+    await writeFile(
+      historyPath(repository, sessionId),
+      JSON.stringify({
+        schemaVersion: 2,
+        sessionHash: hash,
+        repository,
+        checkpoints: [
+          {
+            kind: "git",
+            repository: { ...repository, worktree: join(repository.worktree, "other") },
+            beforeHash,
+            afterHash,
+            beforeRef: `${refPrefix}c/before`,
+            afterRef: `${refPrefix}c/after`,
+            parentLeafId: null,
+            leafId: "r",
+          },
+        ],
+        currentIndex: 0,
+      }),
+    );
+    const store = new SessionHistoryStore(sessionId, repository, git);
+    for (let pass = 0; pass < 2; pass++) {
+      const loaded = await store.load(reader(["r"]));
+      expect(loaded).toMatchObject({
+        status: "loaded",
+        state: { checkpoints: [{ kind: "session" }] },
+      });
+    }
   });
 });

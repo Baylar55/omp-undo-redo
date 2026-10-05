@@ -266,11 +266,14 @@ describe("bounded capture lifecycle", () => {
   function lateReadRunnerFactory(delayMs: number): {
     runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]>;
     adds: () => number;
+    seeds: () => number;
   } {
     let count = 0;
+    let seedCount = 0;
     const runner = (cwd: string, env?: Record<string, string>): GitRunner => {
       const inner = env ? createGitRunner(cwd, { env }) : createGitRunner(cwd);
       const slow: GitRunner = async (args, options) => {
+        if (args[0] === "read-tree") seedCount += 1;
         if (!args.includes("add")) return inner(args, options);
         await sleep(delayMs);
         const result = await inner(args, options);
@@ -280,7 +283,7 @@ describe("bounded capture lifecycle", () => {
       slow.cwd = cwd;
       return slow;
     };
-    return { runner, adds: () => count };
+    return { runner, adds: () => count, seeds: () => seedCount };
   }
 
   async function undoWhenSettled(pi: FakeExtensionApi, ctx: TestContext) {
@@ -327,7 +330,7 @@ describe("bounded capture lifecycle", () => {
 
   it("records a session-only turn when a tool call outwaits the before-snapshot", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-late-"));
-    const { runner } = lateReadRunnerFactory(1_000);
+    const { runner, adds, seeds } = lateReadRunnerFactory(1_000);
     try {
       const pi = new FakeExtensionApi();
       ompUndoRedo(pi as never, {
@@ -347,6 +350,18 @@ describe("bounded capture lifecycle", () => {
       expect(await undoWhenSettled(pi, ctx)).toContain("files were not restored");
       expect(ctx.leaf).toBe("leaf");
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("agent-edit\n");
+
+      // The late snapshot's ref is dropped but its warmed index is kept: the
+      // next turn reuses it instead of re-hashing the workspace from scratch.
+      const seeded = seeds();
+      expect(seeded).toBeGreaterThan(0);
+      await pi.emit("before_agent_start", ctx);
+      for (let attempt = 0; attempt < 50 && adds() < 2; attempt += 1) await sleep(100);
+      expect(adds()).toBe(2);
+      expect(seeds()).toBe(seeded);
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+      expect(await undoWhenSettled(pi, ctx)).toContain("file snapshot restored");
     } finally {
       await rmRetry(cwd);
     }
@@ -489,6 +504,129 @@ describe("bounded capture lifecycle", () => {
       await rmRetry(cwd);
     }
   });
+
+  it("returns from agent_end when the finalize overruns its deadline, still recording the turn", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-finalize-deadline-"));
+    const gate = Promise.withResolvers<void>();
+    const parked = Promise.withResolvers<void>();
+    let updateRefCount = 0;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        // The second update-ref is the after-snapshot: park the finalize there.
+        if (args[0] === "update-ref" && ++updateRefCount >= 2) {
+          parked.resolve();
+          await gate.promise;
+        }
+        return inner(args, options);
+      };
+      gated.cwd = workCwd;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: runner,
+        captureDeadlineMs: 5_000,
+        finalizeDeadlineMs: 200,
+      });
+      const ctx = context(cwd, "finalize-deadline-session");
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      const agentEnd = pi.emit("agent_end", ctx);
+      await parked.promise;
+      // Handler returns while the after-snapshot is still parked.
+      await agentEnd;
+
+      gate.resolve();
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+    } finally {
+      gate.resolve();
+      await rmRetry(cwd);
+    }
+  });
+
+  it.each(["session_start", "session_switch"] as const)(
+    "records a late-finalizing turn in its own session after the session switched (%s)",
+    async (switchEvent) => {
+      const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-switch-"));
+      const gate = Promise.withResolvers<void>();
+      const parked = Promise.withResolvers<void>();
+      const finalizeStarted = Promise.withResolvers<void>();
+      let released = false;
+      let updateRefCount = 0;
+      const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+        const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+        const gated: GitRunner = async (args, options) => {
+          // Only the after-snapshot's `add` (inside finalizeTurn) runs post-release.
+          if (released && args.includes("add")) finalizeStarted.resolve();
+          if (args[0] === "update-ref" && ++updateRefCount === 1) {
+            parked.resolve();
+            await gate.promise;
+          }
+          return inner(args, options);
+        };
+        gated.cwd = workCwd;
+        return gated;
+      };
+      try {
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
+        // One live manager whose id changes in place, as on /new.
+        const ctx = context(cwd, "switch-a");
+        let liveId = "switch-a";
+        ctx.sessionManager.getSessionId = () => liveId;
+        ctx.navigateTree = async (targetId) => {
+          ctx.leaf = targetId;
+          return { cancelled: false };
+        };
+        await pi.emit("session_start", ctx);
+        await writeFile(join(cwd, "tracked.txt"), "base\n");
+        // Park the before-snapshot so the turn's finalize is deferred past the
+        // capture deadline and starts only after the session switched.
+        await pi.emit("before_agent_start", ctx);
+        await parked.promise;
+        await writeFile(join(cwd, "tracked.txt"), "changed\n");
+        ctx.leaf = "turn";
+        await pi.emit("agent_end", ctx);
+
+        if (switchEvent === "session_switch") await pi.emit("session_before_switch", ctx);
+        liveId = "switch-b";
+        await pi.emit(switchEvent, ctx);
+        released = true;
+        gate.resolve();
+        // Hold the live id on B until finalizeTurn has begun under it.
+        await finalizeStarted.promise;
+
+        // Undo waits a bounded time on A's finalize; retry until it has settled.
+        liveId = "switch-a";
+        let message = "";
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+          await pi.runCommand("undo", ctx);
+          message = ctx.ui.notifications.at(-1)?.message ?? "";
+          if (!message.includes("still being finalized")) break;
+        }
+        expect(message).toMatch(/^Undid/);
+
+        // The turn belongs to A: B must hold no history (nothing to redo).
+        liveId = "switch-b";
+        await pi.runCommand("redo", ctx);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
+      } finally {
+        gate.resolve();
+        await rmRetry(cwd);
+      }
+    },
+  );
 
   it("reads the finalize guard after the idle wait when undo is issued mid-stream", async () => {
     // The host runs commands during streaming and stops waiting on an
