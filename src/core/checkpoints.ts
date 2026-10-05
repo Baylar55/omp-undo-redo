@@ -352,7 +352,16 @@ async function pruneIgnoredEntries(
   if (paths && baseTree) {
     const added = await invoke(
       git,
-      ["diff-index", "--cached", "--no-renames", "--diff-filter=A", "--name-only", "-z", baseTree, "--"],
+      [
+        "diff-index",
+        "--cached",
+        "--no-renames",
+        "--diff-filter=A",
+        "--name-only",
+        "-z",
+        baseTree,
+        "--",
+      ],
       { env },
     );
     if (added.code !== 0) return false;

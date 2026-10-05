@@ -603,7 +603,15 @@ describe("history-safe Git checkpoints", () => {
       await subGit(["init", "-q"]);
       await writeFile(join(sub, "f.txt"), "nested\n");
       await subGit(["add", "f.txt"]);
-      await subGit(["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "s"]);
+      await subGit([
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "s",
+      ]);
       const before1 = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
       const after1 = completedCheckpoint(await finishAfterTurn(snap, before1, null, null));
       expect(await text(snap, ["ls-tree", after1.afterHash, "sub"])).toMatch(/^160000 /);
