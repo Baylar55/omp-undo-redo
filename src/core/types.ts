@@ -101,7 +101,7 @@ export interface GitRepository {
    *  (`push --mirror`, `clone --mirror`, `bundle --all`, `log --all`) cannot
    *  export snapshot content. Private-Git: the private repo itself (equal to
    *  `gitDir`). Git mode: a bare store borrowing the user's objects through
-   *  `objects/info/alternates`. */
+   *  `GIT_ALTERNATE_OBJECT_DIRECTORIES` (no `objects/info/alternates` file). */
   storeDir: string;
 }
 

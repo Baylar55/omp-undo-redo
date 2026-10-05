@@ -117,7 +117,13 @@ export function storeEnv(repository: GitRepository): Record<string, string> {
  *  An unborn HEAD reaches nothing: every staged blob the store lacks is
  *  copied (the index is where an unborn repository's snapshot content can
  *  already exist). A clean worktree costs one `diff-tree`; objects the
- *  capture itself wrote are loose in the store and cost a `stat` each. */
+ *  capture itself wrote are loose in the store and cost a `stat` each.
+ *  ponytail: the store's own gc drops these copies again while the user's
+ *  repository still holds the object (prune deletes loose duplicates of any
+ *  pack, alternates' included; `repack -l` skips borrowed objects), so only
+ *  the user's normal gc grace periods protect them, not an aggressive prune.
+ *  Upgrade path: rebuild a `.keep` pack of `rev-list --objects-edge-aggressive
+ *  --all --not <HEAD>` before each store gc. */
 async function pinBorrowedObjects(
   git: GitRunner,
   repository: GitRepository,
