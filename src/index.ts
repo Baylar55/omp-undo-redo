@@ -438,11 +438,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return privateGcQueue;
   }
 
-  /** Best-effort `git gc` over a snapshot store. Runs outside the handler
-   *  deadline accounting (never awaited by a handler) so a slow gc can never
-   *  hit the host's timeout. The prune drops unreferenced objects: expiring
-   *  sessions would otherwise leave recoverable file content behind
-   *  indefinitely. */
+  /** Best-effort `git prune` + `git gc` over a snapshot store. Runs outside
+   *  the handler deadline accounting (never awaited by a handler) so a slow
+   *  gc can never hit the host's timeout. The prune drops unreferenced
+   *  objects: expiring sessions would otherwise leave recoverable file
+   *  content behind indefinitely. */
   async function runPrivateGc(repository: GitRepository): Promise<void> {
     try {
       // Run from a neutral cwd so a slow gc never holds a handle on either the
@@ -450,12 +450,18 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // cwd handle until it exits, which would race teardown rms and the
       // eviction sweep). GIT_DIR is set, so the repo operations work anywhere;
       // a Git store also needs the objects it borrows to walk its snapshots.
-      await gitRunnerFactory(tmpdir(), storeEnv(repository))(
-        ["gc", `--prune=${PRIVATE_SWEEP_PRUNE}`],
-        {
-          timeoutMs: PRIVATE_GC_TIMEOUT_MS,
-        },
-      );
+      const git = gitRunnerFactory(tmpdir(), storeEnv(repository));
+      // gc prunes only after its repack. A repack that outruns the ceiling
+      // (or dies with the terminal) is hard-killed on Windows, so its prune
+      // never runs: expired snapshots stay on disk and every attempt leaves a
+      // multi-GB `tmp_pack_*` behind (#101). The same prune run alone needs
+      // no repack, and also deletes `tmp_*` leftovers past the window.
+      const pruned = await git(["prune", `--expire=${PRIVATE_SWEEP_PRUNE}`], {
+        timeoutMs: PRIVATE_GC_TIMEOUT_MS,
+      });
+      // gc would rerun the same prune and fail the same way.
+      if (pruned.error) return;
+      await git(["gc", `--prune=${PRIVATE_SWEEP_PRUNE}`], { timeoutMs: PRIVATE_GC_TIMEOUT_MS });
     } catch {
       // Best-effort: a failed gc leaves more work for the next trigger.
     }

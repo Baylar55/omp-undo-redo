@@ -1,4 +1,15 @@
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -128,7 +139,7 @@ describe("private-repo housekeeping", () => {
         gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
           const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
           const wrapped: GitRunner = async (args, options) => {
-            if (args[0] === "gc") gcs.push({ args, gitDir: env?.GIT_DIR });
+            if (args[0] === "gc" || args[0] === "prune") gcs.push({ args, gitDir: env?.GIT_DIR });
             return inner(args, options);
           };
           wrapped.cwd = cwd2;
@@ -146,8 +157,9 @@ describe("private-repo housekeeping", () => {
       // Other stores under the shared root (earlier tests' repos) may be gc'd
       // by the retention sweep; the user's own repository never is.
       expect(gcs.some((gc) => gc.gitDir === gitDir)).toBe(false);
-      // Shared by every process in the repository: never `--prune=now`.
-      for (const gc of gcs) expect(gc.args).toContain("--prune=1.hour.ago");
+      // Shared by every process in the repository: never `--prune=now` (gc)
+      // or `--expire=now` (prune).
+      for (const gc of gcs) expect(gc.args.at(-1)).toMatch(/=1\.hour\.ago$/);
     } finally {
       await rmRetry(cwd);
     }
@@ -538,6 +550,70 @@ describe("private-repo housekeeping", () => {
         await pi.emit("session_shutdown", ctx);
       } finally {
         for (const workspace of workspaces) await rmRetry(workspace);
+      }
+    });
+  }, 60000);
+
+  it("reclaims a store whose gc never finishes", async () => {
+    // Regression (#101): gc prunes only after its repack, and a repack that
+    // outruns the ceiling is hard-killed. Every attempt then left a
+    // multi-GB tmp_pack_* behind (456 GB on one machine) and expired
+    // snapshots were never deleted.
+    await withHermeticStore(async (reposDir) => {
+      const dormant = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-killed-"));
+      const current = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-killed-current-"));
+      try {
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, env ? { env } : undefined),
+          dormant,
+          join(reposDir, ".."),
+        );
+        if (!repository) throw new Error("private repo init failed");
+        const git = createGitRunner(dormant, { env: { GIT_DIR: repository.gitDir } });
+        const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        const expired = (
+          await git(["hash-object", "-w", "--stdin"], { stdin: "SECRET=expired\n" })
+        ).stdout.trim();
+        const objects = join(repository.gitDir, "objects");
+        await utimes(join(objects, expired.slice(0, 2), expired.slice(2)), old, old);
+        const packDir = join(objects, "pack");
+        await mkdir(packDir, { recursive: true });
+        // Git creates temp packs read-only; on Windows that blocks a plain unlink.
+        const deadTemp = join(packDir, "tmp_pack_dead");
+        await writeFile(deadTemp, "x");
+        await chmod(deadTemp, 0o444);
+        await utimes(deadTemp, old, old);
+        // Another process's gc, still writing.
+        const liveTemp = join(packDir, "tmp_pack_live");
+        await writeFile(liveTemp, "x");
+        // A cruft-pack marker alone makes the sweep schedule this store's gc.
+        await writeFile(join(packDir, "pack-cruft.mtimes"), "");
+
+        let gcs = 0;
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {
+          gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
+            const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
+            const wrapped: GitRunner = async (args, options) => {
+              if (args[0] !== "gc") return inner(args, options);
+              gcs += 1;
+              return { stdout: "", stderr: "", code: 1, error: "timeout" };
+            };
+            wrapped.cwd = cwd2;
+            if (env) wrapped.env = env;
+            return wrapped;
+          },
+        });
+        const ctx = context(current, "gc-killed-session");
+        await pi.emit("session_start", ctx);
+        expect(await waitFor(async () => gcs > 0, 150)).toBe(true);
+        expect((await git(["cat-file", "-e", expired])).code).not.toBe(0);
+        await expect(stat(deadTemp)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(stat(liveTemp)).resolves.toBeDefined();
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(dormant);
+        await rmRetry(current);
       }
     });
   }, 60000);
