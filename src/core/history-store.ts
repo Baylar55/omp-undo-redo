@@ -297,10 +297,14 @@ async function existingRefs(
   }
 }
 
-export function reconstructSessionHistory(reader: SessionReader): NavigationState {
-  const branch = reader
-    .getBranch(reader.getLeafId() ?? undefined)
-    .filter((entry) => !isSessionExitEntry(entry));
+/** Rebuilds the branch ending at `leafId` (null: the empty session). */
+export function reconstructSessionHistory(
+  reader: SessionReader,
+  leafId: string | null = reader.getLeafId(),
+): NavigationState {
+  const branch = (leafId === null ? [] : reader.getBranch(leafId)).filter(
+    (entry) => !isSessionExitEntry(entry),
+  );
   const checkpoints: TurnCheckpoint[] = [];
   for (let index = 0; index < branch.length; index++) {
     const entry = branch[index];

@@ -811,9 +811,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     ctx.ui.notify(NOTIFICATION_MESSAGES[reason], "warning");
   }
 
+  /** `historyLeafId` bounds the history rebuilt when no stored one loads: a
+   *  finalize passes its turn-start leaf, or the turn it is about to record
+   *  would be rebuilt from the branch and then recorded a second time. */
   async function initializeNavigation(
     ctx: AnyContext,
     replaceExisting: boolean,
+    historyLeafId: string | null = ctx.sessionManager.getLeafId(),
   ): Promise<SessionNavigation> {
     const sessionId = ctx.sessionManager.getSessionId();
     const sessionHash = checkpointNamespace(sessionId);
@@ -877,7 +881,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       } else {
         restored = null;
       }
-      navigation.restoreState(restored ?? reconstructSessionHistory(ctx.sessionManager));
+      navigation.restoreState(
+        restored ?? reconstructSessionHistory(ctx.sessionManager, historyLeafId),
+      );
       await runtimeStore.initializeSession(
         sessionId,
         navigation.snapshot(),
@@ -894,9 +900,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     }
   }
 
-  async function ensureNavigation(ctx: AnyContext): Promise<SessionNavigation | null> {
+  async function ensureNavigation(
+    ctx: AnyContext,
+    historyLeafId?: string | null,
+  ): Promise<SessionNavigation | null> {
     if (closing) return null;
-    return initializeNavigation(ctx, false);
+    return initializeNavigation(ctx, false, historyLeafId);
   }
 
   function track(operation: () => Promise<void>): Promise<void> {
@@ -1089,24 +1098,31 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       pendingNavigationSourceSessionId = typed.sessionManager.getSessionId();
     });
 
-  const invalidateNavigationSourceRedo = (_event: unknown, ctx: unknown) =>
+  // The host emits no `session_start` for the session it switched to, so its
+  // navigation is built here, before any turn: built lazily by that turn's
+  // finalize, it would rebuild a branch that already holds the turn.
+  const adoptSwitchedSession = (_event: unknown, ctx: unknown) =>
     track(async () => {
       if (closing) return;
+      const typed = ctx as AnyContext;
       const sourceSessionId = pendingNavigationSourceSessionId;
       pendingNavigationSourceSessionId = null;
       if (sourceSessionId) {
         await navigations.get(sourceSessionId)?.invalidateRedo();
         // Detached: the switch must not wait out the source's deferred finalize.
-        void track(() => releaseLeftSession(ctx as AnyContext, sourceSessionId));
+        void track(() => releaseLeftSession(typed, sourceSessionId));
       } else {
         await invalidateAllRedo();
       }
+      // Keeps a live navigation (same-id reload, or a resume racing the
+      // release above); otherwise loads the stored history.
+      await ensureNavigation(typed);
     });
 
   pi.on("session_before_switch", rememberNavigationSource);
-  pi.on("session_switch", invalidateNavigationSourceRedo);
+  pi.on("session_switch", adoptSwitchedSession);
   pi.on("session_before_branch", rememberNavigationSource);
-  pi.on("session_branch", invalidateNavigationSourceRedo);
+  pi.on("session_branch", adoptSwitchedSession);
 
   pi.on("before_agent_start", (_event, ctx) =>
     track(async () => {
@@ -1264,12 +1280,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   async function resolveNavigation(
     typed: AnyContext,
     sessionId: string,
+    turnStartLeaf: string | null,
   ): Promise<SessionNavigation | null> {
     const known = navigations.get(sessionId) ?? (await initializations.get(sessionId));
     if (known) return known;
     if (typed.sessionManager.getSessionId() !== sessionId) return null;
     const nav =
-      (await ensureNavigation(typed)) ??
+      (await ensureNavigation(typed, turnStartLeaf)) ??
       createNavigation(
         typed,
         sessionId,
@@ -1339,7 +1356,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         // edits when an older restore crosses this gap.
         if (turnSequenceBySession.get(sessionId) !== turnSequence) {
           await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
-          const gapped = await resolveNavigation(typed, sessionId);
+          const gapped = await resolveNavigation(typed, sessionId, before.parentLeafId);
           await gapped?.recordTurnEnd({
             kind: "session",
             reason: "file_history_gap",
@@ -1348,7 +1365,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           });
           return;
         }
-        const nav = await resolveNavigation(typed, sessionId);
+        const nav = await resolveNavigation(typed, sessionId, before.parentLeafId);
         if (!nav) {
           await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
           return;
@@ -1368,7 +1385,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         leafId: leafId,
       };
     }
-    const nav = await resolveNavigation(typed, sessionId);
+    const nav = await resolveNavigation(typed, sessionId, before.parentLeafId);
     await nav?.recordTurnEnd(completed);
   }
 

@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **The first turn after `/new`, `/resume`, fork or handoff was recorded twice.** OMP emits no `session_start` for the session it switches to, so that session had no navigation until its first turn's finalize built one, and a session without a loadable history file (new, forked, session-only, or expired) rebuilt it from the branch, which already held that turn, before recording the turn again. The second `/undo` was then an empty step, and a `/redo` after it moved the conversation to the turn's end while its files stayed at the before-turn state. `session_switch` and `session_branch` now build the navigation of the session switched to, before any turn, and a navigation that a finalize still has to build rebuilds the branch only up to the turn's start. This also fixes a `/tree` move ignored after `/resume`: redo entries stored by an earlier process survived it, so a later `/redo` jumped back and restored that turn's files.
+
 ## [1.6.5] - 2026-10-05
 
 ### Fixed
