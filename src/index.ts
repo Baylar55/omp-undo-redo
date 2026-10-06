@@ -26,7 +26,7 @@ import {
   checkpointNamespace,
   finishAfterTurn,
   prepareBeforeTurn,
-  releaseAllPersistentSnapshotIndices,
+  releasePersistentSnapshotIndices,
   releaseCheckpoint,
   releasePendingCheckpoint,
   resolveRepository,
@@ -64,6 +64,8 @@ type AnyContext = {
   ui?: {
     notify(message: string, level: string): void;
   };
+  /** Absent on hosts older than OMP's agent identity: read as the main agent. */
+  agent?: { kind: "main" | "sub" };
 };
 
 function readRetentionDays(): number {
@@ -361,8 +363,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     resolveHostIdentity: resolvePersistentHostId,
     resolveRuntimeScope,
   });
+  /** Joined on the first navigation, not at load: a subagent's copy never
+   *  builds one, so it never holds the process's runtime directory. */
   const runtimeStore = new RuntimeActionStateStore();
-  const runtimeReady = runtimeStore.initialize();
   const navigations = new Map<string, SessionNavigation>();
   const backends = new Map<string, FileBackend>();
   /** Checkpoints of the CURRENT turn that no finalize owns yet. Anything left
@@ -423,10 +426,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  loses nothing. */
   const PRIVATE_SWEEP_PRUNE = "1.hour.ago";
 
-  /** Tail of the process-wide gc queue. Every trigger (retention sweep,
-   *  capture threshold, shutdown) routes through `schedulePrivateGc`, so at
-   *  most one repack runs at a time: a boot sweep over many expired stores
-   *  would otherwise start one full `git gc` per store at once. Never
+  /** Tail of this extension copy's gc queue. Every trigger (retention sweep,
+   *  capture threshold, shutdown) routes through `schedulePrivateGc`, so a
+   *  copy runs at most one repack at a time: a boot sweep over many expired
+   *  stores would otherwise start one full `git gc` per store at once. Not
+   *  process-wide: OMP binds a copy per in-process session, but subagent
+   *  copies never capture or expire (`servesMainSession`), so only main
+   *  sessions' copies (one, or one per ACP session) feed a queue. Never
    *  rejects (`runPrivateGc` swallows every failure), so one bad store
    *  cannot stall the queue. */
   let privateGcQueue: Promise<void> = Promise.resolve();
@@ -506,6 +512,46 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const pendingCaptures = new Map<string, PendingCapture>();
   const pendingFinalizations = new Map<string, Promise<void>>();
   const activeOperations = new Set<Promise<void>>();
+  /** Sessions this copy captured for, i.e. whose index leases it owns. */
+  const leaseSessionIds = new Set<string>();
+  /** OMP binds a separate copy of this extension to every in-process subagent
+   *  session (`ctx.agent.kind === "sub"`). Nobody can `/undo` a subagent, so
+   *  its copy captures nothing, keeps no history, waits on no tool call,
+   *  refuses `/undo`/`/redo` (a subagent prompt starting with one runs it),
+   *  and leaves boot and shutdown housekeeping to the main session's copy.
+   *  Hosts without `ctx.agent` read as main. */
+  let servesMainSession = false;
+  let servesSubagent = false;
+  function isMainSession(ctx: AnyContext): boolean {
+    if (ctx.agent?.kind === "sub") {
+      servesSubagent = true;
+      return false;
+    }
+    servesMainSession = true;
+    void startBootHousekeeping();
+    return true;
+  }
+
+  /** Boot housekeeping (eviction, legacy cleanup, orphaned temp indexes)
+   *  starts with the copy's first main-session event instead of at load, so
+   *  a subagent's copy skips it: the main session's copy already ran it.
+   *  ponytail: a copy that sees no session event within
+   *  BOOT_HOUSEKEEPING_FALLBACK_MS runs it anyway; a subagent whose first
+   *  event arrives later than that sweeps once more, which is harmless (a
+   *  sweep racing another one finds the store already renamed and skips it). */
+  const BOOT_HOUSEKEEPING_FALLBACK_MS = 2_000;
+  let bootEviction: Promise<void> | null = null;
+  function startBootHousekeeping(): Promise<void> {
+    if (bootEviction) return bootEviction;
+    bootEviction = evictStalePrivateRepos().catch(() => undefined);
+    void cleanLegacyGitIndexes().catch(() => undefined);
+    const t = setTimeout(() => {
+      void sweepOrphanTempIndexes().catch(() => undefined);
+      void purgeLegacyBlobStore().catch(() => undefined);
+    }, 2_000);
+    t.unref?.();
+    return bootEviction;
+  }
 
   /** How long a snapshot repo must sit untouched before its workspace's
    *  disappearance counts as abandonment rather than a transient mount or
@@ -829,7 +875,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (active) return active;
     }
     const initialization = (async () => {
-      await runtimeReady;
+      await runtimeStore.initialize();
       const previous = navigations.get(sessionId);
       navigations.delete(sessionId);
       if (previous) await previous.suspend();
@@ -842,7 +888,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (backend.kind === "git") void expireRepository(backend.repository, backend.git);
       // After boot eviction, which it would otherwise race (a gc holds
       // handles through eviction's rename and refreshes the idle mtimes).
-      privateRetentionSweep ??= bootEviction
+      privateRetentionSweep ??= startBootHousekeeping()
         .then(() => (closing ? undefined : track(sweepPrivateRepoRetention)))
         .catch(() => undefined);
 
@@ -1063,6 +1109,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     track(async () => {
       if (closing) return;
       const typed = ctx as unknown as AnyContext;
+      if (!isMainSession(typed)) return;
       const sessionId = typed.sessionManager.getSessionId();
       const previousPending = pending.get(sessionId);
       pending.delete(sessionId);
@@ -1105,6 +1152,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     track(async () => {
       if (closing) return;
       const typed = ctx as AnyContext;
+      if (!isMainSession(typed)) return;
       const sourceSessionId = pendingNavigationSourceSessionId;
       pendingNavigationSourceSessionId = null;
       if (sourceSessionId) {
@@ -1128,6 +1176,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     track(async () => {
       if (closing) return;
       const typed = ctx as unknown as AnyContext;
+      if (!isMainSession(typed)) return;
       const sessionId = typed.sessionManager.getSessionId();
       const oldPending = pending.get(sessionId);
       pending.delete(sessionId);
@@ -1160,6 +1209,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (backend.kind === "session") {
         notifySessionOnly(typed, sessionId, backend.reason);
       }
+      if (backend.kind === "git") leaseSessionIds.add(sessionId);
       const gate = { complete: Promise.resolve(), late: false };
       const capture = beginCapture(sessionId, async () => {
         const prepared =
@@ -1436,9 +1486,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // Any capture still running now self-releases on completion (closing is
       // set), and its temporary index is reclaimed by git or the OS.
       await timedOutAfter(Promise.allSettled([...activeOperations]), 5_000);
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices(leaseSessionIds);
       await drainState();
       await ownerRegistry.shutdown();
+      await runtimeStore.shutdown();
       // Store housekeeping on the way out: evict stores whose workspaces
       // vanished, then gc stores that crossed the capture
       // threshold. Runs detached so an overrunning sweep cannot delay
@@ -1446,7 +1497,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // both hold handles through the rename and bump mtimes past the idle
       // cutoff, so every gc waits for eviction to finish first and skips
       // repos it renamed away. Whatever is unfinished when the process
-      // exits is covered by the next boot sweep.
+      // exits is covered by the next boot sweep. A subagent's copy leaves
+      // it to the main session's copy.
+      if (!servesMainSession) return;
       void evictStalePrivateRepos()
         .catch(() => undefined)
         .then(() =>
@@ -1466,7 +1519,6 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
             }),
           ),
         );
-      await runtimeStore.shutdown();
     })();
     return shutdownPromise;
   });
@@ -1474,6 +1526,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const makeHandler = (id: ActionId) => async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
     const typed = ctx as unknown as AnyContext;
+    if (!isMainSession(typed)) {
+      ctx.ui.notify(`/${id} is unavailable in a subagent session.`, "warning");
+      return;
+    }
     const sessionId = typed.sessionManager.getSessionId();
     // Commands run even mid-stream: the turn's finalize only registers at
     // agent_end, so the guards below must be read after the idle wait.
@@ -1516,14 +1572,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     handler: makeHandler("redo"),
   });
 
-  // Boot-time housekeeping (all fire-and-forget, unref'd — 0ms handler latency)
-  const bootEviction = evictStalePrivateRepos().catch(() => undefined);
-  void cleanLegacyGitIndexes().catch(() => undefined);
-  {
-    const t = setTimeout(() => {
-      void sweepOrphanTempIndexes().catch(() => undefined);
-      void purgeLegacyBlobStore().catch(() => undefined);
-    }, 2_000);
-    t.unref?.();
-  }
+  const bootFallback = setTimeout(() => {
+    if (!servesSubagent && !closing) void startBootHousekeeping();
+  }, BOOT_HOUSEKEEPING_FALLBACK_MS);
+  bootFallback.unref?.();
 }

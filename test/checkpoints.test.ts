@@ -22,7 +22,7 @@ import {
   checkpointNamespace,
   finishAfterTurn,
   prepareBeforeTurn,
-  releaseAllPersistentSnapshotIndices,
+  releasePersistentSnapshotIndices,
   releaseCheckpoint,
   releaseRefs,
   releasePendingCheckpoint,
@@ -459,7 +459,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
       await releaseCheckpoint(snap, checkpoint);
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices(["unignore-turn"]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -513,7 +513,7 @@ describe("history-safe Git checkpoints", () => {
       if (freshLeaseDirectory) await expect(stat(freshLeaseDirectory)).rejects.toThrow();
       await releaseCheckpoint(snap, after);
       // Clean up the persisted lease from this test's session.
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices(["normalized-index", "fresh-ground-truth"]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -588,7 +588,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId, "born-ground-truth"]);
     }
   });
 
@@ -633,7 +633,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId, "stale-gitlink-truth"]);
     }
   });
 
@@ -681,7 +681,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after3);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId]);
     }
   });
 
@@ -725,7 +725,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId]);
     }
   });
 
@@ -757,7 +757,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId]);
     }
   });
 
@@ -1316,7 +1316,7 @@ describe("history-safe Git checkpoints", () => {
       expect((await git(["rev-parse", "HEAD"])).code).not.toBe(0);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices(["unborn"]);
     }
   });
 
@@ -1348,7 +1348,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId]);
     }
   });
 
@@ -1394,7 +1394,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId, "unborn-ground-truth"]);
     }
   });
 

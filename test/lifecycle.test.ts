@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { checkpointNamespace } from "../src/core/checkpoints.js";
+import { createGitRunner } from "../src/core/git-runner.js";
 import { runtimeRootDirectory } from "../src/core/runtime-action-state-store.js";
+import type { GitRunner } from "../src/core/types.js";
 import ompUndoRedo from "../src/index.js";
 import {
   context,
@@ -1181,6 +1183,72 @@ describe("extension lifecycle cleanup", () => {
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
         "Redid the session turn, but files were not restored because Git was unavailable when the checkpoint was created.",
       );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  // OMP binds a separate copy of the extension to every in-process subagent
+  // session; the copies share this process (and, on Windows, module state).
+  it("keeps the main session's pooled index when a subagent's copy shuts down", async () => {
+    const cwd = await makeRepository();
+    const commands: string[][] = [];
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: (dir, env) => {
+          const inner = env ? createGitRunner(dir, { env }) : createGitRunner(dir);
+          const runner: GitRunner = async (args, options) => {
+            commands.push(args);
+            return inner(args, options);
+          };
+          runner.cwd = dir;
+          if (env) runner.env = env;
+          return runner;
+        },
+      });
+      const ctx = context(cwd, "main-session");
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "first\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      const subagent = new FakeExtensionApi();
+      ompUndoRedo(subagent as never);
+      await subagent.emit("session_shutdown", context(cwd, "subagent-session"));
+
+      commands.length = 0;
+      await pi.emit("before_agent_start", ctx);
+      // Reused index: no `read-tree` reseed, so no full worktree re-hash.
+      expect(commands.some((args) => args[0] === "read-tree")).toBe(false);
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("captures nothing for a subagent session and refuses its /undo", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = Object.assign(context(cwd, "subagent-only-session"), {
+        agent: { kind: "sub" as const },
+      });
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toEqual([]);
+      // A subagent prompt that starts with `/undo` runs the command.
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("turn");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "/undo is unavailable in a subagent session.",
+      );
+      await pi.emit("session_shutdown", ctx);
     } finally {
       await rmRetry(cwd);
     }

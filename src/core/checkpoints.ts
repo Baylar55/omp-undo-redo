@@ -52,10 +52,19 @@ function persistentIndexKey(repository: GitRepository, sessionId: string): strin
   return `${repository.worktree}\u0000${checkpointNamespace(sessionId)}`;
 }
 
-export async function releaseAllPersistentSnapshotIndices(): Promise<void> {
-  const leases = [...persistentSnapshotIndices.values(), ...leasesInUse.keys()];
-  persistentSnapshotIndices.clear();
-  leasesInUse.clear();
+/** Releases the leases, idle or checked out, of `sessionIds` only. OMP binds a
+ *  separate copy of the extension to every in-process subagent session, and
+ *  those copies can share this module's state: one copy must never release
+ *  another's leases, which are keyed by session. */
+export async function releasePersistentSnapshotIndices(
+  sessionIds: Iterable<string>,
+): Promise<void> {
+  const suffixes = [...sessionIds].map((sessionId) => `\u0000${checkpointNamespace(sessionId)}`);
+  const owned = (key: string): boolean => suffixes.some((suffix) => key.endsWith(suffix));
+  const leases = [
+    ...[...persistentSnapshotIndices].filter(([key]) => owned(key)).map(([, lease]) => lease),
+    ...[...leasesInUse].filter(([, key]) => owned(key)).map(([lease]) => lease),
+  ];
   await Promise.all(leases.map((lease) => releaseSnapshotIndexLease(lease)));
 }
 

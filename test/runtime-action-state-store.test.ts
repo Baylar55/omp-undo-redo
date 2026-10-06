@@ -1,10 +1,37 @@
+import type * as Fs from "node:fs/promises";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { checkpointNamespace } from "../src/core/checkpoints.js";
 import { RuntimeActionStateStore } from "../src/core/runtime-action-state-store.js";
 import type { NavigationState } from "../src/core/types.js";
+
+/** While `hold` is set, `rm` signals `entered` and waits for `hold`, and
+ *  `mkdir` calls are counted in `mkdirsWhileHeld`. */
+const rmGate = vi.hoisted(() => ({
+  hold: undefined as Promise<void> | undefined,
+  entered: undefined as (() => void) | undefined,
+  mkdirsWhileHeld: 0,
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof Fs>();
+  return {
+    ...actual,
+    rm: async (...args: Parameters<typeof actual.rm>) => {
+      if (rmGate.hold) {
+        const hold = rmGate.hold;
+        rmGate.entered?.();
+        await hold;
+      }
+      return actual.rm(...args);
+    },
+    mkdir: (...args: Parameters<typeof actual.mkdir>) => {
+      if (rmGate.hold) rmGate.mkdirsWhileHeld += 1;
+      return actual.mkdir(...args);
+    },
+  };
+});
 
 const roots: string[] = [];
 
@@ -45,6 +72,7 @@ function state(currentIndex: number): NavigationState {
 }
 
 afterEach(async () => {
+  Object.assign(rmGate, { hold: undefined, entered: undefined, mkdirsWhileHeld: 0 });
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -183,6 +211,61 @@ describe("runtime action-state store", () => {
     await expect(access(join(root, "107"))).rejects.toThrow();
     await expect(access(join(root, "108", "runtime.json"))).resolves.toBeUndefined();
     await second.shutdown();
+  });
+
+  it("shares one PID directory between the extension copies of a process", async () => {
+    const root = await makeRoot();
+    const main = new RuntimeActionStateStore({ rootDirectory: root, pid: 110, runtimeId: "main" });
+    const subagent = new RuntimeActionStateStore({
+      rootDirectory: root,
+      pid: 110,
+      runtimeId: "subagent",
+    });
+    await main.publishNavigation("main-session", state(0), "turn");
+    await subagent.publishNavigation("subagent-session", state(0), "turn");
+    expect((await readState(subagent, "subagent-session")).runtimeId).toBe("main");
+    await subagent.shutdown();
+
+    await main.publishNavigation("main-session", state(1), "turn-2");
+    expect((await readState(main, "main-session")).activeSessionLeaf).toBe("turn-2");
+    await expect(access(subagent.sessionPath("subagent-session"))).rejects.toThrow();
+    expect(await readFile(join(root, "110", "runtime.json"), "utf8")).toContain('"main"');
+
+    await main.shutdown();
+    await expect(access(join(root, "110"))).rejects.toThrow();
+  });
+
+  it("keeps the directory of a copy that joins while the last one leaves", async () => {
+    const root = await makeRoot();
+    const leaving = new RuntimeActionStateStore({
+      rootDirectory: root,
+      pid: 111,
+      runtimeId: "leaving",
+    });
+    const joining = new RuntimeActionStateStore({
+      rootDirectory: root,
+      pid: 111,
+      runtimeId: "joining",
+    });
+    await leaving.publishNavigation("old", state(0), "turn");
+    const entered = Promise.withResolvers<void>();
+    const held = Promise.withResolvers<void>();
+    rmGate.entered = entered.resolve;
+    rmGate.hold = held.promise;
+    const left = leaving.shutdown();
+    // The leaver has dropped out and its directory removal is in flight.
+    await entered.promise;
+    rmGate.entered = undefined;
+    const joined = joining.publishNavigation("new", state(0), "turn");
+    // The joiner must not touch the directory before that removal finishes.
+    expect(rmGate.mkdirsWhileHeld).toBe(0);
+    rmGate.hold = undefined;
+    held.resolve();
+    await Promise.all([left, joined]);
+
+    expect((await readState(joining, "new")).runtimeId).toBe("joining");
+    expect(await readFile(join(root, "111", "runtime.json"), "utf8")).toContain('"joining"');
+    await joining.shutdown();
   });
 
   it("swallows filesystem failures", async () => {

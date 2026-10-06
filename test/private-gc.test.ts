@@ -332,6 +332,44 @@ describe("private-repo housekeeping", () => {
     });
   });
 
+  it("leaves boot eviction to the main session's copy, not a subagent's", async () => {
+    await withHermeticStore(async (reposDir) => {
+      const worktreeParent = await mkdtemp(join(tmpdir(), "omp-undo-redo-subagent-boot-ws-"));
+      try {
+        const repoEntry = `${"e".repeat(64)}.git`;
+        const gitDir = join(reposDir, repoEntry);
+        await mkdir(gitDir, { recursive: true });
+        await createGitRunner(reposDir)([
+          "config",
+          "--file",
+          join(gitDir, "config"),
+          "core.worktree",
+          join(worktreeParent, "project"),
+        ]);
+        await backdateRepo(gitDir);
+        const evicted = async (): Promise<boolean> =>
+          !(await readdir(reposDir)).includes(repoEntry);
+
+        const subagent = new FakeExtensionApi();
+        ompUndoRedo(subagent as never, {});
+        await subagent.emit(
+          "session_start",
+          Object.assign(context(worktreeParent, "boot-subagent"), {
+            agent: { kind: "sub" as const },
+          }),
+        );
+        // Past the boot fallback, by which an unidentified copy has swept.
+        // Real time: the fallback is a real timer and the sweep runs git.
+        expect(await waitFor(evicted, 30)).toBe(false);
+
+        ompUndoRedo(new FakeExtensionApi() as never, {});
+        expect(await waitFor(evicted)).toBe(true);
+      } finally {
+        await rm(worktreeParent, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+  });
+
   it("keeps a repo whose live workspace path git quotes in config", async () => {
     // Regression: git writes `worktree = "C:\\…\\C# proj"` for values with
     // `#`/`;`; a raw regex kept quotes and escapes, stat hit ENOENT, and an
