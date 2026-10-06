@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, readlink, rename, rm, stat } from "node:fs/promises";
 import { hostname as systemHostname, homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
-import { deleteRefsBatched, parseRefLines, type RefSpec } from "./git-refs.js";
+import { deleteRefsBatched, markGcPending, parseRefLines, type RefSpec } from "./git-refs.js";
 import type { GitRepository, GitRunner, GitCommandResult, OwnershipMode } from "./types.js";
 
 const CHECKPOINT_OWNER_REF_ROOT = "refs/omp-undo-redo/v2";
@@ -344,6 +344,7 @@ async function cleanupStaleOwner(
 ): Promise<void> {
   const first = await enumerateOwnerRefs(git, repository, ownerId, timeoutMs);
   if (!first.ok) return;
+  if (first.refs.length > 0) await markGcPending(repository.storeDir);
   const deletion = await deleteRefsBatched(git, first.refs, {
     env: { GIT_DIR: repository.storeDir },
     timeoutMs,

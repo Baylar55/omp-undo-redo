@@ -20,6 +20,7 @@ import {
   setupFinished,
   storeRootDirectory,
 } from "./core/private-repo.js";
+import { gcPendingPath } from "./core/git-refs.js";
 import { migrateLegacySnapshots } from "./core/legacy-snapshot-migration.js";
 import { SessionNavigation } from "./core/session-navigation.js";
 import {
@@ -450,7 +451,19 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  objects: expiring sessions would otherwise leave recoverable file
    *  content behind indefinitely. */
   async function runPrivateGc(repository: GitRepository): Promise<void> {
+    // Claimed before gc reads the refs: a deletion during this gc marks the
+    // store anew, and only a gc that finished drops the claim, so one cut
+    // short by a failure, its ceiling or the process exit leaves it for the
+    // next boot's sweep (`storeNeedsGc`). An existing claim (a killed gc, or
+    // another process's gc still running) is never overwritten: that gc may
+    // drop it after missing this mark's deletion, so the mark stays and costs
+    // at most one extra gc.
+    const mark = gcPendingPath(repository.storeDir);
+    const claim = `${mark}.running`;
     try {
+      if (!(await stat(claim).catch(() => null))) {
+        await rename(mark, claim).catch(() => undefined);
+      }
       // Run from a neutral cwd so a slow gc never holds a handle on either the
       // user's workspace or the snapshot repo itself (Windows keeps a child's
       // cwd handle until it exits, which would race teardown rms and the
@@ -467,7 +480,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       });
       // gc would rerun the same prune and fail the same way.
       if (pruned.error) return;
-      await git(["gc", `--prune=${PRIVATE_SWEEP_PRUNE}`], { timeoutMs: PRIVATE_GC_TIMEOUT_MS });
+      const gc = await git(["gc", `--prune=${PRIVATE_SWEEP_PRUNE}`], {
+        timeoutMs: PRIVATE_GC_TIMEOUT_MS,
+      });
+      if (gc.code === 0 && !gc.error) await rm(claim, { force: true });
     } catch {
       // Best-effort: a failed gc leaves more work for the next trigger.
     }
@@ -643,6 +659,34 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     }
   }
 
+  /** Whether a store holds garbage only a gc reclaims. Packed objects a
+   *  deleted ref orphaned outlive `git prune`, and every in-process trigger
+   *  (capture threshold, shutdown, expiry) dies with the process, so the
+   *  sweep checks durable evidence instead: a deletion's `gc-pending` mark,
+   *  the claim of a gc that never finished, a cruft pack (`.mtimes`: objects
+   *  an earlier gc kept inside its prune window), or objects no ref can reach
+   *  at all (stores orphaned before the mark existed). */
+  async function storeNeedsGc(storeDir: string): Promise<boolean> {
+    const mark = gcPendingPath(storeDir);
+    for (const path of [mark, `${mark}.running`]) {
+      if (
+        await stat(path).then(
+          () => true,
+          () => false,
+        )
+      )
+        return true;
+    }
+    const objects = join(storeDir, "objects");
+    const packs = await readdir(join(objects, "pack")).catch(() => [] as string[]);
+    if (packs.some((name) => name.endsWith(".mtimes"))) return true;
+    // Unreadable refs read as "has refs": never gc on a guess.
+    if (await storeHasRefs(storeDir).catch(() => true)) return false;
+    if (packs.some((name) => name.endsWith(".pack"))) return true;
+    const fanouts = await readdir(objects).catch(() => [] as string[]);
+    return fanouts.some((name) => /^[0-9a-f]{2}$/.test(name));
+  }
+
   /** Removes snapshot stores whose workspace (Private-Git) or repository (Git
    *  mode) no longer exists. Runs at boot and on shutdown so vanished
    *  workspaces cannot leave their snapshots (and the file contents inside
@@ -763,9 +807,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
   /** Expires dormant histories in `repository`, once per process. Deleting
    *  refs alone leaves the snapshots' plaintext file contents on disk, so the
-   *  store then gets a background gc. A cruft pack (`.mtimes`) holds objects
-   *  an earlier sweep gc kept inside its prune window; it triggers a gc too,
-   *  else they would outlive retention until some later expiry. */
+   *  store then gets a background gc; so does a store `storeNeedsGc` finds
+   *  garbage in, else a gc an earlier process never ran or finished would
+   *  never be retried. */
   function expireRepository(repository: GitRepository, git: GitRunner): Promise<void> {
     const key = `git:${repository.storeDir}`;
     const existing = expirationPromises.get(key);
@@ -775,10 +819,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         activeSessionHashes(),
       );
       if (closing) return;
-      if (refsRemoved === 0) {
-        const packs = await readdir(join(repository.storeDir, "objects", "pack")).catch(() => []);
-        if (!packs.some((name) => name.endsWith(".mtimes"))) return;
-      }
+      if (refsRemoved === 0 && !(await storeNeedsGc(repository.storeDir))) return;
       // Detached from the expiration promise: shutdown awaits expirations,
       // and must not wait out a gc.
       void track(() => schedulePrivateGc(repository));
@@ -792,9 +833,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  (`.env`, keys) forever. Started by the first session initialization,
    *  once that session is registered active, so the session being resumed
    *  is protected exactly as in the per-repo path. Expiry needs only the
-   *  store; a Git store's `commonDir` supplies the objects its gc reads. */
+   *  store; a Git store's `commonDir` supplies the objects its gc reads.
+   *  Runs with retention off too: expiry then deletes nothing, but pending
+   *  gcs are still retried. */
   async function sweepPrivateRepoRetention(): Promise<void> {
-    if (retentionDays <= 0) return;
     const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
     const entries = await readdir(reposDir).catch(() => [] as string[]);
     for (const entry of entries) {

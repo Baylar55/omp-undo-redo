@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
-import { deleteRefsBatched } from "./git-refs.js";
+import { deleteRefsBatched, markGcPending } from "./git-refs.js";
 import type {
   DiscoveredRepository,
   FileCheckpointUnavailableReason,
@@ -618,6 +618,7 @@ export async function releaseRefs(
       // Each group has at least one ref, so the head carries the repository.
       const { repository } = groupedRefs[0];
       try {
+        await markGcPending(repository.storeDir);
         const outcome = await deleteRefsBatched(gitForRepository(repository), groupedRefs, {
           env: storeEnv(repository),
           onSingleFailure: ({ ref, expectedHash }) =>
@@ -669,6 +670,7 @@ export async function releasePendingCheckpoint(
   >,
   keepIndex = false,
 ): Promise<boolean> {
+  await markGcPending(pending.repository.storeDir);
   const [releasedRef, releasedLease] = await Promise.all([
     deleteRefsBatched(git, [{ ref: pending.beforeRef, expectedHash: pending.beforeHash }], {
       env: storeEnv(pending.repository),

@@ -13,7 +13,8 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { checkpointNamespace, historyRefPrefix } from "../src/core/checkpoints.js";
+import { checkpointNamespace, historyRefPrefix, releaseRefs } from "../src/core/checkpoints.js";
+import { gcPendingPath } from "../src/core/git-refs.js";
 import { createGitRunner } from "../src/core/git-runner.js";
 import {
   ensurePrivateGitRepository,
@@ -516,6 +517,91 @@ describe("private-repo housekeeping", () => {
         await pi.emit("session_shutdown", ctx);
       } finally {
         await rmRetry(dormant);
+        await rmRetry(current);
+      }
+    });
+  }, 60000);
+
+  it("reclaims packed garbage whose gc an earlier process never ran", async () => {
+    // Regression: gc ran only on in-process triggers (capture threshold,
+    // shutdown, an expiry that deleted refs), so packed objects orphaned by a
+    // process that exited before its gc stayed forever: `git prune` never
+    // touches packs (1.12 GiB in a store with zero refs on one machine).
+    await withHermeticStore(async (reposDir) => {
+      const orphaned = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-orphaned-"));
+      const released = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-released-"));
+      const killed = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-claimed-"));
+      const current = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-missed-current-"));
+      try {
+        const seed = async (workspace: string, contents: string[]) => {
+          const repository = await ensurePrivateGitRepository(
+            (cwd2, env) => createGitRunner(cwd2, env ? { env } : undefined),
+            workspace,
+            join(reposDir, ".."),
+          );
+          if (!repository) throw new Error("private repo init failed");
+          const git = createGitRunner(workspace, { env: { GIT_DIR: repository.gitDir } });
+          const refs = [];
+          for (const [index, content] of contents.entries()) {
+            const blob = (await git(["hash-object", "-w", "--stdin"], { stdin: content })).stdout;
+            const ref = `refs/test/${index}`;
+            await git(["update-ref", ref, blob.trim()]);
+            refs.push({ repository, ref, expectedHash: blob.trim() });
+          }
+          // Packed while referenced, and older than the prune window.
+          await git(["gc", "-q"]);
+          const packDir = join(repository.gitDir, "objects", "pack");
+          const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+          for (const name of await readdir(packDir)) await utimes(join(packDir, name), old, old);
+          const exists = async (object: string) =>
+            (await git(["cat-file", "-e", object])).code === 0;
+          return { repository, git, refs, exists };
+        };
+        // Orphaned before stores were marked: no refs, no mark, no cruft pack.
+        const a = await seed(orphaned, ["SECRET=orphaned\n"]);
+        await a.git(["update-ref", "-d", a.refs[0].ref]);
+        // Released through the extension, whose process then exited.
+        const b = await seed(released, ["SECRET=released\n", "SECRET=live\n"]);
+        expect(await releaseRefs(() => b.git, [b.refs[0]])).toBe(true);
+        const mark = gcPendingPath(b.repository.storeDir);
+        await expect(stat(mark)).resolves.toBeDefined();
+        // Released, then its gc claimed the mark and was killed; a later
+        // release marked the store again.
+        const c = await seed(killed, ["SECRET=killed\n", "SECRET=kept\n"]);
+        expect(await releaseRefs(() => c.git, [c.refs[0]])).toBe(true);
+        const markC = gcPendingPath(c.repository.storeDir);
+        const claim = `${markC}.running`;
+        await rename(markC, claim);
+        await writeFile(markC, "");
+
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {});
+        const ctx = context(current, "gc-missed-session");
+        await pi.emit("session_start", ctx);
+        expect(await waitFor(async () => !(await a.exists(a.refs[0].expectedHash)), 150)).toBe(
+          true,
+        );
+        expect(await waitFor(async () => !(await b.exists(b.refs[0].expectedHash)), 150)).toBe(
+          true,
+        );
+        expect(await b.exists(b.refs[1].expectedHash)).toBe(true);
+        expect(await waitFor(async () => !(await c.exists(c.refs[0].expectedHash)), 150)).toBe(
+          true,
+        );
+        expect(await c.exists(c.refs[1].expectedHash)).toBe(true);
+        // A finished gc drops its claim: the next boot does not gc again.
+        const gone = async (path: string) => (await stat(path).catch(() => null)) === null;
+        expect(
+          await waitFor(async () => (await gone(`${mark}.running`)) && (await gone(claim))),
+        ).toBe(true);
+        await expect(stat(mark)).rejects.toMatchObject({ code: "ENOENT" });
+        // Never claimed over a leftover claim: the next boot gcs again.
+        await expect(stat(markC)).resolves.toBeDefined();
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(orphaned);
+        await rmRetry(released);
+        await rmRetry(killed);
         await rmRetry(current);
       }
     });

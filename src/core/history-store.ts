@@ -3,7 +3,7 @@ import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { writeFileAtomic } from "./atomic-write.js";
 import { checkpointNamespace, HISTORY_REF_ROOT, historyRefPrefix } from "./checkpoints.js";
-import { parseRefLines } from "./git-refs.js";
+import { markGcPending, parseRefLines } from "./git-refs.js";
 import {
   pruneStaleHeartbeats,
   sessionHeartbeatIsFresh,
@@ -384,6 +384,7 @@ async function deleteHistoryRefs(
   refs: readonly HistoryRef[],
 ): Promise<boolean> {
   try {
+    await markGcPending(repository.storeDir);
     const commands = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`);
     const result = await git(["update-ref", "--stdin"], {
       env: { GIT_DIR: repository.storeDir },
