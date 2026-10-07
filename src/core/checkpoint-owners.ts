@@ -1,5 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, open, readFile, readdir, readlink, rename, rm, stat } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  readlink,
+  rename,
+  rm,
+  stat,
+  utimes,
+} from "node:fs/promises";
 import { hostname as systemHostname, homedir, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { deleteRefsBatched, markGcPending, parseRefLines, type RefSpec } from "./git-refs.js";
@@ -11,6 +22,11 @@ const MAX_LEASE_BYTES = 64 * 1024;
 const CLEANUP_TIMEOUT_MS = 1_000;
 const MAX_CONCURRENT_OWNERS = 4;
 const DEFAULT_SHUTDOWN_WAIT_MS = 1_000;
+/** Live owners touch their lease this often; a "remote" lease (unprobeable:
+ *  other host ID, hostname, or runtime scope, e.g. a regenerated host-id file
+ *  or a Linux reboot) untouched for the TTL is treated as stale. */
+const LEASE_HEARTBEAT_MS = 60 * 60 * 1_000;
+const REMOTE_LEASE_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const CHECKPOINT_ID_PATTERN = /^[0-9a-f]{16}$/;
@@ -364,8 +380,12 @@ export class CheckpointOwnerRegistry {
   private readonly hostIdentityPromise: Promise<HostIdentity>;
   private readonly runtimeScopePromise: Promise<string | null>;
   private readonly initializations = new Map<string, Promise<OwnershipMode>>();
-  private readonly initialized = new Map<string, { repository: GitRepository; git: GitRunner }>();
+  private readonly initialized = new Map<
+    string,
+    { repository: GitRepository; git: GitRunner; hostId: string; runtimeScope: string }
+  >();
   private readonly scans = new Set<Promise<void>>();
+  private heartbeat: NodeJS.Timeout | undefined;
   constructor(options: OwnerRegistryOptions = {}) {
     const configuredOwnerId = options.ownerId;
     this.ownerId =
@@ -419,10 +439,32 @@ export class CheckpointOwnerRegistry {
       ))
     )
       return "legacy";
-    this.initialized.set(repository.storeDir, { repository, git });
+    this.initialized.set(repository.storeDir, {
+      repository,
+      git,
+      hostId,
+      runtimeScope: leaseRuntimeScope,
+    });
+    this.heartbeat ??= setInterval(() => void this.refreshLeases(), LEASE_HEARTBEAT_MS);
+    this.heartbeat.unref();
     if (host.persistent && resolvedRuntimeScope)
       this.startScan(repository, git, hostId, resolvedRuntimeScope);
     return "v2";
+  }
+
+  /** Bumps each lease's mtime so other hosts never expire a live owner;
+   *  re-publishes a lease another host expired while this one slept (the
+   *  refs it reaped stay gone). A tick still in flight after shutdown cleared
+   *  the timer must not re-create the lease shutdown just removed. */
+  private async refreshLeases(): Promise<void> {
+    for (const { repository, hostId, runtimeScope } of this.initialized.values()) {
+      const now = this.now();
+      await utimes(leasePath(repository, this.ownerId), now, now).catch(
+        () =>
+          this.heartbeat &&
+          publishLease(repository, this.ownerId, hostId, this.hostname, runtimeScope, this.now),
+      );
+    }
   }
 
   private startScan(
@@ -466,7 +508,12 @@ export class CheckpointOwnerRegistry {
         currentRuntimeScope: runtimeScope,
         probePid: this.probePid,
       });
-      if (classification === "stale") candidates.push({ ownerId: lease.ownerId });
+      if (
+        classification === "stale" ||
+        (classification === "remote" &&
+          this.now().getTime() - metadata.mtimeMs >= REMOTE_LEASE_TTL_MS)
+      )
+        candidates.push({ ownerId: lease.ownerId });
     }
     let next = 0;
     const worker = async () => {
@@ -481,6 +528,8 @@ export class CheckpointOwnerRegistry {
   }
 
   async shutdown(): Promise<void> {
+    clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
     const scans = [...this.scans];
     if (scans.length > 0) {
       await Promise.race([Promise.allSettled(scans), delay(this.shutdownWaitMs)]);

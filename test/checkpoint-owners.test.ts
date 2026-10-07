@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CheckpointOwnerRegistry,
   classifyCheckpointOwner,
@@ -167,6 +167,100 @@ describe("checkpoint owner boundaries", () => {
     await expect(readFile(join(ownersDir, `${ownerA}.json`), "utf8")).rejects.toThrow();
     await expect(readFile(join(ownersDir, `${ownerB}.json`), "utf8")).rejects.toThrow();
     expect(await readdir(ownersDir)).not.toContain(`${ownerB}.json`);
+  });
+
+  it("expires a remote owner only after its lease goes untouched for the TTL", async () => {
+    const commonDir = await mkdtemp(join(tmpdir(), "omp-owner-remote-"));
+    const repository: GitRepository = {
+      commonDir,
+      gitDir: commonDir,
+      worktree: commonDir,
+      storeDir: commonDir,
+    };
+    const ownersDir = join(commonDir, "omp-undo-redo", "owners");
+    const oldHost = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    await mkdir(ownersDir, { recursive: true });
+    await writeFile(join(ownersDir, `${ownerA}.json`), lease(ownerA, oldHost, 9999));
+    await writeFile(join(ownersDir, `${ownerB}.json`), lease(ownerB, oldHost, 9999));
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000);
+    await utimes(join(ownersDir, `${ownerA}.json`), eightDaysAgo, eightDaysAgo);
+    const refs = new Set([`refs/omp-undo-redo/v2/${ownerA}/${compactId}/before`]);
+    const git: GitRunner = async (args) => {
+      if (args[0] === "for-each-ref") {
+        const prefix = args[args.length - 1];
+        return {
+          stdout: [...refs]
+            .filter((ref) => ref.startsWith(prefix))
+            .map((ref) => `${ref}\0${objectHash}`)
+            .join("\n"),
+          stderr: "",
+          code: 0,
+        };
+      }
+      refs.clear();
+      return { stdout: "", stderr: "", code: 0 };
+    };
+    const registry = new CheckpointOwnerRegistry({
+      ownerId: "44444444-4444-4444-8444-444444444444",
+      hostIdentity: { id: hostA, persistent: true },
+      hostname: "test-host",
+      runtimeScope,
+      probePid: () => {
+        throw new Error("a remote owner must not be probed");
+      },
+      shutdownWaitMs: 1_000,
+    });
+    try {
+      expect(await registry.ensureInitialized(repository, git)).toBe("v2");
+      await registry.shutdown();
+      expect(refs.size).toBe(0);
+      await expect(readFile(join(ownersDir, `${ownerA}.json`), "utf8")).rejects.toThrow();
+      expect(await readFile(join(ownersDir, `${ownerB}.json`), "utf8")).toContain(ownerB);
+    } finally {
+      await rm(commonDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a live owner's lease fresh until shutdown and restores an expired one", async () => {
+    const commonDir = await mkdtemp(join(tmpdir(), "omp-owner-heartbeat-"));
+    const repository: GitRepository = {
+      commonDir,
+      gitDir: commonDir,
+      worktree: commonDir,
+      storeDir: commonDir,
+    };
+    const leaseFile = join(commonDir, "omp-undo-redo", "owners", `${ownerA}.json`);
+    const git: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+    const hour = 60 * 60 * 1_000;
+    const longAgo = new Date(Date.now() - 10 * 24 * hour);
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const registry = new CheckpointOwnerRegistry({
+      ownerId: ownerA,
+      hostIdentity: { id: hostA, persistent: true },
+      hostname: "test-host",
+      runtimeScope,
+    });
+    try {
+      expect(await registry.ensureInitialized(repository, git)).toBe("v2");
+      await utimes(leaseFile, longAgo, longAgo);
+      await vi.advanceTimersByTimeAsync(hour);
+      await vi.waitFor(async () =>
+        expect(Date.now() - (await stat(leaseFile)).mtimeMs).toBeLessThan(hour),
+      );
+
+      await rm(leaseFile);
+      await vi.advanceTimersByTimeAsync(hour);
+      await vi.waitFor(async () => expect(await readFile(leaseFile, "utf8")).toContain(ownerA));
+
+      await registry.shutdown();
+      await rm(leaseFile, { force: true });
+      await vi.advanceTimersByTimeAsync(2 * hour);
+      await expect(stat(leaseFile)).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+      await registry.shutdown();
+      await rm(commonDir, { recursive: true, force: true });
+    }
   });
 
   it("preserves a live foreign owner with real Git", async () => {
