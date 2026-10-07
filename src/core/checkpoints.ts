@@ -68,15 +68,17 @@ function persistentIndexKey(repository: GitRepository, sessionId: string): strin
 /** Releases the leases, idle or checked out, of `sessionIds` only. OMP binds a
  *  separate copy of the extension to every in-process subagent session, and
  *  those copies can share this module's state: one copy must never release
- *  another's leases, which are keyed by session. */
+ *  another's leases, which are keyed by session. `inUse: false` keeps the
+ *  checked-out ones, which a running git may still be writing. */
 export async function releasePersistentSnapshotIndices(
   sessionIds: Iterable<string>,
+  { inUse = true }: { inUse?: boolean } = {},
 ): Promise<void> {
   const suffixes = [...sessionIds].map((sessionId) => `\u0000${checkpointNamespace(sessionId)}`);
   const owned = (key: string): boolean => suffixes.some((suffix) => key.endsWith(suffix));
   const leases = [
     ...[...persistentSnapshotIndices].filter(([key]) => owned(key)).map(([, lease]) => lease),
-    ...[...leasesInUse].filter(([, key]) => owned(key)).map(([lease]) => lease),
+    ...(inUse ? [...leasesInUse].filter(([, key]) => owned(key)).map(([lease]) => lease) : []),
   ];
   await Promise.all(leases.map((lease) => releaseSnapshotIndexLease(lease)));
 }

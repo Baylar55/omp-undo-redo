@@ -110,6 +110,13 @@ export type OmpUndoRedoDependencies = {
 export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
 export const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
 export const DEFAULT_FINALIZE_DEADLINE_MS = 25_000;
+/** `session_shutdown`'s own deadline. OMP caps the handler at 2 s and then
+ *  exits; the margin covers the fallback lease removal. */
+const SHUTDOWN_BUDGET_MS = 1_500;
+/** How long shutdown waits for in-flight captures and finalizes, within
+ *  SHUTDOWN_BUDGET_MS: the checkpoint releases before this wait and the
+ *  owner-lease check after it need the rest. */
+const SHUTDOWN_TURN_DRAIN_MS = 1_000;
 
 function defaultGitRunnerFactory(cwd: string, env?: Record<string, string>): GitRunner {
   return createGitRunner(cwd, { env });
@@ -543,7 +550,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   // them (evictStalePrivateRepos' in-flight guard).
   const pendingCaptures = new Map<string, PendingCapture>();
   const pendingFinalizations = new Map<string, Promise<void>>();
+  /** Turn work (captures, finalizes, session events) shutdown waits on. */
   const activeOperations = new Set<Promise<void>>();
+  /** Background store gcs and retention sweeps: shutdown never waits on them
+   *  (a repack can take minutes), but eviction defers to them too. */
+  const housekeepingOperations = new Set<Promise<void>>();
   /** Sessions this copy captured for, i.e. whose index leases it owns. */
   const leaseSessionIds = new Set<string>();
   /** OMP binds a separate copy of this extension to every in-process subagent
@@ -731,7 +742,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     // Whatever is left behind is revisited by the next boot or shutdown
     // sweep. Registered-but-idle sessions are deliberately NOT a guard:
     // the shutdown sweep exists to evict exactly those once drained.
-    if (pendingCaptures.size > 0 || pendingFinalizations.size > 0 || activeOperations.size > 0) {
+    if (
+      pendingCaptures.size > 0 ||
+      pendingFinalizations.size > 0 ||
+      activeOperations.size > 0 ||
+      housekeepingOperations.size > 0
+    ) {
       return;
     }
 
@@ -849,9 +865,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       );
       if (closing) return;
       if (refsRemoved === 0 && !(await storeNeedsGc(repository.storeDir))) return;
-      // Detached from the expiration promise: shutdown awaits expirations,
-      // and must not wait out a gc.
-      void track(() => schedulePrivateGc(repository));
+      // Detached from the expiration promise and from shutdown's wait: neither
+      // may wait out a gc.
+      void track(() => schedulePrivateGc(repository), housekeepingOperations);
     })().catch(() => undefined);
     expirationPromises.set(key, expiration);
     return expiration;
@@ -962,7 +978,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // After boot eviction, which it would otherwise race (a gc holds
       // handles through eviction's rename and refreshes the idle mtimes).
       privateRetentionSweep ??= startBootHousekeeping()
-        .then(() => (closing ? undefined : track(sweepPrivateRepoRetention)))
+        .then(() =>
+          closing ? undefined : track(sweepPrivateRepoRetention, housekeepingOperations),
+        )
         .catch(() => undefined);
 
       const store =
@@ -1027,9 +1045,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return initializeNavigation(ctx, false, historyLeafId);
   }
 
-  function track(operation: () => Promise<void>): Promise<void> {
+  function track(
+    operation: () => Promise<void>,
+    operations: Set<Promise<void>> = activeOperations,
+  ): Promise<void> {
     const { promise: tracked, resolve, reject } = Promise.withResolvers<void>();
-    activeOperations.add(tracked);
+    operations.add(tracked);
     void (async () => {
       try {
         await operation();
@@ -1037,7 +1058,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       } catch (error) {
         reject(error);
       } finally {
-        activeOperations.delete(tracked);
+        operations.delete(tracked);
       }
     })();
     return tracked;
@@ -1106,7 +1127,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
               // mid-flight, to avoid repacking under it. The counter reset
               // below prevents gc runs from stacking.
               if (pendingCaptures.size <= 1) {
-                void track(() => schedulePrivateGc(repository));
+                void track(() => schedulePrivateGc(repository), housekeepingOperations);
               } else {
                 capturesSinceGcByStore.set(key, PRIVATE_GC_AFTER_CAPTURES - 1);
               }
@@ -1548,50 +1569,73 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     initializations.clear();
     pending.clear();
     shutdownPromise = (async () => {
-      // Let an in-flight expiry finish (it holds the store lock) and cancel one
-      // that never started, then stop protecting sessions so shutdown GC can
-      // reclaim their data.
       clearInterval(heartbeatTimer);
-      await Promise.allSettled([...expirationPromises.values()]);
-      explicitActiveHashes.clear();
-      await suspendDetached(detachedNavigations, detachedPending);
-      // Bounded: an overrunning capture must not delay shutdown indefinitely.
-      // Any capture still running now self-releases on completion (closing is
-      // set), and its temporary index is reclaimed by git or the OS.
-      await timedOutAfter(Promise.allSettled([...activeOperations]), 5_000);
-      await releasePersistentSnapshotIndices(leaseSessionIds);
-      await drainState();
-      await ownerRegistry.shutdown();
-      await runtimeStore.shutdown();
-      // Store housekeeping on the way out: evict stores whose workspaces
-      // vanished, then gc stores that crossed the capture
-      // threshold. Runs detached so an overrunning sweep cannot delay
-      // shutdown, but internally sequenced: a gc racing the sweep would
-      // both hold handles through the rename and bump mtimes past the idle
-      // cutoff, so every gc waits for eviction to finish first and skips
-      // repos it renamed away. Whatever is unfinished when the process
-      // exits is covered by the next boot sweep. A subagent's copy leaves
-      // it to the main session's copy.
-      if (!servesMainSession) return;
-      void evictStalePrivateRepos()
-        .catch(() => undefined)
-        .then(() =>
-          Promise.allSettled(
-            [...privateRepositories.values()].map(async (entry) => {
-              if ("failure" in entry || !entry.repository || !entry.git) return;
-              const { repository } = entry;
-              const key = gcKey(repository);
-              if (!capturesSinceGcByStore.has(key)) return;
-              capturesSinceGcByStore.delete(key);
-              try {
-                await stat(repository.storeDir);
-              } catch {
-                return;
-              }
-              await schedulePrivateGc(repository);
-            }),
-          ),
+      // Priority order: whatever OMP's cap cuts off runs on in the background
+      // and is lost only if the process exits first.
+      const teardown = (async () => {
+        // Local cleanup first: idle index leases (a checked-out one may sit
+        // under a running git) and the runtime directory.
+        await Promise.all([
+          releasePersistentSnapshotIndices(leaseSessionIds, { inUse: false }),
+          runtimeStore.shutdown(),
+        ]);
+        await suspendDetached(detachedNavigations, detachedPending);
+        // Turn work only, never gcs or sweeps. A capture or finalize still
+        // running after this releases its own checkpoint on completion
+        // (closing is set); the boot sweep reclaims an index it leaves behind.
+        await timedOutAfter(
+          Promise.allSettled([...activeOperations, ...pendingFinalizations.values()]),
+          SHUTDOWN_TURN_DRAIN_MS,
         );
+        await releasePersistentSnapshotIndices(leaseSessionIds);
+        await drainState();
+        await ownerRegistry.shutdown();
+      })();
+      // A git step that overran the budget must not cost the checked-out
+      // leases: drop them now, filesystem only.
+      if (await timedOutAfter(teardown, SHUTDOWN_BUDGET_MS)) {
+        await releasePersistentSnapshotIndices(leaseSessionIds);
+      }
+      // Store housekeeping on the way out, detached so a slow expiry, sweep or
+      // gc never holds the handler. Turn work, sweeps and gcs (eviction defers
+      // to all of them) and in-flight expiries finish first: a sweep can start
+      // an expiry, and an expiry past its `closing` check can still queue a
+      // gc, hence the second housekeeping drain. Then sessions stop being
+      // protected. Then evict stores whose workspaces vanished, then gc stores
+      // that crossed the capture threshold: a gc racing the sweep would both
+      // hold handles through the rename and bump mtimes past the idle cutoff,
+      // so every gc waits for eviction to finish first and skips repos it
+      // renamed away. Whatever is unfinished when the process exits is
+      // covered by the next boot sweep. A subagent's copy leaves eviction and
+      // gc to the main session's copy.
+      void (async () => {
+        await teardown.catch(() => undefined);
+        await Promise.allSettled([
+          ...activeOperations,
+          ...pendingFinalizations.values(),
+          ...housekeepingOperations,
+        ]);
+        await Promise.allSettled([...expirationPromises.values()]);
+        await Promise.allSettled([...housekeepingOperations]);
+        explicitActiveHashes.clear();
+        if (!servesMainSession) return;
+        await evictStalePrivateRepos().catch(() => undefined);
+        await Promise.allSettled(
+          [...privateRepositories.values()].map(async (entry) => {
+            if ("failure" in entry || !entry.repository || !entry.git) return;
+            const { repository } = entry;
+            const key = gcKey(repository);
+            if (!capturesSinceGcByStore.has(key)) return;
+            capturesSinceGcByStore.delete(key);
+            try {
+              await stat(repository.storeDir);
+            } catch {
+              return;
+            }
+            await schedulePrivateGc(repository);
+          }),
+        );
+      })();
     })();
     return shutdownPromise;
   });
