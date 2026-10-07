@@ -10,6 +10,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -669,7 +670,8 @@ describe("history-safe Git checkpoints", () => {
   });
 
   // Untracked: the before tree has no `app.db` entry, so undo would delete it.
-  // Tracked: it keeps HEAD's stale blob, so undo would rewrite it to `v1`.
+  // Tracked: it keeps HEAD's stale blob, so undo would rewrite it to `v0`. The
+  // file differs from HEAD so no index stat data vouches for it unread.
   // Root reads mode-000 files, so the POSIX lock does not hold there.
   for (const tracked of [false, true]) {
     it.skipIf(process.getuid?.() === 0)(
@@ -679,9 +681,9 @@ describe("history-safe Git checkpoints", () => {
         const sessionId = `unreadable-file-${tracked}`;
         const db = join(cwd, "app.db");
         try {
-          if (tracked) await writeFile(db, "v1\n");
+          if (tracked) await writeFile(db, "v0 committed\n");
           await initializeBranch(git, cwd);
-          if (!tracked) await writeFile(db, "v1\n");
+          await writeFile(db, "v1\n");
           // Locked during the before-snapshot only.
           const unlock = await lockFile(db);
           let before: PendingGitCheckpoint;
@@ -1080,6 +1082,46 @@ describe("history-safe Git checkpoints", () => {
       );
       await releasePendingCheckpoint(snap, fresh);
       await releaseCheckpoint(snap, after);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("seeds a fresh index from the repository's index without missing worktree content", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const blob = (hash: string, path: string) => text(snap, ["cat-file", "-p", `${hash}:${path}`]);
+    try {
+      await initializeBranch(git, cwd);
+      for (const name of ["racy.txt", "skip.txt", "assume.txt"]) {
+        await writeFile(join(cwd, name), "r1\n");
+      }
+      await git(["add", "."]);
+      await git(["commit", "-qm", "seed"]);
+
+      // Racy clean: racy.txt's recorded mtime equals the index's own (same
+      // tick), then its content changes keeping size and mtime. Only git's
+      // racy check sees that, and only while the seed copy's mtime is not later.
+      const racy = join(cwd, "racy.txt");
+      const tick = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+      await utimes(racy, tick, tick);
+      await git(["update-index", "-q", "--refresh"]);
+      await utimes(await indexPath(git, cwd), tick, tick);
+      await writeFile(racy, "R9\n");
+      await utimes(racy, tick, tick);
+      const first = pendingCheckpoint(await prepareBeforeTurn(snap, "seed-racy"));
+      expect(await blob(first.beforeHash, "racy.txt")).toBe("R9");
+
+      // `add -A` skips flagged entries, so their worktree edits must still land.
+      await writeFile(join(cwd, "skip.txt"), "skip local\n");
+      await git(["update-index", "--skip-worktree", "skip.txt"]);
+      await writeFile(join(cwd, "assume.txt"), "assume local\n");
+      await git(["update-index", "--assume-unchanged", "assume.txt"]);
+      const second = pendingCheckpoint(await prepareBeforeTurn(snap, "seed-flagged"));
+      expect(await blob(second.beforeHash, "skip.txt")).toBe("skip local");
+      expect(await blob(second.beforeHash, "assume.txt")).toBe("assume local");
+
+      await releasePendingCheckpoint(snap, first);
+      await releasePendingCheckpoint(snap, second);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

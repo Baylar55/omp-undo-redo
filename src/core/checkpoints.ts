@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -8,10 +9,12 @@ import {
   realpath,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
 import { deleteRefsBatched, markGcPending } from "./git-refs.js";
 import type {
@@ -45,9 +48,10 @@ export function historyRefPrefix(sessionHash: string): string {
 }
 
 // Alternate index reused across turns so each turn is not a full `git add -A`
-// re-hash of the whole worktree. The first turn seeds it (a full `add -A` that
-// records a valid stat cache); every later turn's before/after snapshot reuses
-// it, so unchanged files are skipped via git's stat-dance instead of being
+// re-hash of the whole worktree. The first turn seeds it (with the user's own
+// index stat data where `seedFromUserIndex` allows, else a full `add -A`
+// re-hash) and every later turn's before/after snapshot reuses it, so
+// unchanged files are skipped via git's stat-dance instead of being
 // re-read. Keyed by repository + session so concurrent sessions/repos stay
 // isolated. The lease is dropped (and reseeded) whenever its baseline tree
 // changes, and evicted whenever its directory is released. With an unborn HEAD
@@ -383,13 +387,58 @@ type SnapshotResult =
 type SeedSnapshotIndexResult =
   { status: "seeded"; headTree: string } | { status: "empty" | "invalid_head" | "failed" };
 
+/** Seeds `env`'s index with `tree` plus the user's own index stat data for
+ *  every entry whose blob `tree` still holds, so the `add -A` that follows
+ *  re-hashes only changed files instead of every tracked one. `read-tree
+ *  --reset` keeps an old entry only when it matches `tree` (`-m` would also
+ *  refuse partially staged files and conflicts), so the result is a fresh
+ *  `read-tree` with stat data. Declined (false) when the result could differ
+ *  from a fresh seed, or reading the copy would touch the user's git dir:
+ *  skip-worktree and assume-unchanged flags survive the merge and `add -A`
+ *  would skip those paths, and a copied split index resolves its shared part
+ *  from the git dir, whose mtime git then refreshes on every read. The copy's
+ *  mtime is set just below the original's, so git's racy-clean check covers
+ *  at least what it covers in the user's index.
+ *  Streams, not `copyFile`: libuv opens with FILE_SHARE_DELETE on Windows, so
+ *  a concurrent git can still replace the index. */
+async function seedFromUserIndex(
+  git: GitRunner,
+  env: { GIT_INDEX_FILE: string },
+  gitDir: string,
+  tree: string,
+): Promise<boolean> {
+  const source = join(gitDir, "index");
+  try {
+    if ((await readdir(gitDir)).some((name) => name.startsWith("sharedindex."))) return false;
+    const { atime, mtimeMs } = await stat(source);
+    await pipeline(createReadStream(source), createWriteStream(env.GIT_INDEX_FILE));
+    await utimes(env.GIT_INDEX_FILE, atime, new Date(mtimeMs - 1));
+  } catch {
+    return false;
+  }
+  if ((await invoke(git, ["read-tree", "--reset", tree], { env })).code !== 0) return false;
+  // Tags: "H" plain, "S" skip-worktree, lowercase assume-unchanged.
+  const entries = await invoke(git, ["ls-files", "-v", "-z"], { env });
+  return (
+    entries.code === 0 &&
+    entries.stdout.split("\0").every((entry) => !entry || entry.startsWith("H "))
+  );
+}
+
+/** `gitDir`: the repository whose index may seed stat data (`seedFromUserIndex`).
+ *  A declined or failed attempt falls back to a plain `read-tree`, which
+ *  replaces whatever the attempt left in the index file. */
 async function seedSnapshotIndex(
   git: GitRunner,
-  env: Record<string, string>,
+  env: { GIT_INDEX_FILE: string },
+  gitDir?: string,
 ): Promise<SeedSnapshotIndexResult> {
   const headTree = await invoke(git, ["rev-parse", "--verify", "HEAD^{tree}"]);
   const hash = headTree.stdout.trim();
   if (headTree.code === 0 && hash) {
+    if (gitDir && (await seedFromUserIndex(git, env, gitDir, hash))) {
+      return { status: "seeded", headTree: hash };
+    }
     const seeded = await invoke(git, ["read-tree", hash], { env });
     return seeded.code === 0 ? { status: "seeded", headTree: hash } : { status: "failed" };
   }
@@ -566,13 +615,14 @@ export async function createSnapshotCommit(
   git: GitRunner,
   message: string,
   retainIndex = false,
+  gitDir?: string,
 ): Promise<SnapshotResult> {
   let tempDirectory: string | null = null;
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-index-"));
     const indexPath = join(tempDirectory, "index");
     const env = { GIT_INDEX_FILE: indexPath };
-    const seeded = await seedSnapshotIndex(git, env);
+    const seeded = await seedSnapshotIndex(git, env, gitDir);
     if (seeded.status === "invalid_head") return { reason: "invalid_head" };
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const addEnv: Record<string, string> = { ...env };
@@ -863,11 +913,21 @@ export async function prepareBeforeTurn(
       lease = priorLease;
     } else {
       await releaseSnapshotIndexLease(priorLease);
-      snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn", true);
+      snapshot = await createSnapshotCommit(
+        git,
+        "omp-undo-redo: before turn",
+        true,
+        repository.gitDir,
+      );
       if ("hash" in snapshot) lease = snapshot.snapshotIndexLease;
     }
   } else {
-    snapshot = await createSnapshotCommit(git, "omp-undo-redo: before turn", true);
+    snapshot = await createSnapshotCommit(
+      git,
+      "omp-undo-redo: before turn",
+      true,
+      repository.gitDir,
+    );
     if ("hash" in snapshot) lease = snapshot.snapshotIndexLease;
   }
   if (lease) leasesInUse.set(lease, indexKey);
@@ -931,14 +991,24 @@ export async function finishAfterTurn(
       // (shutdown): nothing to retain then.
       const key = leasesInUse.get(lease);
       await releaseSnapshotIndexLease(lease);
-      snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn", key !== undefined);
+      snapshot = await createSnapshotCommit(
+        git,
+        "omp-undo-redo: after turn",
+        key !== undefined,
+        before.repository.gitDir,
+      );
       lease = "hash" in snapshot ? snapshot.snapshotIndexLease : undefined;
       if (lease && key !== undefined) leasesInUse.set(lease, key);
     }
     // On success the lease index now reflects the after-state and stays in the
     // persistent cache for the next turn's before snapshot.
   } else {
-    snapshot = await createSnapshotCommit(git, "omp-undo-redo: after turn");
+    snapshot = await createSnapshotCommit(
+      git,
+      "omp-undo-redo: after turn",
+      false,
+      before.repository.gitDir,
+    );
   }
   const pending = { ...before, snapshotIndexLease: lease };
   if (!("hash" in snapshot)) {
