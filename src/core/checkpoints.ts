@@ -87,6 +87,14 @@ export async function releasePersistentSnapshotIndices(
   await Promise.all(leases.map((lease) => releaseSnapshotIndexLease(lease)));
 }
 
+/** Releases every lease this process holds, idle or checked out. Only for a
+ *  process that hosts no other live copy of the extension: test workers,
+ *  whose sessions never shut down. */
+export async function releaseAllPersistentSnapshotIndices(): Promise<void> {
+  const leases = [...persistentSnapshotIndices.values(), ...leasesInUse.keys()];
+  await Promise.all(leases.map((lease) => releaseSnapshotIndexLease(lease)));
+}
+
 export function checkpointNamespace(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex");
 }
