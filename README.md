@@ -104,7 +104,7 @@ Snapshot stores (`<storeRoot>/repos`) and runtime directories (`<runtimeRoot>/<p
 
 ### Setting the variables
 
-Set these in your Pi/OMP process environment. The extension reads them **once, when it loads**, so set them before starting the agent — changing them while a session is open has no effect. The values are global to the agent process, not per project.
+Set these in your Pi/OMP process environment before starting the agent. A running process never sees later changes to its environment, so changing them in a terminal while a session is open has no effect. The values are global to the agent process, not per project.
 
 **Linux / macOS (bash, zsh)** — export in the current terminal, or add to `~/.bashrc` / `~/.zshrc` so they persist across sessions:
 

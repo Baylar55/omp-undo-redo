@@ -944,123 +944,130 @@ describe("resumed session history", () => {
     }
   });
 
-  it("handles session history expiration on session_start and notifies user", async () => {
-    const cwd = await makeRepository();
-    const sessionId1 = "expired-lifecycle-session-1";
-    const sessionId2 = "active-lifecycle-session-2";
-    const prompt: TestEntry = {
-      id: "prompt",
-      parentId: null,
-      type: "message",
-      message: { role: "user" },
-    };
-    const response: TestEntry = {
-      id: "response",
-      parentId: prompt.id,
-      type: "message",
-      message: { role: "assistant" },
-    };
-
-    try {
-      const originalEnv = process.env.OMP_UNDO_REDO_RETENTION_DAYS;
-      process.env.OMP_UNDO_REDO_RETENTION_DAYS = "30";
-
-      // 1. Initial run for session 1: create a turn checkpoint
-      const firstApi = new FakeExtensionApi();
-      ompUndoRedo(firstApi as never);
-      const firstCtx = context(cwd, sessionId1);
-      firstCtx.leaf = prompt.id;
-      firstCtx.branch = [prompt];
-      firstCtx.entries = [prompt];
-
-      await firstApi.emit("session_start", firstCtx);
-      await firstApi.emit("before_agent_start", firstCtx);
-      await writeFile(join(cwd, "tracked.txt"), "changed\n");
-      firstCtx.leaf = response.id;
-      firstCtx.branch = [prompt, response];
-      firstCtx.entries = [prompt, response];
-      await firstApi.emit("agent_end", firstCtx);
-      await firstApi.emit("session_shutdown", firstCtx);
-
-      // 2. Overwrite history file timestamp for session 1 to 40 days ago
-      const { historyPath } = await import("../src/core/history-store.js");
-      const repo = await gitRepository(cwd);
-      const hPath = historyPath(repo, sessionId1);
-      const content = JSON.parse(await readFile(hPath, "utf8"));
-      content.lastAccessedAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
-      await writeFile(hPath, JSON.stringify(content));
-      // The turn saves left a fresh cross-process heartbeat marker; drop it
-      // so no live owner is implied and the dormant session is sweepable.
-      const { activeHeartbeatPath } = await import("../src/core/history-liveness.js");
-      await rm(
-        activeHeartbeatPath(
-          join(repo.storeDir, "omp-undo-redo", "history"),
-          checkpointNamespace(sessionId1),
-        ),
-        { force: true },
-      );
-
-      // 3. Start session 2 to trigger background expiration of dormant session 1
-      const secondApi = new FakeExtensionApi();
-      ompUndoRedo(secondApi as never);
-      const secondCtx = context(cwd, sessionId2);
-      await secondApi.emit("session_start", secondCtx);
-
-      // The expiration sweep runs in the background; wait until it has
-      // written the tombstone for session 1 before resuming it.
-      const { tombstonePath } = await import("../src/core/history-store.js");
-      const expirationDeadline = Date.now() + 10_000;
-      for (;;) {
-        try {
-          await access(tombstonePath(repo, sessionId1));
-          break;
-        } catch {
-          if (Date.now() > expirationDeadline) {
-            throw new Error("session 1 history was not expired within the deadline");
-          }
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-      }
-
-      // 4. Resume session 1 (now expired)
-      const resumeCtx = context(cwd, sessionId1);
-      resumeCtx.leaf = response.id;
-      resumeCtx.branch = [prompt, response];
-      resumeCtx.entries = [prompt, response];
-      resumeCtx.navigateTree = async (targetId) => {
-        resumeCtx.leaf = targetId;
-        resumeCtx.branch = [prompt];
-        return { cancelled: false };
+  // OMP's in-app `/resume` emits `session_switch`, not `session_start`.
+  it.each(["session_start", "session_switch"] as const)(
+    "handles session history expiration on %s and notifies user",
+    async (resumeEvent) => {
+      const cwd = await makeRepository();
+      const sessionId1 = `expired-lifecycle-session-1-${resumeEvent}`;
+      const sessionId2 = `active-lifecycle-session-2-${resumeEvent}`;
+      const prompt: TestEntry = {
+        id: "prompt",
+        parentId: null,
+        type: "message",
+        message: { role: "user" },
+      };
+      const response: TestEntry = {
+        id: "response",
+        parentId: prompt.id,
+        type: "message",
+        message: { role: "assistant" },
       };
 
-      await secondApi.emit("session_start", resumeCtx);
+      try {
+        const originalEnv = process.env.OMP_UNDO_REDO_RETENTION_DAYS;
+        process.env.OMP_UNDO_REDO_RETENTION_DAYS = "30";
 
-      // Verify expiration notification was shown on resume
-      expect(
-        resumeCtx.ui.notifications.some((n) =>
-          n.message.includes("Undo/redo file history for this session expired"),
-        ),
-      ).toBe(true);
+        // 1. Initial run for session 1: create a turn checkpoint
+        const firstApi = new FakeExtensionApi();
+        ompUndoRedo(firstApi as never);
+        const firstCtx = context(cwd, sessionId1);
+        firstCtx.leaf = prompt.id;
+        firstCtx.branch = [prompt];
+        firstCtx.entries = [prompt];
 
-      // Run undo on resumed session 1
-      await secondApi.runCommand("undo", resumeCtx);
-      expect(resumeCtx.leaf).toBe(prompt.id);
-      expect(resumeCtx.ui.notifications.at(-1)?.message).toBe(
-        "Undid the session turn, but files were not restored because the resumed turn has no usable file checkpoint.",
-      );
+        await firstApi.emit("session_start", firstCtx);
+        await firstApi.emit("before_agent_start", firstCtx);
+        await writeFile(join(cwd, "tracked.txt"), "changed\n");
+        firstCtx.leaf = response.id;
+        firstCtx.branch = [prompt, response];
+        firstCtx.entries = [prompt, response];
+        await firstApi.emit("agent_end", firstCtx);
+        await firstApi.emit("session_shutdown", firstCtx);
 
-      await secondApi.emit("session_shutdown", secondCtx);
-      await secondApi.emit("session_shutdown", resumeCtx);
+        // 2. Overwrite history file timestamp for session 1 to 40 days ago
+        const { historyPath } = await import("../src/core/history-store.js");
+        const repo = await gitRepository(cwd);
+        const hPath = historyPath(repo, sessionId1);
+        const content = JSON.parse(await readFile(hPath, "utf8"));
+        content.lastAccessedAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+        await writeFile(hPath, JSON.stringify(content));
+        // The turn saves left a fresh cross-process heartbeat marker; drop it
+        // so no live owner is implied and the dormant session is sweepable.
+        const { activeHeartbeatPath } = await import("../src/core/history-liveness.js");
+        await rm(
+          activeHeartbeatPath(
+            join(repo.storeDir, "omp-undo-redo", "history"),
+            checkpointNamespace(sessionId1),
+          ),
+          { force: true },
+        );
 
-      if (originalEnv !== undefined) {
-        process.env.OMP_UNDO_REDO_RETENTION_DAYS = originalEnv;
-      } else {
-        delete process.env.OMP_UNDO_REDO_RETENTION_DAYS;
+        // 3. Start session 2 to trigger background expiration of dormant session 1
+        const secondApi = new FakeExtensionApi();
+        ompUndoRedo(secondApi as never);
+        const secondCtx = context(cwd, sessionId2);
+        await secondApi.emit("session_start", secondCtx);
+
+        // The expiration sweep runs in the background; wait until it has
+        // written the tombstone for session 1 before resuming it.
+        const { tombstonePath } = await import("../src/core/history-store.js");
+        const expirationDeadline = Date.now() + 10_000;
+        for (;;) {
+          try {
+            await access(tombstonePath(repo, sessionId1));
+            break;
+          } catch {
+            if (Date.now() > expirationDeadline) {
+              throw new Error("session 1 history was not expired within the deadline");
+            }
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+        }
+
+        // 4. Resume session 1 (now expired)
+        const resumeCtx = context(cwd, sessionId1);
+        resumeCtx.leaf = response.id;
+        resumeCtx.branch = [prompt, response];
+        resumeCtx.entries = [prompt, response];
+        resumeCtx.navigateTree = async (targetId) => {
+          resumeCtx.leaf = targetId;
+          resumeCtx.branch = [prompt];
+          return { cancelled: false };
+        };
+
+        if (resumeEvent === "session_switch") {
+          await secondApi.emit("session_before_switch", secondCtx);
+        }
+        await secondApi.emit(resumeEvent, resumeCtx);
+
+        // Verify expiration notification was shown on resume
+        expect(
+          resumeCtx.ui.notifications.some((n) =>
+            n.message.includes("Undo/redo file history for this session expired"),
+          ),
+        ).toBe(true);
+
+        // Run undo on resumed session 1
+        await secondApi.runCommand("undo", resumeCtx);
+        expect(resumeCtx.leaf).toBe(prompt.id);
+        expect(resumeCtx.ui.notifications.at(-1)?.message).toBe(
+          "Undid the session turn, but files were not restored because the resumed turn has no usable file checkpoint.",
+        );
+
+        await secondApi.emit("session_shutdown", secondCtx);
+        await secondApi.emit("session_shutdown", resumeCtx);
+
+        if (originalEnv !== undefined) {
+          process.env.OMP_UNDO_REDO_RETENTION_DAYS = originalEnv;
+        } else {
+          delete process.env.OMP_UNDO_REDO_RETENTION_DAYS;
+        }
+      } finally {
+        await rmRetry(cwd);
       }
-    } finally {
-      await rmRetry(cwd);
-    }
-  });
+    },
+  );
 });
 
 describe("extension lifecycle cleanup", () => {

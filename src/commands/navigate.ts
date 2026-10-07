@@ -62,8 +62,14 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "the private snapshot repository could not be initialized.";
     case "unsafe_workspace":
       return "file snapshots are disabled in a home directory, drive root, or temp directory.";
-    default:
-      return "the file checkpoint could not be created.";
+    case "before_snapshot_failed":
+      return "the file snapshot before this turn failed or was still running when the turn started.";
+    case "before_ref_failed":
+      return "the file snapshot taken before this turn could not be saved.";
+    case "after_snapshot_failed":
+      return "the file snapshot after this turn failed.";
+    case "after_ref_failed":
+      return "the file snapshot taken after this turn could not be saved.";
   }
 }
 
