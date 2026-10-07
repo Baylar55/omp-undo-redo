@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGitRunner } from "../src/core/git-runner.js";
 import {
@@ -446,6 +446,39 @@ describe("private per-workspace git repositories", () => {
     } finally {
       vi.unstubAllEnvs();
       await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses Private-Git in the home directory, above it, in the temp directory and at a root", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "omp-private-home-"));
+    const home = join(parent, "home");
+    // A sibling of home, so only the temp-directory rule can refuse it.
+    const temp = join(parent, "temp");
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    try {
+      await mkdir(join(home, "project"), { recursive: true });
+      await mkdir(join(temp, "project"), { recursive: true });
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      vi.stubEnv("HOME", home);
+      vi.stubEnv("USERPROFILE", home);
+      vi.stubEnv("TMPDIR", temp);
+      vi.stubEnv("TEMP", temp);
+      vi.stubEnv("TMP", temp);
+      expect(tmpdir()).toBe(temp);
+      for (const cwd of [home, parent, temp, parse(parent).root]) {
+        expect(await resolveBackend(cwd), cwd).toEqual({
+          kind: "session",
+          reason: "unsafe_workspace",
+        });
+      }
+      expect(await readdir(join(storeRoot, "repos")).catch(() => [])).toEqual([]);
+      for (const cwd of [join(home, "project"), join(temp, "project")]) {
+        expect((await resolveBackend(cwd)).kind, cwd).toBe("git");
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(parent, { recursive: true, force: true });
       await rm(storeRoot, { recursive: true, force: true });
     }
   });

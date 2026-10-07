@@ -7,12 +7,13 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { checkpointNamespace, historyRefPrefix, releaseRefs } from "../src/core/checkpoints.js";
 import { gcPendingPath } from "../src/core/git-refs.js";
 import { createGitRunner } from "../src/core/git-runner.js";
@@ -400,6 +401,55 @@ describe("private-repo housekeeping", () => {
         expect(changed).toBe(false);
       } finally {
         await rm(parent, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+  });
+
+  it("evicts an idle private store an earlier version made for the home directory", async () => {
+    await withHermeticStore(async (reposDir) => {
+      const home = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-home-"));
+      const links = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-link-"));
+      const current = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-current-"));
+      try {
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, env ? { env } : undefined),
+          home,
+          join(reposDir, ".."),
+        );
+        if (!repository) throw new Error("private repo init failed");
+        // A non-canonical spelling of home, as v1.5.0/v1.5.1 could store one
+        // (8.3 short name); a junction needs no privilege on Windows.
+        const link = join(links, "home");
+        await symlink(home, link, "junction");
+        await createGitRunner(reposDir)([
+          "config",
+          "--file",
+          join(repository.gitDir, "config"),
+          "core.worktree",
+          link,
+        ]);
+        const repoEntry = basename(repository.gitDir);
+        await backdateRepo(repository.gitDir);
+        vi.stubEnv("HOME", home);
+        vi.stubEnv("USERPROFILE", home);
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {});
+        const ctx = context(current, "evict-home-session");
+        await pi.emit("session_start", ctx);
+        await pi.emit("session_shutdown", ctx);
+        const evicted = await waitFor(async () => {
+          const entries = await readdir(reposDir);
+          return (
+            !entries.includes(repoEntry) &&
+            entries.some((entry) => entry.startsWith(`${repoEntry}.evicted-`))
+          );
+        });
+        expect(evicted).toBe(true);
+      } finally {
+        vi.unstubAllEnvs();
+        await rmRetry(links);
+        await rmRetry(home);
+        await rmRetry(current);
       }
     });
   });

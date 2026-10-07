@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type {
   CwdGitRunnerFactory,
@@ -191,6 +191,23 @@ async function applyConfig(
 }
 
 export { canonicalCwd };
+
+/** Whether Private-Git must not snapshot `canonical` (a `canonicalCwd`
+ *  result): a filesystem root, the home directory or any directory above it,
+ *  or the OS temp directory. `git add` there copies credentials (`.ssh`,
+ *  `AppData`, browser profiles) into plaintext store objects, and on a large
+ *  profile it outruns the runner timeout every turn, so no snapshot completes.
+ *  Git mode is unaffected: the repository's own ignore rules decide. */
+export function refusedPrivateWorkspace(canonical: string): boolean {
+  if (dirname(canonical) === canonical) return true;
+  const home = homedir();
+  if (home) {
+    const below = relative(canonical, canonicalCwd(home));
+    if (below === "") return true;
+    if (below !== ".." && !below.startsWith(`..${sep}`) && !isAbsolute(below)) return true;
+  }
+  return relative(canonical, canonicalCwd(tmpdir())) === "";
+}
 
 /** Appends `<relative-storeRoot>/` to the private repo's info/exclude so a
  *  snapshot never captures the omp state root (which contains the private

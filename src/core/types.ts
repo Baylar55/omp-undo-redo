@@ -24,6 +24,7 @@ export const UNAVAILABLE_REASONS = [
   "file_history_gap",
   "resumed_checkpoint_unavailable",
   "private_repository_unavailable",
+  "unsafe_workspace",
 ] as const;
 
 export type FileCheckpointUnavailableReason = (typeof UNAVAILABLE_REASONS)[number];

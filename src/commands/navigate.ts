@@ -60,6 +60,8 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "the resumed turn has no usable file checkpoint.";
     case "private_repository_unavailable":
       return "the private snapshot repository could not be initialized.";
+    case "unsafe_workspace":
+      return "file snapshots are disabled in a home directory, drive root, or temp directory.";
     default:
       return "the file checkpoint could not be created.";
   }

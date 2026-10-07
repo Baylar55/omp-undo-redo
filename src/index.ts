@@ -1,9 +1,11 @@
 import "./core/compat.js";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs";
 import { readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import type { SessionEntryLike } from "./core/types.js";
 import { runNavigation } from "./commands/navigate.js";
 import {
@@ -17,6 +19,7 @@ import {
   ensureGitSnapshotStore,
   ensurePrivateGitRepository,
   GIT_STORE_SOURCE_KEY,
+  refusedPrivateWorkspace,
   setupFinished,
   storeRootDirectory,
 } from "./core/private-repo.js";
@@ -75,7 +78,10 @@ function readRetentionDays(): number {
 }
 
 export type SessionOnlyReason =
-  "git_unavailable" | "repository_unresolvable" | "private_repository_unavailable";
+  | "git_unavailable"
+  | "repository_unresolvable"
+  | "private_repository_unavailable"
+  | "unsafe_workspace";
 
 export type FileBackend =
   | { kind: "git"; repository: GitRepository; git: GitRunner }
@@ -245,6 +251,9 @@ export async function resolveBackend(
     return { kind: "session", reason: "private_repository_unavailable" };
   }
   if (resolved.reason !== "not_repository") return { kind: "session", reason: resolved.reason };
+  // Checked before any store exists: a refused workspace never gets one.
+  if (refusedPrivateWorkspace(canonicalCwd(cwd)))
+    return { kind: "session", reason: "unsafe_workspace" };
   const priv = await resolvePrivateGit(cwd, privateRepositories, gitRunnerFactory);
   return priv
     ? { kind: "git", repository: priv.repository, git: priv.git }
@@ -296,6 +305,9 @@ const LEGACY_BLOB_QUIET_MS = 7 * 24 * 60 * 60 * 1000;
  *  between retries when a git child still holds a directory handle on
  *  Windows. */
 const EVICTION_RETRY_DELAY_MS = 200;
+
+/** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */
+const nativeRealpath = promisify(realpath.native);
 
 async function removeDirWithRetry(path: string): Promise<boolean> {
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -699,7 +711,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  flight, and even then the repo is only renamed aside as `.evicted-<ts>`
    *  trash for EVICTION_TRASH_RETENTION_MS instead of being deleted outright.
    *  A store whose setup never finished names no source; it is evicted on
-   *  idleness alone, and only while it holds no refs. */
+   *  idleness alone, and only while it holds no refs. A private store of a
+   *  workspace `refusedPrivateWorkspace` rejects is evicted on idleness alone. */
   async function evictStalePrivateRepos(): Promise<void> {
     const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
     let entries: string[];
@@ -746,8 +759,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         } catch {
           // No pidfile.
         }
-        const source = (await storeSource(reposDir, path))?.path;
-        if (source) {
+        const found = await storeSource(reposDir, path);
+        if (found) {
+          const source = found.path;
           const vanished = async (): Promise<boolean> => {
             try {
               await stat(source);
@@ -759,9 +773,20 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
               return code === "ENOENT" || code === "ENOTDIR";
             }
           };
-          if (!(await vanished())) continue;
-          await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
-          if (!(await vanished())) continue;
+          // A private store of a refused workspace (left by an earlier
+          // version) is never used again, so it counts as abandoned. v1.5.0
+          // and v1.5.1 wrote `core.worktree` through non-native realpath,
+          // which keeps Windows 8.3 short names, so it is resolved again
+          // here. Async: a dead network mount then stalls a threadpool
+          // thread, as `vanished` would, never the event loop.
+          const refused =
+            !found.gitStore &&
+            refusedPrivateWorkspace(await nativeRealpath(source).catch(() => source));
+          if (!refused) {
+            if (!(await vanished())) continue;
+            await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
+            if (!(await vanished())) continue;
+          }
         } else if ((await setupFinished(path)) !== false || (await storeHasRefs(path))) {
           // No source to stat. Only a setup that never wrote its marker (a
           // crash or stale config.lock after `git init`) and holds no
@@ -884,6 +909,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       "Git is not available.\nSession navigation still works, but file changes cannot be restored.",
     private_repository_unavailable:
       "The private snapshot repository could not be initialized.\nSession navigation still works, but file changes cannot be restored.",
+    unsafe_workspace:
+      "File snapshots are disabled in a home directory, drive root, or temp directory: they would copy its private files.\nSession navigation still works, but file changes cannot be restored. Start OMP in a project folder to enable them.",
     repository_unresolvable:
       "The Git repository could not be resolved.\nSession navigation still works, but file changes cannot be restored.",
   };
