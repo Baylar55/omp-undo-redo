@@ -1,4 +1,4 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import type { spawn as Spawn } from "node:child_process";
 import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -111,6 +111,24 @@ describe("Git runner", () => {
 
     expect(observer).toHaveBeenCalledTimes(1);
     await expect(resultPromise).resolves.toMatchObject({ error: "timeout" });
+  });
+
+  it("hands stdout to onStdout as it arrives instead of buffering it", async () => {
+    const child = new FakeGitChild();
+    const chunks: string[] = [];
+    const resultPromise = runnerWithChild(child)(["ls-tree", "-r", "-z", "HEAD"], {
+      onStdout: (chunk) => chunks.push(chunk),
+    });
+    child.stdout.write("100644 blob 1\ta\x00100644 bl");
+    await new Promise((resolve) => setImmediate(resolve));
+    // Delivered before the child has finished, not at close.
+    expect(chunks.join("")).toBe("100644 blob 1\ta\x00100644 bl");
+    child.stdout.end("ob 2\tb\0");
+    await once(child.stdout, "end");
+    child.emit("close", 0);
+
+    await expect(resultPromise).resolves.toMatchObject({ code: 0, stdout: "" });
+    expect(chunks.join("")).toBe("100644 blob 1\ta\x00100644 blob 2\tb\x00");
   });
 
   it("classifies synchronous spawn failure as unavailable", async () => {

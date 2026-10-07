@@ -307,6 +307,21 @@ describe("runtime action-state store", () => {
     await joining.shutdown();
   });
 
+  it("forgets a session it left and publishes it again once resumed", async () => {
+    const root = await makeRoot();
+    const store = new RuntimeActionStateStore({ rootDirectory: root, pid: 112 });
+    await store.publishNavigation("left", state(0), "turn");
+    await store.publishNavigation("kept", state(0), "turn");
+
+    await store.releaseSession("left");
+    await expect(access(store.sessionPath("left"))).rejects.toThrow();
+    expect((await readState(store, "kept")).activeSessionLeaf).toBe("turn");
+
+    await store.publishNavigation("left", state(1), "turn-2");
+    expect((await readState(store, "left")).activeSessionLeaf).toBe("turn-2");
+    await store.shutdown();
+  });
+
   it("swallows filesystem failures", async () => {
     const root = await mkdtemp(join(tmpdir(), "omp-undo-redo-runtime-file-"));
     roots.push(root);

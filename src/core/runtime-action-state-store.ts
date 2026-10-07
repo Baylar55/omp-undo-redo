@@ -339,6 +339,15 @@ export class RuntimeActionStateStore {
     await this.enqueue(sessionHash, () => this.writeSession(sessionHash));
   }
 
+  /** Forgets a session this process left (`/new`, `/resume`, fork, handoff):
+   *  drops its projection and, behind its queued writes, its state file. A
+   *  later publish (resumed again) queues behind this and writes it anew. */
+  async releaseSession(sessionId: string): Promise<void> {
+    const sessionHash = checkpointNamespace(sessionId);
+    if (!this.latest.delete(sessionHash)) return;
+    await this.enqueue(sessionHash, () => rm(this.sessionHashPath(sessionHash), { force: true }));
+  }
+
   async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.active = false;

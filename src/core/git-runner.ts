@@ -121,7 +121,8 @@ function resolveDirectGit(): Promise<DirectGit | null> {
 
 /** Every git invocation goes through `spawn`: it handles the stdin-fed
  *  `update-ref --stdin` batches and, unlike `execFile`, imposes no output
- *  buffer cap on large `for-each-ref`/`status` reads. */
+ *  buffer cap on large `for-each-ref`/`status` reads. Output that grows with
+ *  the whole tree (`ls-tree -r`) is streamed through `onStdout` instead. */
 async function runGit(
   cwd: string,
   args: string[],
@@ -214,8 +215,10 @@ async function runGit(
 
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
+  const onStdout = options?.onStdout;
   child.stdout.on("data", (chunk: string) => {
-    stdout += chunk;
+    if (onStdout) onStdout(chunk);
+    else stdout += chunk;
   });
   child.stderr.on("data", (chunk: string) => {
     stderr += chunk;

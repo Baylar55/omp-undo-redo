@@ -1269,7 +1269,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     turnStartLeafBySession.delete(sessionId);
     turnSequenceBySession.delete(sessionId);
     explicitActiveHashes.delete(checkpointNamespace(sessionId));
-    await suspendDetached(navigation ? [navigation] : [], left ? [left] : []);
+    await Promise.all([
+      runtimeStore.releaseSession(sessionId),
+      suspendDetached(navigation ? [navigation] : [], left ? [left] : []),
+    ]);
   }
 
   pi.on("session_start", (_event, ctx) =>

@@ -305,6 +305,29 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("snapshots a repository whose core.safecrlf would refuse the conversion", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "core.autocrlf", "true"]);
+      await git(["config", "core.safecrlf", "true"]);
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "safecrlf-turn"));
+      expect(before).not.toBeNull();
+      if (!before) return;
+
+      // An LF file under autocrlf=true: `git add` with safecrlf=true aborts on it.
+      await writeFile(join(cwd, "turn.txt"), "line one\nline two\n");
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+      expect(after).not.toBeNull();
+      if (!after) return;
+      expect(await text(snap, ["ls-tree", "-r", "--name-only", after.afterHash])).toContain(
+        "turn.txt",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("preserves staged turn state while undoing and redoing the worktree", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {

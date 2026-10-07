@@ -559,9 +559,13 @@ async function addWorktree(
   git: GitRunner,
   env: Record<string, string>,
 ): Promise<OutsideSnapshot | null> {
-  const added = await invoke(git, ["add", "-A", "--ignore-errors", "--", WORKTREE_PATHSPEC], {
-    env: { ...env, LC_ALL: "C" },
-  });
+  // `core.safecrlf` only warns (one stderr line per converted file) or, set to
+  // true, aborts the add; the blobs written are the same either way.
+  const added = await invoke(
+    git,
+    ["-c", "core.safecrlf=false", "add", "-A", "--ignore-errors", "--", WORKTREE_PATHSPEC],
+    { env: { ...env, LC_ALL: "C" } },
+  );
   const outside: OutsideSnapshot = { nestedRepositories: [], unreadableFiles: [] };
   if (added.code === 0) return outside;
   if (added.error || added.code !== 1) return null;
@@ -1224,7 +1228,8 @@ interface SnapshotsOutside extends OutsideSnapshot {
  *  only, and `git apply` without an index skips gitlink hunks) plus the ones a
  *  snapshot left out for having no commit. Unreadable files: a snapshot's
  *  entry for one is stale or missing, so the restore must leave the file on
- *  disk alone. Null when a commit is unreadable.
+ *  disk alone. Null when a commit is unreadable. The listings are streamed,
+ *  so memory stays bounded by what is kept, not by the tree's size.
  *  ponytail: lists every tree entry per restore; record gitlinks at capture
  *  time if undo in million-file trees gets slow. */
 async function pathsOutsideSnapshots(
@@ -1248,17 +1253,24 @@ async function pathsOutsideSnapshots(
   }
   const sourceEntries = new Map<string, string>();
   for (const commit of [sourceHash, targetHash]) {
+    // Entries: "<mode> <type> <object>\t<path>", a format `--index-info` reads.
+    let partial = "";
+    const feed = (chunk: string) => {
+      const entries = (partial + chunk).split("\0");
+      partial = entries.pop()!;
+      for (const entry of entries) {
+        const path = entry.slice(entry.indexOf("\t") + 1);
+        if (entry.startsWith("160000 ")) nested.add(path);
+        if (commit === sourceHash && unreadable.has(path)) sourceEntries.set(path, entry);
+      }
+    };
     const tree = await invoke(git, ["ls-tree", "-r", "-z", "--full-tree", commit], {
       timeoutMs: RESTORE_TIMEOUT_MS,
+      onStdout: feed,
     });
     if (tree.error || tree.code !== 0) return null;
-    // Entries: "<mode> <type> <object>\t<path>", a format `--index-info` reads.
-    for (const entry of tree.stdout.split("\0")) {
-      const tab = entry.indexOf("\t");
-      const path = entry.slice(tab + 1);
-      if (entry.startsWith("160000 ")) nested.add(path);
-      if (commit === sourceHash && unreadable.has(path)) sourceEntries.set(path, entry);
-    }
+    // A runner that ignores `onStdout` buffers instead; scanning twice is harmless.
+    feed(`${tree.stdout}\0`);
   }
   // Mode 0 with an all-zero id of the repository's hash length removes a path.
   const removal = `0 ${"0".repeat(sourceHash.length)}`;

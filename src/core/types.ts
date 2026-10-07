@@ -79,6 +79,11 @@ export interface GitRunOptions {
   env?: Record<string, string | undefined>;
   stdin?: string;
   timeoutMs?: number;
+  /** Receives stdout as it arrives instead of buffering it; `createGitRunner`
+   *  then returns an empty `stdout`. A runner may ignore it and buffer, so
+   *  callers also read the result's `stdout`. For output that grows with the
+   *  repository. */
+  onStdout?: (chunk: string) => void;
 }
 
 export type GitRunError = "unavailable" | "timeout";
