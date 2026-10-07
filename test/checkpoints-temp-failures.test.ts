@@ -64,11 +64,11 @@ function makeGitRunner(
   const runner: GitRunner = async (args, callOpts) => {
     const runOpts = { ...callOpts, env: { ...options?.env, ...callOpts?.env } };
     if (options?.failCommand && args.includes(options.failCommand)) {
-      return { code: 1, stdout: "", stderr: "simulated git failure", error: null };
+      return { code: 1, stdout: "", stderr: "simulated git failure" };
     }
     if (runOpts?.stdin !== undefined) {
       const child = spawn("git", args, {
-        cwd: runOpts?.cwd ?? cwd,
+        cwd,
         env: { ...process.env, ...runOpts?.env },
         windowsHide: true,
       });
@@ -86,25 +86,24 @@ function makeGitRunner(
       child.stdin.end(runOpts.stdin);
       try {
         const [code] = (await once(child, "close")) as [number | null];
-        return { stdout, stderr, code: typeof code === "number" ? code : 1, error: null };
+        return { stdout, stderr, code: typeof code === "number" ? code : 1 };
       } catch (error) {
-        return { stdout, stderr: `${stderr}${String(error)}`, code: 1, error: null };
+        return { stdout, stderr: `${stderr}${String(error)}`, code: 1 };
       }
     }
     try {
       const { stdout, stderr } = await execFileAsync("git", args, {
-        cwd: runOpts?.cwd ?? cwd,
+        cwd,
         env: { ...process.env, ...runOpts.env },
         windowsHide: true,
       });
-      return { code: 0, stdout, stderr, error: null };
+      return { code: 0, stdout, stderr };
     } catch (err: unknown) {
       const error = err as { code?: number; stdout?: string; stderr?: string };
       return {
         code: error.code ?? 1,
         stdout: error.stdout ?? "",
         stderr: error.stderr ?? "",
-        error: null,
       };
     }
   };
@@ -187,7 +186,7 @@ describe("temp-directory failure resilience", () => {
           const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
           const gated: GitRunner = async (args, options) =>
             failAdd && args.includes("add")
-              ? { code: 1, stdout: "", stderr: "simulated add failure", error: null }
+              ? { code: 1, stdout: "", stderr: "simulated add failure" }
               : inner(args, options);
           gated.cwd = workCwd;
           if (env) gated.env = env;
@@ -246,7 +245,7 @@ describe("temp-directory failure resilience", () => {
             const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
             const gated: GitRunner = async (args, options) =>
               args.includes(`omp-undo-redo: retain ${side} checkpoint`)
-                ? { code: 1, stdout: "", stderr: "simulated update-ref failure", error: null }
+                ? { code: 1, stdout: "", stderr: "simulated update-ref failure" }
                 : inner(args, options);
             gated.cwd = workCwd;
             if (env) gated.env = env;

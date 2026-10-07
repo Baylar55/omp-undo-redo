@@ -642,7 +642,8 @@ describe("private per-workspace git repositories", () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-exclude-idem-"));
     try {
       const storeRoot = join(cwd, ".omp");
-      const factory = (cwd2: string, env?: NodeJS.ProcessEnv) => createGitRunner(cwd2, { env });
+      const factory = (cwd2: string, env?: Record<string, string>) =>
+        createGitRunner(cwd2, { env });
       const repository = await ensurePrivateGitRepository(factory, cwd, storeRoot);
       expect(repository).not.toBeNull();
       if (!repository) return;

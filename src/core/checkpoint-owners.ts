@@ -61,8 +61,8 @@ export interface HostIdentityOptions {
   env?: NodeJS.ProcessEnv;
   homeDirectory?: string;
   randomId?: () => string;
-  readFile?: typeof readFile;
-  readlink?: typeof readlink;
+  readFile?: (path: string, encoding: "utf8") => Promise<string>;
+  readlink?: (path: string) => Promise<string>;
 }
 
 export interface LivenessOptions {

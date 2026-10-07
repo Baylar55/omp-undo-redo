@@ -195,7 +195,7 @@ For example, if `f.txt` is committed as `base`, a turn changes it to `turn` and 
 Install dependencies with npm, then use the scripts in `package.json`:
 
 - `npm run build` replaces `dist/` rather than incrementally accumulating files, compiling `src/` to `dist/`.
-- `npm run typecheck` checks TypeScript without emitting files.
+- `npm run typecheck` checks TypeScript in `src/` and `test/` without emitting files.
 - `npm test` runs the deterministic test suite.
 - `npm run lint` and `npm run format:check` check style.
 - `npm run verify` runs the repository verification sequence.

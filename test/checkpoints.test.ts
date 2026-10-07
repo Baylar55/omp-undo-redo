@@ -2031,7 +2031,7 @@ describe("history-safe Git checkpoints", () => {
             // What runGit returns for a child it had to terminate, after
             // `--output` already wrote a valid patch prefix.
             await snap(args, options);
-            return { stdout: "", stderr: "", code: 1, error: "timeout" };
+            return { stdout: "", stderr: "", code: 1, error: "timeout" as const };
           }
           return snap(args, options);
         },

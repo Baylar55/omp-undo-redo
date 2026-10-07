@@ -22,7 +22,7 @@ describe("Node compatibility", () => {
     try {
       const git = async () => ({ stdout: "", stderr: "", code: 0 });
       git.cwd = ".";
-      const repository = { worktree: ".", gitDir: ".git", commonDir: ".git" };
+      const repository = { worktree: ".", gitDir: ".git", commonDir: ".git", storeDir: ".git" };
       const refs = [
         { repository, ref: "refs/omp-undo-redo/test1", expectedHash: "abc" },
         { repository, ref: "refs/omp-undo-redo/test2", expectedHash: "def" },
