@@ -29,6 +29,7 @@ import { SessionNavigation } from "./core/session-navigation.js";
 import {
   checkpointNamespace,
   finishAfterTurn,
+  pinStoreObjects,
   prepareBeforeTurn,
   releasePersistentSnapshotIndices,
   releaseCheckpoint,
@@ -482,6 +483,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       // eviction sweep). GIT_DIR is set, so the repo operations work anywhere;
       // a Git store also needs the objects it borrows to walk its snapshots.
       const git = gitRunnerFactory(tmpdir(), storeEnv(repository));
+      // Git mode: the prune and gc below would drop the store's copies of
+      // objects the user's repository also holds.
+      await pinStoreObjects(git, repository, PRIVATE_GC_TIMEOUT_MS);
       // gc prunes only after its repack. A repack that outruns the ceiling
       // (or dies with the terminal) is hard-killed on Windows, so its prune
       // never runs: expired snapshots stay on disk and every attempt leaves a

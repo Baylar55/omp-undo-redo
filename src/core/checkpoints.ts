@@ -1,5 +1,15 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { CheckpointOwnerRegistry } from "./checkpoint-owners.js";
@@ -130,12 +140,10 @@ export function storeEnv(repository: GitRepository): Record<string, string> {
  *  copied (the index is where an unborn repository's snapshot content can
  *  already exist). A clean worktree costs one `diff-tree`; objects the
  *  capture itself wrote are loose in the store and cost a `stat` each.
- *  ponytail: the store's own gc drops these copies again while the user's
+ *  The store's own gc would drop these copies again while the user's
  *  repository still holds the object (prune deletes loose duplicates of any
- *  pack, alternates' included; `repack -l` skips borrowed objects), so only
- *  the user's normal gc grace periods protect them, not an aggressive prune.
- *  Upgrade path: rebuild a `.keep` pack of `rev-list --objects-edge-aggressive
- *  --all --not <HEAD>` before each store gc. */
+ *  pack, alternates' included; `repack -l` skips borrowed objects), so every
+ *  store gc first moves them into a kept pack (`pinStoreObjects`). */
 async function pinBorrowedObjects(
   git: GitRunner,
   repository: GitRepository,
@@ -198,6 +206,80 @@ async function pinBorrowedObjects(
     stdin: `${borrowed.join("\n")}\n`,
   });
   return packed.code === 0;
+}
+
+/** Content of the `.keep` file that marks a store's pins pack. */
+const PINS_KEEP = "omp-undo-redo pins\n";
+
+/** Runs right before a Git-mode store's prune and gc: packs every object the
+ *  store's refs reach and the user's HEAD does not, borrowed ones included,
+ *  into one pack kept from both (`.keep`), then unkeeps the previous pins
+ *  pack so the same gc reclaims what no ref needs any more. Without it the
+ *  gc would drop `pinBorrowedObjects`' copies (see there), and the user's
+ *  `reflog expire --expire=now --all && gc --prune=now` would then break the
+ *  snapshot. `--objects-edge-aggressive` also leaves out the blobs HEAD's
+ *  tree holds: snapshot commits have no parent, so plain `--objects` would
+ *  copy the whole checkout. An unborn HEAD reaches nothing, so everything is
+ *  pinned. Any failure keeps the previous pins pack, so the gc then loses
+ *  at most the copies made since. Private-Git stores borrow nothing.
+ *  ponytail: no lock spans pinning and gc, so two processes maintaining one
+ *  store at once can unkeep each other's pins pack, and a capture running
+ *  meanwhile can lose its copy to this gc until the next maintenance
+ *  re-pins it; only an aggressive user prune inside that gap loses data.
+ *  Upgrade path: one store-wide lock file held across pin, prune and gc. */
+export async function pinStoreObjects(
+  git: GitRunner,
+  repository: GitRepository,
+  timeoutMs: number,
+): Promise<void> {
+  if (!borrowsObjects(repository)) return;
+  const head = await invoke(git, ["rev-parse", "--verify", "-q", "HEAD"], {
+    env: { GIT_DIR: repository.gitDir },
+  });
+  if (head.error) return;
+  const headHash = head.code === 0 ? head.stdout.trim() : "";
+  // A snapshot whose content the user already pruned stays broken; it must
+  // not keep every other snapshot from being pinned.
+  const listed = await invoke(
+    git,
+    [
+      "rev-list",
+      "--objects",
+      "--objects-edge-aggressive",
+      "--missing=allow-any",
+      "--all",
+      ...(headHash ? ["--not", headHash] : []),
+    ],
+    { timeoutMs },
+  );
+  if (listed.code !== 0 || listed.error) return;
+  // Edges ("-<id>") are HEAD's commits, not objects to pin.
+  const objects = listed.stdout.split("\n").filter((line) => line && !line.startsWith("-"));
+  const packDir = join(repository.storeDir, "objects", "pack");
+  let kept = "";
+  if (objects.length > 0) {
+    const packed = await invoke(git, ["pack-objects", "-q", join(packDir, "pack")], {
+      stdin: `${objects.join("\n")}\n`,
+      timeoutMs,
+    });
+    const hash = packed.stdout.trim();
+    if (packed.code !== 0 || packed.error || !/^[0-9a-f]{40,64}$/.test(hash)) return;
+    kept = `pack-${hash}.keep`;
+    try {
+      await writeFile(join(packDir, kept), PINS_KEEP);
+    } catch {
+      return;
+    }
+  }
+  // Only after the new pack is kept. Unchanged pins rebuild the same pack.
+  const names = await readdir(packDir).catch(() => [] as string[]);
+  for (const name of names) {
+    if (!name.endsWith(".keep") || name === kept) continue;
+    const path = join(packDir, name);
+    if ((await readFile(path, "utf8").catch(() => "")) === PINS_KEEP) {
+      await rm(path, { force: true }).catch(() => undefined);
+    }
+  }
 }
 
 function checkpointRefs(
