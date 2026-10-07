@@ -19,8 +19,11 @@ const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-
 const REF_ROOT = "refs/omp-undo-redo";
 const WORKTREE_PATHSPEC = ":(top)";
 
-/** Commit-message line naming a nested repository a snapshot left out. */
+/** Commit-message lines naming paths a snapshot left out: a nested repository
+ *  with no commit, and a file git could not read (locked by another process,
+ *  no read permission), whose tree entry is stale or missing. */
 const NESTED_REPOSITORY_LINE = "Nested repository outside snapshot: ";
+const UNREADABLE_FILE_LINE = "Unreadable file outside snapshot: ";
 const NO_COMMIT_ERROR = /^error: '(.+?)\/?' does not have a commit checked out$/;
 const UNABLE_TO_INDEX_ERROR = /^error: unable to index file '(.+?)\/?'$/;
 
@@ -389,35 +392,65 @@ async function pruneIgnoredEntries(
   return removed.code === 0;
 }
 
-/** `git add -A` of the whole worktree. An embedded repository with no commit
- *  checked out cannot be recorded even as a gitlink, and would otherwise abort
- *  every snapshot — one `git init` in a subfolder would disable capture. Such
- *  repositories are left out and returned; any other error still fails the
- *  snapshot, since silently omitting an unreadable file would let a restore
- *  treat it as deleted. `LC_ALL=C` pins the message being matched. */
-async function addWorktree(git: GitRunner, env: Record<string, string>): Promise<string[] | null> {
+/** Paths a snapshot left out, relative to the worktree root. */
+interface OutsideSnapshot {
+  nestedRepositories: string[];
+  unreadableFiles: string[];
+}
+
+/** `git add -A` of the whole worktree. Two failures leave a path out instead
+ *  of aborting every snapshot: an embedded repository with no commit checked
+ *  out (cannot be recorded even as a gitlink; one `git init` in a subfolder
+ *  would disable capture), and a file git cannot read (a database held open
+ *  by a running app on Windows; it would disable capture for as long as the
+ *  lock is held). The index keeps whatever entry an unreadable file had, so
+ *  its tree entry is stale or missing: restores pin it (`applyPatch`) instead
+ *  of treating it as deleted. Any other error still fails the snapshot, as
+ *  does an error line not naming the file the following "unable to index"
+ *  line reports. `LC_ALL=C` pins the messages being matched. */
+async function addWorktree(
+  git: GitRunner,
+  env: Record<string, string>,
+): Promise<OutsideSnapshot | null> {
   const added = await invoke(git, ["add", "-A", "--ignore-errors", "--", WORKTREE_PATHSPEC], {
     env: { ...env, LC_ALL: "C" },
   });
-  if (added.code === 0) return [];
+  const outside: OutsideSnapshot = { nestedRepositories: [], unreadableFiles: [] };
+  if (added.code === 0) return outside;
   if (added.error || added.code !== 1) return null;
-  const skipped: string[] = [];
+  // Error lines git printed for the file the next "unable to index" names.
+  let reasons: string[] = [];
   for (const line of added.stderr.split(/\r?\n/)) {
-    const match = NO_COMMIT_ERROR.exec(line);
-    if (match) {
-      skipped.push(match[1]!);
+    const noCommit = NO_COMMIT_ERROR.exec(line);
+    if (noCommit) {
+      outside.nestedRepositories.push(noCommit[1]!);
       continue;
     }
     const unable = UNABLE_TO_INDEX_ERROR.exec(line);
-    if (unable && unable[1] === skipped.at(-1)) continue;
-    if (line.startsWith("error:") || line.startsWith("fatal:")) return null;
+    if (unable) {
+      const path = unable[1]!;
+      if (reasons.length === 0) {
+        if (path !== outside.nestedRepositories.at(-1)) return null;
+      } else {
+        if (!reasons.every((reason) => reason.includes(path))) return null;
+        outside.unreadableFiles.push(path);
+        reasons = [];
+      }
+      continue;
+    }
+    if (line.startsWith("fatal:")) return null;
+    if (line.startsWith("error:")) reasons.push(line);
   }
-  return skipped.length > 0 ? skipped : null;
+  const leftOut = outside.nestedRepositories.length + outside.unreadableFiles.length;
+  return reasons.length === 0 && leftOut > 0 ? outside : null;
 }
 
-function snapshotMessage(message: string, skipped: readonly string[]): string {
-  if (skipped.length === 0) return message;
-  return `${message}\n\n${skipped.map((path) => `${NESTED_REPOSITORY_LINE}${path}`).join("\n")}`;
+function snapshotMessage(message: string, outside: OutsideSnapshot): string {
+  const lines = [
+    ...outside.nestedRepositories.map((path) => `${NESTED_REPOSITORY_LINE}${path}`),
+    ...outside.unreadableFiles.map((path) => `${UNREADABLE_FILE_LINE}${path}`),
+  ];
+  return lines.length === 0 ? message : `${message}\n\n${lines.join("\n")}`;
 }
 
 async function releaseSnapshotIndexLease(lease: SnapshotIndexLease | undefined): Promise<boolean> {
@@ -460,13 +493,13 @@ export async function createSnapshotCommit(
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const skipped = await addWorktree(git, addEnv);
-    if (!skipped) return { reason: "snapshot_failed" };
+    const outside = await addWorktree(git, addEnv);
+    if (!outside) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     if (tree.code !== 0) return { reason: "snapshot_failed" };
     const treeHash = tree.stdout.trim();
     if (!treeHash) return { reason: "snapshot_failed" };
-    const commit = await createCommitForTree(git, treeHash, snapshotMessage(message, skipped));
+    const commit = await createCommitForTree(git, treeHash, snapshotMessage(message, outside));
     if (!("hash" in commit)) return commit;
     if (retainIndex && (seeded.status === "seeded" || seeded.status === "empty")) {
       const snapshotIndexLease: SnapshotIndexLease =
@@ -560,8 +593,8 @@ async function createSnapshotCommitFromLease(
 
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const skipped = await addWorktree(git, addEnv);
-    if (!skipped) return { reason: "snapshot_failed" };
+    const outside = await addWorktree(git, addEnv);
+    if (!outside) return { reason: "snapshot_failed" };
     // `add -A` cannot drop an entry that became ignored after it was staged, so
     // prune those explicitly; a fresh snapshot never holds one unless HEAD
     // tracks it (an unborn baseline tracks nothing).
@@ -573,7 +606,7 @@ async function createSnapshotCommitFromLease(
     if (tree.code !== 0 || !treeHash) return { reason: "snapshot_failed" };
 
     if (!(await leaseBaselineCurrent(git, lease))) return { reason: "snapshot_failed" };
-    return createCommitForTree(git, treeHash, snapshotMessage(message, skipped));
+    return createCommitForTree(git, treeHash, snapshotMessage(message, outside));
   } catch {
     return { reason: "snapshot_failed" };
   } finally {
@@ -885,10 +918,12 @@ export async function retainCheckpointForResume(
   return { ...checkpoint, beforeRef, afterRef };
 }
 
-/** `nestedRepositories`: repositories whose contents the restore could not
- *  touch, relative to the worktree root (see `nestedRepositoriesOutside`). */
+/** `nestedRepositories` and `unreadableFiles`: paths whose contents the
+ *  restore could not touch, relative to the worktree root (see
+ *  `pathsOutsideSnapshots`). */
 export type CheckpointApplyResult =
-  { status: "applied"; nestedRepositories: string[] } | { status: "conflict" | "failed" };
+  | { status: "applied"; nestedRepositories: string[]; unreadableFiles: string[] }
+  | { status: "conflict" | "failed" };
 
 /** Restore invocations get a far larger ceiling than the runner's default:
  *  diffing and applying a multi-GB binary change is slow but legitimate, and
@@ -933,17 +968,16 @@ async function ignoredUnder(
  *  because that tree's rules ignored it while the file stayed on disk.
  *  Restoring must leave such a path alone: deleting it destroys the user's
  *  ignored file (undoing a turn that un-ignored `.env`), and creating it
- *  collides with the file still on disk (redoing that turn). Returns a tree
- *  equal to `targetHash` with those paths pinned to their `sourceHash` state,
- *  or `targetHash` itself when nothing needs pinning. Only a `.gitignore`
- *  change between the two trees can produce such a path, so every other
- *  restore costs one `diff-tree`. */
+ *  collides with the file still on disk (redoing that turn). Returns the
+ *  `--index-info` entries pinning those paths to their `sourceHash` state.
+ *  Only a `.gitignore` change between the two trees can produce such a path,
+ *  so every other restore costs one `diff-tree`. */
 async function shieldIgnoredPaths(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
   directory: string,
-): Promise<string | null> {
+): Promise<string[] | null> {
   const changes = await invoke(git, ["diff-tree", "-r", "-z", sourceHash, targetHash], {
     timeoutMs: RESTORE_TIMEOUT_MS,
   });
@@ -962,7 +996,7 @@ async function shieldIgnoredPaths(
     if (status === "D") deleted.set(path, `${sourceMode} ${sourceSha}`);
     else if (status === "A") added.set(path, `${sourceMode} ${sourceSha}`);
   }
-  if (!rulesChanged || (deleted.size === 0 && added.size === 0)) return targetHash;
+  if (!rulesChanged || (deleted.size === 0 && added.size === 0)) return [];
 
   const keptOnDisk = await ignoredUnder(git, targetHash, [...deleted.keys()], directory, "target");
   const hiddenInSource = await ignoredUnder(
@@ -987,13 +1021,23 @@ async function shieldIgnoredPaths(
       if (onDisk) pinned.push(`${added.get(path)}\t${path}\0`);
     }
   }
-  if (pinned.length === 0) return targetHash;
+  return pinned;
+}
 
-  const env = { GIT_INDEX_FILE: join(directory, "shield-index") };
+/** `targetHash` with `pins` (`--index-info -z` entries) applied, or
+ *  `targetHash` itself when there is nothing to pin. */
+async function pinnedTree(
+  git: GitRunner,
+  targetHash: string,
+  pins: readonly string[],
+  directory: string,
+): Promise<string | null> {
+  if (pins.length === 0) return targetHash;
+  const env = { GIT_INDEX_FILE: join(directory, "pin-index") };
   if ((await invoke(git, ["read-tree", targetHash], { env })).code !== 0) return null;
   const updated = await invoke(git, ["update-index", "-z", "--index-info"], {
     env,
-    stdin: pinned.join(""),
+    stdin: pins.join(""),
   });
   if (updated.code !== 0) return null;
   const tree = await invoke(git, ["write-tree"], { env });
@@ -1001,51 +1045,80 @@ async function shieldIgnoredPaths(
   return tree.code === 0 && treeHash ? treeHash : null;
 }
 
-/** Nested repositories whose contents none of `commits` hold: gitlinks (a
- *  submodule or committed nested repository is recorded as its HEAD commit
+interface SnapshotsOutside extends OutsideSnapshot {
+  /** `--index-info -z` entries pinning every unreadable file to its source
+   *  entry (a removal when the source has none). */
+  unreadablePins: string[];
+}
+
+/** Paths neither commit holds the contents of. Nested repositories: gitlinks
+ *  (a submodule or committed nested repository is recorded as its HEAD commit
  *  only, and `git apply` without an index skips gitlink hunks) plus the ones a
- *  snapshot left out for having no commit. Null when a commit is unreadable.
+ *  snapshot left out for having no commit. Unreadable files: a snapshot's
+ *  entry for one is stale or missing, so the restore must leave the file on
+ *  disk alone. Null when a commit is unreadable.
  *  ponytail: lists every tree entry per restore; record gitlinks at capture
  *  time if undo in million-file trees gets slow. */
-async function nestedRepositoriesOutside(
+async function pathsOutsideSnapshots(
   git: GitRunner,
-  commits: readonly string[],
-): Promise<string[] | null> {
-  const paths = new Set<string>();
-  for (const commit of commits) {
-    const tree = await invoke(git, ["ls-tree", "-r", "-z", "--full-tree", commit], {
-      timeoutMs: RESTORE_TIMEOUT_MS,
-    });
+  sourceHash: string,
+  targetHash: string,
+): Promise<SnapshotsOutside | null> {
+  const nested = new Set<string>();
+  const unreadable = new Set<string>();
+  for (const commit of [sourceHash, targetHash]) {
     const object = await invoke(git, ["cat-file", "commit", commit]);
-    if (tree.error || tree.code !== 0 || object.error || object.code !== 0) return null;
-    // Entries: "<mode> <type> <object>\t<path>".
-    for (const entry of tree.stdout.split("\0")) {
-      if (entry.startsWith("160000 ")) paths.add(entry.slice(entry.indexOf("\t") + 1));
-    }
+    if (object.error || object.code !== 0) return null;
     const message = object.stdout.slice(object.stdout.indexOf("\n\n") + 2);
     for (const line of message.split("\n")) {
       if (line.startsWith(NESTED_REPOSITORY_LINE)) {
-        paths.add(line.slice(NESTED_REPOSITORY_LINE.length));
+        nested.add(line.slice(NESTED_REPOSITORY_LINE.length));
+      } else if (line.startsWith(UNREADABLE_FILE_LINE)) {
+        unreadable.add(line.slice(UNREADABLE_FILE_LINE.length));
       }
     }
   }
-  return [...paths].sort();
+  const sourceEntries = new Map<string, string>();
+  for (const commit of [sourceHash, targetHash]) {
+    const tree = await invoke(git, ["ls-tree", "-r", "-z", "--full-tree", commit], {
+      timeoutMs: RESTORE_TIMEOUT_MS,
+    });
+    if (tree.error || tree.code !== 0) return null;
+    // Entries: "<mode> <type> <object>\t<path>", a format `--index-info` reads.
+    for (const entry of tree.stdout.split("\0")) {
+      const tab = entry.indexOf("\t");
+      const path = entry.slice(tab + 1);
+      if (entry.startsWith("160000 ")) nested.add(path);
+      if (commit === sourceHash && unreadable.has(path)) sourceEntries.set(path, entry);
+    }
+  }
+  // Mode 0 with an all-zero id of the repository's hash length removes a path.
+  const removal = `0 ${"0".repeat(sourceHash.length)}`;
+  return {
+    nestedRepositories: [...nested].sort(),
+    unreadableFiles: [...unreadable].sort(),
+    unreadablePins: [...unreadable].map(
+      (path) => `${sourceEntries.get(path) ?? `${removal}\t${path}`}\0`,
+    ),
+  };
 }
 
 /** Restores `targetHash`'s content over a worktree that currently matches
  *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
- *  Nested repositories are outside every snapshot: an `applied` result lists
- *  them so the caller never reports their contents as restored. */
+ *  Nested repositories and unreadable files are outside the snapshots: the
+ *  patch leaves them as they are, and an `applied` result lists them so the
+ *  caller never reports their contents as restored. */
 export async function applyCheckpoint(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
 ): Promise<CheckpointApplyResult> {
   // Read first: failing after the patch landed would misreport a restore.
-  const nestedRepositories = await nestedRepositoriesOutside(git, [sourceHash, targetHash]);
-  if (!nestedRepositories) return { status: "failed" };
-  const status = await applyPatch(git, sourceHash, targetHash);
-  return status === "applied" ? { status, nestedRepositories } : { status };
+  const outside = await pathsOutsideSnapshots(git, sourceHash, targetHash);
+  if (!outside) return { status: "failed" };
+  const { nestedRepositories, unreadableFiles, unreadablePins } = outside;
+  const status = await applyPatch(git, sourceHash, targetHash, unreadablePins);
+  return status === "applied" ? { status, nestedRepositories, unreadableFiles } : { status };
 }
 
 /** `git apply` without an index first deletes every path it modifies, then
@@ -1136,13 +1209,21 @@ async function applyPatch(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
+  unreadablePins: readonly string[],
 ): Promise<CheckpointApplyResult["status"]> {
   let tempDirectory: string | null = null;
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
     const patchPath = join(tempDirectory, "checkpoint.patch");
     const restore = { timeoutMs: RESTORE_TIMEOUT_MS };
-    const effectiveTarget = await shieldIgnoredPaths(git, sourceHash, targetHash, tempDirectory);
+    const ignoredPins = await shieldIgnoredPaths(git, sourceHash, targetHash, tempDirectory);
+    if (!ignoredPins) return "failed";
+    const effectiveTarget = await pinnedTree(
+      git,
+      targetHash,
+      [...ignoredPins, ...unreadablePins],
+      tempDirectory,
+    );
     if (!effectiveTarget) return "failed";
     const diff = await invoke(
       git,

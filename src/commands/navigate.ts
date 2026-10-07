@@ -65,12 +65,26 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
   }
 }
 
-const LISTED_NESTED_REPOSITORIES = 5;
+const LISTED_PATHS = 5;
 
-function nestedRepositoriesMessage(paths: readonly string[]): string {
-  const listed = paths.slice(0, LISTED_NESTED_REPOSITORIES).join(", ");
-  const more = paths.length - LISTED_NESTED_REPOSITORIES;
-  return `files inside nested Git repositories are outside the snapshot and were not restored: ${listed}${more > 0 ? ` and ${more} more` : ""}.`;
+function listed(paths: readonly string[]): string {
+  const more = paths.length - LISTED_PATHS;
+  return `${paths.slice(0, LISTED_PATHS).join(", ")}${more > 0 ? ` and ${more} more` : ""}`;
+}
+
+function notRestoredMessage(nested: readonly string[], unreadable: readonly string[]): string {
+  const parts: string[] = [];
+  if (nested.length > 0) {
+    parts.push(
+      `files inside nested Git repositories are outside the snapshot and were not restored: ${listed(nested)}`,
+    );
+  }
+  if (unreadable.length > 0) {
+    parts.push(
+      `files Git could not read when the snapshot was taken (locked by another process or no read permission) were left as they are: ${listed(unreadable)}`,
+    );
+  }
+  return `${parts.join("; ")}.`;
 }
 
 export async function runNavigation(
@@ -94,7 +108,7 @@ export async function runNavigation(
         );
       } else if (outcome.files === "partial") {
         ctx.ui.notify(
-          `${verbs.movedPartialPrefix}${nestedRepositoriesMessage(outcome.nestedRepositories)}`,
+          `${verbs.movedPartialPrefix}${notRestoredMessage(outcome.nestedRepositories, outcome.unreadableFiles)}`,
           "warning",
         );
       } else {

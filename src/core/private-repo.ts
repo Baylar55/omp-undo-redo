@@ -23,6 +23,12 @@ export const DEFAULT_EXCLUDES = [
   "build",
   "out",
   "target",
+  // IDE and tool state: Visual Studio holds `.vs` databases open exclusively.
+  ".vs",
+  ".idea",
+  "__pycache__",
+  ".venv",
+  ".gradle",
 ] as const;
 
 /** Per-workspace private repositories: a non-git workspace is snapshotted

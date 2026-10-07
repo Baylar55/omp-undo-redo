@@ -546,24 +546,7 @@ describe("private per-workspace git repositories", () => {
       const entries = new Set(exclude.split(/\r?\n/));
       // The store root is inside the worktree, so its relative entry is seeded…
       expect(entries.has(".omp/")).toBe(true);
-      const expectedExcludes = [
-        ".git",
-        ".hg",
-        ".svn",
-        "node_modules",
-        ".history",
-        "dist",
-        "coverage",
-        ".omp",
-        ".next",
-        "build",
-        "out",
-        "target",
-      ];
-      expect([...DEFAULT_EXCLUDES]).toEqual(expectedExcludes);
-      for (const ignored of expectedExcludes) {
-        expect(entries.has(ignored)).toBe(true);
-      }
+      for (const ignored of DEFAULT_EXCLUDES) expect(entries.has(ignored)).toBe(true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
