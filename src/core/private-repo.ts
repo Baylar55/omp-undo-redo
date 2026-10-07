@@ -95,6 +95,10 @@ function basenameIsRuntime(value: string): boolean {
   return value.endsWith(`${sep}runtime`) || value.endsWith("/runtime");
 }
 
+function defaultStoreRoot(): string {
+  return canonicalCwd(join(homedir(), ".omp", "omp-undo-redo"));
+}
+
 export function storeRootDirectory(): string {
   const explicit = process.env.OMP_UNDO_REDO_STORE_DIR ?? process.env.OMP_UNDO_REDO_BLOB_DIR;
   if (explicit) return canonicalCwd(explicit);
@@ -102,7 +106,24 @@ export function storeRootDirectory(): string {
     const runtime = resolve(process.env.OMP_UNDO_REDO_RUNTIME_DIR);
     return canonicalCwd(basenameIsRuntime(runtime) ? dirname(runtime) : runtime);
   }
-  return canonicalCwd(join(homedir(), ".omp", "omp-undo-redo"));
+  return defaultStoreRoot();
+}
+
+/** Creates `<storeRoot>/repos` owner-only. A Private-Git snapshot captures
+ *  everything in the workspace that is not in DEFAULT_EXCLUDES — .env, id_rsa,
+ *  credentials.json — and git's own loose objects are world-readable under the
+ *  default umask. The mode covers directories this call creates; the chmod of
+ *  `repos` covers one created earlier with the umask default. The store root
+ *  itself is re-moded only at its default location: a configured root may be a
+ *  shared directory (`/tmp` as root in a container), whose permissions are not
+ *  ours to strip, and `repos` already guards every snapshot in it. Windows
+ *  ignores POSIX modes. */
+async function ensureReposDirectory(reposDir: string, storeRoot: string): Promise<void> {
+  await mkdir(reposDir, { recursive: true, mode: 0o700 });
+  if (process.platform === "win32") return;
+  await chmod(reposDir, 0o700).catch(() => undefined);
+  const root = canonicalCwd(storeRoot);
+  if (root === defaultStoreRoot()) await chmod(root, 0o700).catch(() => undefined);
 }
 
 /** The store git dir for a path: `<storeRoot>/repos/<sha256(path)>.git` — a
@@ -279,17 +300,7 @@ export async function ensurePrivateGitRepository(
   const gitDir = privateRepositoryPath(storeRoot, worktree);
   const envGit = gitRunnerFactory(worktree, { GIT_DIR: gitDir });
   try {
-    // Owner-only: a Private-Git snapshot captures everything in the workspace
-    // that is not in DEFAULT_EXCLUDES — .env, id_rsa, credentials.json — and
-    // git's own loose objects are world-readable under the default umask. The
-    // mode covers directories this call creates; the chmod covers a store root
-    // created earlier (by an older version, or by another component) with the
-    // umask default. Windows ignores POSIX modes.
-    await mkdir(dirname(gitDir), { recursive: true, mode: 0o700 });
-    if (process.platform !== "win32") {
-      await chmod(dirname(gitDir), 0o700).catch(() => undefined);
-      await chmod(canonicalCwd(storeRoot), 0o700).catch(() => undefined);
-    }
+    await ensureReposDirectory(dirname(gitDir), storeRoot);
     const state = await setupState(gitDir);
     if (state === "new" || state === "init") {
       const init = await envGit(["init", "-q"]);
@@ -339,11 +350,7 @@ export async function ensureGitSnapshotStore(
   const storeDir = privateRepositoryPath(storeRoot, repository.commonDir);
   const storeGit = gitRunnerFactory(repository.worktree, { GIT_DIR: storeDir });
   try {
-    await mkdir(dirname(storeDir), { recursive: true, mode: 0o700 });
-    if (process.platform !== "win32") {
-      await chmod(dirname(storeDir), 0o700).catch(() => undefined);
-      await chmod(canonicalCwd(storeRoot), 0o700).catch(() => undefined);
-    }
+    await ensureReposDirectory(dirname(storeDir), storeRoot);
     const state = await setupState(storeDir);
     if (state === "new" || state === "init") {
       // Objects written against the user's repository use its hash, so the

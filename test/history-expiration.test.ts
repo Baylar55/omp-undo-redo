@@ -12,6 +12,7 @@ import {
 } from "../src/core/history-store.js";
 import { createGitRunner } from "../src/core/git-runner.js";
 import type { GitRepository, GitRunner } from "../src/core/types.js";
+import { readRetentionDays } from "../src/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -303,6 +304,17 @@ describe("expireGitSessionHistories", () => {
 
     const metadata = await stat(historyFile);
     expect(metadata.isFile()).toBe(true);
+  });
+
+  it("reads OMP_UNDO_REDO_RETENTION_DAYS as a number, falling back to 2 days", () => {
+    // parseInt read "0.5" as 0, which switched retention off.
+    expect(readRetentionDays("0.5")).toBe(0.5);
+    expect(readRetentionDays("1.5")).toBe(1.5);
+    expect(readRetentionDays(" 7 ")).toBe(7);
+    expect(readRetentionDays("0")).toBe(0);
+    for (const invalid of ["", " ", "7days", "-1", "abc", "Infinity"]) {
+      expect(readRetentionDays(invalid)).toBe(2);
+    }
   });
 
   it("skips age expiration when retentionDays=0", async () => {

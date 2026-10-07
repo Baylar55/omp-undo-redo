@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import type { spawn } from "node:child_process";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -388,6 +389,58 @@ describe("private per-workspace git repositories", () => {
       } finally {
         await rm(cwd, { recursive: true, force: true });
         await rm(storeParent, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "leaves the mode of a configured store root alone, such as a shared /tmp",
+    async () => {
+      const cwd = await mkdtemp(join(tmpdir(), "omp-private-shared-"));
+      const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-shared-store-"));
+      try {
+        await chmod(storeRoot, 0o1777);
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, { env }),
+          cwd,
+          storeRoot,
+        );
+        expect(repository).not.toBeNull();
+        if (!repository) return;
+        expect((await stat(storeRoot)).mode & 0o7777).toBe(0o1777);
+        expect((await stat(dirname(repository.gitDir))).mode & 0o777).toBe(0o700);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still restricts a default store root an older version left world-readable",
+    async () => {
+      const cwd = await mkdtemp(join(tmpdir(), "omp-private-default-"));
+      const home = await mkdtemp(join(tmpdir(), "omp-private-default-home-"));
+      try {
+        vi.stubEnv("HOME", home);
+        vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", undefined);
+        vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", undefined);
+        vi.stubEnv("OMP_UNDO_REDO_RUNTIME_DIR", undefined);
+        const storeRoot = storeRootDirectory();
+        expect(storeRoot).toBe(join(await realpath(home), ".omp", "omp-undo-redo"));
+        await mkdir(storeRoot, { recursive: true, mode: 0o755 });
+        await chmod(storeRoot, 0o755);
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, { env }),
+          cwd,
+          storeRoot,
+        );
+        expect(repository).not.toBeNull();
+        expect((await stat(storeRoot)).mode & 0o777).toBe(0o700);
+      } finally {
+        vi.unstubAllEnvs();
+        await rm(cwd, { recursive: true, force: true });
+        await rm(home, { recursive: true, force: true });
       }
     },
   );

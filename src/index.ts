@@ -74,8 +74,11 @@ type AnyContext = {
   agent?: { kind: "main" | "sub" };
 };
 
-function readRetentionDays(): number {
-  const days = parseInt(process.env.OMP_UNDO_REDO_RETENTION_DAYS ?? "", 10);
+/** Strict: `Number`, not `parseInt`, which read "0.5" as 0 (retention off,
+ *  history kept forever) and "7days" as 7. Fractions are honored ("0.5" is 12
+ *  hours); anything that is not a non-negative number falls back to 2. */
+export function readRetentionDays(value = process.env.OMP_UNDO_REDO_RETENTION_DAYS): number {
+  const days = value?.trim() ? Number(value) : NaN;
   return Number.isFinite(days) && days >= 0 ? days : 2;
 }
 

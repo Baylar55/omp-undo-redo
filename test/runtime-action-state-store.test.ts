@@ -1,5 +1,15 @@
 import type * as Fs from "node:fs/promises";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -120,6 +130,35 @@ describe("runtime action-state store", () => {
     expect(published.sessionRevision).toEqual(expect.any(String));
     expect(published.updatedAt).toEqual(expect.any(String));
     expect(files.some((file) => file.endsWith(".tmp"))).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "leaves the mode of a configured root alone, such as a shared /tmp",
+    async () => {
+      const root = await makeRoot();
+      await chmod(root, 0o1777);
+      const store = new RuntimeActionStateStore({ rootDirectory: root, pid: 105 });
+      await store.initialize();
+      expect((await stat(root)).mode & 0o7777).toBe(0o1777);
+      expect((await stat(join(root, "105"))).mode & 0o777).toBe(0o700);
+      expect((await stat(join(root, "105", "sessions"))).mode & 0o777).toBe(0o700);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")("restricts the default root to its owner", async () => {
+    const home = await makeRoot();
+    const root = join(home, ".omp", "omp-undo-redo", "runtime");
+    await mkdir(root, { recursive: true, mode: 0o755 });
+    await chmod(root, 0o755);
+    try {
+      vi.stubEnv("HOME", home);
+      vi.stubEnv("OMP_UNDO_REDO_RUNTIME_DIR", undefined);
+      const store = new RuntimeActionStateStore({ pid: 106 });
+      await store.initialize();
+      expect((await stat(root)).mode & 0o777).toBe(0o700);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("keeps revisions stable for action-only updates and preserves latest result", async () => {

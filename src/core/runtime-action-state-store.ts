@@ -71,10 +71,14 @@ function navigationRevision(state: NavigationState, activeSessionLeaf: string | 
   return createHash("sha256").update(input).digest("hex");
 }
 
+function defaultRuntimeRoot(): string {
+  return resolve(join(homedir(), ".omp", "omp-undo-redo", "runtime"));
+}
+
 export function runtimeRootDirectory(
   rootDirectory = process.env.OMP_UNDO_REDO_RUNTIME_DIR,
 ): string {
-  return resolve(rootDirectory ?? join(homedir(), ".omp", "omp-undo-redo", "runtime"));
+  return rootDirectory === undefined ? defaultRuntimeRoot() : resolve(rootDirectory);
 }
 
 /** One `runtime/<pid>/` serves every copy of the extension in a process: OMP
@@ -151,7 +155,10 @@ export class RuntimeActionStateStore {
   private async prepareRuntimeDirectory(): Promise<void> {
     try {
       await mkdir(this.rootDirectory, { recursive: true, mode: 0o700 });
-      await chmod(this.rootDirectory, 0o700);
+      // A configured root may be a shared directory (`/tmp` as root in a
+      // container) whose permissions are not ours to strip; the per-process
+      // directories below are owner-only either way.
+      if (this.rootDirectory === defaultRuntimeRoot()) await chmod(this.rootDirectory, 0o700);
       await rm(this.runtimeDirectory, { recursive: true, force: true });
       await mkdir(this.sessionsDirectory, { recursive: true, mode: 0o700 });
       await chmod(this.runtimeDirectory, 0o700);
