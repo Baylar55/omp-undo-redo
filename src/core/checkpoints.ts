@@ -98,7 +98,7 @@ function newCheckpointId(): string {
 }
 
 /** A Git-mode store borrows the user's objects instead of copying them. */
-function borrowsObjects(repository: GitRepository): boolean {
+export function borrowsObjects(repository: GitRepository): boolean {
   return repository.storeDir !== repository.gitDir;
 }
 

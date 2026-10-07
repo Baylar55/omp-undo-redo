@@ -27,6 +27,7 @@ import { gcPendingPath } from "./core/git-refs.js";
 import { migrateLegacySnapshots } from "./core/legacy-snapshot-migration.js";
 import { SessionNavigation } from "./core/session-navigation.js";
 import {
+  borrowsObjects,
   checkpointNamespace,
   finishAfterTurn,
   pinStoreObjects,
@@ -419,10 +420,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  (it may hold the turn's own edits) instead of recording a wrong baseline. */
   const beforeSnapshotGates = new Map<string, { complete: Promise<void>; late: boolean }>();
 
-  // Snapshot-store housekeeping: captures between gc runs (per store) and the
-  // threshold that triggers a background `git gc`. Every store is the
-  // extension's own (`storeDir` never names the user's `.git`), so gc can
-  // never touch a user repository.
+  // Snapshot-store housekeeping: captures between maintenance checks (per
+  // store) and the threshold that triggers one (`runCaptureGc`). Every store
+  // is the extension's own (`storeDir` never names the user's `.git`), so gc
+  // can never touch a user repository.
   const PRIVATE_GC_AFTER_CAPTURES = 20;
   const capturesSinceGcByStore = new Map<string, number>();
 
@@ -454,14 +455,17 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  process-wide: OMP binds a copy per in-process session, but subagent
    *  copies never capture or expire (`servesMainSession`), so only main
    *  sessions' copies (one, or one per ACP session) feed a queue. Never
-   *  rejects (`runPrivateGc` swallows every failure), so one bad store
-   *  cannot stall the queue. */
+   *  rejects (`runPrivateGc` and `runCaptureGc` swallow every failure), so
+   *  one bad store cannot stall the queue. */
   let privateGcQueue: Promise<void> = Promise.resolve();
 
-  /** Queues a gc of `repository` behind every gc already scheduled; resolves
-   *  once this one has run. */
-  function schedulePrivateGc(repository: GitRepository): Promise<void> {
-    privateGcQueue = privateGcQueue.then(() => runPrivateGc(repository));
+  /** Queues `run` (default: the full `runPrivateGc`) over `repository`
+   *  behind every gc already scheduled; resolves once this one has run. */
+  function schedulePrivateGc(
+    repository: GitRepository,
+    run: (repository: GitRepository) => Promise<void> = runPrivateGc,
+  ): Promise<void> {
+    privateGcQueue = privateGcQueue.then(() => run(repository));
     return privateGcQueue;
   }
 
@@ -510,6 +514,69 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     } catch {
       // Best-effort: a failed gc leaves more work for the next trigger.
     }
+  }
+
+  /** Maintenance for the capture-driven triggers (capture threshold,
+   *  shutdown). A full gc rewrites the whole store, so running one per 20
+   *  captures made its cost grow with the store. Captures only add objects;
+   *  garbage from ref deletions is the `gc-pending` mark's, which the next
+   *  boot sweep's full gc reclaims. So these triggers repack only once git's
+   *  own `gc --auto` limits say so. A private store lets git decide: it packs
+   *  just the loose objects, and rewrites every pack only past the pack
+   *  limit. A Git-mode store cannot run `gc --auto`: any repack there may
+   *  drop its copies of borrowed objects unless `pinStoreObjects` ran first,
+   *  so it gets the full pinned gc, once it crosses the same limits. */
+  async function runCaptureGc(repository: GitRepository): Promise<void> {
+    try {
+      if (borrowsObjects(repository)) {
+        if (await storeExceedsAutoGcLimits(repository.storeDir)) await runPrivateGc(repository);
+        return;
+      }
+      // Neutral cwd: see `runPrivateGc`. Not detached: a gc running past its
+      // queue entry would escape the eviction guard and the serial queue.
+      // Limits pinned: a user's global `gc.auto=0` would otherwise leave the
+      // store's loose objects unpacked for good, and the Git-mode gate uses
+      // the same numbers.
+      await gitRunnerFactory(tmpdir(), storeEnv(repository))(
+        [
+          "-c",
+          "gc.autoDetach=false",
+          "-c",
+          `gc.auto=${GC_AUTO_LOOSE_OBJECTS}`,
+          "-c",
+          `gc.autoPackLimit=${GC_AUTO_PACK_LIMIT}`,
+          "gc",
+          "--auto",
+          "--quiet",
+          `--prune=${PRIVATE_SWEEP_PRUNE}`,
+        ],
+        { timeoutMs: PRIVATE_GC_TIMEOUT_MS },
+      );
+    } catch {
+      // Best-effort, like `runPrivateGc`.
+    }
+  }
+
+  /** git's defaults for `gc --auto`: loose objects past which it packs them,
+   *  and packs (without a `.keep`) at which it repacks them all. */
+  const GC_AUTO_LOOSE_OBJECTS = 6700;
+  const GC_AUTO_PACK_LIMIT = 50;
+
+  /** git's `gc --auto` test: more than GC_AUTO_LOOSE_OBJECTS loose objects,
+   *  estimated as git does from fan-out `17` alone, or GC_AUTO_PACK_LIMIT
+   *  packs without a `.keep`. */
+  async function storeExceedsAutoGcLimits(storeDir: string): Promise<boolean> {
+    const objects = join(storeDir, "objects");
+    const names = await readdir(join(objects, "pack")).catch(() => [] as string[]);
+    const kept = new Set(names.filter((name) => name.endsWith(".keep")));
+    const packs = names.filter(
+      (name) => name.endsWith(".pack") && !kept.has(`${name.slice(0, -".pack".length)}.keep`),
+    );
+    if (packs.length >= GC_AUTO_PACK_LIMIT) return true;
+    const loose = await readdir(join(objects, "17")).catch(() => [] as string[]);
+    // SHA-1 or SHA-256 object names, minus their two-digit fan-out.
+    const looseObjects = loose.filter((name) => /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/.test(name));
+    return looseObjects.length > Math.ceil(GC_AUTO_LOOSE_OBJECTS / 256);
   }
 
   /** One-time removal of legacy git-indexes directory from pre-v1.5.1 store layout */
@@ -1127,7 +1194,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
               // mid-flight, to avoid repacking under it. The counter reset
               // below prevents gc runs from stacking.
               if (pendingCaptures.size <= 1) {
-                void track(() => schedulePrivateGc(repository), housekeepingOperations);
+                void track(
+                  () => schedulePrivateGc(repository, runCaptureGc),
+                  housekeepingOperations,
+                );
               } else {
                 capturesSinceGcByStore.set(key, PRIVATE_GC_AFTER_CAPTURES - 1);
               }
@@ -1632,7 +1702,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
             } catch {
               return;
             }
-            await schedulePrivateGc(repository);
+            await schedulePrivateGc(repository, runCaptureGc);
           }),
         );
       })();

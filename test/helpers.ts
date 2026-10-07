@@ -1,4 +1,5 @@
 import "../src/core/compat.js";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -164,6 +165,22 @@ export async function gitRepository(cwd: string): Promise<GitRepository> {
   );
   if (!storeDir) throw new Error(`no snapshot store for ${cwd}`);
   return { ...resolved.repository, storeDir };
+}
+
+/** Writes real loose objects into fan-out `17` of `storeDir` until git's
+ *  `gc --auto` estimate (more than 27 there) says the store needs a gc. A
+ *  Git-mode store gets its full, pinned gc only past that limit. */
+export async function seedLooseObjects(storeDir: string): Promise<void> {
+  const run = createGitRunner(tmpdir(), { env: { GIT_DIR: storeDir } });
+  for (let seed = 0, written = 0; written <= 27; seed += 1) {
+    const content = `seed ${seed}\n`;
+    const id = createHash("sha1").update(`blob ${content.length}\0${content}`).digest("hex");
+    if (!id.startsWith("17")) continue;
+    const result = await run(["hash-object", "-w", "--stdin"], { stdin: content });
+    if (result.stdout.trim() !== id)
+      throw new Error(`seeding ${storeDir} failed: ${result.stderr}`);
+    written += 1;
+  }
 }
 
 /** Env binding a runner for the repository at `cwd` to its snapshot store. */

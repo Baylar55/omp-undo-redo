@@ -20,6 +20,7 @@ import {
   makeRepository,
   privateRefs,
   rmRetry,
+  seedLooseObjects,
   type TestEntry,
 } from "./helpers.js";
 
@@ -142,6 +143,8 @@ async function turnOverResetCommit(cwd: string, sessionId: string): Promise<stri
   ctx.entries = [prompt, response];
   await pi.emit("agent_end", ctx);
   expect(await storeHolds(repository, draft)).toBe(true);
+  // Past `gc --auto`'s limits, or shutdown would skip the store gc.
+  await seedLooseObjects(repository.storeDir);
   await pi.emit("session_shutdown", ctx);
   expect(await waitFor(() => gcs.finished() > 0)).toBe(true);
   return draft;

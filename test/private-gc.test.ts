@@ -30,6 +30,7 @@ import {
   gitRepository,
   makeRepository,
   rmRetry,
+  seedLooseObjects,
   type TestContext,
 } from "./helpers.js";
 
@@ -95,16 +96,16 @@ async function runTurns(
 }
 
 describe("private-repo housekeeping", () => {
-  it("runs a background git gc on the private repo after a capture threshold", async () => {
+  it("runs a background git gc --auto on the private repo after a capture threshold", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-gc-"));
-    const commands: string[][] = [];
+    const commands: { args: string[]; gitDir?: string }[] = [];
     try {
       const pi = new FakeExtensionApi();
       const dependencies: OmpUndoRedoDependencies = {
         gitRunnerFactory: (cwd2: string, env?: Record<string, string>): GitRunner => {
           const inner = env ? createGitRunner(cwd2, { env }) : createGitRunner(cwd2);
           const wrapped: GitRunner = async (args, options) => {
-            commands.push(args);
+            commands.push({ args, gitDir: env?.GIT_DIR });
             return inner(args, options);
           };
           return wrapped;
@@ -116,13 +117,19 @@ describe("private-repo housekeeping", () => {
       // gc. (The after-captures run inside finalizeTurn, not beginCapture, so
       // they do not contribute to the counter.)
       await runTurns(pi, ctx, 20, "tracked.txt");
-      for (let attempt = 0; attempt < 120; attempt += 1) {
-        if (commands.some((command) => command[0] === "gc")) break;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
+      const isAutoGc = ({ args }: { args: string[] }) =>
+        args.includes("gc") && args.includes("--auto");
+      expect(await waitFor(async () => commands.some(isAutoGc), 120)).toBe(true);
+      const auto = commands.find(isAutoGc);
+      expect(auto?.args).toContain("--prune=1.hour.ago");
+      // Regression: the threshold ran a full prune + gc, rewriting the whole
+      // store every 20 captures. Captures alone must leave that to git.
       expect(
-        commands.some((command) => command[0] === "gc" && command.includes("--prune=1.hour.ago")),
-      ).toBe(true);
+        commands.filter(
+          ({ args, gitDir }) =>
+            gitDir === auto?.gitDir && (args[0] === "gc" || args[0] === "prune"),
+        ),
+      ).toEqual([]);
     } finally {
       await rmRetry(cwd);
     }
@@ -151,10 +158,18 @@ describe("private-repo housekeeping", () => {
       });
       const ctx = context(cwd, "gc-usergit-session");
       await runTurns(pi, ctx, 20, "tracked.txt");
+      const { storeDir, gitDir } = await gitRepository(cwd);
+      // A Git-mode store gets its (pinned, full) gc only past git's own
+      // `gc --auto` limits. The 20th capture's check may already have run,
+      // so one more capture makes shutdown check the seeded store.
+      await seedLooseObjects(storeDir);
+      ctx.leaf = "leaf20";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "v20\n");
+      await pi.emit("agent_end", ctx);
       await pi.emit("session_shutdown", ctx);
       // Shutdown housekeeping is detached, so a gc would appear after the
       // handler resolves: poll the recorded commands.
-      const { storeDir, gitDir } = await gitRepository(cwd);
       expect(await waitFor(async () => gcs.some((gc) => gc.gitDir === storeDir), 20)).toBe(true);
       // Other stores under the shared root (earlier tests' repos) may be gc'd
       // by the retention sweep; the user's own repository never is.
