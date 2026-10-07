@@ -128,7 +128,7 @@ describe("session_shutdown budget", () => {
   }, 30_000);
 
   it("removes a checked-out index lease inside the host cap while its capture hangs", async () => {
-    await shutdownWithHungGit({ arm: "second-turn", hang: (args) => args[0] === "add" });
+    await shutdownWithHungGit({ arm: "second-turn", hang: (args) => args.includes("add") });
   }, 30_000);
 
   it("removes every index lease inside the host cap while all shutdown git hangs", async () => {

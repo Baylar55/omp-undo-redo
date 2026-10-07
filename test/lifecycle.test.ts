@@ -1221,7 +1221,7 @@ describe("extension lifecycle cleanup", () => {
       commands.length = 0;
       await pi.emit("before_agent_start", ctx);
       // Reused index: no `read-tree` reseed, so no full worktree re-hash.
-      expect(commands.some((args) => args[0] === "read-tree")).toBe(false);
+      expect(commands.some((args) => args.includes("read-tree"))).toBe(false);
       await pi.emit("session_shutdown", ctx);
     } finally {
       await rmRetry(cwd);

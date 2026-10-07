@@ -522,7 +522,7 @@ describe("private per-workspace git repositories", () => {
       ) satisfies GitRunner;
       const snapshot = await createSnapshotCommit(recording, "env-test");
       expect("hash" in snapshot).toBe(true);
-      const addCall = invocations.find((entry) => entry.args[0] === "add");
+      const addCall = invocations.find((entry) => entry.args.includes("add"));
       expect(addCall).toBeDefined();
       expect(addCall!.env.GIT_WORK_TREE).toBe(cwd);
     } finally {

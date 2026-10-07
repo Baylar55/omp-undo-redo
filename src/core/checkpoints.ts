@@ -303,13 +303,19 @@ function checkpointRefs(
 
 type GitCommandResult = Awaited<ReturnType<GitRunner>>;
 
+/** Every command on a temporary index (`GIT_INDEX_FILE` in its env) runs with
+ *  `core.splitIndex=false`: a repository that enables it would otherwise have
+ *  git write the shared part of each temp index into the repository's git dir. */
 async function invoke(
   git: GitRunner,
   args: string[],
   options?: Parameters<GitRunner>[1],
 ): Promise<GitCommandResult> {
   try {
-    return await git(args, options);
+    return await git(
+      options?.env?.GIT_INDEX_FILE ? ["-c", "core.splitIndex=false", ...args] : args,
+      options,
+    );
   } catch {
     return { stdout: "", stderr: "", code: 1, error: "unavailable" };
   }

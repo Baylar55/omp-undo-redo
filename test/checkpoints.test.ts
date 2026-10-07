@@ -5,6 +5,7 @@ import {
   chmod,
   lstat,
   mkdtemp,
+  readdir,
   readFile,
   readlink,
   rm,
@@ -525,7 +526,7 @@ describe("history-safe Git checkpoints", () => {
       await writeFile(join(cwd, "headonly.txt"), "tracked after recreation\n");
       const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
-      expect(commands.some((args) => args[0] === "diff-index")).toBe(true);
+      expect(commands.some((args) => args.includes("diff-index"))).toBe(true);
       // With cross-turn index reuse the lease is retained after the after-snapshot
       // (not deleted) so the next turn can reuse it for a cheap before snapshot.
       await expect(stat(leaseDirectory)).resolves.toBeDefined();
@@ -567,7 +568,7 @@ describe("history-safe Git checkpoints", () => {
       const before = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, "empty-normalization"));
       const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
-      expect(commands.some((args) => args[0] === "diff-index")).toBe(true);
+      expect(commands.some((args) => args.includes("diff-index"))).toBe(true);
       expect(commands.some((args) => args.includes("reset"))).toBe(false);
       await releaseCheckpoint(snap, after);
     } finally {
@@ -795,7 +796,7 @@ describe("history-safe Git checkpoints", () => {
       ) satisfies GitRunner;
       // Next turn reuses the fallback's index instead of reseeding from HEAD.
       const before2 = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId));
-      expect(commands.some((args) => args[0] === "read-tree")).toBe(false);
+      expect(commands.some((args) => args.includes("read-tree"))).toBe(false);
       expect(before2.snapshotIndexLease?.directory).toBeDefined();
       expect(before2.snapshotIndexLease?.directory).not.toBe(staleDirectory);
       const tree = (hash: string) => text(snap, ["rev-parse", `${hash}^{tree}`]);
@@ -1075,7 +1076,7 @@ describe("history-safe Git checkpoints", () => {
       ) satisfies GitRunner;
       const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
-      expect(commands.some((args) => args[0] === "read-tree")).toBe(true);
+      expect(commands.some((args) => args.includes("read-tree"))).toBe(true);
       const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "head-change-fresh"));
       expect(await text(snap, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
         await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
@@ -1124,6 +1125,58 @@ describe("history-safe Git checkpoints", () => {
       await releasePendingCheckpoint(snap, second);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("never writes a split index's shared part into the repository's git dir", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const sessionId = "split-index";
+    const sharedIndexes = async () =>
+      (await readdir(join(cwd, ".git"))).filter((name) => name.startsWith("sharedindex.")).sort();
+    const tree = (hash: string) => text(snap, ["rev-parse", `${hash}^{tree}`]);
+    const commands: string[][] = [];
+    const recording = Object.assign(
+      async (args: string[], options?: Parameters<GitRunner>[1]) => {
+        commands.push(args);
+        return snap(args, options);
+      },
+      { cwd, env: snap.env },
+    ) satisfies GitRunner;
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "gone.txt"), "deleted during turn\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "gone"]);
+      await git(["config", "core.splitIndex", "true"]);
+      await git(["update-index", "--split-index"]);
+      const shared = await sharedIndexes();
+      expect(shared).toHaveLength(1);
+
+      const before = pendingCheckpoint(await prepareBeforeTurn(recording, sessionId));
+      await rm(join(cwd, "gone.txt"));
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      const after = completedCheckpoint(await finishAfterTurn(recording, before, null, null));
+      // The reused index lacks HEAD's gone.txt, so normalization runs
+      // `--literal-pathspecs reset` on it.
+      const next = pendingCheckpoint(await prepareBeforeTurn(recording, sessionId));
+      expect(commands.some((args) => args.includes("reset"))).toBe(true);
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "split-index-fresh"));
+      expect(await tree(next.beforeHash)).toBe(await tree(fresh.beforeHash));
+      expect(await tree(after.afterHash)).toBe(await tree(fresh.beforeHash));
+
+      expect(await applyCheckpoint(recording, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await readFile(join(cwd, "gone.txt"), "utf8")).toBe("deleted during turn\n");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await sharedIndexes()).toEqual(shared);
+
+      await releasePendingCheckpoint(snap, next);
+      await releasePendingCheckpoint(snap, fresh);
+      await releaseCheckpoint(snap, after);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releasePersistentSnapshotIndices([sessionId, "split-index-fresh"]);
     }
   });
 
