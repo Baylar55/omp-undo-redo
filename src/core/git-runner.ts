@@ -2,10 +2,32 @@ import "./compat.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { GitRunner } from "./types.js";
 
 const TERMINATION_GRACE_MS = 250;
+
+/** On Windows, spawning a bare name (libuv `search_path`) tries the child's
+ *  cwd before PATH, so `taskkill`/`git` would run an exe planted in the
+ *  workspace. Both are spawned by absolute path instead. */
+const TASKKILL = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
+
+/** libuv's lookup without its cwd step and relative PATH entries: each
+ *  absolute PATH directory in order, `git.com` before `git.exe`. Runs only
+ *  when the direct git.exe probe failed; not cached, so a moved or
+ *  reinstalled git is found again like a bare `spawn("git")` would. */
+async function findGitOnPath(env: NodeJS.ProcessEnv): Promise<string | null> {
+  const pathKey = Object.keys(env).find((key) => key.toUpperCase() === "PATH");
+  for (const entry of ((pathKey && env[pathKey]) || "").split(";")) {
+    const dir = entry.replaceAll('"', "");
+    if (!isAbsolute(dir)) continue;
+    for (const name of ["git.com", "git.exe"]) {
+      const file = join(dir, name);
+      if ((await stat(file).catch(() => null))?.isFile()) return file;
+    }
+  }
+  return null;
+}
 
 /** Ceiling for any invocation that does not ask for a shorter one. A git child
  *  that never exits (stalled SMB/NFS mount, AV holding a handle, a `.git` lock
@@ -100,7 +122,7 @@ function resolveDirectGit(): Promise<DirectGit | null> {
 /** Every git invocation goes through `spawn`: it handles the stdin-fed
  *  `update-ref --stdin` batches and, unlike `execFile`, imposes no output
  *  buffer cap on large `for-each-ref`/`status` reads. */
-function runGit(
+async function runGit(
   cwd: string,
   args: string[],
   options: Parameters<GitRunner>[1],
@@ -108,16 +130,23 @@ function runGit(
   direct: DirectGit | null,
 ): Promise<ChildResult> {
   const { promise, resolve } = Promise.withResolvers<ChildResult>();
+  const env: NodeJS.ProcessEnv = { ...process.env, ...direct?.env, ...options?.env };
+  if (direct) {
+    // Windows env names are case-insensitive; extend the existing key
+    // (often `Path`) rather than adding a second one.
+    const pathKey = Object.keys(env).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
+    env[pathKey] = direct.pathPrefix + (env[pathKey] ?? "");
+  }
+  // An injected spawn is a test double; give it the plain command.
+  const command =
+    direct?.exe ??
+    (process.platform === "win32" && !dependencies.spawnGit ? await findGitOnPath(env) : "git");
+  if (command === null) {
+    return { stdout: "", stderr: "spawn git ENOENT", code: 1, error: "unavailable" };
+  }
   let child: ChildProcessWithoutNullStreams;
   try {
-    const env: NodeJS.ProcessEnv = { ...process.env, ...direct?.env, ...options?.env };
-    if (direct) {
-      // Windows env names are case-insensitive; extend the existing key
-      // (often `Path`) rather than adding a second one.
-      const pathKey = Object.keys(env).find((key) => key.toUpperCase() === "PATH") ?? "PATH";
-      env[pathKey] = direct.pathPrefix + (env[pathKey] ?? "");
-    }
-    child = (dependencies.spawnGit ?? spawn)(direct?.exe ?? "git", args, {
+    child = (dependencies.spawnGit ?? spawn)(command, args, {
       cwd,
       env,
       windowsHide: true,
@@ -168,7 +197,7 @@ function runGit(
     // hooks or alias shells; `kill()` would end only the direct child. /T
     // must walk the tree while that child is alive.
     if (process.platform === "win32" && child.pid !== undefined && !exited) {
-      spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      spawn(TASKKILL, ["/PID", String(child.pid), "/T", "/F"], {
         stdio: "ignore",
         windowsHide: true,
       }).once("error", () => {});

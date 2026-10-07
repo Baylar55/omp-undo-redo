@@ -49,3 +49,24 @@ jobs:
 
       - name: Check package contents
         run: npm run pack:check
+
+  windows-tests:
+    # Windows-only paths (launcher probe, taskkill tree-kill, PATH lookup)
+    # are skipped on ubuntu.
+    name: Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm run test
