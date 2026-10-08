@@ -165,7 +165,7 @@ export interface PendingGitCheckpoint {
   parentLeafId: string | null;
 }
 
-export interface PendingSessionCheckpoint {
+interface PendingSessionCheckpoint {
   kind: "session";
   reason: FileCheckpointUnavailableReason;
   parentLeafId: string | null;

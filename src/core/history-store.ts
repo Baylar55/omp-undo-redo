@@ -550,13 +550,10 @@ export class SessionHistoryStore {
     }
 
     const path = historyPath(this.repository, this.sessionId);
-    const present = await stat(path)
-      .then(() => true)
-      .catch(() => false);
-    if (!present) return { status: "unavailable", reason: "missing" };
+    const metadata = await stat(path).catch(() => null);
+    if (!metadata) return { status: "unavailable", reason: "missing" };
     await touchSessionHeartbeat(dir, sessionHash);
     try {
-      const metadata = await stat(path);
       if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) {
         return { status: "unavailable", reason: "unusable" };
       }

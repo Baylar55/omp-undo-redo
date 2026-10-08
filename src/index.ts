@@ -82,13 +82,13 @@ export function readRetentionDays(value = process.env.OMP_UNDO_REDO_RETENTION_DA
   return Number.isFinite(days) && days >= 0 ? days : 2;
 }
 
-export type SessionOnlyReason =
+type SessionOnlyReason =
   | "git_unavailable"
   | "repository_unresolvable"
   | "private_repository_unavailable"
   | "unsafe_workspace";
 
-export type FileBackend =
+type FileBackend =
   | { kind: "git"; repository: GitRepository; git: GitRunner }
   | { kind: "session"; reason: SessionOnlyReason };
 
@@ -111,9 +111,9 @@ export type OmpUndoRedoDependencies = {
   finalizeDeadlineMs?: number;
 };
 
-export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
-export const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
-export const DEFAULT_FINALIZE_DEADLINE_MS = 25_000;
+const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
+const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
+const DEFAULT_FINALIZE_DEADLINE_MS = 25_000;
 /** `session_shutdown`'s own deadline. OMP caps the handler at 2 s and then
  *  exits; the margin covers the fallback lease removal. */
 const SHUTDOWN_BUDGET_MS = 1_500;
@@ -151,7 +151,7 @@ type ActivePrivateRepoEntry = {
   git?: GitRunner;
   ready: Promise<boolean>;
 };
-export type PrivateRepoEntry = ActivePrivateRepoEntry | { failure: true };
+type PrivateRepoEntry = ActivePrivateRepoEntry | { failure: true };
 
 type HistoryWriter = { save(state: NavigationState): Promise<void> };
 
@@ -1308,12 +1308,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   // Switch and branch share one slot; if it is empty (never set, or clobbered by
   // an interleaved navigation) the post-event invalidates every session's redo,
   // which is a safe superset, and releases no session (unknown source).
-  const rememberNavigationSource = (_event: unknown, ctx: unknown) =>
-    track(async () => {
-      if (closing) return;
-      const typed = ctx as AnyContext;
-      pendingNavigationSourceSessionId = typed.sessionManager.getSessionId();
-    });
+  const rememberNavigationSource = (_event: unknown, ctx: unknown): void => {
+    if (closing) return;
+    pendingNavigationSourceSessionId = (ctx as AnyContext).sessionManager.getSessionId();
+  };
 
   // The host emits no `session_start` for the session it switched to, so its
   // navigation is built here, before any turn: built lazily by that turn's

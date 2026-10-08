@@ -47,11 +47,10 @@ export async function touchSessionHeartbeat(
 export async function sessionHeartbeatIsFresh(
   historyDir: string,
   sessionHash: string,
-  ttlMs: number = ACTIVE_HEARTBEAT_TTL_MS,
 ): Promise<boolean> {
   try {
     const metadata = await stat(activeHeartbeatPath(historyDir, sessionHash));
-    return Date.now() - metadata.mtimeMs < ttlMs;
+    return Date.now() - metadata.mtimeMs < ACTIVE_HEARTBEAT_TTL_MS;
   } catch {
     return false;
   }
@@ -59,10 +58,7 @@ export async function sessionHeartbeatIsFresh(
 
 /** Removes markers whose owners stopped beating so the history directory
  *  does not accumulate one file per historical session forever. */
-export async function pruneStaleHeartbeats(
-  historyDir: string,
-  ttlMs: number = ACTIVE_HEARTBEAT_TTL_MS,
-): Promise<void> {
+export async function pruneStaleHeartbeats(historyDir: string): Promise<void> {
   let names: string[];
   try {
     names = await readdir(historyDir);
@@ -75,7 +71,7 @@ export async function pruneStaleHeartbeats(
     try {
       const metadata = await stat(path);
       if (!metadata.isFile()) continue;
-      if (Date.now() - metadata.mtimeMs >= ttlMs) {
+      if (Date.now() - metadata.mtimeMs >= ACTIVE_HEARTBEAT_TTL_MS) {
         await rm(path, { force: true }).catch(() => undefined);
       }
     } catch {

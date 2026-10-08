@@ -111,7 +111,7 @@ export function parseCheckpointOwnerRef(ref: string): ParsedCheckpointRef | null
   return { ownerId, checkpointId, phase };
 }
 
-export function ownerCheckpointPrefix(ownerId: string): string | null {
+function ownerCheckpointPrefix(ownerId: string): string | null {
   return isCanonicalUuid(ownerId) ? `${CHECKPOINT_OWNER_REF_ROOT}/${ownerId}/` : null;
 }
 
