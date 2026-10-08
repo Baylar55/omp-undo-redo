@@ -69,7 +69,7 @@ export interface RuntimeActionState {
   actionResult?: ActionInvocationResult;
 }
 
-export type CommandNavigationResult = NavigationResult | { status: "busy" } | { status: "closing" };
+export type CommandNavigationResult = NavigationResult | { status: "busy" };
 
 export interface NavigationPort extends SessionReader {
   navigateTree(targetId: string): Promise<TreeNavigationResult>;
