@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { GitRunner } from "./types.js";
 
 export type RefSpec = { ref: string; expectedHash: string };
@@ -14,6 +16,28 @@ export function parseRefLines(stdout: string): RefSpec[] | null {
     refs.push({ ref: line.slice(0, separator), expectedHash: line.slice(separator + 1) });
   }
   return refs;
+}
+
+/** Durable "this store holds garbage" flag. A deleted ref can orphan packed
+ *  objects, which `git prune` never deletes: only a gc reclaims them, and
+ *  every gc trigger lives in process memory, lost to an exit or a killed gc.
+ *  The boot sweep gcs every store that carries it. */
+export function gcPendingPath(storeDir: string): string {
+  return join(storeDir, "omp-undo-redo", "gc-pending");
+}
+
+/** Marks `storeDir` before a store-ref deletion, so a crash between the
+ *  deletion and its gc cannot drop the trigger. Best-effort: it never blocks
+ *  the deletion, and never recreates a store removed meanwhile (no recursive
+ *  mkdir). */
+export async function markGcPending(storeDir: string): Promise<void> {
+  try {
+    const path = gcPendingPath(storeDir);
+    await mkdir(dirname(path), { mode: 0o700 }).catch(() => undefined);
+    await writeFile(path, "");
+  } catch {
+    // The deletion proceeds; a later trigger still gcs the store.
+  }
 }
 
 /** Deletes refs in one `update-ref --stdin` batch, halving on failure so a

@@ -1,9 +1,11 @@
 import "./core/compat.js";
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs";
 import { readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import type { SessionEntryLike } from "./core/types.js";
 import { runNavigation } from "./commands/navigate.js";
 import {
@@ -17,16 +19,20 @@ import {
   ensureGitSnapshotStore,
   ensurePrivateGitRepository,
   GIT_STORE_SOURCE_KEY,
+  refusedPrivateWorkspace,
   setupFinished,
   storeRootDirectory,
 } from "./core/private-repo.js";
+import { gcPendingPath } from "./core/git-refs.js";
 import { migrateLegacySnapshots } from "./core/legacy-snapshot-migration.js";
 import { SessionNavigation } from "./core/session-navigation.js";
 import {
+  borrowsObjects,
   checkpointNamespace,
   finishAfterTurn,
+  pinStoreObjects,
   prepareBeforeTurn,
-  releaseAllPersistentSnapshotIndices,
+  releasePersistentSnapshotIndices,
   releaseCheckpoint,
   releasePendingCheckpoint,
   resolveRepository,
@@ -64,17 +70,25 @@ type AnyContext = {
   ui?: {
     notify(message: string, level: string): void;
   };
+  /** Absent on hosts older than OMP's agent identity: read as the main agent. */
+  agent?: { kind: "main" | "sub" };
 };
 
-function readRetentionDays(): number {
-  const days = parseInt(process.env.OMP_UNDO_REDO_RETENTION_DAYS ?? "", 10);
+/** Strict: `Number`, not `parseInt`, which read "0.5" as 0 (retention off,
+ *  history kept forever) and "7days" as 7. Fractions are honored ("0.5" is 12
+ *  hours); anything that is not a non-negative number falls back to 2. */
+export function readRetentionDays(value = process.env.OMP_UNDO_REDO_RETENTION_DAYS): number {
+  const days = value?.trim() ? Number(value) : NaN;
   return Number.isFinite(days) && days >= 0 ? days : 2;
 }
 
-export type SessionOnlyReason =
-  "git_unavailable" | "repository_unresolvable" | "private_repository_unavailable";
+type SessionOnlyReason =
+  | "git_unavailable"
+  | "repository_unresolvable"
+  | "private_repository_unavailable"
+  | "unsafe_workspace";
 
-export type FileBackend =
+type FileBackend =
   | { kind: "git"; repository: GitRepository; git: GitRunner }
   | { kind: "session"; reason: SessionOnlyReason };
 
@@ -97,9 +111,16 @@ export type OmpUndoRedoDependencies = {
   finalizeDeadlineMs?: number;
 };
 
-export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
-export const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
-export const DEFAULT_FINALIZE_DEADLINE_MS = 25_000;
+const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
+const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
+const DEFAULT_FINALIZE_DEADLINE_MS = 25_000;
+/** `session_shutdown`'s own deadline. OMP caps the handler at 2 s and then
+ *  exits; the margin covers the fallback lease removal. */
+const SHUTDOWN_BUDGET_MS = 1_500;
+/** How long shutdown waits for in-flight captures and finalizes, within
+ *  SHUTDOWN_BUDGET_MS: the checkpoint releases before this wait and the
+ *  owner-lease check after it need the rest. */
+const SHUTDOWN_TURN_DRAIN_MS = 1_000;
 
 function defaultGitRunnerFactory(cwd: string, env?: Record<string, string>): GitRunner {
   return createGitRunner(cwd, { env });
@@ -130,7 +151,7 @@ type ActivePrivateRepoEntry = {
   git?: GitRunner;
   ready: Promise<boolean>;
 };
-export type PrivateRepoEntry = ActivePrivateRepoEntry | { failure: true };
+type PrivateRepoEntry = ActivePrivateRepoEntry | { failure: true };
 
 type HistoryWriter = { save(state: NavigationState): Promise<void> };
 
@@ -242,6 +263,9 @@ export async function resolveBackend(
     return { kind: "session", reason: "private_repository_unavailable" };
   }
   if (resolved.reason !== "not_repository") return { kind: "session", reason: resolved.reason };
+  // Checked before any store exists: a refused workspace never gets one.
+  if (refusedPrivateWorkspace(canonicalCwd(cwd)))
+    return { kind: "session", reason: "unsafe_workspace" };
   const priv = await resolvePrivateGit(cwd, privateRepositories, gitRunnerFactory);
   return priv
     ? { kind: "git", repository: priv.repository, git: priv.git }
@@ -293,6 +317,9 @@ const LEGACY_BLOB_QUIET_MS = 7 * 24 * 60 * 60 * 1000;
  *  between retries when a git child still holds a directory handle on
  *  Windows. */
 const EVICTION_RETRY_DELAY_MS = 200;
+
+/** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */
+const nativeRealpath = promisify(realpath.native);
 
 async function removeDirWithRetry(path: string): Promise<boolean> {
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -361,8 +388,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     resolveHostIdentity: resolvePersistentHostId,
     resolveRuntimeScope,
   });
+  /** Joined on the first navigation, not at load: a subagent's copy never
+   *  builds one, so it never holds the process's runtime directory. */
   const runtimeStore = new RuntimeActionStateStore();
-  const runtimeReady = runtimeStore.initialize();
   const navigations = new Map<string, SessionNavigation>();
   const backends = new Map<string, FileBackend>();
   /** Checkpoints of the CURRENT turn that no finalize owns yet. Anything left
@@ -395,10 +423,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  (it may hold the turn's own edits) instead of recording a wrong baseline. */
   const beforeSnapshotGates = new Map<string, { complete: Promise<void>; late: boolean }>();
 
-  // Snapshot-store housekeeping: captures between gc runs (per store) and the
-  // threshold that triggers a background `git gc`. Every store is the
-  // extension's own (`storeDir` never names the user's `.git`), so gc can
-  // never touch a user repository.
+  // Snapshot-store housekeeping: captures between maintenance checks (per
+  // store) and the threshold that triggers one (`runCaptureGc`). Every store
+  // is the extension's own (`storeDir` never names the user's `.git`), so gc
+  // can never touch a user repository.
   const PRIVATE_GC_AFTER_CAPTURES = 20;
   const capturesSinceGcByStore = new Map<string, number>();
 
@@ -423,18 +451,24 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  loses nothing. */
   const PRIVATE_SWEEP_PRUNE = "1.hour.ago";
 
-  /** Tail of the process-wide gc queue. Every trigger (retention sweep,
-   *  capture threshold, shutdown) routes through `schedulePrivateGc`, so at
-   *  most one repack runs at a time: a boot sweep over many expired stores
-   *  would otherwise start one full `git gc` per store at once. Never
-   *  rejects (`runPrivateGc` swallows every failure), so one bad store
-   *  cannot stall the queue. */
+  /** Tail of this extension copy's gc queue. Every trigger (retention sweep,
+   *  capture threshold, shutdown) routes through `schedulePrivateGc`, so a
+   *  copy runs at most one repack at a time: a boot sweep over many expired
+   *  stores would otherwise start one full `git gc` per store at once. Not
+   *  process-wide: OMP binds a copy per in-process session, but subagent
+   *  copies never capture or expire (`servesMainSession`), so only main
+   *  sessions' copies (one, or one per ACP session) feed a queue. Never
+   *  rejects (`runPrivateGc` and `runCaptureGc` swallow every failure), so
+   *  one bad store cannot stall the queue. */
   let privateGcQueue: Promise<void> = Promise.resolve();
 
-  /** Queues a gc of `repository` behind every gc already scheduled; resolves
-   *  once this one has run. */
-  function schedulePrivateGc(repository: GitRepository): Promise<void> {
-    privateGcQueue = privateGcQueue.then(() => runPrivateGc(repository));
+  /** Queues `run` (default: the full `runPrivateGc`) over `repository`
+   *  behind every gc already scheduled; resolves once this one has run. */
+  function schedulePrivateGc(
+    repository: GitRepository,
+    run: (repository: GitRepository) => Promise<void> = runPrivateGc,
+  ): Promise<void> {
+    privateGcQueue = privateGcQueue.then(() => run(repository));
     return privateGcQueue;
   }
 
@@ -444,13 +478,28 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  objects: expiring sessions would otherwise leave recoverable file
    *  content behind indefinitely. */
   async function runPrivateGc(repository: GitRepository): Promise<void> {
+    // Claimed before gc reads the refs: a deletion during this gc marks the
+    // store anew, and only a gc that finished drops the claim, so one cut
+    // short by a failure, its ceiling or the process exit leaves it for the
+    // next boot's sweep (`storeNeedsGc`). An existing claim (a killed gc, or
+    // another process's gc still running) is never overwritten: that gc may
+    // drop it after missing this mark's deletion, so the mark stays and costs
+    // at most one extra gc.
+    const mark = gcPendingPath(repository.storeDir);
+    const claim = `${mark}.running`;
     try {
+      if (!(await stat(claim).catch(() => null))) {
+        await rename(mark, claim).catch(() => undefined);
+      }
       // Run from a neutral cwd so a slow gc never holds a handle on either the
       // user's workspace or the snapshot repo itself (Windows keeps a child's
       // cwd handle until it exits, which would race teardown rms and the
       // eviction sweep). GIT_DIR is set, so the repo operations work anywhere;
       // a Git store also needs the objects it borrows to walk its snapshots.
       const git = gitRunnerFactory(tmpdir(), storeEnv(repository));
+      // Git mode: the prune and gc below would drop the store's copies of
+      // objects the user's repository also holds.
+      await pinStoreObjects(git, repository, PRIVATE_GC_TIMEOUT_MS);
       // gc prunes only after its repack. A repack that outruns the ceiling
       // (or dies with the terminal) is hard-killed on Windows, so its prune
       // never runs: expired snapshots stay on disk and every attempt leaves a
@@ -461,10 +510,76 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       });
       // gc would rerun the same prune and fail the same way.
       if (pruned.error) return;
-      await git(["gc", `--prune=${PRIVATE_SWEEP_PRUNE}`], { timeoutMs: PRIVATE_GC_TIMEOUT_MS });
+      const gc = await git(["gc", `--prune=${PRIVATE_SWEEP_PRUNE}`], {
+        timeoutMs: PRIVATE_GC_TIMEOUT_MS,
+      });
+      if (gc.code === 0 && !gc.error) await rm(claim, { force: true });
     } catch {
       // Best-effort: a failed gc leaves more work for the next trigger.
     }
+  }
+
+  /** Maintenance for the capture-driven triggers (capture threshold,
+   *  shutdown). A full gc rewrites the whole store, so running one per 20
+   *  captures made its cost grow with the store. Captures only add objects;
+   *  garbage from ref deletions is the `gc-pending` mark's, which the next
+   *  boot sweep's full gc reclaims. So these triggers repack only once git's
+   *  own `gc --auto` limits say so. A private store lets git decide: it packs
+   *  just the loose objects, and rewrites every pack only past the pack
+   *  limit. A Git-mode store cannot run `gc --auto`: any repack there may
+   *  drop its copies of borrowed objects unless `pinStoreObjects` ran first,
+   *  so it gets the full pinned gc, once it crosses the same limits. */
+  async function runCaptureGc(repository: GitRepository): Promise<void> {
+    try {
+      if (borrowsObjects(repository)) {
+        if (await storeExceedsAutoGcLimits(repository.storeDir)) await runPrivateGc(repository);
+        return;
+      }
+      // Neutral cwd: see `runPrivateGc`. Not detached: a gc running past its
+      // queue entry would escape the eviction guard and the serial queue.
+      // Limits pinned: a user's global `gc.auto=0` would otherwise leave the
+      // store's loose objects unpacked for good, and the Git-mode gate uses
+      // the same numbers.
+      await gitRunnerFactory(tmpdir(), storeEnv(repository))(
+        [
+          "-c",
+          "gc.autoDetach=false",
+          "-c",
+          `gc.auto=${GC_AUTO_LOOSE_OBJECTS}`,
+          "-c",
+          `gc.autoPackLimit=${GC_AUTO_PACK_LIMIT}`,
+          "gc",
+          "--auto",
+          "--quiet",
+          `--prune=${PRIVATE_SWEEP_PRUNE}`,
+        ],
+        { timeoutMs: PRIVATE_GC_TIMEOUT_MS },
+      );
+    } catch {
+      // Best-effort, like `runPrivateGc`.
+    }
+  }
+
+  /** git's defaults for `gc --auto`: loose objects past which it packs them,
+   *  and packs (without a `.keep`) at which it repacks them all. */
+  const GC_AUTO_LOOSE_OBJECTS = 6700;
+  const GC_AUTO_PACK_LIMIT = 50;
+
+  /** git's `gc --auto` test: more than GC_AUTO_LOOSE_OBJECTS loose objects,
+   *  estimated as git does from fan-out `17` alone, or GC_AUTO_PACK_LIMIT
+   *  packs without a `.keep`. */
+  async function storeExceedsAutoGcLimits(storeDir: string): Promise<boolean> {
+    const objects = join(storeDir, "objects");
+    const names = await readdir(join(objects, "pack")).catch(() => [] as string[]);
+    const kept = new Set(names.filter((name) => name.endsWith(".keep")));
+    const packs = names.filter(
+      (name) => name.endsWith(".pack") && !kept.has(`${name.slice(0, -".pack".length)}.keep`),
+    );
+    if (packs.length >= GC_AUTO_PACK_LIMIT) return true;
+    const loose = await readdir(join(objects, "17")).catch(() => [] as string[]);
+    // SHA-1 or SHA-256 object names, minus their two-digit fan-out.
+    const looseObjects = loose.filter((name) => /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/.test(name));
+    return looseObjects.length > Math.ceil(GC_AUTO_LOOSE_OBJECTS / 256);
   }
 
   /** One-time removal of legacy git-indexes directory from pre-v1.5.1 store layout */
@@ -505,7 +620,51 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   // them (evictStalePrivateRepos' in-flight guard).
   const pendingCaptures = new Map<string, PendingCapture>();
   const pendingFinalizations = new Map<string, Promise<void>>();
+  /** Turn work (captures, finalizes, session events) shutdown waits on. */
   const activeOperations = new Set<Promise<void>>();
+  /** Background store gcs and retention sweeps: shutdown never waits on them
+   *  (a repack can take minutes), but eviction defers to them too. */
+  const housekeepingOperations = new Set<Promise<void>>();
+  /** Sessions this copy captured for, i.e. whose index leases it owns. */
+  const leaseSessionIds = new Set<string>();
+  /** OMP binds a separate copy of this extension to every in-process subagent
+   *  session (`ctx.agent.kind === "sub"`). Nobody can `/undo` a subagent, so
+   *  its copy captures nothing, keeps no history, waits on no tool call,
+   *  refuses `/undo`/`/redo` (a subagent prompt starting with one runs it),
+   *  and leaves boot and shutdown housekeeping to the main session's copy.
+   *  Hosts without `ctx.agent` read as main. */
+  let servesMainSession = false;
+  let servesSubagent = false;
+  function isMainSession(ctx: AnyContext): boolean {
+    if (ctx.agent?.kind === "sub") {
+      servesSubagent = true;
+      return false;
+    }
+    servesMainSession = true;
+    void startBootHousekeeping();
+    return true;
+  }
+
+  /** Boot housekeeping (eviction, legacy cleanup, orphaned temp indexes)
+   *  starts with the copy's first main-session event instead of at load, so
+   *  a subagent's copy skips it: the main session's copy already ran it.
+   *  ponytail: a copy that sees no session event within
+   *  BOOT_HOUSEKEEPING_FALLBACK_MS runs it anyway; a subagent whose first
+   *  event arrives later than that sweeps once more, which is harmless (a
+   *  sweep racing another one finds the store already renamed and skips it). */
+  const BOOT_HOUSEKEEPING_FALLBACK_MS = 2_000;
+  let bootEviction: Promise<void> | null = null;
+  function startBootHousekeeping(): Promise<void> {
+    if (bootEviction) return bootEviction;
+    bootEviction = evictStalePrivateRepos().catch(() => undefined);
+    void cleanLegacyGitIndexes().catch(() => undefined);
+    const t = setTimeout(() => {
+      void sweepOrphanTempIndexes().catch(() => undefined);
+      void purgeLegacyBlobStore().catch(() => undefined);
+    }, 2_000);
+    t.unref?.();
+    return bootEviction;
+  }
 
   /** How long a snapshot repo must sit untouched before its workspace's
    *  disappearance counts as abandonment rather than a transient mount or
@@ -597,6 +756,34 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     }
   }
 
+  /** Whether a store holds garbage only a gc reclaims. Packed objects a
+   *  deleted ref orphaned outlive `git prune`, and every in-process trigger
+   *  (capture threshold, shutdown, expiry) dies with the process, so the
+   *  sweep checks durable evidence instead: a deletion's `gc-pending` mark,
+   *  the claim of a gc that never finished, a cruft pack (`.mtimes`: objects
+   *  an earlier gc kept inside its prune window), or objects no ref can reach
+   *  at all (stores orphaned before the mark existed). */
+  async function storeNeedsGc(storeDir: string): Promise<boolean> {
+    const mark = gcPendingPath(storeDir);
+    for (const path of [mark, `${mark}.running`]) {
+      if (
+        await stat(path).then(
+          () => true,
+          () => false,
+        )
+      )
+        return true;
+    }
+    const objects = join(storeDir, "objects");
+    const packs = await readdir(join(objects, "pack")).catch(() => [] as string[]);
+    if (packs.some((name) => name.endsWith(".mtimes"))) return true;
+    // Unreadable refs read as "has refs": never gc on a guess.
+    if (await storeHasRefs(storeDir).catch(() => true)) return false;
+    if (packs.some((name) => name.endsWith(".pack"))) return true;
+    const fanouts = await readdir(objects).catch(() => [] as string[]);
+    return fanouts.some((name) => /^[0-9a-f]{2}$/.test(name));
+  }
+
   /** Removes snapshot stores whose workspace (Private-Git) or repository (Git
    *  mode) no longer exists. Runs at boot and on shutdown so vanished
    *  workspaces cannot leave their snapshots (and the file contents inside
@@ -609,7 +796,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  flight, and even then the repo is only renamed aside as `.evicted-<ts>`
    *  trash for EVICTION_TRASH_RETENTION_MS instead of being deleted outright.
    *  A store whose setup never finished names no source; it is evicted on
-   *  idleness alone, and only while it holds no refs. */
+   *  idleness alone, and only while it holds no refs. A private store of a
+   *  workspace `refusedPrivateWorkspace` rejects is evicted on idleness alone. */
   async function evictStalePrivateRepos(): Promise<void> {
     const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
     let entries: string[];
@@ -624,7 +812,12 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     // Whatever is left behind is revisited by the next boot or shutdown
     // sweep. Registered-but-idle sessions are deliberately NOT a guard:
     // the shutdown sweep exists to evict exactly those once drained.
-    if (pendingCaptures.size > 0 || pendingFinalizations.size > 0 || activeOperations.size > 0) {
+    if (
+      pendingCaptures.size > 0 ||
+      pendingFinalizations.size > 0 ||
+      activeOperations.size > 0 ||
+      housekeepingOperations.size > 0
+    ) {
       return;
     }
 
@@ -656,8 +849,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         } catch {
           // No pidfile.
         }
-        const source = (await storeSource(reposDir, path))?.path;
-        if (source) {
+        const found = await storeSource(reposDir, path);
+        if (found) {
+          const source = found.path;
           const vanished = async (): Promise<boolean> => {
             try {
               await stat(source);
@@ -669,9 +863,20 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
               return code === "ENOENT" || code === "ENOTDIR";
             }
           };
-          if (!(await vanished())) continue;
-          await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
-          if (!(await vanished())) continue;
+          // A private store of a refused workspace (left by an earlier
+          // version) is never used again, so it counts as abandoned. v1.5.0
+          // and v1.5.1 wrote `core.worktree` through non-native realpath,
+          // which keeps Windows 8.3 short names, so it is resolved again
+          // here. Async: a dead network mount then stalls a threadpool
+          // thread, as `vanished` would, never the event loop.
+          const refused =
+            !found.gitStore &&
+            refusedPrivateWorkspace(await nativeRealpath(source).catch(() => source));
+          if (!refused) {
+            if (!(await vanished())) continue;
+            await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
+            if (!(await vanished())) continue;
+          }
         } else if ((await setupFinished(path)) !== false || (await storeHasRefs(path))) {
           // No source to stat. Only a setup that never wrote its marker (a
           // crash or stale config.lock after `git init`) and holds no
@@ -717,9 +922,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
 
   /** Expires dormant histories in `repository`, once per process. Deleting
    *  refs alone leaves the snapshots' plaintext file contents on disk, so the
-   *  store then gets a background gc. A cruft pack (`.mtimes`) holds objects
-   *  an earlier sweep gc kept inside its prune window; it triggers a gc too,
-   *  else they would outlive retention until some later expiry. */
+   *  store then gets a background gc; so does a store `storeNeedsGc` finds
+   *  garbage in, else a gc an earlier process never ran or finished would
+   *  never be retried. */
   function expireRepository(repository: GitRepository, git: GitRunner): Promise<void> {
     const key = `git:${repository.storeDir}`;
     const existing = expirationPromises.get(key);
@@ -729,13 +934,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         activeSessionHashes(),
       );
       if (closing) return;
-      if (refsRemoved === 0) {
-        const packs = await readdir(join(repository.storeDir, "objects", "pack")).catch(() => []);
-        if (!packs.some((name) => name.endsWith(".mtimes"))) return;
-      }
-      // Detached from the expiration promise: shutdown awaits expirations,
-      // and must not wait out a gc.
-      void track(() => schedulePrivateGc(repository));
+      if (refsRemoved === 0 && !(await storeNeedsGc(repository.storeDir))) return;
+      // Detached from the expiration promise and from shutdown's wait: neither
+      // may wait out a gc.
+      void track(() => schedulePrivateGc(repository), housekeepingOperations);
     })().catch(() => undefined);
     expirationPromises.set(key, expiration);
     return expiration;
@@ -746,9 +948,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
    *  (`.env`, keys) forever. Started by the first session initialization,
    *  once that session is registered active, so the session being resumed
    *  is protected exactly as in the per-repo path. Expiry needs only the
-   *  store; a Git store's `commonDir` supplies the objects its gc reads. */
+   *  store; a Git store's `commonDir` supplies the objects its gc reads.
+   *  Runs with retention off too: expiry then deletes nothing, but pending
+   *  gcs are still retried. */
   async function sweepPrivateRepoRetention(): Promise<void> {
-    if (retentionDays <= 0) return;
     const reposDir = join(canonicalCwd(storeRootDirectory()), "repos");
     const entries = await readdir(reposDir).catch(() => [] as string[]);
     for (const entry of entries) {
@@ -796,6 +999,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       "Git is not available.\nSession navigation still works, but file changes cannot be restored.",
     private_repository_unavailable:
       "The private snapshot repository could not be initialized.\nSession navigation still works, but file changes cannot be restored.",
+    unsafe_workspace:
+      "File snapshots are disabled in a home directory, drive root, or temp directory: they would copy its private files.\nSession navigation still works, but file changes cannot be restored. Start OMP in a project folder to enable them.",
     repository_unresolvable:
       "The Git repository could not be resolved.\nSession navigation still works, but file changes cannot be restored.",
   };
@@ -811,9 +1016,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     ctx.ui.notify(NOTIFICATION_MESSAGES[reason], "warning");
   }
 
+  /** `historyLeafId` bounds the history rebuilt when no stored one loads: a
+   *  finalize passes its turn-start leaf, or the turn it is about to record
+   *  would be rebuilt from the branch and then recorded a second time. */
   async function initializeNavigation(
     ctx: AnyContext,
     replaceExisting: boolean,
+    historyLeafId: string | null = ctx.sessionManager.getLeafId(),
   ): Promise<SessionNavigation> {
     const sessionId = ctx.sessionManager.getSessionId();
     const sessionHash = checkpointNamespace(sessionId);
@@ -825,7 +1034,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (active) return active;
     }
     const initialization = (async () => {
-      await runtimeReady;
+      await runtimeStore.initialize();
       const previous = navigations.get(sessionId);
       navigations.delete(sessionId);
       if (previous) await previous.suspend();
@@ -838,8 +1047,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (backend.kind === "git") void expireRepository(backend.repository, backend.git);
       // After boot eviction, which it would otherwise race (a gc holds
       // handles through eviction's rename and refreshes the idle mtimes).
-      privateRetentionSweep ??= bootEviction
-        .then(() => (closing ? undefined : track(sweepPrivateRepoRetention)))
+      privateRetentionSweep ??= startBootHousekeeping()
+        .then(() =>
+          closing ? undefined : track(sweepPrivateRepoRetention, housekeepingOperations),
+        )
         .catch(() => undefined);
 
       const store =
@@ -877,7 +1088,9 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       } else {
         restored = null;
       }
-      navigation.restoreState(restored ?? reconstructSessionHistory(ctx.sessionManager));
+      navigation.restoreState(
+        restored ?? reconstructSessionHistory(ctx.sessionManager, historyLeafId),
+      );
       await runtimeStore.initializeSession(
         sessionId,
         navigation.snapshot(),
@@ -894,14 +1107,20 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     }
   }
 
-  async function ensureNavigation(ctx: AnyContext): Promise<SessionNavigation | null> {
+  async function ensureNavigation(
+    ctx: AnyContext,
+    historyLeafId?: string | null,
+  ): Promise<SessionNavigation | null> {
     if (closing) return null;
-    return initializeNavigation(ctx, false);
+    return initializeNavigation(ctx, false, historyLeafId);
   }
 
-  function track(operation: () => Promise<void>): Promise<void> {
+  function track(
+    operation: () => Promise<void>,
+    operations: Set<Promise<void>> = activeOperations,
+  ): Promise<void> {
     const { promise: tracked, resolve, reject } = Promise.withResolvers<void>();
-    activeOperations.add(tracked);
+    operations.add(tracked);
     void (async () => {
       try {
         await operation();
@@ -909,7 +1128,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       } catch (error) {
         reject(error);
       } finally {
-        activeOperations.delete(tracked);
+        operations.delete(tracked);
       }
     })();
     return tracked;
@@ -978,7 +1197,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
               // mid-flight, to avoid repacking under it. The counter reset
               // below prevents gc runs from stacking.
               if (pendingCaptures.size <= 1) {
-                void track(() => schedulePrivateGc(repository));
+                void track(
+                  () => schedulePrivateGc(repository, runCaptureGc),
+                  housekeepingOperations,
+                );
               } else {
                 capturesSinceGcByStore.set(key, PRIVATE_GC_AFTER_CAPTURES - 1);
               }
@@ -1047,13 +1269,17 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     turnStartLeafBySession.delete(sessionId);
     turnSequenceBySession.delete(sessionId);
     explicitActiveHashes.delete(checkpointNamespace(sessionId));
-    await suspendDetached(navigation ? [navigation] : [], left ? [left] : []);
+    await Promise.all([
+      runtimeStore.releaseSession(sessionId),
+      suspendDetached(navigation ? [navigation] : [], left ? [left] : []),
+    ]);
   }
 
   pi.on("session_start", (_event, ctx) =>
     track(async () => {
       if (closing) return;
       const typed = ctx as unknown as AnyContext;
+      if (!isMainSession(typed)) return;
       const sessionId = typed.sessionManager.getSessionId();
       const previousPending = pending.get(sessionId);
       pending.delete(sessionId);
@@ -1082,36 +1308,43 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   // Switch and branch share one slot; if it is empty (never set, or clobbered by
   // an interleaved navigation) the post-event invalidates every session's redo,
   // which is a safe superset, and releases no session (unknown source).
-  const rememberNavigationSource = (_event: unknown, ctx: unknown) =>
+  const rememberNavigationSource = (_event: unknown, ctx: unknown): void => {
+    if (closing) return;
+    pendingNavigationSourceSessionId = (ctx as AnyContext).sessionManager.getSessionId();
+  };
+
+  // The host emits no `session_start` for the session it switched to, so its
+  // navigation is built here, before any turn: built lazily by that turn's
+  // finalize, it would rebuild a branch that already holds the turn.
+  const adoptSwitchedSession = (_event: unknown, ctx: unknown) =>
     track(async () => {
       if (closing) return;
       const typed = ctx as AnyContext;
-      pendingNavigationSourceSessionId = typed.sessionManager.getSessionId();
-    });
-
-  const invalidateNavigationSourceRedo = (_event: unknown, ctx: unknown) =>
-    track(async () => {
-      if (closing) return;
+      if (!isMainSession(typed)) return;
       const sourceSessionId = pendingNavigationSourceSessionId;
       pendingNavigationSourceSessionId = null;
       if (sourceSessionId) {
         await navigations.get(sourceSessionId)?.invalidateRedo();
         // Detached: the switch must not wait out the source's deferred finalize.
-        void track(() => releaseLeftSession(ctx as AnyContext, sourceSessionId));
+        void track(() => releaseLeftSession(typed, sourceSessionId));
       } else {
         await invalidateAllRedo();
       }
+      // Keeps a live navigation (same-id reload, or a resume racing the
+      // release above); otherwise loads the stored history.
+      await ensureNavigation(typed);
     });
 
   pi.on("session_before_switch", rememberNavigationSource);
-  pi.on("session_switch", invalidateNavigationSourceRedo);
+  pi.on("session_switch", adoptSwitchedSession);
   pi.on("session_before_branch", rememberNavigationSource);
-  pi.on("session_branch", invalidateNavigationSourceRedo);
+  pi.on("session_branch", adoptSwitchedSession);
 
   pi.on("before_agent_start", (_event, ctx) =>
     track(async () => {
       if (closing) return;
       const typed = ctx as unknown as AnyContext;
+      if (!isMainSession(typed)) return;
       const sessionId = typed.sessionManager.getSessionId();
       const oldPending = pending.get(sessionId);
       pending.delete(sessionId);
@@ -1144,6 +1377,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       if (backend.kind === "session") {
         notifySessionOnly(typed, sessionId, backend.reason);
       }
+      if (backend.kind === "git") leaseSessionIds.add(sessionId);
       const gate = { complete: Promise.resolve(), late: false };
       const capture = beginCapture(sessionId, async () => {
         const prepared =
@@ -1264,12 +1498,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   async function resolveNavigation(
     typed: AnyContext,
     sessionId: string,
+    turnStartLeaf: string | null,
   ): Promise<SessionNavigation | null> {
     const known = navigations.get(sessionId) ?? (await initializations.get(sessionId));
     if (known) return known;
     if (typed.sessionManager.getSessionId() !== sessionId) return null;
     const nav =
-      (await ensureNavigation(typed)) ??
+      (await ensureNavigation(typed, turnStartLeaf)) ??
       createNavigation(
         typed,
         sessionId,
@@ -1339,7 +1574,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         // edits when an older restore crosses this gap.
         if (turnSequenceBySession.get(sessionId) !== turnSequence) {
           await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
-          const gapped = await resolveNavigation(typed, sessionId);
+          const gapped = await resolveNavigation(typed, sessionId, before.parentLeafId);
           await gapped?.recordTurnEnd({
             kind: "session",
             reason: "file_history_gap",
@@ -1348,7 +1583,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
           });
           return;
         }
-        const nav = await resolveNavigation(typed, sessionId);
+        const nav = await resolveNavigation(typed, sessionId, before.parentLeafId);
         if (!nav) {
           await releaseCheckpoint(gitRunnerFor(result.checkpoint.repository), result.checkpoint);
           return;
@@ -1368,7 +1603,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         leafId: leafId,
       };
     }
-    const nav = await resolveNavigation(typed, sessionId);
+    const nav = await resolveNavigation(typed, sessionId, before.parentLeafId);
     await nav?.recordTurnEnd(completed);
   }
 
@@ -1408,48 +1643,73 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     initializations.clear();
     pending.clear();
     shutdownPromise = (async () => {
-      // Let an in-flight expiry finish (it holds the store lock) and cancel one
-      // that never started, then stop protecting sessions so shutdown GC can
-      // reclaim their data.
       clearInterval(heartbeatTimer);
-      await Promise.allSettled([...expirationPromises.values()]);
-      explicitActiveHashes.clear();
-      await suspendDetached(detachedNavigations, detachedPending);
-      // Bounded: an overrunning capture must not delay shutdown indefinitely.
-      // Any capture still running now self-releases on completion (closing is
-      // set), and its temporary index is reclaimed by git or the OS.
-      await timedOutAfter(Promise.allSettled([...activeOperations]), 5_000);
-      await releaseAllPersistentSnapshotIndices();
-      await drainState();
-      await ownerRegistry.shutdown();
-      // Store housekeeping on the way out: evict stores whose workspaces
-      // vanished, then gc stores that crossed the capture
-      // threshold. Runs detached so an overrunning sweep cannot delay
-      // shutdown, but internally sequenced: a gc racing the sweep would
-      // both hold handles through the rename and bump mtimes past the idle
-      // cutoff, so every gc waits for eviction to finish first and skips
-      // repos it renamed away. Whatever is unfinished when the process
-      // exits is covered by the next boot sweep.
-      void evictStalePrivateRepos()
-        .catch(() => undefined)
-        .then(() =>
-          Promise.allSettled(
-            [...privateRepositories.values()].map(async (entry) => {
-              if ("failure" in entry || !entry.repository || !entry.git) return;
-              const { repository } = entry;
-              const key = gcKey(repository);
-              if (!capturesSinceGcByStore.has(key)) return;
-              capturesSinceGcByStore.delete(key);
-              try {
-                await stat(repository.storeDir);
-              } catch {
-                return;
-              }
-              await schedulePrivateGc(repository);
-            }),
-          ),
+      // Priority order: whatever OMP's cap cuts off runs on in the background
+      // and is lost only if the process exits first.
+      const teardown = (async () => {
+        // Local cleanup first: idle index leases (a checked-out one may sit
+        // under a running git) and the runtime directory.
+        await Promise.all([
+          releasePersistentSnapshotIndices(leaseSessionIds, { inUse: false }),
+          runtimeStore.shutdown(),
+        ]);
+        await suspendDetached(detachedNavigations, detachedPending);
+        // Turn work only, never gcs or sweeps. A capture or finalize still
+        // running after this releases its own checkpoint on completion
+        // (closing is set); the boot sweep reclaims an index it leaves behind.
+        await timedOutAfter(
+          Promise.allSettled([...activeOperations, ...pendingFinalizations.values()]),
+          SHUTDOWN_TURN_DRAIN_MS,
         );
-      await runtimeStore.shutdown();
+        await releasePersistentSnapshotIndices(leaseSessionIds);
+        await drainState();
+        await ownerRegistry.shutdown();
+      })();
+      // A git step that overran the budget must not cost the checked-out
+      // leases: drop them now, filesystem only.
+      if (await timedOutAfter(teardown, SHUTDOWN_BUDGET_MS)) {
+        await releasePersistentSnapshotIndices(leaseSessionIds);
+      }
+      // Store housekeeping on the way out, detached so a slow expiry, sweep or
+      // gc never holds the handler. Turn work, sweeps and gcs (eviction defers
+      // to all of them) and in-flight expiries finish first: a sweep can start
+      // an expiry, and an expiry past its `closing` check can still queue a
+      // gc, hence the second housekeeping drain. Then sessions stop being
+      // protected. Then evict stores whose workspaces vanished, then gc stores
+      // that crossed the capture threshold: a gc racing the sweep would both
+      // hold handles through the rename and bump mtimes past the idle cutoff,
+      // so every gc waits for eviction to finish first and skips repos it
+      // renamed away. Whatever is unfinished when the process exits is
+      // covered by the next boot sweep. A subagent's copy leaves eviction and
+      // gc to the main session's copy.
+      void (async () => {
+        await teardown.catch(() => undefined);
+        await Promise.allSettled([
+          ...activeOperations,
+          ...pendingFinalizations.values(),
+          ...housekeepingOperations,
+        ]);
+        await Promise.allSettled([...expirationPromises.values()]);
+        await Promise.allSettled([...housekeepingOperations]);
+        explicitActiveHashes.clear();
+        if (!servesMainSession) return;
+        await evictStalePrivateRepos().catch(() => undefined);
+        await Promise.allSettled(
+          [...privateRepositories.values()].map(async (entry) => {
+            if ("failure" in entry || !entry.repository || !entry.git) return;
+            const { repository } = entry;
+            const key = gcKey(repository);
+            if (!capturesSinceGcByStore.has(key)) return;
+            capturesSinceGcByStore.delete(key);
+            try {
+              await stat(repository.storeDir);
+            } catch {
+              return;
+            }
+            await schedulePrivateGc(repository, runCaptureGc);
+          }),
+        );
+      })();
     })();
     return shutdownPromise;
   });
@@ -1457,6 +1717,10 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const makeHandler = (id: ActionId) => async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
     const typed = ctx as unknown as AnyContext;
+    if (!isMainSession(typed)) {
+      ctx.ui.notify(`/${id} is unavailable in a subagent session.`, "warning");
+      return;
+    }
     const sessionId = typed.sessionManager.getSessionId();
     // Commands run even mid-stream: the turn's finalize only registers at
     // agent_end, so the guards below must be read after the idle wait.
@@ -1499,14 +1763,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     handler: makeHandler("redo"),
   });
 
-  // Boot-time housekeeping (all fire-and-forget, unref'd — 0ms handler latency)
-  const bootEviction = evictStalePrivateRepos().catch(() => undefined);
-  void cleanLegacyGitIndexes().catch(() => undefined);
-  {
-    const t = setTimeout(() => {
-      void sweepOrphanTempIndexes().catch(() => undefined);
-      void purgeLegacyBlobStore().catch(() => undefined);
-    }, 2_000);
-    t.unref?.();
-  }
+  const bootFallback = setTimeout(() => {
+    if (!servesSubagent && !closing) void startBootHousekeeping();
+  }, BOOT_HOUSEKEEPING_FALLBACK_MS);
+  bootFallback.unref?.();
 }

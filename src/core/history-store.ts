@@ -3,7 +3,7 @@ import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { writeFileAtomic } from "./atomic-write.js";
 import { checkpointNamespace, HISTORY_REF_ROOT, historyRefPrefix } from "./checkpoints.js";
-import { parseRefLines } from "./git-refs.js";
+import { markGcPending, parseRefLines } from "./git-refs.js";
 import {
   pruneStaleHeartbeats,
   sessionHeartbeatIsFresh,
@@ -297,10 +297,14 @@ async function existingRefs(
   }
 }
 
-export function reconstructSessionHistory(reader: SessionReader): NavigationState {
-  const branch = reader
-    .getBranch(reader.getLeafId() ?? undefined)
-    .filter((entry) => !isSessionExitEntry(entry));
+/** Rebuilds the branch ending at `leafId` (null: the empty session). */
+export function reconstructSessionHistory(
+  reader: SessionReader,
+  leafId: string | null = reader.getLeafId(),
+): NavigationState {
+  const branch = (leafId === null ? [] : reader.getBranch(leafId)).filter(
+    (entry) => !isSessionExitEntry(entry),
+  );
   const checkpoints: TurnCheckpoint[] = [];
   for (let index = 0; index < branch.length; index++) {
     const entry = branch[index];
@@ -380,6 +384,7 @@ async function deleteHistoryRefs(
   refs: readonly HistoryRef[],
 ): Promise<boolean> {
   try {
+    await markGcPending(repository.storeDir);
     const commands = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`);
     const result = await git(["update-ref", "--stdin"], {
       env: { GIT_DIR: repository.storeDir },
@@ -545,13 +550,10 @@ export class SessionHistoryStore {
     }
 
     const path = historyPath(this.repository, this.sessionId);
-    const present = await stat(path)
-      .then(() => true)
-      .catch(() => false);
-    if (!present) return { status: "unavailable", reason: "missing" };
+    const metadata = await stat(path).catch(() => null);
+    if (!metadata) return { status: "unavailable", reason: "missing" };
     await touchSessionHeartbeat(dir, sessionHash);
     try {
-      const metadata = await stat(path);
       if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) {
         return { status: "unavailable", reason: "unusable" };
       }

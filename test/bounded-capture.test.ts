@@ -113,7 +113,7 @@ function raceRunnerFactory(delayMs: number): {
         listeners.forEach((listener) => listener());
         return result;
       }
-      if (["write-tree", "commit-tree", "update-ref", "rev-parse"].includes(args[0] ?? "")) {
+      if (["write-tree", "commit-tree", "update-ref", "rev-parse"].some((c) => args.includes(c))) {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
         return inner(args, options);
       }
@@ -273,7 +273,7 @@ describe("bounded capture lifecycle", () => {
     const runner = (cwd: string, env?: Record<string, string>): GitRunner => {
       const inner = env ? createGitRunner(cwd, { env }) : createGitRunner(cwd);
       const slow: GitRunner = async (args, options) => {
-        if (args[0] === "read-tree") seedCount += 1;
+        if (args.includes("read-tree")) seedCount += 1;
         if (!args.includes("add")) return inner(args, options);
         await sleep(delayMs);
         const result = await inner(args, options);

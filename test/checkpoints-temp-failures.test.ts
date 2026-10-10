@@ -64,11 +64,11 @@ function makeGitRunner(
   const runner: GitRunner = async (args, callOpts) => {
     const runOpts = { ...callOpts, env: { ...options?.env, ...callOpts?.env } };
     if (options?.failCommand && args.includes(options.failCommand)) {
-      return { code: 1, stdout: "", stderr: "simulated git failure", error: null };
+      return { code: 1, stdout: "", stderr: "simulated git failure" };
     }
     if (runOpts?.stdin !== undefined) {
       const child = spawn("git", args, {
-        cwd: runOpts?.cwd ?? cwd,
+        cwd,
         env: { ...process.env, ...runOpts?.env },
         windowsHide: true,
       });
@@ -86,25 +86,24 @@ function makeGitRunner(
       child.stdin.end(runOpts.stdin);
       try {
         const [code] = (await once(child, "close")) as [number | null];
-        return { stdout, stderr, code: typeof code === "number" ? code : 1, error: null };
+        return { stdout, stderr, code: typeof code === "number" ? code : 1 };
       } catch (error) {
-        return { stdout, stderr: `${stderr}${String(error)}`, code: 1, error: null };
+        return { stdout, stderr: `${stderr}${String(error)}`, code: 1 };
       }
     }
     try {
       const { stdout, stderr } = await execFileAsync("git", args, {
-        cwd: runOpts?.cwd ?? cwd,
+        cwd,
         env: { ...process.env, ...runOpts.env },
         windowsHide: true,
       });
-      return { code: 0, stdout, stderr, error: null };
+      return { code: 0, stdout, stderr };
     } catch (err: unknown) {
       const error = err as { code?: number; stdout?: string; stderr?: string };
       return {
         code: error.code ?? 1,
         stdout: error.stdout ?? "",
         stderr: error.stderr ?? "",
-        error: null,
       };
     }
   };
@@ -163,14 +162,14 @@ describe("temp-directory failure resilience", () => {
       expect(ctx.leaf).toBe("leaf");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Undid the session turn, but files were not restored because the file checkpoint could not be created.",
+        "Undid the session turn, but files were not restored because the file snapshot before this turn failed or was still running when the turn started.",
       );
 
       await pi.runCommand("redo", ctx);
       expect(ctx.leaf).toBe("turn-1");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Redid the session turn, but files were not restored because the file checkpoint could not be created.",
+        "Redid the session turn, but files were not restored because the file snapshot before this turn failed or was still running when the turn started.",
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -187,7 +186,7 @@ describe("temp-directory failure resilience", () => {
           const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
           const gated: GitRunner = async (args, options) =>
             failAdd && args.includes("add")
-              ? { code: 1, stdout: "", stderr: "simulated add failure", error: null }
+              ? { code: 1, stdout: "", stderr: "simulated add failure" }
               : inner(args, options);
           gated.cwd = workCwd;
           if (env) gated.env = env;
@@ -235,6 +234,51 @@ describe("temp-directory failure resilience", () => {
     }
   });
 
+  it.each(["before", "after"] as const)(
+    "A3. a %s-ref write failure names the unsaved snapshot on undo/redo",
+    async (side) => {
+      const cwd = await makeRepository();
+      try {
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {
+          gitRunnerFactory: (workCwd, env) => {
+            const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+            const gated: GitRunner = async (args, options) =>
+              args.includes(`omp-undo-redo: retain ${side} checkpoint`)
+                ? { code: 1, stdout: "", stderr: "simulated update-ref failure" }
+                : inner(args, options);
+            gated.cwd = workCwd;
+            if (env) gated.env = env;
+            return gated;
+          },
+        });
+        const ctx = context(cwd, `sess-${side}-ref-fail`);
+        ctx.navigateTree = async (targetId) => {
+          ctx.leaf = targetId;
+          return { cancelled: false };
+        };
+
+        await pi.emit("session_start", ctx);
+        await pi.emit("before_agent_start", ctx);
+        await writeFile(join(cwd, "tracked.txt"), "changed\n");
+        ctx.leaf = "turn-1";
+        await pi.emit("agent_end", ctx);
+        expect(await privateRefs(cwd)).toEqual([]);
+
+        const reason = `files were not restored because the file snapshot taken ${side} this turn could not be saved.`;
+        await pi.runCommand("undo", ctx);
+        expect(ctx.leaf).toBe("leaf");
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(`Undid the session turn, but ${reason}`);
+        await pi.runCommand("redo", ctx);
+        expect(ctx.leaf).toBe("turn-1");
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(`Redid the session turn, but ${reason}`);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("B. after-snapshot allocation failure releases the pending ref", async () => {
     const cwd = await makeRepository();
     try {
@@ -265,14 +309,14 @@ describe("temp-directory failure resilience", () => {
       expect(ctx.leaf).toBe("leaf");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Undid the session turn, but files were not restored because the file checkpoint could not be created.",
+        "Undid the session turn, but files were not restored because the file snapshot after this turn failed.",
       );
 
       await pi.runCommand("redo", ctx);
       expect(ctx.leaf).toBe("turn-1");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Redid the session turn, but files were not restored because the file checkpoint could not be created.",
+        "Redid the session turn, but files were not restored because the file snapshot after this turn failed.",
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -444,7 +488,11 @@ describe("temp-directory failure resilience", () => {
         afterRes.checkpoint.afterHash,
         afterRes.checkpoint.afterHash,
       );
-      expect(emptyApplyRes).toEqual({ status: "applied", nestedRepositories: [] });
+      expect(emptyApplyRes).toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

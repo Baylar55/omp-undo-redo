@@ -207,10 +207,13 @@ export class SessionNavigation {
     );
   }
 
-  private restoredResult(applied: { nestedRepositories: string[] }): NavigationResult {
-    const { nestedRepositories } = applied;
-    return nestedRepositories.length > 0
-      ? { status: "moved", files: "partial", nestedRepositories }
+  private restoredResult(applied: {
+    nestedRepositories: string[];
+    unreadableFiles: string[];
+  }): NavigationResult {
+    const { nestedRepositories, unreadableFiles } = applied;
+    return nestedRepositories.length > 0 || unreadableFiles.length > 0
+      ? { status: "moved", files: "partial", nestedRepositories, unreadableFiles }
       : { status: "moved", files: "restored" };
   }
 

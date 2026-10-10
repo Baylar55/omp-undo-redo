@@ -1,6 +1,6 @@
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import type { spawn as Spawn } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -33,6 +33,7 @@ function runnerWithChild(child: FakeGitChild, terminationGraceMs = 50) {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 describe("Git runner", () => {
@@ -112,6 +113,24 @@ describe("Git runner", () => {
     await expect(resultPromise).resolves.toMatchObject({ error: "timeout" });
   });
 
+  it("hands stdout to onStdout as it arrives instead of buffering it", async () => {
+    const child = new FakeGitChild();
+    const chunks: string[] = [];
+    const resultPromise = runnerWithChild(child)(["ls-tree", "-r", "-z", "HEAD"], {
+      onStdout: (chunk) => chunks.push(chunk),
+    });
+    child.stdout.write("100644 blob 1\ta\x00100644 bl");
+    await new Promise((resolve) => setImmediate(resolve));
+    // Delivered before the child has finished, not at close.
+    expect(chunks.join("")).toBe("100644 blob 1\ta\x00100644 bl");
+    child.stdout.end("ob 2\tb\0");
+    await once(child.stdout, "end");
+    child.emit("close", 0);
+
+    await expect(resultPromise).resolves.toMatchObject({ code: 0, stdout: "" });
+    expect(chunks.join("")).toBe("100644 blob 1\ta\x00100644 blob 2\tb\x00");
+  });
+
   it("classifies synchronous spawn failure as unavailable", async () => {
     const spawnGit = (() => {
       throw new Error("missing");
@@ -158,4 +177,28 @@ describe("Git runner", () => {
     expect(result.error).toBe("timeout");
     expect(Date.now() - started).toBeLessThan(10_000);
   }, 15_000);
+
+  it.runIf(process.platform === "win32")(
+    "never runs a git.exe from the working directory when the direct probe fails",
+    async () => {
+      // Spawning a bare `git` on Windows tries the child's cwd before PATH.
+      // A bogus GIT_EXEC_PATH fails the direct git.exe probe, forcing the
+      // launcher fallback that used to spawn `git` by name.
+      const cwd = await mkdtemp(join(tmpdir(), "omp-runner-planted-"));
+      try {
+        await copyFile(
+          join(process.env.SystemRoot ?? "C:\\Windows", "System32", "hostname.exe"),
+          join(cwd, "git.exe"),
+        );
+        vi.stubEnv("GIT_EXEC_PATH", join(cwd, "missing-exec-path"));
+        vi.resetModules();
+        // Dynamic: the probe result is module state; a fresh instance must re-probe.
+        const fresh = await import("../src/core/git-runner.js");
+        const result = await fresh.createGitRunner(cwd)(["--version"]);
+        expect(result.stdout).toMatch(/^git version /);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
 });

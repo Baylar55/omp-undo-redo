@@ -5,11 +5,13 @@ import {
   chmod,
   lstat,
   mkdtemp,
+  readdir,
   readFile,
   readlink,
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,7 +24,7 @@ import {
   checkpointNamespace,
   finishAfterTurn,
   prepareBeforeTurn,
-  releaseAllPersistentSnapshotIndices,
+  releasePersistentSnapshotIndices,
   releaseCheckpoint,
   releaseRefs,
   releasePendingCheckpoint,
@@ -172,6 +174,33 @@ function completedCheckpoint(result: Awaited<ReturnType<typeof finishAfterTurn>>
   return result.checkpoint;
 }
 
+/** Makes `path` unreadable for git until the returned release runs: an
+ *  exclusive share-mode handle on Windows (how a running app holds its
+ *  database), mode 000 elsewhere. */
+async function lockFile(path: string): Promise<() => Promise<void>> {
+  if (process.platform !== "win32") {
+    await chmod(path, 0o000);
+    return () => chmod(path, 0o644);
+  }
+  const holder = spawn(
+    "powershell",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "$h = [IO.File]::Open($env:LOCK_PATH, 'Open', 'ReadWrite', 'None'); 'locked'; [Console]::In.ReadLine() | Out-Null",
+    ],
+    { env: { ...process.env, LOCK_PATH: path }, windowsHide: true },
+  );
+  const [chunk] = (await once(holder.stdout, "data")) as [Buffer];
+  if (!chunk.toString().includes("locked")) throw new Error(`lock failed: ${chunk.toString()}`);
+  return async () => {
+    const closed = once(holder, "close");
+    holder.stdin.end("\n");
+    await closed;
+  };
+}
+
 function checkpointWithRepository(
   beforeHash: string,
   afterHash: string,
@@ -258,6 +287,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       await expect(readFile(join(cwd, "agent.txt"))).rejects.toThrow();
@@ -265,10 +295,34 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       expect(await readFile(join(cwd, "agent.txt"), "utf8")).toBe("agent commit\n");
       expect(await readFile(join(cwd, "turn.txt"), "utf8")).toBe("uncommitted turn change\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("snapshots a repository whose core.safecrlf would refuse the conversion", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "core.autocrlf", "true"]);
+      await git(["config", "core.safecrlf", "true"]);
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "safecrlf-turn"));
+      expect(before).not.toBeNull();
+      if (!before) return;
+
+      // An LF file under autocrlf=true: `git add` with safecrlf=true aborts on it.
+      await writeFile(join(cwd, "turn.txt"), "line one\nline two\n");
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+      expect(after).not.toBeNull();
+      if (!after) return;
+      expect(await text(snap, ["ls-tree", "-r", "--name-only", after.afterHash])).toContain(
+        "turn.txt",
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -297,6 +351,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
       expect(await readFile(savedIndexPath)).toEqual(savedIndex.raw);
@@ -317,6 +372,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
       expect(await readFile(savedIndexPath)).toEqual(indexBeforeRedo);
@@ -448,18 +504,18 @@ describe("history-safe Git checkpoints", () => {
 
       await expect(
         applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
-      ).resolves.toEqual({ status: "applied", nestedRepositories: [] });
+      ).resolves.toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
       expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe(".env\n");
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
       await expect(
         applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
-      ).resolves.toEqual({ status: "applied", nestedRepositories: [] });
+      ).resolves.toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
       expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe("# cleaned\n");
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
       await releaseCheckpoint(snap, checkpoint);
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices(["unignore-turn"]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -493,7 +549,7 @@ describe("history-safe Git checkpoints", () => {
       await writeFile(join(cwd, "headonly.txt"), "tracked after recreation\n");
       const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
-      expect(commands.some((args) => args[0] === "diff-index")).toBe(true);
+      expect(commands.some((args) => args.includes("diff-index"))).toBe(true);
       // With cross-turn index reuse the lease is retained after the after-snapshot
       // (not deleted) so the next turn can reuse it for a cheap before snapshot.
       await expect(stat(leaseDirectory)).resolves.toBeDefined();
@@ -513,7 +569,7 @@ describe("history-safe Git checkpoints", () => {
       if (freshLeaseDirectory) await expect(stat(freshLeaseDirectory)).rejects.toThrow();
       await releaseCheckpoint(snap, after);
       // Clean up the persisted lease from this test's session.
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices(["normalized-index", "fresh-ground-truth"]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -535,7 +591,7 @@ describe("history-safe Git checkpoints", () => {
       const before = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, "empty-normalization"));
       const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
-      expect(commands.some((args) => args[0] === "diff-index")).toBe(true);
+      expect(commands.some((args) => args.includes("diff-index"))).toBe(true);
       expect(commands.some((args) => args.includes("reset"))).toBe(false);
       await releaseCheckpoint(snap, after);
     } finally {
@@ -588,7 +644,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId, "born-ground-truth"]);
     }
   });
 
@@ -633,9 +689,58 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId, "stale-gitlink-truth"]);
     }
   });
+
+  // Untracked: the before tree has no `app.db` entry, so undo would delete it.
+  // Tracked: it keeps HEAD's stale blob, so undo would rewrite it to `v0`. The
+  // file differs from HEAD so no index stat data vouches for it unread.
+  // Root reads mode-000 files, so the POSIX lock does not hold there.
+  for (const tracked of [false, true]) {
+    it.skipIf(process.getuid?.() === 0)(
+      `snapshots around ${tracked ? "a tracked" : "an untracked"} file git cannot read and leaves it alone on restore`,
+      async () => {
+        const { cwd, git, snap } = await makeRepo();
+        const sessionId = `unreadable-file-${tracked}`;
+        const db = join(cwd, "app.db");
+        try {
+          if (tracked) await writeFile(db, "v0 committed\n");
+          await initializeBranch(git, cwd);
+          await writeFile(db, "v1\n");
+          // Locked during the before-snapshot only.
+          const unlock = await lockFile(db);
+          let before: PendingGitCheckpoint;
+          try {
+            before = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId));
+          } finally {
+            await unlock();
+          }
+          await writeFile(join(cwd, "tracked.txt"), "turn\n");
+          await writeFile(db, "v2\n");
+          const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+
+          const notRestored = { nestedRepositories: [], unreadableFiles: ["app.db"] };
+          expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
+            status: "applied",
+            ...notRestored,
+          });
+          expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+          expect(await readFile(db, "utf8")).toBe("v2\n");
+          expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
+            status: "applied",
+            ...notRestored,
+          });
+          expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
+          expect(await readFile(db, "utf8")).toBe("v2\n");
+          await releaseCheckpoint(snap, after);
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+          await releasePersistentSnapshotIndices([sessionId]);
+        }
+      },
+    );
+  }
 
   it("reuses the persisted alternate index across consecutive turns to avoid a full re-hash", async () => {
     const { cwd, git, snap } = await makeRepo();
@@ -681,7 +786,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after3);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId]);
     }
   });
 
@@ -714,7 +819,7 @@ describe("history-safe Git checkpoints", () => {
       ) satisfies GitRunner;
       // Next turn reuses the fallback's index instead of reseeding from HEAD.
       const before2 = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId));
-      expect(commands.some((args) => args[0] === "read-tree")).toBe(false);
+      expect(commands.some((args) => args.includes("read-tree"))).toBe(false);
       expect(before2.snapshotIndexLease?.directory).toBeDefined();
       expect(before2.snapshotIndexLease?.directory).not.toBe(staleDirectory);
       const tree = (hash: string) => text(snap, ["rev-parse", `${hash}^{tree}`]);
@@ -725,7 +830,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId]);
     }
   });
 
@@ -757,7 +862,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId]);
     }
   });
 
@@ -872,6 +977,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("inside base\n");
       expect(await readFile(join(cwd, "outside-modified.txt"), "utf8")).toBe(
@@ -888,6 +994,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("inside after turn\n");
       expect(await readFile(join(cwd, "outside-modified.txt"), "utf8")).toBe(
@@ -957,11 +1064,13 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       await git(["switch", "A"]);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await text(git, ["symbolic-ref", "--short", "HEAD"])).toBe("A");
       expect(await branchRefs(git)).toBe(refsAfterSwitch);
@@ -990,7 +1099,7 @@ describe("history-safe Git checkpoints", () => {
       ) satisfies GitRunner;
       const after = completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null));
 
-      expect(commands.some((args) => args[0] === "read-tree")).toBe(true);
+      expect(commands.some((args) => args.includes("read-tree"))).toBe(true);
       const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "head-change-fresh"));
       expect(await text(snap, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
         await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
@@ -999,6 +1108,98 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("seeds a fresh index from the repository's index without missing worktree content", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const blob = (hash: string, path: string) => text(snap, ["cat-file", "-p", `${hash}:${path}`]);
+    try {
+      await initializeBranch(git, cwd);
+      for (const name of ["racy.txt", "skip.txt", "assume.txt"]) {
+        await writeFile(join(cwd, name), "r1\n");
+      }
+      await git(["add", "."]);
+      await git(["commit", "-qm", "seed"]);
+
+      // Racy clean: racy.txt's recorded mtime equals the index's own (same
+      // tick), then its content changes keeping size and mtime. Only git's
+      // racy check sees that, and only while the seed copy's mtime is not later.
+      const racy = join(cwd, "racy.txt");
+      const tick = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+      await utimes(racy, tick, tick);
+      await git(["update-index", "-q", "--refresh"]);
+      await utimes(await indexPath(git, cwd), tick, tick);
+      await writeFile(racy, "R9\n");
+      await utimes(racy, tick, tick);
+      const first = pendingCheckpoint(await prepareBeforeTurn(snap, "seed-racy"));
+      expect(await blob(first.beforeHash, "racy.txt")).toBe("R9");
+
+      // `add -A` skips flagged entries, so their worktree edits must still land.
+      await writeFile(join(cwd, "skip.txt"), "skip local\n");
+      await git(["update-index", "--skip-worktree", "skip.txt"]);
+      await writeFile(join(cwd, "assume.txt"), "assume local\n");
+      await git(["update-index", "--assume-unchanged", "assume.txt"]);
+      const second = pendingCheckpoint(await prepareBeforeTurn(snap, "seed-flagged"));
+      expect(await blob(second.beforeHash, "skip.txt")).toBe("skip local");
+      expect(await blob(second.beforeHash, "assume.txt")).toBe("assume local");
+
+      await releasePendingCheckpoint(snap, first);
+      await releasePendingCheckpoint(snap, second);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("never writes a split index's shared part into the repository's git dir", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const sessionId = "split-index";
+    const sharedIndexes = async () =>
+      (await readdir(join(cwd, ".git"))).filter((name) => name.startsWith("sharedindex.")).sort();
+    const tree = (hash: string) => text(snap, ["rev-parse", `${hash}^{tree}`]);
+    const commands: string[][] = [];
+    const recording = Object.assign(
+      async (args: string[], options?: Parameters<GitRunner>[1]) => {
+        commands.push(args);
+        return snap(args, options);
+      },
+      { cwd, env: snap.env },
+    ) satisfies GitRunner;
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "gone.txt"), "deleted during turn\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "gone"]);
+      await git(["config", "core.splitIndex", "true"]);
+      await git(["update-index", "--split-index"]);
+      const shared = await sharedIndexes();
+      expect(shared).toHaveLength(1);
+
+      const before = pendingCheckpoint(await prepareBeforeTurn(recording, sessionId));
+      await rm(join(cwd, "gone.txt"));
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      const after = completedCheckpoint(await finishAfterTurn(recording, before, null, null));
+      // The reused index lacks HEAD's gone.txt, so normalization runs
+      // `--literal-pathspecs reset` on it.
+      const next = pendingCheckpoint(await prepareBeforeTurn(recording, sessionId));
+      expect(commands.some((args) => args.includes("reset"))).toBe(true);
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, "split-index-fresh"));
+      expect(await tree(next.beforeHash)).toBe(await tree(fresh.beforeHash));
+      expect(await tree(after.afterHash)).toBe(await tree(fresh.beforeHash));
+
+      expect(await applyCheckpoint(recording, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await readFile(join(cwd, "gone.txt"), "utf8")).toBe("deleted during turn\n");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await sharedIndexes()).toEqual(shared);
+
+      await releasePendingCheckpoint(snap, next);
+      await releasePendingCheckpoint(snap, fresh);
+      await releaseCheckpoint(snap, after);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await releasePersistentSnapshotIndices([sessionId, "split-index-fresh"]);
     }
   });
 
@@ -1040,11 +1241,13 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await indexState(git, cwd)).toEqual(saved);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await indexState(git, cwd)).toEqual(saved);
       expect(await releaseCheckpoint(snap, after)).toBe(true);
@@ -1071,11 +1274,13 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await branchRefs(git)).toBe(refs);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await branchRefs(git)).toBe(refs);
       expect(await releaseCheckpoint(snap, after)).toBe(true);
@@ -1131,6 +1336,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await readFile(join(cwd, "old name.txt"), "utf8")).toBe("old\n");
       expect(await readFile(join(cwd, "delete me.txt"), "utf8")).toBe("delete\n");
@@ -1149,6 +1355,7 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await readFile(join(cwd, "new name.txt"), "utf8")).toBe("renamed\n");
       expect(await readFile(join(cwd, "binary.bin"))).toEqual(Buffer.from([255, 254, 253, 252]));
@@ -1305,18 +1512,18 @@ describe("history-safe Git checkpoints", () => {
 
       expect(
         await applyCheckpoint(snap, finished.checkpoint.afterHash, finished.checkpoint.beforeHash),
-      ).toEqual({ status: "applied", nestedRepositories: [] });
+      ).toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
       await expect(readFile(join(cwd, "before.txt"), "utf8")).resolves.toBe("before\n");
       await expect(readFile(join(cwd, "after.txt"))).rejects.toThrow();
 
       expect(
         await applyCheckpoint(snap, finished.checkpoint.beforeHash, finished.checkpoint.afterHash),
-      ).toEqual({ status: "applied", nestedRepositories: [] });
+      ).toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
       await expect(readFile(join(cwd, "after.txt"), "utf8")).resolves.toBe("after\n");
       expect((await git(["rev-parse", "HEAD"])).code).not.toBe(0);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices(["unborn"]);
     }
   });
 
@@ -1348,7 +1555,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId]);
     }
   });
 
@@ -1394,7 +1601,7 @@ describe("history-safe Git checkpoints", () => {
       await releaseCheckpoint(snap, after2);
     } finally {
       await rm(cwd, { recursive: true, force: true });
-      await releaseAllPersistentSnapshotIndices();
+      await releasePersistentSnapshotIndices([sessionId, "unborn-ground-truth"]);
     }
   });
 
@@ -1724,11 +1931,13 @@ describe("history-safe Git checkpoints", () => {
       expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
       expect(await applyCheckpoint(snap, beforeHash, afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
+        unreadableFiles: [],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn   \n");
     } finally {
@@ -1822,7 +2031,7 @@ describe("history-safe Git checkpoints", () => {
             // What runGit returns for a child it had to terminate, after
             // `--output` already wrote a valid patch prefix.
             await snap(args, options);
-            return { stdout: "", stderr: "", code: 1, error: "timeout" };
+            return { stdout: "", stderr: "", code: 1, error: "timeout" as const };
           }
           return snap(args, options);
         },

@@ -63,6 +63,7 @@ function checkpoint(parentLeafId: string | null, leafId: string): GitCheckpoint 
     worktree: ".",
     gitDir: ".git",
     commonDir: ".git",
+    storeDir: ".git",
   };
   return {
     kind: "git",
@@ -95,8 +96,8 @@ describe("session navigation", () => {
   it("supports repeated undo and redo", async () => {
     const session = port();
     const navigation = makeNavigation(session);
-    navigation.recordTurnEnd(checkpoint("u1", "a1"));
-    navigation.recordTurnEnd(checkpoint("u2", "a2"));
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
 
     expect((await navigation.undo()).status).toBe("moved");
     expect(session.leaf).toBe("u2");
@@ -217,10 +218,10 @@ describe("session navigation", () => {
   it("clears forward checkpoints on a new branch", async () => {
     const session = port();
     const navigation = makeNavigation(session);
-    navigation.recordTurnEnd(checkpoint("u1", "a1"));
-    navigation.recordTurnEnd(checkpoint("u2", "a2"));
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
     await navigation.undo();
-    navigation.recordTurnEnd(checkpoint("u1", "new-branch"));
+    await navigation.recordTurnEnd(checkpoint("u1", "new-branch"));
     expect((await navigation.redo()).status).toBe("empty");
   });
 
@@ -228,7 +229,7 @@ describe("session navigation", () => {
     const session = port();
     session.navigateTree = async () => ({ cancelled: true });
     const navigation = makeNavigation(session);
-    navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     expect((await navigation.undo()).status).toBe("cancelled");
     expect((await navigation.redo()).status).toBe("empty");
   });
@@ -237,7 +238,7 @@ describe("session navigation", () => {
     const session = port();
     const failingGit: GitRunner = async () => ({ stdout: "", stderr: "fatal", code: 128 });
     const navigation = new SessionNavigation(session, failingGit);
-    navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     expect((await navigation.undo()).status).toBe("git_failed");
   });
   it("serializes turn finalization against an in-flight undo", async () => {
@@ -250,7 +251,7 @@ describe("session navigation", () => {
     const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, async () => {
       applyCalls++;
       await applyGate;
-      return { status: "applied", nestedRepositories: [] };
+      return { status: "applied", nestedRepositories: [], unreadableFiles: [] };
     });
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
@@ -315,7 +316,7 @@ describe("session navigation", () => {
       undefined,
       async (_checkpoint, sourceHash, targetHash) => {
         applied.push([sourceHash, targetHash]);
-        return { status: "applied", nestedRepositories: [] };
+        return { status: "applied", nestedRepositories: [], unreadableFiles: [] };
       },
     );
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));

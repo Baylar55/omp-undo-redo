@@ -5,23 +5,30 @@ on:
     tags:
       - "v*.*.*"
 
-permissions:
-  contents: write
-  id-token: write
+# Jobs opt in to what they need. Only `publish` holds write/OIDC/npm credentials,
+# and it never installs dependencies or runs repository code.
+permissions: {}
 
 jobs:
-  publish:
-    name: Publish package
+  verify:
+    name: Verify package
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+      version: ${{ steps.package.outputs.version }}
+      tarball: ${{ steps.pack.outputs.tarball }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
           cache: npm
 
       - name: Validate tag and package version
@@ -51,17 +58,52 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Verify package
         run: npm run verify
+
+      # Pack the dist that `verify` just built and smoke-tested; skip prepack's rebuild.
+      - name: Pack package
+        id: pack
+        shell: bash
+        run: |
+          TARBALL="$(npm pack --ignore-scripts --silent)"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Upload package tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish package
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Download package tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package
 
       - name: Check whether npm version already exists
         id: npm-version
         shell: bash
         env:
-          PACKAGE_NAME: ${{ steps.package.outputs.name }}
-          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+          PACKAGE_NAME: ${{ needs.verify.outputs.name }}
+          PACKAGE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
           if NPM_VIEW_OUTPUT="$(npm view "$PACKAGE_NAME@$PACKAGE_VERSION" version --registry=https://registry.npmjs.org 2>&1)"; then
             echo "npm version $PACKAGE_NAME@$PACKAGE_VERSION already exists; skipping publish"
@@ -79,11 +121,13 @@ jobs:
         if: steps.npm-version.outputs.exists != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+          TARBALL: ${{ needs.verify.outputs.tarball }}
+        run: npm publish "./$TARBALL" --access public --provenance --ignore-scripts
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then

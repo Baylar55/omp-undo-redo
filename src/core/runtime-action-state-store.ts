@@ -71,14 +71,30 @@ function navigationRevision(state: NavigationState, activeSessionLeaf: string | 
   return createHash("sha256").update(input).digest("hex");
 }
 
+function defaultRuntimeRoot(): string {
+  return resolve(join(homedir(), ".omp", "omp-undo-redo", "runtime"));
+}
+
 export function runtimeRootDirectory(
   rootDirectory = process.env.OMP_UNDO_REDO_RUNTIME_DIR,
 ): string {
-  return resolve(rootDirectory ?? join(homedir(), ".omp", "omp-undo-redo", "runtime"));
+  return rootDirectory === undefined ? defaultRuntimeRoot() : resolve(rootDirectory);
 }
 
+/** One `runtime/<pid>/` serves every copy of the extension in a process: OMP
+ *  binds a separate copy to each in-process subagent (and ACP) session, each
+ *  with its own store and possibly its own evaluation of this module. The
+ *  first copy in prepares the directory and writes the marker, whose runtime
+ *  id every copy then publishes under; the last one out removes it. `tail`
+ *  orders those steps, so a copy joining during a teardown keeps its
+ *  directory. Held on `globalThis` because module state can be per copy. */
+type SharedRuntimeDirectory = { users: number; runtimeId: string; tail: Promise<void> };
+const sharedRuntimeDirectories = ((globalThis as Record<symbol, unknown>)[
+  Symbol.for("omp-undo-redo/runtime-directories/v1")
+] ??= new Map<string, SharedRuntimeDirectory>()) as Map<string, SharedRuntimeDirectory>;
+
 export class RuntimeActionStateStore {
-  readonly runtimeId: string;
+  private runtimeId: string;
   readonly pid: number;
   readonly runtimeDirectory: string;
   readonly sessionsDirectory: string;
@@ -94,7 +110,7 @@ export class RuntimeActionStateStore {
   private ready: Promise<void> | null = null;
   private shutdownPromise: Promise<void> | null = null;
   private active = true;
-  private ownsRuntimeDirectory = false;
+  private shared: SharedRuntimeDirectory | null = null;
 
   constructor(options: RuntimeActionStateStoreOptions = {}) {
     this.rootDirectory = runtimeRootDirectory(options.rootDirectory);
@@ -121,14 +137,32 @@ export class RuntimeActionStateStore {
   }
 
   private async initializeInternal(): Promise<void> {
+    let shared = sharedRuntimeDirectories.get(this.runtimeDirectory);
+    if (!shared) {
+      shared = { users: 0, runtimeId: this.runtimeId, tail: Promise.resolve() };
+      sharedRuntimeDirectories.set(this.runtimeDirectory, shared);
+    }
+    this.shared = shared;
+    shared.users += 1;
+    if (shared.users === 1) {
+      shared.runtimeId = this.runtimeId;
+      shared.tail = shared.tail.then(() => this.prepareRuntimeDirectory());
+    }
+    this.runtimeId = shared.runtimeId;
+    await shared.tail;
+  }
+
+  private async prepareRuntimeDirectory(): Promise<void> {
     try {
       await mkdir(this.rootDirectory, { recursive: true, mode: 0o700 });
-      await chmod(this.rootDirectory, 0o700);
+      // A configured root may be a shared directory (`/tmp` as root in a
+      // container) whose permissions are not ours to strip; the per-process
+      // directories below are owner-only either way.
+      if (this.rootDirectory === defaultRuntimeRoot()) await chmod(this.rootDirectory, 0o700);
       await rm(this.runtimeDirectory, { recursive: true, force: true });
       await mkdir(this.sessionsDirectory, { recursive: true, mode: 0o700 });
       await chmod(this.runtimeDirectory, 0o700);
       await chmod(this.sessionsDirectory, 0o700);
-      this.ownsRuntimeDirectory = true;
       const marker: RuntimeMarker = {
         schemaVersion: RUNTIME_SCHEMA,
         protocol: RUNTIME_PROTOCOL,
@@ -305,18 +339,38 @@ export class RuntimeActionStateStore {
     await this.enqueue(sessionHash, () => this.writeSession(sessionHash));
   }
 
+  /** Forgets a session this process left (`/new`, `/resume`, fork, handoff):
+   *  drops its projection and, behind its queued writes, its state file. A
+   *  later publish (resumed again) queues behind this and writes it anew. */
+  async releaseSession(sessionId: string): Promise<void> {
+    const sessionHash = checkpointNamespace(sessionId);
+    if (!this.latest.delete(sessionHash)) return;
+    await this.enqueue(sessionHash, () => rm(this.sessionHashPath(sessionHash), { force: true }));
+  }
+
   async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.active = false;
     this.shutdownPromise = (async () => {
       if (this.ready) await this.ready;
       await Promise.all([...this.tails.values()]);
+      const published = [...this.latest.keys()];
       this.latest.clear();
       this.tails.clear();
-      if (this.ownsRuntimeDirectory) {
-        await rm(this.runtimeDirectory, { recursive: true, force: true }).catch(() => undefined);
+      const shared = this.shared;
+      if (!shared) return;
+      this.shared = null;
+      shared.users -= 1;
+      if (shared.users > 0) {
+        await Promise.all(
+          published.map((hash) => rm(this.sessionHashPath(hash), { force: true }).catch(() => {})),
+        );
+        return;
       }
-      this.ownsRuntimeDirectory = false;
+      shared.tail = shared.tail.then(() =>
+        rm(this.runtimeDirectory, { recursive: true, force: true }).catch(() => undefined),
+      );
+      await shared.tail;
     })();
     await this.shutdownPromise;
   }

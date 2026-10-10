@@ -24,6 +24,7 @@ export const UNAVAILABLE_REASONS = [
   "file_history_gap",
   "resumed_checkpoint_unavailable",
   "private_repository_unavailable",
+  "unsafe_workspace",
 ] as const;
 
 export type FileCheckpointUnavailableReason = (typeof UNAVAILABLE_REASONS)[number];
@@ -34,9 +35,15 @@ export type TreeNavigationResult = {
 
 export type NavigationResult =
   | { status: "moved"; files: "restored" }
-  /** Restored everything the snapshot holds; `nestedRepositories` (worktree
-   *  root relative) are outside it and were not restored. */
-  | { status: "moved"; files: "partial"; nestedRepositories: string[] }
+  /** Restored everything the snapshot holds; `nestedRepositories` and
+   *  `unreadableFiles` (worktree root relative) are outside it and were not
+   *  restored. */
+  | {
+      status: "moved";
+      files: "partial";
+      nestedRepositories: string[];
+      unreadableFiles: string[];
+    }
   | {
       status: "moved";
       files: "unavailable";
@@ -62,7 +69,7 @@ export interface RuntimeActionState {
   actionResult?: ActionInvocationResult;
 }
 
-export type CommandNavigationResult = NavigationResult | { status: "busy" } | { status: "closing" };
+export type CommandNavigationResult = NavigationResult | { status: "busy" };
 
 export interface NavigationPort extends SessionReader {
   navigateTree(targetId: string): Promise<TreeNavigationResult>;
@@ -72,6 +79,11 @@ export interface GitRunOptions {
   env?: Record<string, string | undefined>;
   stdin?: string;
   timeoutMs?: number;
+  /** Receives stdout as it arrives instead of buffering it; `createGitRunner`
+   *  then returns an empty `stdout`. A runner may ignore it and buffer, so
+   *  callers also read the result's `stdout`. For output that grows with the
+   *  repository. */
+  onStdout?: (chunk: string) => void;
 }
 
 export type GitRunError = "unavailable" | "timeout";
@@ -153,7 +165,7 @@ export interface PendingGitCheckpoint {
   parentLeafId: string | null;
 }
 
-export interface PendingSessionCheckpoint {
+interface PendingSessionCheckpoint {
   kind: "session";
   reason: FileCheckpointUnavailableReason;
   parentLeafId: string | null;

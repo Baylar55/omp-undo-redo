@@ -52,8 +52,8 @@
   "scripts": {
     "clean": "node scripts/clean-dist.mjs",
     "prebuild": "npm run clean",
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
     "prepack": "npm run build",
     "lint": "eslint .",
     "format": "prettier --write .",

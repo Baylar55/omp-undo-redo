@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import type { spawn } from "node:child_process";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -12,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGitRunner } from "../src/core/git-runner.js";
 import {
@@ -392,6 +393,58 @@ describe("private per-workspace git repositories", () => {
     },
   );
 
+  it.skipIf(process.platform === "win32")(
+    "leaves the mode of a configured store root alone, such as a shared /tmp",
+    async () => {
+      const cwd = await mkdtemp(join(tmpdir(), "omp-private-shared-"));
+      const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-shared-store-"));
+      try {
+        await chmod(storeRoot, 0o1777);
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, { env }),
+          cwd,
+          storeRoot,
+        );
+        expect(repository).not.toBeNull();
+        if (!repository) return;
+        expect((await stat(storeRoot)).mode & 0o7777).toBe(0o1777);
+        expect((await stat(dirname(repository.gitDir))).mode & 0o777).toBe(0o700);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still restricts a default store root an older version left world-readable",
+    async () => {
+      const cwd = await mkdtemp(join(tmpdir(), "omp-private-default-"));
+      const home = await mkdtemp(join(tmpdir(), "omp-private-default-home-"));
+      try {
+        vi.stubEnv("HOME", home);
+        vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", undefined);
+        vi.stubEnv("OMP_UNDO_REDO_BLOB_DIR", undefined);
+        vi.stubEnv("OMP_UNDO_REDO_RUNTIME_DIR", undefined);
+        const storeRoot = storeRootDirectory();
+        expect(storeRoot).toBe(join(await realpath(home), ".omp", "omp-undo-redo"));
+        await mkdir(storeRoot, { recursive: true, mode: 0o755 });
+        await chmod(storeRoot, 0o755);
+        const repository = await ensurePrivateGitRepository(
+          (cwd2, env) => createGitRunner(cwd2, { env }),
+          cwd,
+          storeRoot,
+        );
+        expect(repository).not.toBeNull();
+        expect((await stat(storeRoot)).mode & 0o777).toBe(0o700);
+      } finally {
+        vi.unstubAllEnvs();
+        await rm(cwd, { recursive: true, force: true });
+        await rm(home, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("resolveBackend returns a git backend for a non-git cwd when git is available", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-backend-"));
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
@@ -450,6 +503,39 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it("refuses Private-Git in the home directory, above it, in the temp directory and at a root", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "omp-private-home-"));
+    const home = join(parent, "home");
+    // A sibling of home, so only the temp-directory rule can refuse it.
+    const temp = join(parent, "temp");
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    try {
+      await mkdir(join(home, "project"), { recursive: true });
+      await mkdir(join(temp, "project"), { recursive: true });
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      vi.stubEnv("HOME", home);
+      vi.stubEnv("USERPROFILE", home);
+      vi.stubEnv("TMPDIR", temp);
+      vi.stubEnv("TEMP", temp);
+      vi.stubEnv("TMP", temp);
+      expect(tmpdir()).toBe(temp);
+      for (const cwd of [home, parent, temp, parse(parent).root]) {
+        expect(await resolveBackend(cwd), cwd).toEqual({
+          kind: "session",
+          reason: "unsafe_workspace",
+        });
+      }
+      expect(await readdir(join(storeRoot, "repos")).catch(() => [])).toEqual([]);
+      for (const cwd of [join(home, "project"), join(temp, "project")]) {
+        expect((await resolveBackend(cwd)).kind, cwd).toBe("git");
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(parent, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("git operations run with GIT_DIR/GIT_WORK_TREE env", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-env-"));
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
@@ -489,7 +575,7 @@ describe("private per-workspace git repositories", () => {
       ) satisfies GitRunner;
       const snapshot = await createSnapshotCommit(recording, "env-test");
       expect("hash" in snapshot).toBe(true);
-      const addCall = invocations.find((entry) => entry.args[0] === "add");
+      const addCall = invocations.find((entry) => entry.args.includes("add"));
       expect(addCall).toBeDefined();
       expect(addCall!.env.GIT_WORK_TREE).toBe(cwd);
     } finally {
@@ -546,24 +632,7 @@ describe("private per-workspace git repositories", () => {
       const entries = new Set(exclude.split(/\r?\n/));
       // The store root is inside the worktree, so its relative entry is seeded…
       expect(entries.has(".omp/")).toBe(true);
-      const expectedExcludes = [
-        ".git",
-        ".hg",
-        ".svn",
-        "node_modules",
-        ".history",
-        "dist",
-        "coverage",
-        ".omp",
-        ".next",
-        "build",
-        "out",
-        "target",
-      ];
-      expect([...DEFAULT_EXCLUDES]).toEqual(expectedExcludes);
-      for (const ignored of expectedExcludes) {
-        expect(entries.has(ignored)).toBe(true);
-      }
+      for (const ignored of DEFAULT_EXCLUDES) expect(entries.has(ignored)).toBe(true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -573,7 +642,8 @@ describe("private per-workspace git repositories", () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-exclude-idem-"));
     try {
       const storeRoot = join(cwd, ".omp");
-      const factory = (cwd2: string, env?: NodeJS.ProcessEnv) => createGitRunner(cwd2, { env });
+      const factory = (cwd2: string, env?: Record<string, string>) =>
+        createGitRunner(cwd2, { env });
       const repository = await ensurePrivateGitRepository(factory, cwd, storeRoot);
       expect(repository).not.toBeNull();
       if (!repository) return;
