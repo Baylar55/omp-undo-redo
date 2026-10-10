@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import "../src/core/compat.js";
 import { checkpointNamespace } from "../src/core/checkpoints.js";
 import { RuntimeActionStateStore } from "../src/core/runtime-action-state-store.js";
 import type { NavigationState } from "../src/core/types.js";
