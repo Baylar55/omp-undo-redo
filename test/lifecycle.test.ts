@@ -1,7 +1,7 @@
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { checkpointNamespace } from "../src/core/checkpoints.js";
 import { createGitRunner } from "../src/core/git-runner.js";
 import { runtimeRootDirectory } from "../src/core/runtime-action-state-store.js";
@@ -150,6 +150,44 @@ describe("session-only lifecycle fallback", () => {
       );
     } finally {
       await rmRetry(cwd);
+    }
+  });
+
+  it("snapshots files once a store that failed at session start becomes available", async () => {
+    // A launch that lost the race for a new store stayed session-only for the
+    // whole session: the failed backend was cached.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-store-recovers-"));
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-undo-redo-store-recovers-store-"));
+    try {
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      await writeFile(join(storeRoot, "repos"), "not a directory");
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "store-recovers-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("could not be initialized");
+      await pi.emit("before_agent_start", ctx);
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      await rm(join(storeRoot, "repos"));
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+
+      await pi.runCommand("undo", ctx);
+      await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      vi.unstubAllEnvs();
+      await rmRetry(cwd);
+      await rmRetry(storeRoot);
     }
   });
 

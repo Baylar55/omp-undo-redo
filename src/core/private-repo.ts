@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type {
@@ -193,11 +194,59 @@ async function setupState(gitDir: string): Promise<"new" | "done" | "busy" | "in
   if (finished !== false) return finished ? "done" : "busy";
   if (Date.now() - Math.max(head, config, lock) < SETUP_QUIET_MS) return "busy";
   if (lock !== 0) await rm(join(gitDir, "config.lock"), { force: true }).catch(() => undefined);
-  const hasObjects = await stat(join(gitDir, "objects")).then(
+  return (await hasObjects(gitDir)) ? "config" : "init";
+}
+
+function hasObjects(gitDir: string): Promise<boolean> {
+  return stat(join(gitDir, "objects")).then(
     () => true,
     () => false,
   );
-  return hasObjects ? "config" : "init";
+}
+
+/** Retries after a failed setup step. ~1.6s of backoff in total: enough for
+ *  launches started together to take turns on config.lock. */
+const SETUP_RETRIES = 6;
+const SETUP_RETRY_MS = 25;
+
+/** Runs the setup `setupState` calls for: `init` (git init) then `configure`
+ *  (its config keys, marker last). Launches started together on one store
+ *  contend for config.lock, and the loser's `git init` or `git config` fails,
+ *  so a failed step is retried with backoff. A retry re-reads the state: one
+ *  another launch finished is taken as is, unless this launch ran `git init`,
+ *  which may have reset `core.bare` behind that launch's config, so the
+ *  config is reapplied (every launch writes the same values). "busy" on the
+ *  first look is used as found, and "done" runs `onDone`. Returns false when
+ *  a new store could not be set up; an existing one is used as found. */
+async function setUpStore(
+  gitDir: string,
+  init: () => Promise<boolean>,
+  configure: () => Promise<boolean>,
+  onDone?: () => Promise<unknown>,
+): Promise<boolean> {
+  const first = await setupState(gitDir);
+  if (first === "busy") return true;
+  if (first === "done") {
+    await onDone?.();
+    return true;
+  }
+  let state: "new" | "init" | "config" = first;
+  let initRan = false;
+  for (let attempt = 0; ; attempt++) {
+    let ok = true;
+    if (state !== "config") {
+      initRan = true;
+      ok = await init();
+    }
+    if (ok && (await configure())) return true;
+    if (attempt === SETUP_RETRIES) return first !== "new";
+    await sleep(SETUP_RETRY_MS * 2 ** attempt * (0.5 + Math.random()));
+    const now = await setupState(gitDir);
+    if (now === "done" && !initRan) return true;
+    // A repeated `git init` resets `core.bare`: only once `objects/` shows
+    // some init finished is the config alone redone.
+    state = now === "new" ? "new" : (await hasObjects(gitDir)) ? "config" : "init";
+  }
 }
 
 /** Applies `entries` in order and stops at the first failure. */
@@ -301,24 +350,17 @@ export async function ensurePrivateGitRepository(
   const envGit = gitRunnerFactory(worktree, { GIT_DIR: gitDir });
   try {
     await ensureReposDirectory(dirname(gitDir), storeRoot);
-    const state = await setupState(gitDir);
-    if (state === "new" || state === "init") {
-      const init = await envGit(["init", "-q"]);
-      if (init.code !== 0 && state === "new") return null;
-    }
-    if (state === "new" || state === "init" || state === "config") {
+    const ready = await setUpStore(
+      gitDir,
+      async () => (await envGit(["init", "-q"])).code === 0,
       // `core.worktree` goes last: `setupFinished` reads it as proof the rest ran.
-      const configured = await applyConfig(envGit, [
-        ...PRIVATE_REPO_CONFIG,
-        ["core.worktree", worktree],
-      ]);
-      if (!configured && state === "new") return null;
-    } else if (state === "done") {
+      () => applyConfig(envGit, [...PRIVATE_REPO_CONFIG, ["core.worktree", worktree]]),
       // Ensure repositories created by earlier versions write future objects
       // owner-only. Not while "busy": the write would contend for the
       // config.lock a running setup needs.
-      await envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined);
-    }
+      () => envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined),
+    );
+    if (!ready) return null;
     await ensureExclude(gitDir, worktree, storeRoot);
     return { worktree, gitDir, commonDir: gitDir, storeDir: gitDir };
   } catch {
@@ -351,34 +393,34 @@ export async function ensureGitSnapshotStore(
   const storeGit = gitRunnerFactory(repository.worktree, { GIT_DIR: storeDir });
   try {
     await ensureReposDirectory(dirname(storeDir), storeRoot);
-    const state = await setupState(storeDir);
-    if (state === "new" || state === "init") {
-      // Objects written against the user's repository use its hash, so the
-      // store must too or its refs could not name them.
-      const format = await gitRunnerFactory(repository.worktree, {
-        GIT_DIR: repository.commonDir,
-      })(["config", "--get", "extensions.objectformat"]);
-      const objectFormat = format.code === 0 ? format.stdout.trim() : "";
-      const init = await storeGit([
-        "init",
-        "--bare",
-        "-q",
-        ...(objectFormat ? [`--object-format=${objectFormat}`] : []),
-      ]);
-      if (init.code !== 0 && state === "new") return null;
-    }
-    if (state === "new" || state === "init" || state === "config") {
-      const configured = await applyConfig(storeGit, [
-        ["core.sharedRepository", "0600"],
-        // Only the extension's own git reads these refs, so paths past
-        // MAX_PATH cannot hide them from anyone's gc.
-        ["core.longpaths", "true"],
-        // Last: `setupFinished` reads it as proof the rest ran.
-        [GIT_STORE_SOURCE_KEY, repository.commonDir],
-      ]);
-      if (!configured && state === "new") return null;
-    }
-    return storeDir;
+    const ready = await setUpStore(
+      storeDir,
+      async () => {
+        // Objects written against the user's repository use its hash, so the
+        // store must too or its refs could not name them.
+        const format = await gitRunnerFactory(repository.worktree, {
+          GIT_DIR: repository.commonDir,
+        })(["config", "--get", "extensions.objectformat"]);
+        const objectFormat = format.code === 0 ? format.stdout.trim() : "";
+        const init = await storeGit([
+          "init",
+          "--bare",
+          "-q",
+          ...(objectFormat ? [`--object-format=${objectFormat}`] : []),
+        ]);
+        return init.code === 0;
+      },
+      () =>
+        applyConfig(storeGit, [
+          ["core.sharedRepository", "0600"],
+          // Only the extension's own git reads these refs, so paths past
+          // MAX_PATH cannot hide them from anyone's gc.
+          ["core.longpaths", "true"],
+          // Last: `setupFinished` reads it as proof the rest ran.
+          [GIT_STORE_SOURCE_KEY, repository.commonDir],
+        ]),
+    );
+    return ready ? storeDir : null;
   } catch {
     return null;
   }

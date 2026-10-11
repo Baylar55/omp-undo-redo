@@ -151,7 +151,7 @@ type ActivePrivateRepoEntry = {
   git?: GitRunner;
   ready: Promise<boolean>;
 };
-type PrivateRepoEntry = ActivePrivateRepoEntry | { failure: true };
+type PrivateRepoEntry = ActivePrivateRepoEntry;
 
 type HistoryWriter = { save(state: NavigationState): Promise<void> };
 
@@ -185,22 +185,18 @@ async function resolvePrivateGit(
   gitRunnerFactory: CwdGitRunnerFactory,
 ): Promise<{ repository: GitRepository; git: GitRunner } | null> {
   const canonical = canonicalCwd(cwd);
-  const existing = privateRepositories.get(canonical);
-  if (existing) {
-    if ("failure" in existing) return null;
-    const ok = await existing.ready;
-    return ok && existing.repository && existing.git
-      ? { repository: existing.repository, git: existing.git }
-      : null;
+  let entry = privateRepositories.get(canonical);
+  if (!entry) {
+    entry = startPrivateRepo(canonical, gitRunnerFactory);
+    privateRepositories.set(canonical, entry);
   }
-  const entry = startPrivateRepo(canonical, gitRunnerFactory);
-  privateRepositories.set(canonical, entry);
-  const ok = await entry.ready;
-  if (!ok || !entry.repository || !entry.git) {
-    privateRepositories.set(canonical, { failure: true });
-    return null;
+  if ((await entry.ready) && entry.repository && entry.git) {
+    return { repository: entry.repository, git: entry.git };
   }
-  return { repository: entry.repository, git: entry.git };
+  // Not cached: the next resolution tries again (a launch racing this one
+  // for the store, or a store directory fixed meanwhile).
+  if (privateRepositories.get(canonical) === entry) privateRepositories.delete(canonical);
+  return null;
 }
 
 /** Git mode: binds the worktree to its snapshot store, moving any snapshots an
@@ -246,12 +242,7 @@ export async function resolveBackend(
     // keying by commonDir would make the second worktree reuse the first's
     // runner and run git operations in the wrong directory.
     let entry = privateRepositories.get(found.worktree);
-    if (
-      !entry ||
-      "failure" in entry ||
-      !(await entry.ready) ||
-      entry.repository?.gitDir !== found.gitDir
-    ) {
+    if (!entry || !(await entry.ready) || entry.repository?.gitDir !== found.gitDir) {
       entry = startGitStore(found, gitRunnerFactory);
       privateRepositories.set(found.worktree, entry);
     }
@@ -1340,6 +1331,27 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   pi.on("session_before_branch", rememberNavigationSource);
   pi.on("session_branch", adoptSwitchedSession);
 
+  /** The backend a turn snapshots with. An unavailable store is not cached: a
+   *  launch racing this one for it, or a store directory fixed meanwhile, may
+   *  let a later turn snapshot. */
+  async function turnBackend(typed: AnyContext, sessionId: string): Promise<FileBackend> {
+    const cached = backends.get(sessionId);
+    if (
+      cached &&
+      !(cached.kind === "session" && cached.reason === "private_repository_unavailable")
+    )
+      return cached;
+    const resolved = await resolveBackend(typed.cwd, privateRepositories, gitRunnerFactory);
+    if (!cached || resolved.kind !== "git") return resolved;
+    // Its navigation was built without a history store: rebuilt as
+    // session_start does, or file checkpoints would not be persisted. Not
+    // while a turn still finalizes into it; the next turn tries again.
+    if (pendingFinalizations.has(sessionId) || initializations.has(sessionId)) return cached;
+    if (!navigations.has(sessionId)) return resolved;
+    await initializeNavigation(typed, true);
+    return backends.get(sessionId) ?? resolved;
+  }
+
   pi.on("before_agent_start", (_event, ctx) =>
     track(async () => {
       if (closing) return;
@@ -1370,9 +1382,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         return;
       }
 
-      const backend =
-        backends.get(sessionId) ??
-        (await resolveBackend(typed.cwd, privateRepositories, gitRunnerFactory));
+      const backend = await turnBackend(typed, sessionId);
       backends.set(sessionId, backend);
       if (backend.kind === "session") {
         notifySessionOnly(typed, sessionId, backend.reason);
@@ -1696,7 +1706,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         await evictStalePrivateRepos().catch(() => undefined);
         await Promise.allSettled(
           [...privateRepositories.values()].map(async (entry) => {
-            if ("failure" in entry || !entry.repository || !entry.git) return;
+            if (!entry.repository || !entry.git) return;
             const { repository } = entry;
             const key = gcKey(repository);
             if (!capturesSinceGcByStore.has(key)) return;

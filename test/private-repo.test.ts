@@ -285,6 +285,38 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it("sets up a new store for every launch started at once", async () => {
+    // Launches racing on a new store collided on config.lock, and every loser
+    // went session-only for its whole session.
+    const cwd = await makeRepository();
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    try {
+      const resolved = await resolveRepository(createGitRunner(cwd));
+      if (!("repository" in resolved)) throw new Error("not a repository");
+      const { repository } = resolved;
+      const launches = Array.from({ length: 6 }, () => [
+        ensurePrivateGitRepository(factory, cwd, storeRoot),
+        ensureGitSnapshotStore(factory, repository, storeRoot),
+      ]).flat();
+      for (const result of await Promise.all(launches)) expect(result).not.toBeNull();
+      const gitDir = privateRepositoryPath(storeRoot, cwd);
+      // A launch's late `git init` resets `core.bare` behind another's config.
+      expect(await storeConfig(gitDir, "core.bare")).toEqual({ code: 0, value: "false" });
+      expect(await storeConfig(gitDir, "core.worktree")).toEqual({
+        code: 0,
+        value: await realpath(cwd),
+      });
+      const storeDir = privateRepositoryPath(storeRoot, repository.commonDir);
+      expect(await storeConfig(storeDir, GIT_STORE_SOURCE_KEY)).toEqual({
+        code: 0,
+        value: repository.commonDir,
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("does not redo a finished store on later launches", async () => {
     // A second `git init` resets `core.bare`, and a launch that rewrote every
     // key would pay a dozen git processes and widen the config.lock window for
