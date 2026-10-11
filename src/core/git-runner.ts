@@ -1,8 +1,10 @@
 import "./compat.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { storeRootDirectory } from "./private-repo.js";
 import type { GitRunner } from "./types.js";
 
 const TERMINATION_GRACE_MS = 250;
@@ -277,17 +279,55 @@ async function runGit(
   return promise;
 }
 
+/** Longest stderr kept per debug entry: `add -A` or `apply` can print a
+ *  line per file. */
+const DEBUG_STDERR_LIMIT = 8192;
+
+/** `OMP_UNDO_REDO_DEBUG=1`: appends `entry` (plus time and pid) to
+ *  `<storeRoot>/debug.log` as one JSON line. Not under a snapshot store: the
+ *  store's own setup is one of the failures worth logging. Synchronous, so a
+ *  process that dies right after a failure still leaves its last lines, and
+ *  lines keep their order; the cost is paid only while debugging. Every
+ *  error is ignored: logging must never fail what it observes.
+ *  ponytail: unbounded while enabled; add rotation if anyone leaves it on. */
+export function debugLog(entry: Record<string, unknown>): void {
+  if (process.env.OMP_UNDO_REDO_DEBUG !== "1") return;
+  try {
+    const root = storeRootDirectory();
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const line = { time: new Date().toISOString(), pid: process.pid, ...entry };
+    appendFileSync(join(root, "debug.log"), `${JSON.stringify(line)}\n`, { mode: 0o600 });
+  } catch {
+    // Diagnostics only.
+  }
+}
+
 export function createGitRunner(cwd: string, dependencies: GitRunnerDependencies = {}): GitRunner {
   const { env } = dependencies;
-  const runner: GitRunner = async (args, options) =>
-    runGit(
+  const runner: GitRunner = async (args, options) => {
+    const merged = { ...env, ...options?.env };
+    const started = Date.now();
+    const result = await runGit(
       cwd,
       args,
-      { ...options, env: { ...env, ...options?.env } },
+      { ...options, env: merged },
       dependencies,
       // An injected spawn is a test double; give it the plain command.
       dependencies.spawnGit ? null : await resolveDirectGit(),
     );
+    // Never stdin or stdout (snapshot content); the env is only the
+    // overrides this extension sets (paths, `LC_ALL`).
+    debugLog({
+      cwd,
+      args,
+      env: merged,
+      code: result.code,
+      error: result.error,
+      ms: Date.now() - started,
+      stderr: result.stderr.slice(0, DEBUG_STDERR_LIMIT),
+    });
+    return result;
+  };
   runner.cwd = cwd;
   if (env) runner.env = env;
   return runner;

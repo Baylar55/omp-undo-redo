@@ -24,6 +24,7 @@ export const UNAVAILABLE_REASONS = [
   "file_history_gap",
   "resumed_checkpoint_unavailable",
   "private_repository_unavailable",
+  "store_unavailable",
   "unsafe_workspace",
 ] as const;
 
@@ -54,7 +55,10 @@ export type NavigationResult =
     }
   | { status: "empty" }
   | { status: "cancelled" }
-  | { status: "git_failed"; failure: "conflict" | "failed" }
+  /** `conflictedFiles` (worktree root relative): the paths the restore
+   *  refused; empty when git named none. */
+  | { status: "git_failed"; failure: "conflict"; conflictedFiles: string[] }
+  | { status: "git_failed"; failure: "failed" }
   | { status: "rollback_failed" };
 
 export type ActionId = "undo" | "redo";

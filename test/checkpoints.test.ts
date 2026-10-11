@@ -20,6 +20,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { SessionNavigation } from "../src/core/session-navigation.js";
 import {
+  applyCheckPaths,
   applyCheckpoint,
   checkpointNamespace,
   finishAfterTurn,
@@ -1540,7 +1541,11 @@ describe("history-safe Git checkpoints", () => {
       const navigation = new SessionNavigation(navigationPort, snap);
       await navigation.recordTurnEnd(checkpoint);
 
-      expect(await navigation.undo()).toEqual({ status: "git_failed", failure: "conflict" });
+      expect(await navigation.undo()).toEqual({
+        status: "git_failed",
+        failure: "conflict",
+        conflictedFiles: ["tracked.txt"],
+      });
       expect(await readFile(join(cwd, "tracked.txt"))).toEqual(savedContent);
       expect(await indexState(git, cwd)).toEqual(savedIndex);
       expect(await branchRefs(git)).toBe(savedRefs);
@@ -2135,6 +2140,7 @@ describe("history-safe Git checkpoints", () => {
       await writeFile(join(cwd, "tracked.txt"), "drifted\n");
       expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toEqual({
         status: "conflict",
+        conflictedFiles: [],
       });
 
       // An unrelated untracked file must NOT be misdiagnosed as a conflict:
@@ -2160,6 +2166,7 @@ describe("history-safe Git checkpoints", () => {
       );
       expect(await applyCheckpoint(collisionCheck, beforeHash, afterHash)).toEqual({
         status: "conflict",
+        conflictedFiles: ["new-file.txt"],
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -2323,5 +2330,30 @@ describe("history-safe Git checkpoints", () => {
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
+  });
+});
+
+describe("applyCheckPaths", () => {
+  it("names each refused path once, in git's order", () => {
+    const stderr = [
+      "error: patch failed: src/a.ts:12",
+      "error: src/a.ts: patch does not apply",
+      "error: notes: v2.md: patch does not apply",
+      "error: new.txt: already exists in working directory",
+      "error: gone.txt: No such file or directory",
+      "error: link: wrong type",
+      "error: run.sh has type 100644, expected 100755",
+      "error: src/a.ts: patch does not apply",
+      "error: unrecognized input",
+      "",
+    ].join("\r\n");
+    expect(applyCheckPaths(stderr)).toEqual([
+      "src/a.ts",
+      "notes: v2.md",
+      "new.txt",
+      "gone.txt",
+      "link",
+      "run.sh",
+    ]);
   });
 });

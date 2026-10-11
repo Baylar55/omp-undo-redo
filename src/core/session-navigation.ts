@@ -293,6 +293,14 @@ export class SessionNavigation {
       : { status: "moved", files: "restored", restoredFiles };
   }
 
+  private restoreFailedResult(
+    applied: Exclude<CheckpointApplyResult, { status: "applied" }>,
+  ): NavigationResult {
+    return applied.status === "conflict"
+      ? { status: "git_failed", failure: "conflict", conflictedFiles: applied.conflictedFiles }
+      : { status: "git_failed", failure: "failed" };
+  }
+
   undo(): Promise<NavigationResult> {
     return this.serializeNavigation(() => this.performUndo());
   }
@@ -311,10 +319,7 @@ export class SessionNavigation {
     const applied = await this.applyFileCheckpoint(checkpoint, "before");
     if (applied.status !== "applied") {
       await this.clearIntent();
-      return {
-        status: "git_failed",
-        failure: applied.status === "conflict" ? "conflict" : "failed",
-      };
+      return this.restoreFailedResult(applied);
     }
     if (!(await this.navigateSession(checkpoint.parentLeafId))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "after");
@@ -346,10 +351,7 @@ export class SessionNavigation {
     const applied = await this.applyFileCheckpoint(checkpoint, "after");
     if (applied.status !== "applied") {
       await this.clearIntent();
-      return {
-        status: "git_failed",
-        failure: applied.status === "conflict" ? "conflict" : "failed",
-      };
+      return this.restoreFailedResult(applied);
     }
     if (!(await this.navigateSession(checkpoint.leafId))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "before");

@@ -535,6 +535,21 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it("names the Git-mode snapshot store, not a private repository, when it cannot be set up", async () => {
+    const cwd = await makeRepository();
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-git-store-fail-"));
+    try {
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      await writeFile(join(storeRoot, "repos"), "not a directory");
+      const backend = await resolveBackend(cwd);
+      expect(backend).toEqual({ kind: "session", reason: "store_unavailable" });
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("refuses Private-Git in the home directory, above it, in the temp directory and at a root", async () => {
     const parent = await mkdtemp(join(tmpdir(), "omp-private-home-"));
     const home = join(parent, "home");

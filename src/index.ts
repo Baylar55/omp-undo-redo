@@ -13,7 +13,7 @@ import {
   resolvePersistentHostId,
   resolveRuntimeScope,
 } from "./core/checkpoint-owners.js";
-import { createGitRunner } from "./core/git-runner.js";
+import { createGitRunner, debugLog } from "./core/git-runner.js";
 import {
   canonicalCwd,
   ensureGitSnapshotStore,
@@ -88,6 +88,7 @@ type SessionOnlyReason =
   | "git_unavailable"
   | "repository_unresolvable"
   | "private_repository_unavailable"
+  | "store_unavailable"
   | "unsafe_workspace";
 
 type FileBackend =
@@ -251,7 +252,7 @@ export async function resolveBackend(
     }
     if (privateRepositories.get(found.worktree) === entry)
       privateRepositories.delete(found.worktree);
-    return { kind: "session", reason: "private_repository_unavailable" };
+    return { kind: "session", reason: "store_unavailable" };
   }
   if (resolved.reason !== "not_repository") return { kind: "session", reason: resolved.reason };
   // Checked before any store exists: a refused workspace never gets one.
@@ -997,6 +998,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       "Git is not available.\nSession navigation still works, but file changes cannot be restored.",
     private_repository_unavailable:
       "The private snapshot repository could not be initialized.\nSession navigation still works, but file changes cannot be restored.",
+    store_unavailable:
+      "The snapshot store for this Git repository could not be initialized.\nSession navigation still works, but file changes cannot be restored.",
     unsafe_workspace:
       "File snapshots are disabled in a home directory, drive root, or temp directory: they would copy its private files.\nSession navigation still works, but file changes cannot be restored. Start OMP in a project folder to enable them.",
     repository_unresolvable:
@@ -1395,7 +1398,11 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     const cached = backends.get(sessionId);
     if (
       cached &&
-      !(cached.kind === "session" && cached.reason === "private_repository_unavailable")
+      !(
+        cached.kind === "session" &&
+        (cached.reason === "private_repository_unavailable" ||
+          cached.reason === "store_unavailable")
+      )
     )
       return cached;
     const resolved = await resolveBackend(typed.cwd, privateRepositories, gitRunnerFactory);
@@ -1542,8 +1549,14 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       () => undefined,
       // Best-effort diagnostics only: the tracked promise must stay
       // never-rejecting for awaiting undo/redo handlers.
-      // eslint-disable-next-line no-console
-      (error) => console.error("[omp-undo-redo] finalize failed", error),
+      (error) => {
+        // eslint-disable-next-line no-console
+        console.error("[omp-undo-redo] finalize failed", error);
+        debugLog({
+          event: "finalize failed",
+          error: error instanceof Error ? (error.stack ?? error.message) : String(error),
+        });
+      },
     );
     pendingFinalizations.set(sessionId, tracked);
     // A slow after-snapshot must not hold the handler past the host cap. The

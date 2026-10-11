@@ -1146,7 +1146,9 @@ export async function retainCheckpointForResume(
  *  `pathsOutsideSnapshots`). `restoredFiles`: every path the restore wrote,
  *  created or deleted, relative to the worktree root. The snapshots cover the
  *  whole worktree, so this includes edits made during the turn by anyone
- *  else (an editor, another process), not only the agent's. */
+ *  else (an editor, another process), not only the agent's.
+ *  `conflictedFiles`: the paths `git apply --check` refused, relative to the
+ *  worktree root; empty when its output named none. */
 export type CheckpointApplyResult =
   | {
       status: "applied";
@@ -1154,7 +1156,8 @@ export type CheckpointApplyResult =
       unreadableFiles: string[];
       restoredFiles: string[];
     }
-  | { status: "conflict" | "failed" };
+  | { status: "conflict"; conflictedFiles: string[] }
+  | { status: "failed" };
 
 /** Restore invocations get a far larger ceiling than the runner's default:
  *  diffing and applying a multi-GB binary change is slow but legitimate, and
@@ -1375,8 +1378,32 @@ export async function applyCheckpoint(
     config = autocrlfOffConfig(setting);
   }
   const applied = await applyPatch(git, sourceHash, targetHash, unreadablePins, config, checkOnly);
-  if (typeof applied === "string") return { status: applied };
+  if (applied === "failed") return { status: "failed" };
+  if ("conflictedFiles" in applied) return { status: "conflict", ...applied };
   return { status: "applied", nestedRepositories, unreadableFiles, ...applied };
+}
+
+/** `git apply --check` stderr (run under `LC_ALL=C`) lines that name a path:
+ *  every failed hunk or binary patch ends in "<path>: patch does not apply";
+ *  the other forms come from the worktree check of a path. */
+const APPLY_CHECK_PATH = [
+  /^error: (.+): (?:patch does not apply|already exists in working directory|wrong type|No such file or directory)$/,
+  /^error: (.+) has type [0-7]+, expected [0-7]+$/,
+];
+
+/** The distinct paths `git apply --check` refused, in the order it named them. */
+export function applyCheckPaths(stderr: string): string[] {
+  const paths = new Set<string>();
+  for (const line of stderr.split(/\r?\n/)) {
+    for (const pattern of APPLY_CHECK_PATH) {
+      const match = pattern.exec(line);
+      if (match) {
+        paths.add(match[1]);
+        break;
+      }
+    }
+  }
+  return [...paths];
 }
 
 /** Paths `git apply` touches going from `sourceHash` to `targetHash`. Gitlinks
@@ -1504,7 +1531,7 @@ async function applyPatch(
   unreadablePins: readonly string[],
   config: readonly string[],
   checkOnly: boolean,
-): Promise<{ restoredFiles: string[] } | "conflict" | "failed"> {
+): Promise<{ restoredFiles: string[] } | { conflictedFiles: string[] } | "failed"> {
   let tempDirectory: string | null = null;
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
@@ -1601,8 +1628,9 @@ async function applyPatch(
         { env: probeEnv, timeoutMs: RESTORE_TIMEOUT_MS },
       );
       if (tracked.error) return "failed";
-      if (tracked.code !== 0) return "conflict";
-      if (check.stderr.includes("already exists in working directory")) return "conflict";
+      const conflict = { conflictedFiles: applyCheckPaths(check.stderr) };
+      if (tracked.code !== 0) return conflict;
+      if (check.stderr.includes("already exists in working directory")) return conflict;
       return "failed";
     }
 

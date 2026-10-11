@@ -60,6 +60,8 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "the resumed turn has no usable file checkpoint.";
     case "private_repository_unavailable":
       return "the private snapshot repository could not be initialized.";
+    case "store_unavailable":
+      return "the snapshot store for this Git repository could not be initialized.";
     case "unsafe_workspace":
       return "file snapshots are disabled in a home directory, drive root, or temp directory.";
     case "before_snapshot_failed":
@@ -145,7 +147,9 @@ export async function runNavigation(
       break;
     case "git_failed":
       ctx.ui.notify(
-        outcome.failure === "conflict" ? verbs.conflict : "Could not restore the Git checkpoint.",
+        outcome.failure === "conflict"
+          ? `${verbs.conflict}${outcome.conflictedFiles.length > 0 ? ` Conflicting files: ${listed(outcome.conflictedFiles)}.` : ""}`
+          : "Could not restore the Git checkpoint.",
         "warning",
       );
       break;
