@@ -53,6 +53,8 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 ## [1.6.5] - 2026-10-05
 
+**Not downgrade-safe.** 1.6.4 and earlier cannot read a history file that 1.6.5 or later has loaded or saved (schema 3). In a Git repository, 1.6.5's first session start also moves every earlier snapshot and history file out of the repository into the snapshot store, where 1.6.4 does not look. After a rollback those sessions resume without file undo; files in the worktree are not touched.
+
 ### Fixed
 
 - **A snapshot store whose `git gc` never finished leaked a temp pack per attempt and never deleted expired snapshots** ([#101](https://github.com/Baylar55/omp-undo-redo/issues/101), reported by @HellCatVN). `git gc` prunes only after it repacks. A repack that outran the 15-minute ceiling was force-killed (on Windows `taskkill /F` gives git no chance to delete its temp files), as was one cut off by a closed terminal, so its prune never ran: each attempt left its partial `objects/pack/tmp_pack_*` behind, and because the gc counter restarts with every process, the attempts kept coming (126 files / 456 GB on one machine, with `packs: 0`). Expired sessions' snapshot contents (`.env`, keys) stayed on disk too. Every gc now runs `git prune --expire=1.hour.ago` first. It needs no repack, so it finishes where gc cannot, and it deletes unreferenced objects and `tmp_*` files older than the window, with the same rules gc's own prune step uses. If the prune itself fails to run, the gc is skipped, because it would fail the same way. A repack too slow to finish still repeats on every trigger, but it no longer leaves anything behind.
@@ -130,7 +132,7 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 ### Changed
 
 - Repository resolution issues one `git rev-parse` instead of three, removing two process spawns per turn.
-- **Breaking: requires Node.js >= 22** (`package.json` `engines`, CI). Node 20 reached end of life in April 2026; the extension now uses the built-in `Promise.withResolvers()` instead of a hand-rolled equivalent.
+- **Breaking: requires Node.js >= 22** (`package.json` `engines`, CI). Node 20 reached end of life in April 2026; the extension now uses the built-in `Promise.withResolvers()` instead of a hand-rolled equivalent. Reverted in 1.6.2, which should be used instead; this should not have shipped in a patch.
 - Internal cleanup with no behavior change: `/undo` and `/redo` share one `runNavigation`/`makeHandler` path (`src/commands/navigate.ts`), repeated atomic JSON writes and ref helpers moved into `src/core/atomic-write.ts` and `src/core/git-refs.ts`, test scaffolding shared through `test/helpers.ts`, and dead exports, unreachable branches, `.npmignore`, and `scripts/check-dist.mjs` removed (~1,200 net lines deleted).
 
 ## [1.6.0] - 2026-09-05
