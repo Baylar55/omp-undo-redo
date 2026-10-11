@@ -285,14 +285,30 @@ export function refusedPrivateWorkspace(canonical: string): boolean {
  *  (`node_modules`, `dist`, `.omp`, …) so private-git snapshots do not grow
  *  unbounded on churning dependency/build/state directories. The store-root
  *  entry is skipped when it is not inside the worktree; the built-in ignores
- *  are always seeded. */
+ *  are always seeded. Launches started together race to replace the file, and
+ *  Windows fails a rename onto (or a read of) a file another launch is
+ *  replacing with EPERM. Every launch writes the same entries, so a failed
+ *  update is retried with backoff: it re-reads and stops once they are there. */
 async function ensureExclude(gitDir: string, worktree: string, storeRoot: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await updateExclude(gitDir, worktree, storeRoot);
+    } catch (error) {
+      if (attempt === SETUP_RETRIES) throw error;
+      await sleep(SETUP_RETRY_MS * 2 ** attempt * (0.5 + Math.random()));
+    }
+  }
+}
+
+async function updateExclude(gitDir: string, worktree: string, storeRoot: string): Promise<void> {
   const excludePath = join(gitDir, "info", "exclude");
   let content = "";
   try {
     content = await readFile(excludePath, "utf8");
-  } catch {
-    content = "";
+  } catch (error) {
+    // Only a missing file is empty: rewriting after any other read failure
+    // would drop the user's own entries.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const managed: string[] = [];
   const canonicalStoreRoot = canonicalCwd(storeRoot);

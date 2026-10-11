@@ -82,8 +82,9 @@ jobs:
         run: npm run test
 
   bun-tests:
-    # OMP runs extensions under Bun (engines.bun >=1.3.14), so test on that
-    # floor. `--bun` is required: without it the vitest shebang picks Node.
+    # The OMP host runs extensions under Bun; its own package.json (not ours)
+    # declares engines.bun >=1.3.14, so test on that floor. `--bun` is
+    # required: without it the vitest shebang picks Node.
     name: Tests (${{ matrix.os }}, Bun 1.3.14)
     runs-on: ${{ matrix.os }}
     strategy:
