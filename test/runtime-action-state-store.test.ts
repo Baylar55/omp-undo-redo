@@ -8,10 +8,11 @@ import {
   readdir,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { hostname, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "../src/core/compat.js";
 import { checkpointNamespace } from "../src/core/checkpoints.js";
@@ -25,6 +26,8 @@ const rmGate = vi.hoisted(() => ({
   entered: undefined as (() => void) | undefined,
   mkdirsWhileHeld: 0,
 }));
+/** `stat` of any path in `fail` rejects, as an unreadable directory would. */
+const statGate = vi.hoisted(() => ({ fail: new Set<string>() }));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof Fs>();
   return {
@@ -41,6 +44,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       if (rmGate.hold) rmGate.mkdirsWhileHeld += 1;
       return actual.mkdir(...args);
     },
+    stat: (...args: Parameters<typeof actual.stat>) =>
+      statGate.fail.has(String(args[0]))
+        ? Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))
+        : actual.stat(...args),
   };
 });
 
@@ -84,6 +91,8 @@ function state(currentIndex: number): NavigationState {
 
 afterEach(async () => {
   Object.assign(rmGate, { hold: undefined, entered: undefined, mkdirsWhileHeld: 0 });
+  statGate.fail.clear();
+  vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -320,6 +329,87 @@ describe("runtime action-state store", () => {
 
     await store.publishNavigation("left", state(1), "turn-2");
     expect((await readState(store, "left")).activeSessionLeaf).toBe("turn-2");
+    await store.shutdown();
+  });
+
+  it("reaps only runtime directories that are dead or ancient on this host", async () => {
+    const root = await makeRoot();
+    const store = new RuntimeActionStateStore({ rootDirectory: root, pid: 200 });
+    await store.initialize();
+
+    const now = Date.now();
+    const recent = new Date(now - 60_000);
+    const ancient = new Date(now - 48 * 60 * 60 * 1_000);
+    // pid -> process.kill outcome: an errno code, "" for alive and ours.
+    const killCodes: Record<number, string> = {};
+    // Each fixture: dir name = pid; mtime applied last since writes bump it.
+    // `code` unset = no numeric marker pid, so the sweep must never probe it.
+    const fixtures: Array<{
+      pid: number;
+      code?: string;
+      startedAt: Date;
+      mtime: Date;
+      host?: string;
+      unreadable?: boolean;
+      marker?: "none" | "corrupt" | "string-pid";
+    }> = [
+      { pid: 301, code: "ESRCH", startedAt: recent, mtime: recent }, // gone
+      { pid: 302, code: "EPERM", startedAt: recent, mtime: recent }, // foreign, recent
+      { pid: 303, code: "EPERM", startedAt: ancient, mtime: ancient }, // foreign, ancient
+      { pid: 304, code: "ESRCH", startedAt: ancient, mtime: ancient, host: "other-host" },
+      { pid: 305, code: "EPERM", startedAt: ancient, mtime: ancient, unreadable: true },
+      { pid: 306, code: "EPERM", startedAt: recent, mtime: ancient }, // marker still fresh
+      { pid: 307, code: "EPERM", startedAt: ancient, mtime: recent }, // dir still fresh
+      { pid: 308, code: "EINVAL", startedAt: ancient, mtime: ancient }, // unknown probe error
+      { pid: 309, code: "", startedAt: ancient, mtime: ancient }, // alive and ours: never aged out
+      { pid: 310, startedAt: ancient, mtime: ancient, marker: "none" }, // age decides
+      { pid: 311, startedAt: recent, mtime: recent, marker: "none" },
+      { pid: 312, startedAt: ancient, mtime: ancient, marker: "corrupt" },
+      { pid: 313, startedAt: recent, mtime: recent, marker: "string-pid" },
+    ];
+    for (const f of fixtures) {
+      const dir = join(root, String(f.pid));
+      await mkdir(join(dir, "sessions"), { recursive: true });
+      if (f.marker !== "none") {
+        await writeFile(
+          join(dir, "runtime.json"),
+          f.marker === "corrupt"
+            ? "{not json"
+            : JSON.stringify({
+                schemaVersion: 1,
+                protocol: "omp-undo-redo/runtime",
+                runtimeId: `r-${f.pid}`,
+                pid: f.marker === "string-pid" ? String(f.pid) : f.pid,
+                hostname: f.host ?? hostname(),
+                startedAt: f.startedAt.toISOString(),
+              }),
+        );
+      }
+      await utimes(dir, f.mtime, f.mtime);
+      if (f.unreadable) statGate.fail.add(resolve(dir));
+      if (f.code !== undefined) killCodes[f.pid] = f.code;
+    }
+    await mkdir(join(root, "not-a-pid"));
+    await utimes(join(root, "not-a-pid"), ancient, ancient);
+
+    const kill = vi.spyOn(process, "kill").mockImplementation((pid) => {
+      const code = killCodes[Number(pid)];
+      if (code === undefined) throw new Error(`unexpected kill(${String(pid)})`);
+      if (code) throw Object.assign(new Error(code), { code });
+      return true;
+    });
+    // Bracket access reaches the private sweep with its real, checked signature.
+    await store["reapStaleRuntimes"]();
+
+    expect((await readdir(root)).sort()).toEqual(
+      ["200", "302", "304", "305", "306", "307", "308", "309", "311", "313", "not-a-pid"].sort(),
+    );
+    // Signal 0 only probes. Exactly the same-host numeric marker pids are probed:
+    // never itself (200), the other host's (304) or a dir without a numeric pid.
+    expect(kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
+    expect(kill.mock.calls.map(([pid]) => pid).sort((a, b) => a - b)).toEqual([
+      301, 302, 303, 305, 306, 307, 308, 309,
+    ]);
     await store.shutdown();
   });
 

@@ -218,16 +218,23 @@ export class RuntimeActionStateStore {
         if (typeof marker.pid === "number") {
           try {
             process.kill(marker.pid, 0);
+            // Alive and ours: never age it out. A live owner does not refresh
+            // its directory, so after 24 h the age check would delete the
+            // state it is still publishing. A recycled pid's directory is
+            // reaped once that process exits (ESRCH) instead.
+            continue;
           } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
-            // ESRCH: gone. EPERM: alive but foreign, so fall through to the age
-            // check. Any other code: leave the directory alone.
+            // ESRCH: gone. EPERM: alive but un-signallable, usually a recycled
+            // pid under another user (in a shared root it may be that user's
+            // live OMP); fall through to the age check. Any other code: leave
+            // the directory alone.
             if (code === "ESRCH") dead = true;
             else if (code !== "EPERM") continue;
           }
         }
-        // PID-recycling guard: a live (or unprobeable) pid only loses its
-        // directory once the marker and the directory are both ancient.
+        // PID-recycling guard: an unprobeable pid (or a missing marker) only
+        // loses its directory once the marker and the directory are both ancient.
         if (!dead && !(await isAncient(dir, marker.startedAt))) continue;
         await rm(dir, { recursive: true, force: true }).catch(() => undefined);
       }
