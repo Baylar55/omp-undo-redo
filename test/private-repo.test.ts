@@ -432,6 +432,8 @@ describe("private per-workspace git repositories", () => {
       const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-shared-store-"));
       try {
         await chmod(storeRoot, 0o1777);
+        // Bun's chmod drops the sticky bit, so compare against what actually got set.
+        const sharedMode = (await stat(storeRoot)).mode & 0o7777;
         const repository = await ensurePrivateGitRepository(
           (cwd2, env) => createGitRunner(cwd2, { env }),
           cwd,
@@ -439,7 +441,7 @@ describe("private per-workspace git repositories", () => {
         );
         expect(repository).not.toBeNull();
         if (!repository) return;
-        expect((await stat(storeRoot)).mode & 0o7777).toBe(0o1777);
+        expect((await stat(storeRoot)).mode & 0o7777).toBe(sharedMode);
         expect((await stat(dirname(repository.gitDir))).mode & 0o777).toBe(0o700);
       } finally {
         await rm(cwd, { recursive: true, force: true });

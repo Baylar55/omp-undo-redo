@@ -1041,12 +1041,15 @@ describe("history-safe Git checkpoints", () => {
       try {
         await initializeBranch(git, cwd);
         await writeFile(join(cwd, ":(top)-literal\tline\n.txt"), "literal path\n");
-        const nonUtf8Path = Buffer.concat([
-          Buffer.from(cwd),
-          Buffer.from(sep),
-          Buffer.from([0x6e, 0x6f, 0x6e, 0x2d, 0x75, 0x74, 0x66, 0x38, 0x2d, 0x80]),
-        ]);
-        await writeFile(nonUtf8Path, "raw path\n");
+        // APFS rejects non-UTF-8 names (EILSEQ), so macOS can't hold such a path.
+        if (process.platform !== "darwin") {
+          const nonUtf8Path = Buffer.concat([
+            Buffer.from(cwd),
+            Buffer.from(sep),
+            Buffer.from([0x6e, 0x6f, 0x6e, 0x2d, 0x75, 0x74, 0x66, 0x38, 0x2d, 0x80]),
+          ]);
+          await writeFile(nonUtf8Path, "raw path\n");
+        }
 
         const before = pendingCheckpoint(await prepareBeforeTurn(snap, "raw-paths"));
         const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));

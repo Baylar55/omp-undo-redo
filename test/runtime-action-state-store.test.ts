@@ -147,9 +147,11 @@ describe("runtime action-state store", () => {
     async () => {
       const root = await makeRoot();
       await chmod(root, 0o1777);
+      // Bun's chmod drops the sticky bit, so compare against what actually got set.
+      const sharedMode = (await stat(root)).mode & 0o7777;
       const store = new RuntimeActionStateStore({ rootDirectory: root, pid: 105 });
       await store.initialize();
-      expect((await stat(root)).mode & 0o7777).toBe(0o1777);
+      expect((await stat(root)).mode & 0o7777).toBe(sharedMode);
       expect((await stat(join(root, "105"))).mode & 0o777).toBe(0o700);
       expect((await stat(join(root, "105", "sessions"))).mode & 0o777).toBe(0o700);
     },
