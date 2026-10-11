@@ -144,7 +144,8 @@ function userObjects(repository: GitRepository): string {
  *  every command inside the private repo; Git mode keeps the user's
  *  repository (HEAD, config, ignore rules), writes objects to the store and
  *  reads the user's through `GIT_ALTERNATE_OBJECT_DIRECTORIES`, so snapshot
- *  objects never enter the user's object store. */
+ *  objects never enter the user's object store. Clean filters still run in
+ *  the user's repository: Git LFS writes to its LFS storage (README). */
 export function snapshotRunnerEnv(repository: GitRepository): Record<string, string> {
   return borrowsObjects(repository)
     ? {
@@ -1403,7 +1404,8 @@ async function changedPaths(
  *  writes them back, so a failed write (locked file, full disk, killed child)
  *  leaves paths missing and the rest at target content. Undoes exactly what
  *  apply did, from `sourceHash` through a scratch index: paths it removed,
- *  paths it wrote (content equals the target blob) and paths it created. A
+ *  paths it wrote (content equals the target blob), paths it left empty (a
+ *  failed smudge filter) and paths it created. A
  *  path still holding other content is left alone: `apply --check` accepts
  *  drift outside the hunks, and overwriting it would destroy that edit. The
  *  hash and the checkout run with apply's `config`, so they convert exactly
@@ -1445,6 +1447,12 @@ async function rollbackPartialApply(
         await rm(join(worktree, path), { force: true }).catch(() => undefined);
       }
     } else if (!present) {
+      restore.push(path);
+    } else if (status !== "D" && present.isFile() && present.size === 0) {
+      // Apply creates a file before converting its content, so a failed
+      // smudge filter (Git LFS missing an object) leaves it empty. `apply
+      // --check` proved the path held its hunks' preimage, so an empty file
+      // is apply's write or an empty source: restoring the source is safe.
       restore.push(path);
     } else if (status !== "D" && present.isFile() && !path.includes("\n")) {
       written.set(path, targetSha!);

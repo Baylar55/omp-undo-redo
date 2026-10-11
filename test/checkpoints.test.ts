@@ -2297,4 +2297,31 @@ describe("history-safe Git checkpoints", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("rolls back a file a failed smudge filter left empty", async () => {
+    // Git LFS missing an object (`git lfs prune`) fails apply's smudge after
+    // apply created the file, which emptied the current content of the file.
+    // `grep -v ^A` fails (exit 1) on "A\n" only, so restoring "B\n" works.
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "filter.picky.clean", "cat"]);
+      await git(["config", "filter.picky.smudge", "grep -v ^A"]);
+      await git(["config", "filter.picky.required", "true"]);
+      await writeFile(join(cwd, ".gitattributes"), "*.dat filter=picky\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "attributes"]);
+      await writeFile(join(cwd, "model.dat"), "A\n");
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "failed-smudge"));
+      await writeFile(join(cwd, "model.dat"), "B\n");
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
+        status: "failed",
+      });
+      expect(await readFile(join(cwd, "model.dat"), "utf8")).toBe("B\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
