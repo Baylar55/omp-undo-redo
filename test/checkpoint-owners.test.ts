@@ -468,9 +468,10 @@ describe("checkpoint owner boundaries", () => {
       const navigation = new SessionNavigation(port, git);
       await navigation.recordTurnEnd(finished.checkpoint);
 
-      expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
+      const restored = { status: "moved", files: "restored", restoredFiles: ["tracked.txt"] };
+      expect(await navigation.undo()).toEqual(restored);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("before\n");
-      expect(await navigation.redo()).toEqual({ status: "moved", files: "restored" });
+      expect(await navigation.redo()).toEqual(restored);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("after\n");
       await navigation.suspend();
     } finally {
@@ -529,7 +530,11 @@ describe("checkpoint owner boundaries", () => {
         };
         const navigation = new SessionNavigation(port, git);
         await navigation.recordTurnEnd(retained);
-        expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
+        expect(await navigation.undo()).toEqual({
+          status: "moved",
+          files: "restored",
+          restoredFiles: ["tracked.txt"],
+        });
         expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("before\n");
       } finally {
         await ownerRegistry.shutdown();

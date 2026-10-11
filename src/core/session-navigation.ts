@@ -208,13 +208,14 @@ export class SessionNavigation {
   }
 
   private restoredResult(applied: {
+    restoredFiles: string[];
     nestedRepositories: string[];
     unreadableFiles: string[];
   }): NavigationResult {
-    const { nestedRepositories, unreadableFiles } = applied;
+    const { restoredFiles, nestedRepositories, unreadableFiles } = applied;
     return nestedRepositories.length > 0 || unreadableFiles.length > 0
-      ? { status: "moved", files: "partial", nestedRepositories, unreadableFiles }
-      : { status: "moved", files: "restored" };
+      ? { status: "moved", files: "partial", restoredFiles, nestedRepositories, unreadableFiles }
+      : { status: "moved", files: "restored", restoredFiles };
   }
 
   undo(): Promise<NavigationResult> {

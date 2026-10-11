@@ -251,7 +251,7 @@ describe("session navigation", () => {
     const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, async () => {
       applyCalls++;
       await applyGate;
-      return { status: "applied", nestedRepositories: [], unreadableFiles: [] };
+      return { status: "applied", nestedRepositories: [], unreadableFiles: [], restoredFiles: [] };
     });
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
@@ -316,7 +316,12 @@ describe("session navigation", () => {
       undefined,
       async (_checkpoint, sourceHash, targetHash) => {
         applied.push([sourceHash, targetHash]);
-        return { status: "applied", nestedRepositories: [], unreadableFiles: [] };
+        return {
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: ["a.txt"],
+        };
       },
     );
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
@@ -325,19 +330,31 @@ describe("session navigation", () => {
 
     // A turn with no file snapshot moves the session only; it must not
     // destroy the file history recorded before or after it.
-    expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
+    expect(await navigation.undo()).toEqual({
+      status: "moved",
+      files: "restored",
+      restoredFiles: ["a.txt"],
+    });
     expect(await navigation.undo()).toMatchObject({
       files: "unavailable",
       reason: "not_repository",
     });
-    expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
+    expect(await navigation.undo()).toEqual({
+      status: "moved",
+      files: "restored",
+      restoredFiles: ["a.txt"],
+    });
     expect(session.leaf).toBe("u1");
     expect(applied).toEqual([
       ["after-a3", "before-a3"],
       ["after-a1", "before-a1"],
     ]);
 
-    expect(await navigation.redo()).toEqual({ status: "moved", files: "restored" });
+    expect(await navigation.redo()).toEqual({
+      status: "moved",
+      files: "restored",
+      restoredFiles: ["a.txt"],
+    });
     expect(applied.at(-1)).toEqual(["before-a1", "after-a1"]);
   });
 

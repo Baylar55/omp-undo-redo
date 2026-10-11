@@ -1142,9 +1142,17 @@ export async function retainCheckpointForResume(
 
 /** `nestedRepositories` and `unreadableFiles`: paths whose contents the
  *  restore could not touch, relative to the worktree root (see
- *  `pathsOutsideSnapshots`). */
+ *  `pathsOutsideSnapshots`). `restoredFiles`: every path the restore wrote,
+ *  created or deleted, relative to the worktree root. The snapshots cover the
+ *  whole worktree, so this includes edits made during the turn by anyone
+ *  else (an editor, another process), not only the agent's. */
 export type CheckpointApplyResult =
-  | { status: "applied"; nestedRepositories: string[]; unreadableFiles: string[] }
+  | {
+      status: "applied";
+      nestedRepositories: string[];
+      unreadableFiles: string[];
+      restoredFiles: string[];
+    }
   | { status: "conflict" | "failed" };
 
 /** Restore invocations get a far larger ceiling than the runner's default:
@@ -1362,8 +1370,33 @@ export async function applyCheckpoint(
     if (!setting) return { status: "failed" };
     config = autocrlfOffConfig(setting);
   }
-  const status = await applyPatch(git, sourceHash, targetHash, unreadablePins, config);
-  return status === "applied" ? { status, nestedRepositories, unreadableFiles } : { status };
+  const applied = await applyPatch(git, sourceHash, targetHash, unreadablePins, config);
+  if (typeof applied === "string") return { status: applied };
+  return { status: "applied", nestedRepositories, unreadableFiles, ...applied };
+}
+
+/** Paths `git apply` touches going from `sourceHash` to `targetHash`. Gitlinks
+ *  are skipped: apply leaves them alone and `pathsOutsideSnapshots` reports
+ *  them. Null when git fails. */
+async function changedPaths(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+): Promise<string[] | null> {
+  const changes = await invoke(
+    git,
+    ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
+    { timeoutMs: RESTORE_TIMEOUT_MS },
+  );
+  if (changes.error || changes.code !== 0) return null;
+  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
+  const fields = changes.stdout.split("\0");
+  const paths: string[] = [];
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const [sourceMode, targetMode] = fields[index]!.slice(1).split(" ");
+    if (sourceMode !== "160000" && targetMode !== "160000") paths.push(fields[index + 1]!);
+  }
+  return paths;
 }
 
 /** `git apply` without an index first deletes every path it modifies, then
@@ -1459,7 +1492,7 @@ async function applyPatch(
   targetHash: string,
   unreadablePins: readonly string[],
   config: readonly string[],
-): Promise<CheckpointApplyResult["status"]> {
+): Promise<{ restoredFiles: string[] } | "conflict" | "failed"> {
   let tempDirectory: string | null = null;
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
@@ -1499,8 +1532,11 @@ async function applyPatch(
     // "there were differences": without this the truncated patch `--output`
     // already wrote would be applied and reported as a complete restore.
     if (diff.error) return "failed";
-    if (diff.code === 0) return "applied";
+    if (diff.code === 0) return { restoredFiles: [] };
     if (diff.code !== 1) return "failed";
+    // Listed before applying: failing after the patch landed would misreport.
+    const restoredFiles = await changedPaths(git, sourceHash, effectiveTarget);
+    if (!restoredFiles) return "failed";
 
     const check = await invoke(
       git,
@@ -1563,7 +1599,7 @@ async function applyPatch(
       [...config, "apply", "--whitespace=nowarn", patchPath],
       restore,
     );
-    if (applied.code === 0) return "applied";
+    if (applied.code === 0) return { restoredFiles };
     await rollbackPartialApply(git, sourceHash, effectiveTarget, tempDirectory, config).catch(
       () => undefined,
     );

@@ -288,6 +288,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["agent.txt", "turn.txt"],
       });
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       await expect(readFile(join(cwd, "agent.txt"))).rejects.toThrow();
@@ -296,6 +297,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["agent.txt", "turn.txt"],
       });
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       expect(await readFile(join(cwd, "agent.txt"), "utf8")).toBe("agent commit\n");
@@ -455,6 +457,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
       expect(await readFile(savedIndexPath)).toEqual(savedIndex.raw);
@@ -476,6 +479,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
       expect(await readFile(savedIndexPath)).toEqual(indexBeforeRedo);
@@ -605,15 +609,26 @@ describe("history-safe Git checkpoints", () => {
       await writeFile(join(cwd, ".gitignore"), "# cleaned\n");
       const checkpoint = completedCheckpoint(await finishAfterTurn(snap, pending, null, null));
 
+      // `.env` is pinned to its on-disk state, so only `.gitignore` is restored.
       await expect(
         applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
-      ).resolves.toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
+      ).resolves.toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: [".gitignore"],
+      });
       expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe(".env\n");
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
       await expect(
         applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
-      ).resolves.toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
+      ).resolves.toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: [".gitignore"],
+      });
       expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe("# cleaned\n");
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
@@ -823,7 +838,11 @@ describe("history-safe Git checkpoints", () => {
           await writeFile(db, "v2\n");
           const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
 
-          const notRestored = { nestedRepositories: [], unreadableFiles: ["app.db"] };
+          const notRestored = {
+            nestedRepositories: [],
+            unreadableFiles: ["app.db"],
+            restoredFiles: ["tracked.txt"],
+          };
           expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
             status: "applied",
             ...notRestored,
@@ -1081,6 +1100,8 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        // Worktree root relative, even for a session started in `nested/`.
+        restoredFiles: ["nested/inside.txt"],
       });
       expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("inside base\n");
       expect(await readFile(join(cwd, "outside-modified.txt"), "utf8")).toBe(
@@ -1098,6 +1119,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["nested/inside.txt"],
       });
       expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("inside after turn\n");
       expect(await readFile(join(cwd, "outside-modified.txt"), "utf8")).toBe(
@@ -1168,12 +1190,14 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       await git(["switch", "A"]);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await text(git, ["symbolic-ref", "--short", "HEAD"])).toBe("A");
       expect(await branchRefs(git)).toBe(refsAfterSwitch);
@@ -1345,12 +1369,14 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["after-only.txt", "staged.txt"],
       });
       expect(await indexState(git, cwd)).toEqual(saved);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["after-only.txt", "staged.txt"],
       });
       expect(await indexState(git, cwd)).toEqual(saved);
       expect(await releaseCheckpoint(snap, after)).toBe(true);
@@ -1378,12 +1404,14 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await branchRefs(git)).toBe(refs);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await branchRefs(git)).toBe(refs);
       expect(await releaseCheckpoint(snap, after)).toBe(true);
@@ -1436,11 +1464,23 @@ describe("history-safe Git checkpoints", () => {
       expect(after).not.toBeNull();
       if (!after) return;
 
-      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
+      // `executable.sh` and `link to old.txt` join these where the platform
+      // records modes and symlinks.
+      const restoredFiles = [
+        "after-only Ω.txt",
+        "binary.bin",
+        "delete me.txt",
+        "new name.txt",
+        "old name.txt",
+      ];
+      const undone = await applyCheckpoint(snap, after.afterHash, after.beforeHash);
+      expect(undone).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: expect.arrayContaining(restoredFiles),
       });
+      expect(undone.status === "applied" && undone.restoredFiles).not.toContain("before-only.txt");
       expect(await readFile(join(cwd, "old name.txt"), "utf8")).toBe("old\n");
       expect(await readFile(join(cwd, "delete me.txt"), "utf8")).toBe("delete\n");
       await expect(readFile(join(cwd, "new name.txt"))).rejects.toThrow();
@@ -1459,6 +1499,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: expect.arrayContaining(restoredFiles),
       });
       expect(await readFile(join(cwd, "new name.txt"), "utf8")).toBe("renamed\n");
       expect(await readFile(join(cwd, "binary.bin"))).toEqual(Buffer.from([255, 254, 253, 252]));
@@ -1615,13 +1656,23 @@ describe("history-safe Git checkpoints", () => {
 
       expect(
         await applyCheckpoint(snap, finished.checkpoint.afterHash, finished.checkpoint.beforeHash),
-      ).toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
+      ).toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: ["after.txt", "before.txt"],
+      });
       await expect(readFile(join(cwd, "before.txt"), "utf8")).resolves.toBe("before\n");
       await expect(readFile(join(cwd, "after.txt"))).rejects.toThrow();
 
       expect(
         await applyCheckpoint(snap, finished.checkpoint.beforeHash, finished.checkpoint.afterHash),
-      ).toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
+      ).toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: ["after.txt", "before.txt"],
+      });
       await expect(readFile(join(cwd, "after.txt"), "utf8")).resolves.toBe("after\n");
       expect((await git(["rev-parse", "HEAD"])).code).not.toBe(0);
     } finally {
@@ -2035,12 +2086,14 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
       expect(await applyCheckpoint(snap, beforeHash, afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn   \n");
     } finally {

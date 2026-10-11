@@ -94,7 +94,7 @@ describe("session-only lifecycle fallback", () => {
 
       await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Undid last turn: session moved back and file snapshot restored.",
+        "Undid last turn: session moved back and file snapshot restored. Restored files: tracked.txt.",
       );
       expect(await privateRefs(cwd)).toHaveLength(2);
       const refs = await privateRefs(cwd);
@@ -102,7 +102,78 @@ describe("session-only lifecycle fallback", () => {
       await pi.runCommand("redo", ctx);
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Redid last turn: session moved forward and file snapshot restored.",
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("names every restored file, including one edited outside the agent during the turn", async () => {
+    const cwd = await makeRepository();
+    try {
+      await writeFile(join(cwd, "notes.md"), "user draft v1\n");
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "external-edit-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "agent\n");
+      // The user saves notes.md in an editor while the turn runs.
+      await writeFile(join(cwd, "notes.md"), "user draft v2\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      await pi.emit("before_agent_start", ctx);
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. No files changed.",
+      );
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "notes.md"), "utf8")).toBe("user draft v1\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. Restored files: notes.md, tracked.txt.",
+      );
+
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "notes.md"), "utf8")).toBe("user draft v2\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: notes.md, tracked.txt.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("lists the first five restored files and counts the rest", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "many-files-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      for (let index = 1; index <= 7; index++) {
+        await writeFile(join(cwd, `f${index}.txt`), `${index}\n`);
+      }
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. Restored files: f1.txt, f2.txt, f3.txt, f4.txt, f5.txt and 2 more.",
       );
     } finally {
       await rmRetry(cwd);
@@ -288,7 +359,7 @@ describe("session-only lifecycle fallback", () => {
         const ctx = await undoTurn(cwd, "mod", "submodule-session");
         const [undo, redo] = ctx.ui.notifications.slice(-2);
         expect(undo).toEqual({
-          message: `Undid last turn: session moved back and file snapshot restored, but ${NOT_RESTORED}: mod.`,
+          message: `Undid last turn: session moved back and file snapshot restored, but ${NOT_RESTORED}: mod. Restored files: top.txt.`,
           level: "warning",
         });
         expect(redo?.message).toContain(`${NOT_RESTORED}: mod.`);
@@ -586,7 +657,7 @@ describe("navigation invalidation lifecycle", () => {
       expect(ctx.leaf).toBe("turn");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Redid last turn: session moved forward and file snapshot restored.",
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
       );
     } finally {
       await rmRetry(cwd);
@@ -624,7 +695,7 @@ describe("navigation invalidation lifecycle", () => {
       await pi.runCommand("redo", ctx);
 
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Redid last turn: session moved forward and file snapshot restored.",
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
       );
     } finally {
       await rmRetry(cwd);
@@ -715,7 +786,7 @@ describe("resumed session history", () => {
       expect(third.leaf).toBe(response.id);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
       expect(third.ui.notifications.at(-1)?.message).toBe(
-        "Redid last turn: session moved forward and file snapshot restored.",
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
       );
       await thirdApi.emit("session_shutdown", third);
     } finally {
@@ -810,7 +881,7 @@ describe("resumed session history", () => {
       expect(second.leaf).toBe(r2.id);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn2\n");
       expect(second.ui.notifications.at(-1)?.message).toBe(
-        "Redid last turn: session moved forward and file snapshot restored.",
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
       );
 
       // Undo turn 2 again
@@ -818,7 +889,7 @@ describe("resumed session history", () => {
       expect(second.leaf).toBe(p2.id);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn1\n");
       expect(second.ui.notifications.at(-1)?.message).toBe(
-        "Undid last turn: session moved back and file snapshot restored.",
+        "Undid last turn: session moved back and file snapshot restored. Restored files: tracked.txt.",
       );
 
       // Undo turn 1
@@ -826,7 +897,7 @@ describe("resumed session history", () => {
       expect(second.leaf).toBe(p1.id);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
       expect(second.ui.notifications.at(-1)?.message).toBe(
-        "Undid last turn: session moved back and file snapshot restored.",
+        "Undid last turn: session moved back and file snapshot restored. Restored files: tracked.txt.",
       );
 
       await secondApi.emit("session_shutdown", second);

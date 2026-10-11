@@ -95,6 +95,13 @@ function notRestoredMessage(nested: readonly string[], unreadable: readonly stri
   return `${parts.join("; ")}.`;
 }
 
+/** The snapshots cover the whole worktree, so this names every file the
+ *  restore touched, including ones edited during the turn by someone other
+ *  than the agent (an editor, another process). */
+function restoredFilesMessage(paths: readonly string[]): string {
+  return paths.length > 0 ? ` Restored files: ${listed(paths)}.` : " No files changed.";
+}
+
 export async function runNavigation(
   navigation: SessionNavigation,
   ctx: ExtensionCommandContext,
@@ -116,11 +123,14 @@ export async function runNavigation(
         );
       } else if (outcome.files === "partial") {
         ctx.ui.notify(
-          `${verbs.movedPartialPrefix}${notRestoredMessage(outcome.nestedRepositories, outcome.unreadableFiles)}`,
+          `${verbs.movedPartialPrefix}${notRestoredMessage(outcome.nestedRepositories, outcome.unreadableFiles)}${restoredFilesMessage(outcome.restoredFiles)}`,
           "warning",
         );
       } else {
-        ctx.ui.notify(verbs.movedSuccess, "info");
+        ctx.ui.notify(
+          `${verbs.movedSuccess}${restoredFilesMessage(outcome.restoredFiles)}`,
+          "info",
+        );
       }
       break;
     }
