@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Security
+
+- **An exported `GIT_DIR` or `GIT_WORK_TREE` decided what was snapshotted and restored.** Every git command inherited OMP's environment. With `GIT_DIR` exported for a bare dotfiles repository (`core.worktree=$HOME`), a session in an unrelated non-Git `~/proj` ran in Git mode with the home folder as its worktree: snapshots copied `.bashrc`, `secret.key` and everything else not ignored into the store, `/undo` restored across the whole home folder, and the Private-Git home-folder refusal never ran. An inherited `GIT_WORK_TREE`, which git hooks export, made a Git project resolve to that folder as its worktree (its checkpoints then fell back to session-only) and ran Private-Git's path-relative commands against the wrong folder. Git commands now start without git's repository-location variables (`git rev-parse --local-env-vars`, keeping `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` as git does for other repositories), so the working directory alone picks the repository. An exported `GIT_DIR` no longer points OMP at another repository.
+
 ## [1.6.6] - 2026-10-10
 
 ### Fixed

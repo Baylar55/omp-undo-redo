@@ -536,6 +536,43 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  // GIT_DIR: a dotfiles repo (bare, core.worktree above the project) exported
+  // while working in an unrelated folder. GIT_WORK_TREE: exported by a hook;
+  // git honors it with a discovered repository and overrides core.worktree.
+  it.each([
+    { variable: "GIT_DIR", gitProject: false },
+    { variable: "GIT_WORK_TREE", gitProject: true },
+  ])("ignores an inherited $variable pointing outside the project", async (scenario) => {
+    const parent = await mkdtemp(join(tmpdir(), "omp-private-inherited-"));
+    const dotfiles = join(parent, "dotfiles.git");
+    const project = join(parent, "proj");
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    try {
+      await mkdir(project);
+      if (scenario.gitProject) execFileSync("git", ["init", "-q", project]);
+      await writeFile(join(parent, "secret.key"), "secret");
+      await writeFile(join(project, "code.txt"), "code");
+      execFileSync("git", ["init", "-q", "--bare", dotfiles]);
+      execFileSync("git", ["--git-dir", dotfiles, "config", "core.bare", "false"]);
+      execFileSync("git", ["--git-dir", dotfiles, "config", "core.worktree", parent]);
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      vi.stubEnv(scenario.variable, scenario.variable === "GIT_DIR" ? dotfiles : parent);
+
+      const backend = await resolveBackend(project);
+      expect(backend.kind).toBe("git");
+      if (backend.kind !== "git") return;
+      expect(backend.repository.worktree).toBe(await realpath(project));
+      const snapshot = await createSnapshotCommit(backend.git, "inherited-env");
+      if (!("hash" in snapshot)) throw new Error(JSON.stringify(snapshot));
+      const tree = await backend.git(["ls-tree", "-r", "--name-only", snapshot.hash]);
+      expect(tree.stdout.trim().split("\n")).toEqual(["code.txt"]);
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(parent, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("git operations run with GIT_DIR/GIT_WORK_TREE env", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-env-"));
     const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
