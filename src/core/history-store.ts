@@ -20,6 +20,7 @@ import type {
   SessionEntryLike,
   SessionReader,
   SessionOnlyCheckpoint,
+  RestoreIntent,
   TurnCheckpoint,
 } from "./types.js";
 import { UNAVAILABLE_REASONS } from "./types.js";
@@ -140,6 +141,22 @@ export function tombstonePath(repository: GitRepository, sessionIdOrHash: string
     ? sessionIdOrHash
     : checkpointNamespace(sessionIdOrHash);
   return join(historyDirectory(repository), `${sessionHash}.expired.json`);
+}
+
+/** Dot-prefixed: the expiry sweep skips it as a history file. */
+function restoreIntentPath(repository: GitRepository, sessionHash: string): string {
+  return join(historyDirectory(repository), `.restore.${sessionHash}.json`);
+}
+
+function isRestoreIntent(value: unknown): value is RestoreIntent {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    (candidate.direction === "undo" || candidate.direction === "redo") &&
+    ["beforeRef", "beforeHash", "afterRef", "afterHash"].every(
+      (key) => typeof candidate[key] === "string",
+    )
+  );
 }
 
 async function readTombstone(
@@ -501,6 +518,7 @@ export async function expireGitSessionHistories(
     await writeJsonAtomic(dir, tombstoneFile, tombstoneData).catch(() => undefined);
 
     await rm(filePath, { force: true }).catch(() => undefined);
+    await rm(restoreIntentPath(repository, sessionHash), { force: true }).catch(() => undefined);
   }
 
   // Refs with no history JSON at all (crash, failed save): the loop above
@@ -655,5 +673,31 @@ export class SessionHistoryStore {
       () => undefined,
     );
     await this.write(checkpoints, state.currentIndex);
+  }
+
+  async saveRestoreIntent(intent: RestoreIntent): Promise<void> {
+    const path = restoreIntentPath(this.repository, checkpointNamespace(this.sessionId));
+    await writeJsonAtomic(historyDirectory(this.repository), path, intent);
+  }
+
+  /** Null when there is none or it cannot be read now. A malformed one is
+   *  deleted: no later load could settle it either. */
+  async loadRestoreIntent(): Promise<RestoreIntent | null> {
+    const path = restoreIntentPath(this.repository, checkpointNamespace(this.sessionId));
+    const text = await readFile(path, "utf8").catch(() => null);
+    if (text === null) return null;
+    try {
+      const value = JSON.parse(text) as unknown;
+      if (isRestoreIntent(value)) return value;
+    } catch {
+      // malformed: dropped below
+    }
+    await this.clearRestoreIntent().catch(() => undefined);
+    return null;
+  }
+
+  async clearRestoreIntent(): Promise<void> {
+    const path = restoreIntentPath(this.repository, checkpointNamespace(this.sessionId));
+    await rm(path, { force: true });
   }
 }

@@ -6,6 +6,7 @@ import type {
   NavigationPort,
   NavigationResult,
   NavigationState,
+  RestoreIntent,
   SessionOnlyCheckpoint,
   TreeNavigationResult,
   TurnCheckpoint,
@@ -29,6 +30,62 @@ type ApplyCheckpoint = (
   targetHash: string,
 ) => Promise<CheckpointApplyResult>;
 
+export type RestoreIntentPort = {
+  save(intent: RestoreIntent): Promise<void>;
+  clear(): Promise<void>;
+};
+
+export type RestoreRecovery =
+  /** No restore of `state` was in flight: the intent outlived a persisted cursor. */
+  | { outcome: "stale" }
+  /** The worktree is still at the source: nothing to do. */
+  | { outcome: "unchanged" }
+  /** Every file reached the target; `state` has the cursor moved to match. */
+  | { outcome: "completed"; state: NavigationState }
+  /** Files are neither at the source nor at the target. */
+  | { outcome: "partial"; storeDir: string; sourceHash: string; targetHash: string }
+  /** Git could not tell: keep the intent for the next load. */
+  | { outcome: "unknown" };
+
+/** Settles a restore the previous process was killed in the middle of.
+ *  `applies(checkpoint, from, to)`: whether restoring `from` → `to` would
+ *  apply to the worktree as it is (null: git failed). Applying cleanly from
+ *  the source is the same check the next undo/redo makes, so it wins when
+ *  both directions apply (an empty patch). Never writes a file. */
+export async function recoverInterruptedRestore(
+  state: NavigationState,
+  intent: RestoreIntent,
+  applies: (checkpoint: GitCheckpoint, from: string, to: string) => Promise<boolean | null>,
+): Promise<RestoreRecovery> {
+  const undo = intent.direction === "undo";
+  const checkpoint = state.checkpoints[undo ? state.currentIndex : state.currentIndex + 1];
+  if (
+    checkpoint?.kind !== "git" ||
+    checkpoint.beforeRef !== intent.beforeRef ||
+    checkpoint.beforeHash !== intent.beforeHash ||
+    checkpoint.afterRef !== intent.afterRef ||
+    checkpoint.afterHash !== intent.afterHash
+  )
+    return { outcome: "stale" };
+  const sourceHash = undo ? checkpoint.afterHash : checkpoint.beforeHash;
+  const targetHash = undo ? checkpoint.beforeHash : checkpoint.afterHash;
+  const atSource = await applies(checkpoint, sourceHash, targetHash);
+  if (atSource === null) return { outcome: "unknown" };
+  if (atSource) return { outcome: "unchanged" };
+  const atTarget = await applies(checkpoint, targetHash, sourceHash);
+  if (atTarget === null) return { outcome: "unknown" };
+  if (!atTarget) {
+    return { outcome: "partial", storeDir: checkpoint.repository.storeDir, sourceHash, targetHash };
+  }
+  return {
+    outcome: "completed",
+    state: {
+      checkpoints: [...state.checkpoints],
+      currentIndex: state.currentIndex + (undo ? -1 : 1),
+    },
+  };
+}
+
 export class SessionNavigation {
   private checkpoints: TurnCheckpoint[] = [];
   private currentIndex = -1;
@@ -38,6 +95,7 @@ export class SessionNavigation {
   private navigationTail: Promise<void> = Promise.resolve();
   private readonly stateChanged: (state: NavigationState) => Promise<void>;
   private readonly applyGit: ApplyCheckpoint;
+  private readonly intents: RestoreIntentPort;
 
   constructor(
     private readonly port: Omit<NavigationPort, "navigateTree"> & {
@@ -47,6 +105,7 @@ export class SessionNavigation {
     gitFactory?: GitRunnerFactory,
     stateChanged?: (state: NavigationState) => Promise<void>,
     applyGit?: ApplyCheckpoint,
+    intents?: RestoreIntentPort,
   ) {
     this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git);
     this.stateChanged = stateChanged ?? (async () => undefined);
@@ -54,6 +113,7 @@ export class SessionNavigation {
       applyGit ??
       ((checkpoint, sourceHash, targetHash) =>
         applyCheckpoint(this.gitForRepository(checkpoint.repository), sourceHash, targetHash));
+    this.intents = intents ?? { save: async () => undefined, clear: async () => undefined };
     if (port.navigateTree) this.navigateTree = port.navigateTree.bind(port);
   }
 
@@ -69,11 +129,15 @@ export class SessionNavigation {
     return { checkpoints: [...this.checkpoints], currentIndex: this.currentIndex };
   }
 
-  private async persistState(): Promise<void> {
-    await this.stateChanged({
+  /** False when the state could not be saved. */
+  private async persistState(): Promise<boolean> {
+    return this.stateChanged({
       checkpoints: [...this.checkpoints],
       currentIndex: this.currentIndex,
-    }).catch(() => undefined);
+    }).then(
+      () => true,
+      () => false,
+    );
   }
 
   setNavigateTree(navigateTree: NavigationPort["navigateTree"]): void {
@@ -207,6 +271,17 @@ export class SessionNavigation {
     );
   }
 
+  private async saveIntent(direction: "undo" | "redo", checkpoint: GitCheckpoint): Promise<void> {
+    const { beforeRef, beforeHash, afterRef, afterHash } = checkpoint;
+    await this.intents
+      .save({ direction, beforeRef, beforeHash, afterRef, afterHash })
+      .catch(() => undefined);
+  }
+
+  private async clearIntent(): Promise<void> {
+    await this.intents.clear().catch(() => undefined);
+  }
+
   private restoredResult(applied: {
     restoredFiles: string[];
     nestedRepositories: string[];
@@ -232,8 +307,10 @@ export class SessionNavigation {
       return this.sessionOnlyResult(checkpoint);
     }
 
+    await this.saveIntent("undo", checkpoint);
     const applied = await this.applyFileCheckpoint(checkpoint, "before");
     if (applied.status !== "applied") {
+      await this.clearIntent();
       return {
         status: "git_failed",
         failure: applied.status === "conflict" ? "conflict" : "failed",
@@ -241,11 +318,13 @@ export class SessionNavigation {
     }
     if (!(await this.navigateSession(checkpoint.parentLeafId))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "after");
+      await this.clearIntent();
       if (compensated.status !== "applied") return { status: "rollback_failed" };
       return { status: "cancelled" };
     }
     this.currentIndex--;
-    await this.persistState();
+    // Unsaved, the cursor dies with the process: the intent lets the next load move it.
+    if (await this.persistState()) await this.clearIntent();
     return this.restoredResult(applied);
   }
 
@@ -263,8 +342,10 @@ export class SessionNavigation {
       return this.sessionOnlyResult(checkpoint);
     }
 
+    await this.saveIntent("redo", checkpoint);
     const applied = await this.applyFileCheckpoint(checkpoint, "after");
     if (applied.status !== "applied") {
+      await this.clearIntent();
       return {
         status: "git_failed",
         failure: applied.status === "conflict" ? "conflict" : "failed",
@@ -272,11 +353,12 @@ export class SessionNavigation {
     }
     if (!(await this.navigateSession(checkpoint.leafId))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "before");
+      await this.clearIntent();
       if (compensated.status !== "applied") return { status: "rollback_failed" };
       return { status: "cancelled" };
     }
     this.currentIndex++;
-    await this.persistState();
+    if (await this.persistState()) await this.clearIntent();
     return this.restoredResult(applied);
   }
 }

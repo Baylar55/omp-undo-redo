@@ -832,6 +832,153 @@ describe("resumed session history", () => {
     }
   });
 
+  describe("an undo or redo killed between the file restore and the session move", () => {
+    const prompt: TestEntry = {
+      id: "prompt",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: TestEntry = {
+      id: "response",
+      parentId: prompt.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    const exit: TestEntry = {
+      id: "exit",
+      parentId: response.id,
+      type: "custom",
+      customType: "session_exit",
+    };
+
+    /** Runs a two-file turn, then an `/undo` (or an undo and a `/redo`) whose
+     *  session move never returns: the process "dies" there, with no shutdown. */
+    async function killed(cwd: string, sessionId: string, command: "undo" | "redo"): Promise<void> {
+      await writeFile(join(cwd, "other.txt"), "base\n");
+      await git(cwd, ["add", "."]);
+      await git(cwd, ["commit", "-qm", "other"]);
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, sessionId);
+      ctx.leaf = prompt.id;
+      ctx.branch = [prompt];
+      ctx.entries = [prompt];
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await writeFile(join(cwd, "other.txt"), "changed\n");
+      ctx.leaf = response.id;
+      ctx.branch = [prompt, response];
+      ctx.entries = [prompt, response];
+      await pi.emit("agent_end", ctx);
+      if (command === "redo") {
+        ctx.navigateTree = async (targetId) => {
+          ctx.leaf = targetId;
+          return { cancelled: false };
+        };
+        await pi.runCommand("undo", ctx);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      }
+      const { promise: navigating, resolve } = Promise.withResolvers<void>();
+      ctx.navigateTree = () => {
+        resolve();
+        return Promise.withResolvers<{ cancelled: boolean }>().promise;
+      };
+      void pi.runCommand(command, ctx);
+      await navigating;
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(
+        command === "undo" ? "base\n" : "changed\n",
+      );
+    }
+
+    /** The next process, resumed where the session file ends. */
+    async function restart(cwd: string, sessionId: string) {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, sessionId);
+      ctx.leaf = exit.id;
+      ctx.branch = [prompt, response, exit];
+      ctx.entries = [prompt, response, exit];
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        ctx.branch = targetId === prompt.id ? [prompt] : [prompt, response];
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      return { pi, ctx };
+    }
+
+    it("moves the cursor when every file was restored", async () => {
+      const cwd = await makeRepository();
+      const sessionId = "killed-undo-completed";
+      try {
+        await killed(cwd, sessionId, "undo");
+        const { pi, ctx } = await restart(cwd, sessionId);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(
+          "The /undo interrupted by the last exit had already restored the files; undo history now matches them.",
+        );
+        await pi.runCommand("redo", ctx);
+        expect(ctx.leaf).toBe(response.id);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+        expect(await readFile(join(cwd, "other.txt"), "utf8")).toBe("changed\n");
+        await pi.runCommand("undo", ctx);
+        expect(ctx.leaf).toBe(prompt.id);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+        await pi.emit("session_shutdown", ctx);
+
+        // Settled once: the next start finds nothing to recover.
+        const again = await restart(cwd, sessionId);
+        expect(again.ctx.ui.notifications).toEqual([]);
+        await again.pi.emit("session_shutdown", again.ctx);
+      } finally {
+        await rmRetry(cwd);
+      }
+    });
+
+    it("names both snapshots and keeps the cursor when files are half restored", async () => {
+      const cwd = await makeRepository();
+      const sessionId = "killed-undo-partial";
+      try {
+        await killed(cwd, sessionId, "undo");
+        // As if apply had been killed before reaching other.txt.
+        await writeFile(join(cwd, "other.txt"), "changed\n");
+        const { pi, ctx } = await restart(cwd, sessionId);
+        const warning = ctx.ui.notifications.at(-1);
+        expect(warning?.level).toBe("warning");
+        expect(warning?.message).toMatch(
+          /^The \/undo interrupted by the last exit left files partly restored; undo history was left as it was\. Restore them by hand from the snapshots in .+: [0-9a-f]{40} \(before the \/undo\) and [0-9a-f]{40} \(its result\)\.$/,
+        );
+        await pi.runCommand("undo", ctx);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe("Worktree changed; nothing was undone.");
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(cwd);
+      }
+    });
+
+    it("moves the cursor forward after a killed redo", async () => {
+      const cwd = await makeRepository();
+      const sessionId = "killed-redo-completed";
+      try {
+        await killed(cwd, sessionId, "redo");
+        const { pi, ctx } = await restart(cwd, sessionId);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(
+          "The /redo interrupted by the last exit had already restored the files; undo history now matches them.",
+        );
+        await pi.runCommand("redo", ctx);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
+        await pi.runCommand("undo", ctx);
+        expect(ctx.leaf).toBe(prompt.id);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+        expect(await readFile(join(cwd, "other.txt"), "utf8")).toBe("base\n");
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(cwd);
+      }
+    });
+  });
+
   it("restores multi-turn undo and redo checkpoints across runtime restarts when undone turns exist", async () => {
     const cwd = await makeRepository();
     const sessionId = "resumed-multi-turn-session";

@@ -25,8 +25,9 @@ import {
 } from "./core/private-repo.js";
 import { gcPendingPath } from "./core/git-refs.js";
 import { migrateLegacySnapshots } from "./core/legacy-snapshot-migration.js";
-import { SessionNavigation } from "./core/session-navigation.js";
+import { recoverInterruptedRestore, SessionNavigation } from "./core/session-navigation.js";
 import {
+  applyCheckpoint,
   borrowsObjects,
   checkpointNamespace,
   finishAfterTurn,
@@ -54,6 +55,7 @@ import type {
   GitRepository,
   GitRunner,
   NavigationState,
+  RestoreIntent,
   PendingTurnCheckpoint,
   SessionOnlyCheckpoint,
 } from "./core/types.js";
@@ -152,8 +154,6 @@ type ActivePrivateRepoEntry = {
   ready: Promise<boolean>;
 };
 type PrivateRepoEntry = ActivePrivateRepoEntry;
-
-type HistoryWriter = { save(state: NavigationState): Promise<void> };
 
 function startPrivateRepo(
   canonical: string,
@@ -266,7 +266,7 @@ export async function resolveBackend(
 function createNavigation(
   ctx: AnyContext,
   sessionId: string,
-  store: HistoryWriter | undefined,
+  store: SessionHistoryStore | undefined,
   runtimeStore: RuntimeActionStateStore,
   backend?: FileBackend,
   gitForRepository?: (repository: GitRepository) => GitRunner,
@@ -283,10 +283,17 @@ function createNavigation(
     gitForRepository ?? ((repository) => gitRunnerFactory(repository.worktree)),
     async (state) => {
       const activeSessionLeaf = manager.getLeafId();
-      await Promise.allSettled([
-        ...(store ? [store.save(state)] : []),
+      const [saved] = await Promise.allSettled([
+        store?.save(state),
         runtimeStore.publishNavigation(sessionId, state, activeSessionLeaf),
       ]);
+      // Rejecting keeps an in-flight restore's intent: the cursor is not durable.
+      if (saved.status === "rejected") throw saved.reason;
+    },
+    undefined,
+    store && {
+      save: (intent) => store.saveRestoreIntent(intent),
+      clear: () => store.clearRestoreIntent(),
     },
   );
 }
@@ -1079,9 +1086,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       } else {
         restored = null;
       }
-      navigation.restoreState(
-        restored ?? reconstructSessionHistory(ctx.sessionManager, historyLeafId),
-      );
+      let state = restored ?? reconstructSessionHistory(ctx.sessionManager, historyLeafId);
+      // ponytail: without loaded history (expired, unusable, missing) the intent
+      // matches no git checkpoint and is dropped unreported, even over a
+      // half-restored worktree. Probe the intent's own hashes if that ever matters.
+      const intent = store ? await store.loadRestoreIntent() : null;
+      if (store && intent) state = await settleInterruptedRestore(ctx, store, state, intent);
+      navigation.restoreState(state);
       await runtimeStore.initializeSession(
         sessionId,
         navigation.snapshot(),
@@ -1096,6 +1107,52 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     } finally {
       if (initializations.get(sessionId) === initialization) initializations.delete(sessionId);
     }
+  }
+
+  /** Settles the restore a killed process left behind (`RestoreIntent`).
+   *  Only the cursor moves: files are never written at load. */
+  async function settleInterruptedRestore(
+    ctx: AnyContext,
+    store: SessionHistoryStore,
+    state: NavigationState,
+    intent: RestoreIntent,
+  ): Promise<NavigationState> {
+    const recovery = await recoverInterruptedRestore(
+      state,
+      intent,
+      async (checkpoint, from, to) => {
+        const { status } = await applyCheckpoint(
+          gitRunnerFor(checkpoint.repository),
+          from,
+          to,
+          true,
+        );
+        return status === "failed" ? null : status === "applied";
+      },
+    ).catch(() => ({ outcome: "unknown" as const }));
+    if (recovery.outcome === "unknown") return state;
+    const command = `/${intent.direction}`;
+    if (recovery.outcome === "completed") {
+      ctx.ui?.notify?.(
+        `The ${command} interrupted by the last exit had already restored the files; undo history now matches them.`,
+        "info",
+      );
+      // Unsaved, the intent stays and the next load moves the cursor again.
+      const saved = await store.save(recovery.state).then(
+        () => true,
+        () => false,
+      );
+      if (saved) await store.clearRestoreIntent().catch(() => undefined);
+      return recovery.state;
+    }
+    if (recovery.outcome === "partial") {
+      ctx.ui?.notify?.(
+        `The ${command} interrupted by the last exit left files partly restored; undo history was left as it was. Restore them by hand from the snapshots in ${recovery.storeDir}: ${recovery.sourceHash} (before the ${command}) and ${recovery.targetHash} (its result).`,
+        "warning",
+      );
+    }
+    await store.clearRestoreIntent().catch(() => undefined);
+    return state;
   }
 
   async function ensureNavigation(

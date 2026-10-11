@@ -158,6 +158,18 @@ export interface NavigationState {
   currentIndex: number;
 }
 
+/** A file restore in progress, written before `git apply` touches the
+ *  worktree and removed once the cursor is persisted, so a process killed in
+ *  between leaves a record the next load settles. Names the checkpoint by
+ *  its refs and hashes. */
+export interface RestoreIntent {
+  direction: "undo" | "redo";
+  beforeRef: string;
+  beforeHash: string;
+  afterRef: string;
+  afterHash: string;
+}
+
 export interface PendingGitCheckpoint {
   kind: "git";
   repository: GitRepository;

@@ -1355,11 +1355,14 @@ async function pathsOutsideSnapshots(
  *  patch leaves them as they are, and an `applied` result lists them so the
  *  caller never reports their contents as restored. Worktree files are read
  *  and written the way the snapshots were captured: with `core.autocrlf` off
- *  (`autocrlfOffConfig`), or through it for snapshots of earlier versions. */
+ *  (`autocrlfOffConfig`), or through it for snapshots of earlier versions.
+ *  `checkOnly` stops after `git apply --check`: `applied` then means the
+ *  restore would apply to the worktree as it is, and nothing was written. */
 export async function applyCheckpoint(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
+  checkOnly = false,
 ): Promise<CheckpointApplyResult> {
   // Read first: failing after the patch landed would misreport a restore.
   const outside = await pathsOutsideSnapshots(git, sourceHash, targetHash);
@@ -1371,7 +1374,7 @@ export async function applyCheckpoint(
     if (!setting) return { status: "failed" };
     config = autocrlfOffConfig(setting);
   }
-  const applied = await applyPatch(git, sourceHash, targetHash, unreadablePins, config);
+  const applied = await applyPatch(git, sourceHash, targetHash, unreadablePins, config, checkOnly);
   if (typeof applied === "string") return { status: applied };
   return { status: "applied", nestedRepositories, unreadableFiles, ...applied };
 }
@@ -1500,6 +1503,7 @@ async function applyPatch(
   targetHash: string,
   unreadablePins: readonly string[],
   config: readonly string[],
+  checkOnly: boolean,
 ): Promise<{ restoredFiles: string[] } | "conflict" | "failed"> {
   let tempDirectory: string | null = null;
   try {
@@ -1602,6 +1606,7 @@ async function applyPatch(
       return "failed";
     }
 
+    if (checkOnly) return { restoredFiles };
     const applied = await invoke(
       git,
       [...config, "apply", "--whitespace=nowarn", patchPath],
