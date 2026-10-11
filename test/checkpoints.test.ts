@@ -328,6 +328,109 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  // `eol`: what `core.autocrlf` writes for a text attribute (true: CRLF,
+  // input: LF) on every platform, where `core.eol` alone would write native.
+  it.each([
+    ["true", "\r\n"],
+    ["input", "\n"],
+  ])("restores worktree bytes exactly under core.autocrlf=%s", async (setting, eol) => {
+    const { cwd, git, snap } = await makeRepo();
+    const bytes = (name: string) => readFile(join(cwd, name), "latin1");
+    const auto = (first: string) => `${first}${eol}w2${eol}`;
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "core.autocrlf", setting]);
+      // crlf.txt is committed under autocrlf: the repository's index holds its
+      // LF blob with stat data that matches the CRLF file on disk (backdated,
+      // so git's racy check does not re-hash it anyway). w.auto has a text
+      // attribute, which still normalizes it, and is written back with the
+      // line ending `core.autocrlf` gives it.
+      await writeFile(join(cwd, ".gitattributes"), "*.auto text=auto\n");
+      await writeFile(join(cwd, "crlf.txt"), "c1\r\nc2\r\n");
+      const old = new Date(Date.now() - 60_000);
+      await utimes(join(cwd, "crlf.txt"), old, old);
+      await writeFile(join(cwd, "w.auto"), auto("w1"));
+      await git(["add", "."]);
+      await git(["commit", "-qm", "eol"]);
+      await writeFile(join(cwd, "lf.txt"), "line1\nline2\n");
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, `exact-bytes-${setting}`));
+      await writeFile(join(cwd, "lf.txt"), "line1\nchanged\n");
+      await writeFile(join(cwd, "crlf.txt"), "c1\r\nchanged\r\n");
+      await writeFile(join(cwd, "w.auto"), auto("changed"));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes("lf.txt")).toBe("line1\nline2\n");
+      expect(await bytes("crlf.txt")).toBe("c1\r\nc2\r\n");
+      expect(await bytes("w.auto")).toBe(auto("w1"));
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes("lf.txt")).toBe("line1\nchanged\n");
+      expect(await bytes("crlf.txt")).toBe("c1\r\nchanged\r\n");
+      expect(await bytes("w.auto")).toBe(auto("changed"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("records and reverts a turn that only changes line endings", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const bytes = () => readFile(join(cwd, "eol.txt"), "latin1");
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "core.autocrlf", "true"]);
+      await writeFile(join(cwd, "eol.txt"), "e1\r\ne2\r\n");
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "eol-only"));
+      await writeFile(join(cwd, "eol.txt"), "e1\ne2\n");
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+      const tree = (hash: string) => text(snap, ["rev-parse", `${hash}^{tree}`]);
+      expect(await tree(after.afterHash)).not.toBe(await tree(after.beforeHash));
+
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes()).toBe("e1\r\ne2\r\n");
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes()).toBe("e1\ne2\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("restores a checkpoint captured with line-ending conversion through that conversion", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const index = join(cwd, ".git", "legacy-index");
+    // How earlier versions snapshotted: `add -A` with the repository's
+    // conversion, and no exact-bytes line in the commit message.
+    const legacySnapshot = async () => {
+      const env = { GIT_INDEX_FILE: index };
+      await text(snap, ["read-tree", "HEAD"], { env });
+      await text(snap, ["add", "-A"], { env });
+      const tree = await text(snap, ["write-tree"], { env });
+      return text(snap, ["commit-tree", tree, "-m", "omp-undo-redo: before turn"]);
+    };
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "core.autocrlf", "true"]);
+      await writeFile(join(cwd, "old.txt"), "o1\r\no2\r\n");
+      const beforeHash = await legacySnapshot();
+      await writeFile(join(cwd, "old.txt"), "o1\r\nchanged\r\n");
+      const afterHash = await legacySnapshot();
+
+      expect(await applyCheckpoint(snap, afterHash, beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await readFile(join(cwd, "old.txt"), "latin1")).toBe("o1\r\no2\r\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("preserves staged turn state while undoing and redoing the worktree", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {
@@ -1969,7 +2072,7 @@ describe("history-safe Git checkpoints", () => {
       // Force the check to fail the way an unparsable patch would.
       const failingCheck: GitRunner = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) =>
-          args[0] === "apply" && args.includes("--check")
+          args.includes("apply") && args.includes("--check")
             ? { stdout: "", stderr: "error: unrecognized input", code: 1 }
             : snap(args, options),
         { cwd: snap.cwd, env: snap.env },
@@ -1993,7 +2096,7 @@ describe("history-safe Git checkpoints", () => {
       // IS a worktree conflict.
       const collisionCheck: GitRunner = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) =>
-          args[0] === "apply" && args.includes("--check")
+          args.includes("apply") && args.includes("--check")
             ? {
                 stdout: "",
                 stderr: "error: new-file.txt: already exists in working directory",
@@ -2074,7 +2177,7 @@ describe("history-safe Git checkpoints", () => {
       const failingApply = (mutate: () => Promise<void>): GitRunner =>
         Object.assign(
           async (args: string[], options?: Parameters<GitRunner>[1]) => {
-            if (args[0] !== "apply" || args.includes("--check")) return snap(args, options);
+            if (!args.includes("apply") || args.includes("--check")) return snap(args, options);
             await mutate();
             return { stdout: "", stderr: "error: cannot write", code: 1 };
           },
@@ -2115,10 +2218,12 @@ describe("history-safe Git checkpoints", () => {
       expect(await read("second.txt")).toBe(lines("l1"));
       await expect(lstat(join(cwd, "created.txt"))).rejects.toThrow();
 
-      // Undo under CRLF conversion: apply smudges what it writes. One file it
-      // wrote must revert, one it never touched carries a user edit outside
-      // the hunks (so `apply --check` passes) and must survive.
+      // Undo under CRLF conversion (a text attribute with core.autocrlf):
+      // apply smudges what it writes. One file it wrote must revert, one it
+      // never touched carries a user edit outside the hunks (so `apply
+      // --check` passes) and must survive.
       await git(["config", "core.autocrlf", "true"]);
+      await writeFile(join(cwd, ".gitattributes"), "*.txt text\n");
       await writeFile(join(cwd, "tracked.txt"), "turn\n");
       await writeFile(join(cwd, "second.txt"), lines("L1", "mine"));
       await writeFile(join(cwd, "created.txt"), "created\n");
