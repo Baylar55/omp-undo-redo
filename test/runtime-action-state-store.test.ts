@@ -258,7 +258,8 @@ describe("runtime action-state store", () => {
 
     await Promise.all([first.shutdown(), first.shutdown()]);
     await expect(access(join(root, "107"))).rejects.toThrow();
-    await expect(access(join(root, "108", "runtime.json"))).resolves.toBeUndefined();
+    // Bun resolves access() with null, Node with undefined: just require it not to reject.
+    await access(join(root, "108", "runtime.json"));
     await second.shutdown();
   });
 
