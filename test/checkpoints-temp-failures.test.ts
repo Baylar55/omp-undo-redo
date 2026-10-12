@@ -492,6 +492,7 @@ describe("temp-directory failure resilience", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: [],
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });

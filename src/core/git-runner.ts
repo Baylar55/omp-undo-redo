@@ -1,8 +1,10 @@
 import "./compat.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { storeRootDirectory } from "./private-repo.js";
 import type { GitRunner } from "./types.js";
 
 const TERMINATION_GRACE_MS = 250;
@@ -46,7 +48,7 @@ type ChildResult = {
 };
 
 export interface GitRunnerDependencies {
-  /** Fixed env merged after `process.env` and before per-invocation
+  /** Fixed env merged after `process.env` (minus `REPOSITORY_ENV`) and before per-invocation
    *  `options.env`, so it overrides the process environment. Used for private
    *  per-workspace repositories where GIT_DIR must be present on every command;
    *  the runner re-exposes it as `runner.env` so callers can detect it. */
@@ -64,6 +66,30 @@ type DirectGit = { exe: string; pathPrefix: string; env: Record<string, string> 
 const LAUNCHER_ENV = ["PATH", "HOME", "MSYSTEM", "PLINK_PROTOCOL", "MSYS"];
 
 let directGit: Promise<DirectGit | null> | undefined;
+
+/** `git rev-parse --local-env-vars` minus the `-c` config pair: the set git
+ *  itself clears before running a command in another repository
+ *  (run-command.c `sanitize_repo_env`). Inherited from a hook or a dotfiles
+ *  setup they would point every command at a foreign repository and
+ *  worktree; this runner picks its repository itself, through cwd or its
+ *  fixed `env`. `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` are kept on purpose
+ *  (env-supplied `safe.directory` in containers): whoever can set them could
+ *  still pass `core.worktree`, but can already set any env of this process. */
+const REPOSITORY_ENV: Record<string, true> = {
+  GIT_ALTERNATE_OBJECT_DIRECTORIES: true,
+  GIT_CONFIG: true,
+  GIT_OBJECT_DIRECTORY: true,
+  GIT_DIR: true,
+  GIT_WORK_TREE: true,
+  GIT_IMPLICIT_WORK_TREE: true,
+  GIT_GRAFT_FILE: true,
+  GIT_INDEX_FILE: true,
+  GIT_NO_REPLACE_OBJECTS: true,
+  GIT_REPLACE_REF_BASE: true,
+  GIT_PREFIX: true,
+  GIT_SHALLOW_FILE: true,
+  GIT_COMMON_DIR: true,
+};
 
 /** On Windows `git` on PATH is usually a launcher that starts the real
  *  git.exe, so every invocation costs two processes. One probe through the
@@ -131,7 +157,16 @@ async function runGit(
   direct: DirectGit | null,
 ): Promise<ChildResult> {
   const { promise, resolve } = Promise.withResolvers<ChildResult>();
-  const env: NodeJS.ProcessEnv = { ...process.env, ...direct?.env, ...options?.env };
+  // Windows env names are case-insensitive.
+  const inherited = Object.entries(process.env).filter(
+    ([key]) =>
+      !Object.hasOwn(REPOSITORY_ENV, process.platform === "win32" ? key.toUpperCase() : key),
+  );
+  const env: NodeJS.ProcessEnv = {
+    ...Object.fromEntries(inherited),
+    ...direct?.env,
+    ...options?.env,
+  };
   if (direct) {
     // Windows env names are case-insensitive; extend the existing key
     // (often `Path`) rather than adding a second one.
@@ -244,17 +279,55 @@ async function runGit(
   return promise;
 }
 
+/** Longest stderr kept per debug entry: `add -A` or `apply` can print a
+ *  line per file. */
+const DEBUG_STDERR_LIMIT = 8192;
+
+/** `OMP_UNDO_REDO_DEBUG=1`: appends `entry` (plus time and pid) to
+ *  `<storeRoot>/debug.log` as one JSON line. Not under a snapshot store: the
+ *  store's own setup is one of the failures worth logging. Synchronous, so a
+ *  process that dies right after a failure still leaves its last lines, and
+ *  lines keep their order; the cost is paid only while debugging. Every
+ *  error is ignored: logging must never fail what it observes.
+ *  ponytail: unbounded while enabled; add rotation if anyone leaves it on. */
+export function debugLog(entry: Record<string, unknown>): void {
+  if (process.env.OMP_UNDO_REDO_DEBUG !== "1") return;
+  try {
+    const root = storeRootDirectory();
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const line = { time: new Date().toISOString(), pid: process.pid, ...entry };
+    appendFileSync(join(root, "debug.log"), `${JSON.stringify(line)}\n`, { mode: 0o600 });
+  } catch {
+    // Diagnostics only.
+  }
+}
+
 export function createGitRunner(cwd: string, dependencies: GitRunnerDependencies = {}): GitRunner {
   const { env } = dependencies;
-  const runner: GitRunner = async (args, options) =>
-    runGit(
+  const runner: GitRunner = async (args, options) => {
+    const merged = { ...env, ...options?.env };
+    const started = Date.now();
+    const result = await runGit(
       cwd,
       args,
-      { ...options, env: { ...env, ...options?.env } },
+      { ...options, env: merged },
       dependencies,
       // An injected spawn is a test double; give it the plain command.
       dependencies.spawnGit ? null : await resolveDirectGit(),
     );
+    // Never stdin or stdout (snapshot content); the env is only the
+    // overrides this extension sets (paths, `LC_ALL`).
+    debugLog({
+      cwd,
+      args,
+      env: merged,
+      code: result.code,
+      error: result.error,
+      ms: Date.now() - started,
+      stderr: result.stderr.slice(0, DEBUG_STDERR_LIMIT),
+    });
+    return result;
+  };
   runner.cwd = cwd;
   if (env) runner.env = env;
   return runner;

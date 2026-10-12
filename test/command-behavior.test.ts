@@ -1,11 +1,12 @@
 import { reconstructSessionHistory } from "../src/core/history-store.js";
-import { SessionNavigation } from "../src/core/session-navigation.js";
+import { recoverInterruptedRestore, SessionNavigation } from "../src/core/session-navigation.js";
 import { describe, expect, it, vi } from "vitest";
 import type {
   GitCheckpoint,
   GitRepository,
   GitRunner,
   NavigationPort,
+  RestoreIntent,
   SessionOnlyCheckpoint,
 } from "../src/core/types.js";
 
@@ -251,7 +252,7 @@ describe("session navigation", () => {
     const navigation = new SessionNavigation(session, mockGit(), undefined, undefined, async () => {
       applyCalls++;
       await applyGate;
-      return { status: "applied", nestedRepositories: [], unreadableFiles: [] };
+      return { status: "applied", nestedRepositories: [], unreadableFiles: [], restoredFiles: [] };
     });
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
     await navigation.recordTurnEnd(checkpoint("u2", "a2"));
@@ -316,7 +317,12 @@ describe("session navigation", () => {
       undefined,
       async (_checkpoint, sourceHash, targetHash) => {
         applied.push([sourceHash, targetHash]);
-        return { status: "applied", nestedRepositories: [], unreadableFiles: [] };
+        return {
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: ["a.txt"],
+        };
       },
     );
     await navigation.recordTurnEnd(checkpoint("u1", "a1"));
@@ -325,19 +331,31 @@ describe("session navigation", () => {
 
     // A turn with no file snapshot moves the session only; it must not
     // destroy the file history recorded before or after it.
-    expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
+    expect(await navigation.undo()).toEqual({
+      status: "moved",
+      files: "restored",
+      restoredFiles: ["a.txt"],
+    });
     expect(await navigation.undo()).toMatchObject({
       files: "unavailable",
       reason: "not_repository",
     });
-    expect(await navigation.undo()).toEqual({ status: "moved", files: "restored" });
+    expect(await navigation.undo()).toEqual({
+      status: "moved",
+      files: "restored",
+      restoredFiles: ["a.txt"],
+    });
     expect(session.leaf).toBe("u1");
     expect(applied).toEqual([
       ["after-a3", "before-a3"],
       ["after-a1", "before-a1"],
     ]);
 
-    expect(await navigation.redo()).toEqual({ status: "moved", files: "restored" });
+    expect(await navigation.redo()).toEqual({
+      status: "moved",
+      files: "restored",
+      restoredFiles: ["a.txt"],
+    });
     expect(applied.at(-1)).toEqual(["before-a1", "after-a1"]);
   });
 
@@ -362,5 +380,91 @@ describe("session navigation", () => {
     await navigation.recordTurnEnd(sessionCheckpoint("u1", "a1"));
     await navigation.suspend();
     expect(calls).toBe(0);
+  });
+
+  it("keeps the restore intent when the moved cursor could not be saved", async () => {
+    const intents: string[] = [];
+    const make = (save: () => Promise<void>) =>
+      new SessionNavigation(
+        port(),
+        mockGit(),
+        undefined,
+        save,
+        async () => ({
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: [],
+        }),
+        {
+          save: async (intent) => void intents.push(`save ${intent.direction}`),
+          clear: async () => void intents.push("clear"),
+        },
+      );
+    const saved = make(async () => undefined);
+    await saved.recordTurnEnd(checkpoint("u1", "a1"));
+    expect((await saved.undo()).status).toBe("moved");
+    expect(intents.splice(0)).toEqual(["save undo", "clear"]);
+
+    let failing = false;
+    const unsaved = make(async () => {
+      if (failing) throw new Error("disk full");
+    });
+    await unsaved.recordTurnEnd(checkpoint("u1", "a1"));
+    failing = true;
+    expect((await unsaved.undo()).status).toBe("moved");
+    expect(intents).toEqual(["save undo"]);
+  });
+});
+
+describe("recoverInterruptedRestore", () => {
+  const first = checkpoint("u1", "a1");
+  const second = checkpoint("u2", "a2");
+  const state = { checkpoints: [first, second], currentIndex: 0 };
+  const intentFor = (direction: "undo" | "redo", target: GitCheckpoint): RestoreIntent => ({
+    direction,
+    beforeRef: target.beforeRef,
+    beforeHash: target.beforeHash,
+    afterRef: target.afterRef,
+    afterHash: target.afterHash,
+  });
+
+  it("moves a redo's cursor forward when only the reverse patch applies", async () => {
+    const probes: Array<[string, string]> = [];
+    const recovery = await recoverInterruptedRestore(
+      state,
+      intentFor("redo", second),
+      async (_c, from, to) => {
+        probes.push([from, to]);
+        return from === "after-a2";
+      },
+    );
+    expect(probes).toEqual([
+      ["before-a2", "after-a2"],
+      ["after-a2", "before-a2"],
+    ]);
+    expect(recovery).toEqual({ outcome: "completed", state: { ...state, currentIndex: 1 } });
+  });
+
+  it("calls an intent naming a checkpoint off the cursor stale, and a git failure unknown", async () => {
+    const never = async () => {
+      throw new Error("must not probe");
+    };
+    // The undo of `first` landed (cursor saved at -1) before the intent was cleared.
+    expect(
+      await recoverInterruptedRestore(
+        { ...state, currentIndex: -1 },
+        intentFor("undo", first),
+        never,
+      ),
+    ).toEqual({ outcome: "stale" });
+    expect(await recoverInterruptedRestore(state, intentFor("redo", first), never)).toEqual({
+      outcome: "stale",
+    });
+    expect(
+      await recoverInterruptedRestore(state, intentFor("undo", first), async () => null),
+    ).toEqual({
+      outcome: "unknown",
+    });
   });
 });

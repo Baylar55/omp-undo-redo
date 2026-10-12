@@ -1,7 +1,17 @@
 import { rm } from "node:fs/promises";
+import type * as NodeOs from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll } from "vitest";
+import { afterAll, vi } from "vitest";
+
+// Node's homedir() reads HOME (USERPROFILE on Windows) on every call; Bun's
+// ignores runtime changes, so vi.stubEnv("HOME") would not reach src under Bun.
+vi.mock("node:os", async (importOriginal) => {
+  const os = await importOriginal<typeof NodeOs>();
+  const homedir = () =>
+    process.env[process.platform === "win32" ? "USERPROFILE" : "HOME"] || os.homedir();
+  return { ...os, homedir, default: { ...os, homedir } };
+});
 
 // Every Git workspace gets a snapshot store under the store root, which
 // defaults to ~/.omp. Suites that do not pick their own root share a temp one.

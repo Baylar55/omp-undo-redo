@@ -13,7 +13,7 @@ import {
   resolvePersistentHostId,
   resolveRuntimeScope,
 } from "./core/checkpoint-owners.js";
-import { createGitRunner } from "./core/git-runner.js";
+import { createGitRunner, debugLog } from "./core/git-runner.js";
 import {
   canonicalCwd,
   ensureGitSnapshotStore,
@@ -25,8 +25,9 @@ import {
 } from "./core/private-repo.js";
 import { gcPendingPath } from "./core/git-refs.js";
 import { migrateLegacySnapshots } from "./core/legacy-snapshot-migration.js";
-import { SessionNavigation } from "./core/session-navigation.js";
+import { recoverInterruptedRestore, SessionNavigation } from "./core/session-navigation.js";
 import {
+  applyCheckpoint,
   borrowsObjects,
   checkpointNamespace,
   finishAfterTurn,
@@ -54,6 +55,7 @@ import type {
   GitRepository,
   GitRunner,
   NavigationState,
+  RestoreIntent,
   PendingTurnCheckpoint,
   SessionOnlyCheckpoint,
 } from "./core/types.js";
@@ -86,6 +88,7 @@ type SessionOnlyReason =
   | "git_unavailable"
   | "repository_unresolvable"
   | "private_repository_unavailable"
+  | "store_unavailable"
   | "unsafe_workspace";
 
 type FileBackend =
@@ -151,9 +154,7 @@ type ActivePrivateRepoEntry = {
   git?: GitRunner;
   ready: Promise<boolean>;
 };
-type PrivateRepoEntry = ActivePrivateRepoEntry | { failure: true };
-
-type HistoryWriter = { save(state: NavigationState): Promise<void> };
+type PrivateRepoEntry = ActivePrivateRepoEntry;
 
 function startPrivateRepo(
   canonical: string,
@@ -185,22 +186,18 @@ async function resolvePrivateGit(
   gitRunnerFactory: CwdGitRunnerFactory,
 ): Promise<{ repository: GitRepository; git: GitRunner } | null> {
   const canonical = canonicalCwd(cwd);
-  const existing = privateRepositories.get(canonical);
-  if (existing) {
-    if ("failure" in existing) return null;
-    const ok = await existing.ready;
-    return ok && existing.repository && existing.git
-      ? { repository: existing.repository, git: existing.git }
-      : null;
+  let entry = privateRepositories.get(canonical);
+  if (!entry) {
+    entry = startPrivateRepo(canonical, gitRunnerFactory);
+    privateRepositories.set(canonical, entry);
   }
-  const entry = startPrivateRepo(canonical, gitRunnerFactory);
-  privateRepositories.set(canonical, entry);
-  const ok = await entry.ready;
-  if (!ok || !entry.repository || !entry.git) {
-    privateRepositories.set(canonical, { failure: true });
-    return null;
+  if ((await entry.ready) && entry.repository && entry.git) {
+    return { repository: entry.repository, git: entry.git };
   }
-  return { repository: entry.repository, git: entry.git };
+  // Not cached: the next resolution tries again (a launch racing this one
+  // for the store, or a store directory fixed meanwhile).
+  if (privateRepositories.get(canonical) === entry) privateRepositories.delete(canonical);
+  return null;
 }
 
 /** Git mode: binds the worktree to its snapshot store, moving any snapshots an
@@ -246,12 +243,7 @@ export async function resolveBackend(
     // keying by commonDir would make the second worktree reuse the first's
     // runner and run git operations in the wrong directory.
     let entry = privateRepositories.get(found.worktree);
-    if (
-      !entry ||
-      "failure" in entry ||
-      !(await entry.ready) ||
-      entry.repository?.gitDir !== found.gitDir
-    ) {
+    if (!entry || !(await entry.ready) || entry.repository?.gitDir !== found.gitDir) {
       entry = startGitStore(found, gitRunnerFactory);
       privateRepositories.set(found.worktree, entry);
     }
@@ -260,7 +252,7 @@ export async function resolveBackend(
     }
     if (privateRepositories.get(found.worktree) === entry)
       privateRepositories.delete(found.worktree);
-    return { kind: "session", reason: "private_repository_unavailable" };
+    return { kind: "session", reason: "store_unavailable" };
   }
   if (resolved.reason !== "not_repository") return { kind: "session", reason: resolved.reason };
   // Checked before any store exists: a refused workspace never gets one.
@@ -275,7 +267,7 @@ export async function resolveBackend(
 function createNavigation(
   ctx: AnyContext,
   sessionId: string,
-  store: HistoryWriter | undefined,
+  store: SessionHistoryStore | undefined,
   runtimeStore: RuntimeActionStateStore,
   backend?: FileBackend,
   gitForRepository?: (repository: GitRepository) => GitRunner,
@@ -292,30 +284,24 @@ function createNavigation(
     gitForRepository ?? ((repository) => gitRunnerFactory(repository.worktree)),
     async (state) => {
       const activeSessionLeaf = manager.getLeafId();
-      await Promise.allSettled([
-        ...(store ? [store.save(state)] : []),
+      const [saved] = await Promise.allSettled([
+        store?.save(state),
         runtimeStore.publishNavigation(sessionId, state, activeSessionLeaf),
       ]);
+      // Rejecting keeps an in-flight restore's intent: the cursor is not durable.
+      if (saved.status === "rejected") throw saved.reason;
+    },
+    undefined,
+    store && {
+      save: (intent) => store.saveRestoreIntent(intent),
+      clear: () => store.clearRestoreIntent(),
     },
   );
 }
 
-const LEGACY_BLOB_DIRS = [
-  "blobs",
-  "trees",
-  "refs",
-  "locks",
-  "leases",
-  "journals",
-  "history",
-] as const;
-
-const LEGACY_BLOB_QUIET_MS = 7 * 24 * 60 * 60 * 1000;
-
 /** Delay riding out short flaps: between the two workspace stats,
- *  between retries when removing legacy blob dirs or evicted repos, and
- *  between retries when a git child still holds a directory handle on
- *  Windows. */
+ *  between retries when removing evicted repos, and between retries when a
+ *  git child still holds a directory handle on Windows. */
 const EVICTION_RETRY_DELAY_MS = 200;
 
 /** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */
@@ -334,39 +320,6 @@ async function removeDirWithRetry(path: string): Promise<boolean> {
     }
   }
   return false;
-}
-
-/** One-shot removal of the pre-v1.5.1 store layout, whose dirs hold user file
- *  content and are never reclaimed by anything else. Kept while the pre-1.5.1
- *  tail (v1.5.1 shipped 2026-08-21) can still upgrade straight to 1.6.x.
- *  ponytail: delete this, LEGACY_BLOB_DIRS, LEGACY_BLOB_QUIET_MS,
- *  cleanLegacyGitIndexes, their boot wiring, and test/legacy-blob-purge.test.ts
- *  at v1.7.0. removeDirWithRetry/EVICTION_RETRY_DELAY_MS stay: eviction uses them. */
-export async function purgeLegacyBlobStore(): Promise<void> {
-  const root = canonicalCwd(storeRootDirectory());
-  const isDir = async (name: string): Promise<boolean> =>
-    stat(join(root, name))
-      .then((s) => s.isDirectory())
-      .catch(() => false);
-  if (!(await isDir("blobs"))) return;
-  if (!(await isDir("trees")) && !(await isDir("journals"))) return;
-
-  let newest = 0;
-  for (const name of LEGACY_BLOB_DIRS) {
-    const dir = join(root, name);
-    const metadata = await stat(dir).catch(() => undefined);
-    if (!metadata) continue;
-    newest = Math.max(newest, metadata.mtimeMs);
-    // Liveness lives in these three only; blobs/ and trees/ are never walked.
-    if (name !== "locks" && name !== "leases" && name !== "history") continue;
-    for (const entry of await readdir(dir).catch(() => [])) {
-      const child = await stat(join(dir, entry)).catch(() => undefined);
-      if (child) newest = Math.max(newest, child.mtimeMs);
-    }
-  }
-  if (Date.now() - newest < LEGACY_BLOB_QUIET_MS) return;
-
-  for (const name of LEGACY_BLOB_DIRS) await removeDirWithRetry(join(root, name));
 }
 
 export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependencies = {}): void {
@@ -582,12 +535,6 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return looseObjects.length > Math.ceil(GC_AUTO_LOOSE_OBJECTS / 256);
   }
 
-  /** One-time removal of legacy git-indexes directory from pre-v1.5.1 store layout */
-  async function cleanLegacyGitIndexes(): Promise<void> {
-    const legacy = join(canonicalCwd(storeRootDirectory()), "git-indexes");
-    await rm(legacy, { recursive: true, force: true }).catch(() => undefined);
-  }
-
   /** Removes orphaned %TEMP%/omp-undo-redo-index-* dirs older than 24h.
    *  Persistent alternates (SnapshotIndexLease) keep mtime fresh while in use;
    *  only abandoned crash orphans age >24h. */
@@ -645,7 +592,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return true;
   }
 
-  /** Boot housekeeping (eviction, legacy cleanup, orphaned temp indexes)
+  /** Boot housekeeping (eviction, orphaned temp indexes)
    *  starts with the copy's first main-session event instead of at load, so
    *  a subagent's copy skips it: the main session's copy already ran it.
    *  ponytail: a copy that sees no session event within
@@ -657,10 +604,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   function startBootHousekeeping(): Promise<void> {
     if (bootEviction) return bootEviction;
     bootEviction = evictStalePrivateRepos().catch(() => undefined);
-    void cleanLegacyGitIndexes().catch(() => undefined);
     const t = setTimeout(() => {
       void sweepOrphanTempIndexes().catch(() => undefined);
-      void purgeLegacyBlobStore().catch(() => undefined);
     }, 2_000);
     t.unref?.();
     return bootEviction;
@@ -999,6 +944,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       "Git is not available.\nSession navigation still works, but file changes cannot be restored.",
     private_repository_unavailable:
       "The private snapshot repository could not be initialized.\nSession navigation still works, but file changes cannot be restored.",
+    store_unavailable:
+      "The snapshot store for this Git repository could not be initialized.\nSession navigation still works, but file changes cannot be restored.",
     unsafe_workspace:
       "File snapshots are disabled in a home directory, drive root, or temp directory: they would copy its private files.\nSession navigation still works, but file changes cannot be restored. Start OMP in a project folder to enable them.",
     repository_unresolvable:
@@ -1088,9 +1035,13 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       } else {
         restored = null;
       }
-      navigation.restoreState(
-        restored ?? reconstructSessionHistory(ctx.sessionManager, historyLeafId),
-      );
+      let state = restored ?? reconstructSessionHistory(ctx.sessionManager, historyLeafId);
+      // ponytail: without loaded history (expired, unusable, missing) the intent
+      // matches no git checkpoint and is dropped unreported, even over a
+      // half-restored worktree. Probe the intent's own hashes if that ever matters.
+      const intent = store ? await store.loadRestoreIntent() : null;
+      if (store && intent) state = await settleInterruptedRestore(ctx, store, state, intent);
+      navigation.restoreState(state);
       await runtimeStore.initializeSession(
         sessionId,
         navigation.snapshot(),
@@ -1105,6 +1056,52 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     } finally {
       if (initializations.get(sessionId) === initialization) initializations.delete(sessionId);
     }
+  }
+
+  /** Settles the restore a killed process left behind (`RestoreIntent`).
+   *  Only the cursor moves: files are never written at load. */
+  async function settleInterruptedRestore(
+    ctx: AnyContext,
+    store: SessionHistoryStore,
+    state: NavigationState,
+    intent: RestoreIntent,
+  ): Promise<NavigationState> {
+    const recovery = await recoverInterruptedRestore(
+      state,
+      intent,
+      async (checkpoint, from, to) => {
+        const { status } = await applyCheckpoint(
+          gitRunnerFor(checkpoint.repository),
+          from,
+          to,
+          true,
+        );
+        return status === "failed" ? null : status === "applied";
+      },
+    ).catch(() => ({ outcome: "unknown" as const }));
+    if (recovery.outcome === "unknown") return state;
+    const command = `/${intent.direction}`;
+    if (recovery.outcome === "completed") {
+      ctx.ui?.notify?.(
+        `The ${command} interrupted by the last exit had already restored the files; undo history now matches them.`,
+        "info",
+      );
+      // Unsaved, the intent stays and the next load moves the cursor again.
+      const saved = await store.save(recovery.state).then(
+        () => true,
+        () => false,
+      );
+      if (saved) await store.clearRestoreIntent().catch(() => undefined);
+      return recovery.state;
+    }
+    if (recovery.outcome === "partial") {
+      ctx.ui?.notify?.(
+        `The ${command} interrupted by the last exit left files partly restored; undo history was left as it was. Restore them by hand from the snapshots in ${recovery.storeDir}: ${recovery.sourceHash} (before the ${command}) and ${recovery.targetHash} (its result).`,
+        "warning",
+      );
+    }
+    await store.clearRestoreIntent().catch(() => undefined);
+    return state;
   }
 
   async function ensureNavigation(
@@ -1340,6 +1337,31 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   pi.on("session_before_branch", rememberNavigationSource);
   pi.on("session_branch", adoptSwitchedSession);
 
+  /** The backend a turn snapshots with. An unavailable store is not cached: a
+   *  launch racing this one for it, or a store directory fixed meanwhile, may
+   *  let a later turn snapshot. */
+  async function turnBackend(typed: AnyContext, sessionId: string): Promise<FileBackend> {
+    const cached = backends.get(sessionId);
+    if (
+      cached &&
+      !(
+        cached.kind === "session" &&
+        (cached.reason === "private_repository_unavailable" ||
+          cached.reason === "store_unavailable")
+      )
+    )
+      return cached;
+    const resolved = await resolveBackend(typed.cwd, privateRepositories, gitRunnerFactory);
+    if (!cached || resolved.kind !== "git") return resolved;
+    // Its navigation was built without a history store: rebuilt as
+    // session_start does, or file checkpoints would not be persisted. Not
+    // while a turn still finalizes into it; the next turn tries again.
+    if (pendingFinalizations.has(sessionId) || initializations.has(sessionId)) return cached;
+    if (!navigations.has(sessionId)) return resolved;
+    await initializeNavigation(typed, true);
+    return backends.get(sessionId) ?? resolved;
+  }
+
   pi.on("before_agent_start", (_event, ctx) =>
     track(async () => {
       if (closing) return;
@@ -1370,9 +1392,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         return;
       }
 
-      const backend =
-        backends.get(sessionId) ??
-        (await resolveBackend(typed.cwd, privateRepositories, gitRunnerFactory));
+      const backend = await turnBackend(typed, sessionId);
       backends.set(sessionId, backend);
       if (backend.kind === "session") {
         notifySessionOnly(typed, sessionId, backend.reason);
@@ -1475,8 +1495,14 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
       () => undefined,
       // Best-effort diagnostics only: the tracked promise must stay
       // never-rejecting for awaiting undo/redo handlers.
-      // eslint-disable-next-line no-console
-      (error) => console.error("[omp-undo-redo] finalize failed", error),
+      (error) => {
+        // eslint-disable-next-line no-console
+        console.error("[omp-undo-redo] finalize failed", error);
+        debugLog({
+          event: "finalize failed",
+          error: error instanceof Error ? (error.stack ?? error.message) : String(error),
+        });
+      },
     );
     pendingFinalizations.set(sessionId, tracked);
     // A slow after-snapshot must not hold the handler past the host cap. The
@@ -1696,7 +1722,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
         await evictStalePrivateRepos().catch(() => undefined);
         await Promise.allSettled(
           [...privateRepositories.values()].map(async (entry) => {
-            if ("failure" in entry || !entry.repository || !entry.git) return;
+            if (!entry.repository || !entry.git) return;
             const { repository } = entry;
             const key = gcKey(repository);
             if (!capturesSinceGcByStore.has(key)) return;

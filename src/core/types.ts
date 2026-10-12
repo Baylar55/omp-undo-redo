@@ -24,6 +24,7 @@ export const UNAVAILABLE_REASONS = [
   "file_history_gap",
   "resumed_checkpoint_unavailable",
   "private_repository_unavailable",
+  "store_unavailable",
   "unsafe_workspace",
 ] as const;
 
@@ -34,13 +35,16 @@ export type TreeNavigationResult = {
 };
 
 export type NavigationResult =
-  | { status: "moved"; files: "restored" }
+  /** `restoredFiles` (worktree root relative): every path the restore wrote,
+   *  created or deleted, whoever last edited it. */
+  | { status: "moved"; files: "restored"; restoredFiles: string[] }
   /** Restored everything the snapshot holds; `nestedRepositories` and
    *  `unreadableFiles` (worktree root relative) are outside it and were not
    *  restored. */
   | {
       status: "moved";
       files: "partial";
+      restoredFiles: string[];
       nestedRepositories: string[];
       unreadableFiles: string[];
     }
@@ -51,7 +55,10 @@ export type NavigationResult =
     }
   | { status: "empty" }
   | { status: "cancelled" }
-  | { status: "git_failed"; failure: "conflict" | "failed" }
+  /** `conflictedFiles` (worktree root relative): the paths the restore
+   *  refused; empty when git named none. */
+  | { status: "git_failed"; failure: "conflict"; conflictedFiles: string[] }
+  | { status: "git_failed"; failure: "failed" }
   | { status: "rollback_failed" };
 
 export type ActionId = "undo" | "redo";
@@ -153,6 +160,18 @@ export type TurnCheckpoint = GitCheckpoint | SessionOnlyCheckpoint;
 export interface NavigationState {
   checkpoints: TurnCheckpoint[];
   currentIndex: number;
+}
+
+/** A file restore in progress, written before `git apply` touches the
+ *  worktree and removed once the cursor is persisted, so a process killed in
+ *  between leaves a record the next load settles. Names the checkpoint by
+ *  its refs and hashes. */
+export interface RestoreIntent {
+  direction: "undo" | "redo";
+  beforeRef: string;
+  beforeHash: string;
+  afterRef: string;
+  afterHash: string;
 }
 
 export interface PendingGitCheckpoint {

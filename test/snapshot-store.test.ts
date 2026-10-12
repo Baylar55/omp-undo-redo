@@ -250,7 +250,7 @@ describe("snapshot storage", () => {
       expect(ctx.leaf).toBe(prompt.id);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Undid last turn: session moved back and file snapshot restored.",
+        "Undid last turn: session moved back and file snapshot restored. Restored files: tracked.txt.",
       );
       await pi.emit("session_shutdown", ctx);
     } finally {
@@ -280,7 +280,7 @@ describe("snapshot storage", () => {
       expect(ctx.leaf).toBe(prompt.id);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("draft\n");
       expect(ctx.ui.notifications.at(-1)?.message).toBe(
-        "Undid last turn: session moved back and file snapshot restored.",
+        "Undid last turn: session moved back and file snapshot restored. Restored files: tracked.txt.",
       );
       await pi.emit("session_shutdown", ctx);
     } finally {

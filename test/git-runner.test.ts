@@ -1,6 +1,6 @@
 import { EventEmitter, once } from "node:events";
 import type { spawn as Spawn } from "node:child_process";
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -42,6 +42,30 @@ describe("Git runner", () => {
     const result = await git(["show-ref", "--verify", "refs/heads/missing"]);
     expect(result.code).not.toBe(0);
     expect(result.error).toBeUndefined();
+  });
+
+  it("logs argv, exit code and stderr to <storeRoot>/debug.log only with OMP_UNDO_REDO_DEBUG=1", async () => {
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-runner-debug-"));
+    try {
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      const git = await runnerInTempRepo();
+      const log = join(storeRoot, "debug.log");
+      expect(await stat(log).catch(() => null)).toBeNull();
+
+      vi.stubEnv("OMP_UNDO_REDO_DEBUG", "1");
+      await git(["show-ref", "--verify", "refs/heads/missing"], { env: { LC_ALL: "C" } });
+      const entry = JSON.parse(await readFile(log, "utf8"));
+      expect(entry).toMatchObject({
+        pid: process.pid,
+        cwd: git.cwd,
+        args: ["show-ref", "--verify", "refs/heads/missing"],
+        env: { LC_ALL: "C" },
+        code: 128,
+      });
+      expect(entry.stderr).toContain("refs/heads/missing");
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+    }
   });
 
   it("settles stdin commands after Git closes", async () => {

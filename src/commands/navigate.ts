@@ -60,6 +60,8 @@ function unavailableMessage(reason: FileCheckpointUnavailableReason): string {
       return "the resumed turn has no usable file checkpoint.";
     case "private_repository_unavailable":
       return "the private snapshot repository could not be initialized.";
+    case "store_unavailable":
+      return "the snapshot store for this Git repository could not be initialized.";
     case "unsafe_workspace":
       return "file snapshots are disabled in a home directory, drive root, or temp directory.";
     case "before_snapshot_failed":
@@ -95,6 +97,13 @@ function notRestoredMessage(nested: readonly string[], unreadable: readonly stri
   return `${parts.join("; ")}.`;
 }
 
+/** The snapshots cover the whole worktree, so this names every file the
+ *  restore touched, including ones edited during the turn by someone other
+ *  than the agent (an editor, another process). */
+function restoredFilesMessage(paths: readonly string[]): string {
+  return paths.length > 0 ? ` Restored files: ${listed(paths)}.` : " No files changed.";
+}
+
 export async function runNavigation(
   navigation: SessionNavigation,
   ctx: ExtensionCommandContext,
@@ -116,11 +125,14 @@ export async function runNavigation(
         );
       } else if (outcome.files === "partial") {
         ctx.ui.notify(
-          `${verbs.movedPartialPrefix}${notRestoredMessage(outcome.nestedRepositories, outcome.unreadableFiles)}`,
+          `${verbs.movedPartialPrefix}${notRestoredMessage(outcome.nestedRepositories, outcome.unreadableFiles)}${restoredFilesMessage(outcome.restoredFiles)}`,
           "warning",
         );
       } else {
-        ctx.ui.notify(verbs.movedSuccess, "info");
+        ctx.ui.notify(
+          `${verbs.movedSuccess}${restoredFilesMessage(outcome.restoredFiles)}`,
+          "info",
+        );
       }
       break;
     }
@@ -135,7 +147,9 @@ export async function runNavigation(
       break;
     case "git_failed":
       ctx.ui.notify(
-        outcome.failure === "conflict" ? verbs.conflict : "Could not restore the Git checkpoint.",
+        outcome.failure === "conflict"
+          ? `${verbs.conflict}${outcome.conflictedFiles.length > 0 ? ` Conflicting files: ${listed(outcome.conflictedFiles)}.` : ""}`
+          : "Could not restore the Git checkpoint.",
         "warning",
       );
       break;

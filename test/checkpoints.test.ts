@@ -20,6 +20,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { SessionNavigation } from "../src/core/session-navigation.js";
 import {
+  applyCheckPaths,
   applyCheckpoint,
   checkpointNamespace,
   finishAfterTurn,
@@ -288,6 +289,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["agent.txt", "turn.txt"],
       });
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       await expect(readFile(join(cwd, "agent.txt"))).rejects.toThrow();
@@ -296,6 +298,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["agent.txt", "turn.txt"],
       });
       expect(await text(git, ["rev-parse", "HEAD"])).toBe(agentCommit);
       expect(await readFile(join(cwd, "agent.txt"), "utf8")).toBe("agent commit\n");
@@ -328,6 +331,109 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  // `eol`: what `core.autocrlf` writes for a text attribute (true: CRLF,
+  // input: LF) on every platform, where `core.eol` alone would write native.
+  it.each([
+    ["true", "\r\n"],
+    ["input", "\n"],
+  ])("restores worktree bytes exactly under core.autocrlf=%s", async (setting, eol) => {
+    const { cwd, git, snap } = await makeRepo();
+    const bytes = (name: string) => readFile(join(cwd, name), "latin1");
+    const auto = (first: string) => `${first}${eol}w2${eol}`;
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "core.autocrlf", setting]);
+      // crlf.txt is committed under autocrlf: the repository's index holds its
+      // LF blob with stat data that matches the CRLF file on disk (backdated,
+      // so git's racy check does not re-hash it anyway). w.auto has a text
+      // attribute, which still normalizes it, and is written back with the
+      // line ending `core.autocrlf` gives it.
+      await writeFile(join(cwd, ".gitattributes"), "*.auto text=auto\n");
+      await writeFile(join(cwd, "crlf.txt"), "c1\r\nc2\r\n");
+      const old = new Date(Date.now() - 60_000);
+      await utimes(join(cwd, "crlf.txt"), old, old);
+      await writeFile(join(cwd, "w.auto"), auto("w1"));
+      await git(["add", "."]);
+      await git(["commit", "-qm", "eol"]);
+      await writeFile(join(cwd, "lf.txt"), "line1\nline2\n");
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, `exact-bytes-${setting}`));
+      await writeFile(join(cwd, "lf.txt"), "line1\nchanged\n");
+      await writeFile(join(cwd, "crlf.txt"), "c1\r\nchanged\r\n");
+      await writeFile(join(cwd, "w.auto"), auto("changed"));
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes("lf.txt")).toBe("line1\nline2\n");
+      expect(await bytes("crlf.txt")).toBe("c1\r\nc2\r\n");
+      expect(await bytes("w.auto")).toBe(auto("w1"));
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes("lf.txt")).toBe("line1\nchanged\n");
+      expect(await bytes("crlf.txt")).toBe("c1\r\nchanged\r\n");
+      expect(await bytes("w.auto")).toBe(auto("changed"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("records and reverts a turn that only changes line endings", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const bytes = () => readFile(join(cwd, "eol.txt"), "latin1");
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "core.autocrlf", "true"]);
+      await writeFile(join(cwd, "eol.txt"), "e1\r\ne2\r\n");
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "eol-only"));
+      await writeFile(join(cwd, "eol.txt"), "e1\ne2\n");
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+      const tree = (hash: string) => text(snap, ["rev-parse", `${hash}^{tree}`]);
+      expect(await tree(after.afterHash)).not.toBe(await tree(after.beforeHash));
+
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes()).toBe("e1\r\ne2\r\n");
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes()).toBe("e1\ne2\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("restores a checkpoint captured with line-ending conversion through that conversion", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const index = join(cwd, ".git", "legacy-index");
+    // How earlier versions snapshotted: `add -A` with the repository's
+    // conversion, and no exact-bytes line in the commit message.
+    const legacySnapshot = async () => {
+      const env = { GIT_INDEX_FILE: index };
+      await text(snap, ["read-tree", "HEAD"], { env });
+      await text(snap, ["add", "-A"], { env });
+      const tree = await text(snap, ["write-tree"], { env });
+      return text(snap, ["commit-tree", tree, "-m", "omp-undo-redo: before turn"]);
+    };
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "core.autocrlf", "true"]);
+      await writeFile(join(cwd, "old.txt"), "o1\r\no2\r\n");
+      const beforeHash = await legacySnapshot();
+      await writeFile(join(cwd, "old.txt"), "o1\r\nchanged\r\n");
+      const afterHash = await legacySnapshot();
+
+      expect(await applyCheckpoint(snap, afterHash, beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await readFile(join(cwd, "old.txt"), "latin1")).toBe("o1\r\no2\r\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("preserves staged turn state while undoing and redoing the worktree", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {
@@ -352,6 +458,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
       expect(await readFile(savedIndexPath)).toEqual(savedIndex.raw);
@@ -373,6 +480,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
       expect(await readFile(savedIndexPath)).toEqual(indexBeforeRedo);
@@ -502,15 +610,26 @@ describe("history-safe Git checkpoints", () => {
       await writeFile(join(cwd, ".gitignore"), "# cleaned\n");
       const checkpoint = completedCheckpoint(await finishAfterTurn(snap, pending, null, null));
 
+      // `.env` is pinned to its on-disk state, so only `.gitignore` is restored.
       await expect(
         applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
-      ).resolves.toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
+      ).resolves.toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: [".gitignore"],
+      });
       expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe(".env\n");
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
       await expect(
         applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
-      ).resolves.toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
+      ).resolves.toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: [".gitignore"],
+      });
       expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe("# cleaned\n");
       expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
@@ -720,7 +839,11 @@ describe("history-safe Git checkpoints", () => {
           await writeFile(db, "v2\n");
           const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
 
-          const notRestored = { nestedRepositories: [], unreadableFiles: ["app.db"] };
+          const notRestored = {
+            nestedRepositories: [],
+            unreadableFiles: ["app.db"],
+            restoredFiles: ["tracked.txt"],
+          };
           expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
             status: "applied",
             ...notRestored,
@@ -918,12 +1041,15 @@ describe("history-safe Git checkpoints", () => {
       try {
         await initializeBranch(git, cwd);
         await writeFile(join(cwd, ":(top)-literal\tline\n.txt"), "literal path\n");
-        const nonUtf8Path = Buffer.concat([
-          Buffer.from(cwd),
-          Buffer.from(sep),
-          Buffer.from([0x6e, 0x6f, 0x6e, 0x2d, 0x75, 0x74, 0x66, 0x38, 0x2d, 0x80]),
-        ]);
-        await writeFile(nonUtf8Path, "raw path\n");
+        // APFS rejects non-UTF-8 names (EILSEQ), so macOS can't hold such a path.
+        if (process.platform !== "darwin") {
+          const nonUtf8Path = Buffer.concat([
+            Buffer.from(cwd),
+            Buffer.from(sep),
+            Buffer.from([0x6e, 0x6f, 0x6e, 0x2d, 0x75, 0x74, 0x66, 0x38, 0x2d, 0x80]),
+          ]);
+          await writeFile(nonUtf8Path, "raw path\n");
+        }
 
         const before = pendingCheckpoint(await prepareBeforeTurn(snap, "raw-paths"));
         const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
@@ -978,6 +1104,8 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        // Worktree root relative, even for a session started in `nested/`.
+        restoredFiles: ["nested/inside.txt"],
       });
       expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("inside base\n");
       expect(await readFile(join(cwd, "outside-modified.txt"), "utf8")).toBe(
@@ -995,6 +1123,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["nested/inside.txt"],
       });
       expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("inside after turn\n");
       expect(await readFile(join(cwd, "outside-modified.txt"), "utf8")).toBe(
@@ -1065,12 +1194,14 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       await git(["switch", "A"]);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await text(git, ["symbolic-ref", "--short", "HEAD"])).toBe("A");
       expect(await branchRefs(git)).toBe(refsAfterSwitch);
@@ -1242,12 +1373,14 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["after-only.txt", "staged.txt"],
       });
       expect(await indexState(git, cwd)).toEqual(saved);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["after-only.txt", "staged.txt"],
       });
       expect(await indexState(git, cwd)).toEqual(saved);
       expect(await releaseCheckpoint(snap, after)).toBe(true);
@@ -1275,12 +1408,14 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await branchRefs(git)).toBe(refs);
       expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await branchRefs(git)).toBe(refs);
       expect(await releaseCheckpoint(snap, after)).toBe(true);
@@ -1333,11 +1468,23 @@ describe("history-safe Git checkpoints", () => {
       expect(after).not.toBeNull();
       if (!after) return;
 
-      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
+      // `executable.sh` and `link to old.txt` join these where the platform
+      // records modes and symlinks.
+      const restoredFiles = [
+        "after-only Ω.txt",
+        "binary.bin",
+        "delete me.txt",
+        "new name.txt",
+        "old name.txt",
+      ];
+      const undone = await applyCheckpoint(snap, after.afterHash, after.beforeHash);
+      expect(undone).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: expect.arrayContaining(restoredFiles),
       });
+      expect(undone.status === "applied" && undone.restoredFiles).not.toContain("before-only.txt");
       expect(await readFile(join(cwd, "old name.txt"), "utf8")).toBe("old\n");
       expect(await readFile(join(cwd, "delete me.txt"), "utf8")).toBe("delete\n");
       await expect(readFile(join(cwd, "new name.txt"))).rejects.toThrow();
@@ -1356,6 +1503,7 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: expect.arrayContaining(restoredFiles),
       });
       expect(await readFile(join(cwd, "new name.txt"), "utf8")).toBe("renamed\n");
       expect(await readFile(join(cwd, "binary.bin"))).toEqual(Buffer.from([255, 254, 253, 252]));
@@ -1396,7 +1544,11 @@ describe("history-safe Git checkpoints", () => {
       const navigation = new SessionNavigation(navigationPort, snap);
       await navigation.recordTurnEnd(checkpoint);
 
-      expect(await navigation.undo()).toEqual({ status: "git_failed", failure: "conflict" });
+      expect(await navigation.undo()).toEqual({
+        status: "git_failed",
+        failure: "conflict",
+        conflictedFiles: ["tracked.txt"],
+      });
       expect(await readFile(join(cwd, "tracked.txt"))).toEqual(savedContent);
       expect(await indexState(git, cwd)).toEqual(savedIndex);
       expect(await branchRefs(git)).toBe(savedRefs);
@@ -1512,13 +1664,23 @@ describe("history-safe Git checkpoints", () => {
 
       expect(
         await applyCheckpoint(snap, finished.checkpoint.afterHash, finished.checkpoint.beforeHash),
-      ).toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
+      ).toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: ["after.txt", "before.txt"],
+      });
       await expect(readFile(join(cwd, "before.txt"), "utf8")).resolves.toBe("before\n");
       await expect(readFile(join(cwd, "after.txt"))).rejects.toThrow();
 
       expect(
         await applyCheckpoint(snap, finished.checkpoint.beforeHash, finished.checkpoint.afterHash),
-      ).toEqual({ status: "applied", nestedRepositories: [], unreadableFiles: [] });
+      ).toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: ["after.txt", "before.txt"],
+      });
       await expect(readFile(join(cwd, "after.txt"), "utf8")).resolves.toBe("after\n");
       expect((await git(["rev-parse", "HEAD"])).code).not.toBe(0);
     } finally {
@@ -1932,12 +2094,14 @@ describe("history-safe Git checkpoints", () => {
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
       expect(await applyCheckpoint(snap, beforeHash, afterHash)).toEqual({
         status: "applied",
         nestedRepositories: [],
         unreadableFiles: [],
+        restoredFiles: ["tracked.txt"],
       });
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn   \n");
     } finally {
@@ -1969,7 +2133,7 @@ describe("history-safe Git checkpoints", () => {
       // Force the check to fail the way an unparsable patch would.
       const failingCheck: GitRunner = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) =>
-          args[0] === "apply" && args.includes("--check")
+          args.includes("apply") && args.includes("--check")
             ? { stdout: "", stderr: "error: unrecognized input", code: 1 }
             : snap(args, options),
         { cwd: snap.cwd, env: snap.env },
@@ -1979,6 +2143,7 @@ describe("history-safe Git checkpoints", () => {
       await writeFile(join(cwd, "tracked.txt"), "drifted\n");
       expect(await applyCheckpoint(failingCheck, beforeHash, afterHash)).toEqual({
         status: "conflict",
+        conflictedFiles: [],
       });
 
       // An unrelated untracked file must NOT be misdiagnosed as a conflict:
@@ -1993,7 +2158,7 @@ describe("history-safe Git checkpoints", () => {
       // IS a worktree conflict.
       const collisionCheck: GitRunner = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) =>
-          args[0] === "apply" && args.includes("--check")
+          args.includes("apply") && args.includes("--check")
             ? {
                 stdout: "",
                 stderr: "error: new-file.txt: already exists in working directory",
@@ -2004,6 +2169,7 @@ describe("history-safe Git checkpoints", () => {
       );
       expect(await applyCheckpoint(collisionCheck, beforeHash, afterHash)).toEqual({
         status: "conflict",
+        conflictedFiles: ["new-file.txt"],
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -2074,7 +2240,7 @@ describe("history-safe Git checkpoints", () => {
       const failingApply = (mutate: () => Promise<void>): GitRunner =>
         Object.assign(
           async (args: string[], options?: Parameters<GitRunner>[1]) => {
-            if (args[0] !== "apply" || args.includes("--check")) return snap(args, options);
+            if (!args.includes("apply") || args.includes("--check")) return snap(args, options);
             await mutate();
             return { stdout: "", stderr: "error: cannot write", code: 1 };
           },
@@ -2115,10 +2281,12 @@ describe("history-safe Git checkpoints", () => {
       expect(await read("second.txt")).toBe(lines("l1"));
       await expect(lstat(join(cwd, "created.txt"))).rejects.toThrow();
 
-      // Undo under CRLF conversion: apply smudges what it writes. One file it
-      // wrote must revert, one it never touched carries a user edit outside
-      // the hunks (so `apply --check` passes) and must survive.
+      // Undo under CRLF conversion (a text attribute with core.autocrlf):
+      // apply smudges what it writes. One file it wrote must revert, one it
+      // never touched carries a user edit outside the hunks (so `apply
+      // --check` passes) and must survive.
       await git(["config", "core.autocrlf", "true"]);
+      await writeFile(join(cwd, ".gitattributes"), "*.txt text\n");
       await writeFile(join(cwd, "tracked.txt"), "turn\n");
       await writeFile(join(cwd, "second.txt"), lines("L1", "mine"));
       await writeFile(join(cwd, "created.txt"), "created\n");
@@ -2138,5 +2306,57 @@ describe("history-safe Git checkpoints", () => {
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
+  });
+
+  it("rolls back a file a failed smudge filter left empty", async () => {
+    // Git LFS missing an object (`git lfs prune`) fails apply's smudge after
+    // apply created the file, which emptied the current content of the file.
+    // `grep -v ^A` fails (exit 1) on "A\n" only, so restoring "B\n" works.
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await git(["config", "filter.picky.clean", "cat"]);
+      await git(["config", "filter.picky.smudge", "grep -v ^A"]);
+      await git(["config", "filter.picky.required", "true"]);
+      await writeFile(join(cwd, ".gitattributes"), "*.dat filter=picky\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "attributes"]);
+      await writeFile(join(cwd, "model.dat"), "A\n");
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "failed-smudge"));
+      await writeFile(join(cwd, "model.dat"), "B\n");
+      const after = completedCheckpoint(await finishAfterTurn(snap, before, null, null));
+
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
+        status: "failed",
+      });
+      expect(await readFile(join(cwd, "model.dat"), "utf8")).toBe("B\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("applyCheckPaths", () => {
+  it("names each refused path once, in git's order", () => {
+    const stderr = [
+      "error: patch failed: src/a.ts:12",
+      "error: src/a.ts: patch does not apply",
+      "error: notes: v2.md: patch does not apply",
+      "error: new.txt: already exists in working directory",
+      "error: gone.txt: No such file or directory",
+      "error: link: wrong type",
+      "error: run.sh has type 100644, expected 100755",
+      "error: src/a.ts: patch does not apply",
+      "error: unrecognized input",
+      "",
+    ].join("\r\n");
+    expect(applyCheckPaths(stderr)).toEqual([
+      "src/a.ts",
+      "notes: v2.md",
+      "new.txt",
+      "gone.txt",
+      "link",
+      "run.sh",
+    ]);
   });
 });

@@ -285,6 +285,38 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it("sets up a new store for every launch started at once", async () => {
+    // Launches racing on a new store collided on config.lock, and every loser
+    // went session-only for its whole session.
+    const cwd = await makeRepository();
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    try {
+      const resolved = await resolveRepository(createGitRunner(cwd));
+      if (!("repository" in resolved)) throw new Error("not a repository");
+      const { repository } = resolved;
+      const launches = Array.from({ length: 6 }, () => [
+        ensurePrivateGitRepository(factory, cwd, storeRoot),
+        ensureGitSnapshotStore(factory, repository, storeRoot),
+      ]).flat();
+      for (const result of await Promise.all(launches)) expect(result).not.toBeNull();
+      const gitDir = privateRepositoryPath(storeRoot, cwd);
+      // A launch's late `git init` resets `core.bare` behind another's config.
+      expect(await storeConfig(gitDir, "core.bare")).toEqual({ code: 0, value: "false" });
+      expect(await storeConfig(gitDir, "core.worktree")).toEqual({
+        code: 0,
+        value: await realpath(cwd),
+      });
+      const storeDir = privateRepositoryPath(storeRoot, repository.commonDir);
+      expect(await storeConfig(storeDir, GIT_STORE_SOURCE_KEY)).toEqual({
+        code: 0,
+        value: repository.commonDir,
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("does not redo a finished store on later launches", async () => {
     // A second `git init` resets `core.bare`, and a launch that rewrote every
     // key would pay a dozen git processes and widen the config.lock window for
@@ -400,6 +432,8 @@ describe("private per-workspace git repositories", () => {
       const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-shared-store-"));
       try {
         await chmod(storeRoot, 0o1777);
+        // Bun's chmod drops the sticky bit, so compare against what actually got set.
+        const sharedMode = (await stat(storeRoot)).mode & 0o7777;
         const repository = await ensurePrivateGitRepository(
           (cwd2, env) => createGitRunner(cwd2, { env }),
           cwd,
@@ -407,7 +441,7 @@ describe("private per-workspace git repositories", () => {
         );
         expect(repository).not.toBeNull();
         if (!repository) return;
-        expect((await stat(storeRoot)).mode & 0o7777).toBe(0o1777);
+        expect((await stat(storeRoot)).mode & 0o7777).toBe(sharedMode);
         expect((await stat(dirname(repository.gitDir))).mode & 0o777).toBe(0o700);
       } finally {
         await rm(cwd, { recursive: true, force: true });
@@ -503,6 +537,21 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it("names the Git-mode snapshot store, not a private repository, when it cannot be set up", async () => {
+    const cwd = await makeRepository();
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-git-store-fail-"));
+    try {
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      await writeFile(join(storeRoot, "repos"), "not a directory");
+      const backend = await resolveBackend(cwd);
+      expect(backend).toEqual({ kind: "session", reason: "store_unavailable" });
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("refuses Private-Git in the home directory, above it, in the temp directory and at a root", async () => {
     const parent = await mkdtemp(join(tmpdir(), "omp-private-home-"));
     const home = join(parent, "home");
@@ -529,6 +578,43 @@ describe("private per-workspace git repositories", () => {
       for (const cwd of [join(home, "project"), join(temp, "project")]) {
         expect((await resolveBackend(cwd)).kind, cwd).toBe("git");
       }
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(parent, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // GIT_DIR: a dotfiles repo (bare, core.worktree above the project) exported
+  // while working in an unrelated folder. GIT_WORK_TREE: exported by a hook;
+  // git honors it with a discovered repository and overrides core.worktree.
+  it.each([
+    { variable: "GIT_DIR", gitProject: false },
+    { variable: "GIT_WORK_TREE", gitProject: true },
+  ])("ignores an inherited $variable pointing outside the project", async (scenario) => {
+    const parent = await mkdtemp(join(tmpdir(), "omp-private-inherited-"));
+    const dotfiles = join(parent, "dotfiles.git");
+    const project = join(parent, "proj");
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    try {
+      await mkdir(project);
+      if (scenario.gitProject) execFileSync("git", ["init", "-q", project]);
+      await writeFile(join(parent, "secret.key"), "secret");
+      await writeFile(join(project, "code.txt"), "code");
+      execFileSync("git", ["init", "-q", "--bare", dotfiles]);
+      execFileSync("git", ["--git-dir", dotfiles, "config", "core.bare", "false"]);
+      execFileSync("git", ["--git-dir", dotfiles, "config", "core.worktree", parent]);
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      vi.stubEnv(scenario.variable, scenario.variable === "GIT_DIR" ? dotfiles : parent);
+
+      const backend = await resolveBackend(project);
+      expect(backend.kind).toBe("git");
+      if (backend.kind !== "git") return;
+      expect(backend.repository.worktree).toBe(await realpath(project));
+      const snapshot = await createSnapshotCommit(backend.git, "inherited-env");
+      if (!("hash" in snapshot)) throw new Error(JSON.stringify(snapshot));
+      const tree = await backend.git(["ls-tree", "-r", "--name-only", snapshot.hash]);
+      expect(tree.stdout.trim().split("\n")).toEqual(["code.txt"]);
     } finally {
       vi.unstubAllEnvs();
       await rm(parent, { recursive: true, force: true });
