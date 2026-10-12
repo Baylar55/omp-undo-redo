@@ -286,6 +286,48 @@ describe("private-repo housekeeping", () => {
     });
   });
 
+  it("boot housekeeping deletes nothing at the store root outside repos/", async () => {
+    // The store root may be a user-chosen directory, and it still holds the
+    // pre-1.6 layout (plaintext workspace copies) on stores upgraded from 1.5.x.
+    await withHermeticStore(async (reposDir) => {
+      const root = storeRootDirectory();
+      const stale = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      const foreign = ["blobs", "trees", "journals", "history", "git-indexes", "notes"];
+      for (const name of foreign) {
+        await mkdir(join(root, name), { recursive: true });
+        await writeFile(join(root, name, "item.txt"), "user data");
+        await utimes(join(root, name, "item.txt"), stale, stale);
+        await utimes(join(root, name), stale, stale);
+      }
+      await writeFile(join(root, "notes.txt"), "user data");
+      await utimes(join(root, "notes.txt"), stale, stale);
+      // Aged trash and an aged orphan temp index: their removal proves the boot
+      // sweep and the sweeps boot defers by 2 s both ran.
+      const trash = join(reposDir, `x.git.evicted-${Date.now() - 8 * 24 * 60 * 60 * 1000}`);
+      await mkdir(trash, { recursive: true });
+      const orphan = await mkdtemp(join(tmpdir(), "omp-undo-redo-index-root-guard-"));
+      await utimes(orphan, stale, stale);
+
+      ompUndoRedo(new FakeExtensionApi() as never, {});
+      expect(await waitFor(async () => (await readdir(reposDir)).length === 0, 100)).toBe(true);
+      expect(
+        await waitFor(
+          () =>
+            stat(orphan).then(
+              () => false,
+              () => true,
+            ),
+          100,
+        ),
+      ).toBe(true);
+
+      expect((await readdir(root)).sort()).toEqual([...foreign, "notes.txt", "repos"].sort());
+      for (const name of foreign) {
+        expect(await readFile(join(root, name, "item.txt"), "utf8")).toBe("user data");
+      }
+    });
+  }, 30000);
+
   it("keeps a freshly captured repo even when its workspace has vanished", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-fresh-"));
     try {

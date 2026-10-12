@@ -25,6 +25,18 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 - **An exported `GIT_DIR` or `GIT_WORK_TREE` decided what was snapshotted and restored.** Every git command inherited OMP's environment. With `GIT_DIR` exported for a bare dotfiles repository (`core.worktree=$HOME`), a session in an unrelated non-Git `~/proj` ran in Git mode with the home folder as its worktree: snapshots copied `.bashrc`, `secret.key` and everything else not ignored into the store, `/undo` restored across the whole home folder, and the Private-Git home-folder refusal never ran. An inherited `GIT_WORK_TREE`, which git hooks export, made a Git project resolve to that folder as its worktree (its checkpoints then fell back to session-only) and ran Private-Git's path-relative commands against the wrong folder. Git commands now start without git's repository-location variables (`git rev-parse --local-env-vars`, keeping `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` as git does for other repositories), so the working directory alone picks the repository. An exported `GIT_DIR` no longer points OMP at another repository.
 
+### Removed
+
+- **Startup no longer reclaims the pre-1.6 store layout.** The 1.6.x boot cleanup is gone, along with the `purgeLegacyBlobStore` export. It deleted the blob-mode store (once untouched for 7 days) and the pre-1.5.1 `git-indexes` directory. Anyone upgrading straight from 1.5.x keeps those directories, and the blob-mode ones hold plaintext copies of workspace files. Nothing in 1.6 or later reads them. Close every 1.5.x OMP process first (deleting a live store loses its undo history), then remove them by hand. The store root is `~/.omp/omp-undo-redo` unless `OMP_UNDO_REDO_STORE_DIR` (or `OMP_UNDO_REDO_BLOB_DIR`) sets it, or `OMP_UNDO_REDO_RUNTIME_DIR` does without a store variable. Delete these entries in it: `blobs`, `trees`, `refs`, `locks`, `leases`, `journals`, `history`, `git-indexes`. Keep `repos/`, `runtime/` and `debug.log`, which are current data.
+
+  ```bash
+  cd ~/.omp/omp-undo-redo && rm -rf blobs trees refs locks leases journals history git-indexes
+  ```
+
+  ```powershell
+  'blobs','trees','refs','locks','leases','journals','history','git-indexes' | ForEach-Object { Remove-Item -Recurse -Force (Join-Path "$HOME\.omp\omp-undo-redo" $_) -ErrorAction SilentlyContinue }
+  ```
+
 ## [1.6.6] - 2026-10-10
 
 ### Fixed

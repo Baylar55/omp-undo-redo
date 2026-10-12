@@ -299,22 +299,9 @@ function createNavigation(
   );
 }
 
-const LEGACY_BLOB_DIRS = [
-  "blobs",
-  "trees",
-  "refs",
-  "locks",
-  "leases",
-  "journals",
-  "history",
-] as const;
-
-const LEGACY_BLOB_QUIET_MS = 7 * 24 * 60 * 60 * 1000;
-
 /** Delay riding out short flaps: between the two workspace stats,
- *  between retries when removing legacy blob dirs or evicted repos, and
- *  between retries when a git child still holds a directory handle on
- *  Windows. */
+ *  between retries when removing evicted repos, and between retries when a
+ *  git child still holds a directory handle on Windows. */
 const EVICTION_RETRY_DELAY_MS = 200;
 
 /** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */
@@ -333,39 +320,6 @@ async function removeDirWithRetry(path: string): Promise<boolean> {
     }
   }
   return false;
-}
-
-/** One-shot removal of the pre-v1.5.1 store layout, whose dirs hold user file
- *  content and are never reclaimed by anything else. Kept while the pre-1.5.1
- *  tail (v1.5.1 shipped 2026-08-21) can still upgrade straight to 1.6.x.
- *  ponytail: delete this, LEGACY_BLOB_DIRS, LEGACY_BLOB_QUIET_MS,
- *  cleanLegacyGitIndexes, their boot wiring, and test/legacy-blob-purge.test.ts
- *  at v1.7.0. removeDirWithRetry/EVICTION_RETRY_DELAY_MS stay: eviction uses them. */
-export async function purgeLegacyBlobStore(): Promise<void> {
-  const root = canonicalCwd(storeRootDirectory());
-  const isDir = async (name: string): Promise<boolean> =>
-    stat(join(root, name))
-      .then((s) => s.isDirectory())
-      .catch(() => false);
-  if (!(await isDir("blobs"))) return;
-  if (!(await isDir("trees")) && !(await isDir("journals"))) return;
-
-  let newest = 0;
-  for (const name of LEGACY_BLOB_DIRS) {
-    const dir = join(root, name);
-    const metadata = await stat(dir).catch(() => undefined);
-    if (!metadata) continue;
-    newest = Math.max(newest, metadata.mtimeMs);
-    // Liveness lives in these three only; blobs/ and trees/ are never walked.
-    if (name !== "locks" && name !== "leases" && name !== "history") continue;
-    for (const entry of await readdir(dir).catch(() => [])) {
-      const child = await stat(join(dir, entry)).catch(() => undefined);
-      if (child) newest = Math.max(newest, child.mtimeMs);
-    }
-  }
-  if (Date.now() - newest < LEGACY_BLOB_QUIET_MS) return;
-
-  for (const name of LEGACY_BLOB_DIRS) await removeDirWithRetry(join(root, name));
 }
 
 export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependencies = {}): void {
@@ -581,12 +535,6 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return looseObjects.length > Math.ceil(GC_AUTO_LOOSE_OBJECTS / 256);
   }
 
-  /** One-time removal of legacy git-indexes directory from pre-v1.5.1 store layout */
-  async function cleanLegacyGitIndexes(): Promise<void> {
-    const legacy = join(canonicalCwd(storeRootDirectory()), "git-indexes");
-    await rm(legacy, { recursive: true, force: true }).catch(() => undefined);
-  }
-
   /** Removes orphaned %TEMP%/omp-undo-redo-index-* dirs older than 24h.
    *  Persistent alternates (SnapshotIndexLease) keep mtime fresh while in use;
    *  only abandoned crash orphans age >24h. */
@@ -644,7 +592,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
     return true;
   }
 
-  /** Boot housekeeping (eviction, legacy cleanup, orphaned temp indexes)
+  /** Boot housekeeping (eviction, orphaned temp indexes)
    *  starts with the copy's first main-session event instead of at load, so
    *  a subagent's copy skips it: the main session's copy already ran it.
    *  ponytail: a copy that sees no session event within
@@ -656,10 +604,8 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   function startBootHousekeeping(): Promise<void> {
     if (bootEviction) return bootEviction;
     bootEviction = evictStalePrivateRepos().catch(() => undefined);
-    void cleanLegacyGitIndexes().catch(() => undefined);
     const t = setTimeout(() => {
       void sweepOrphanTempIndexes().catch(() => undefined);
-      void purgeLegacyBlobStore().catch(() => undefined);
     }, 2_000);
     t.unref?.();
     return bootEviction;
