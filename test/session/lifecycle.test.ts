@@ -1,0 +1,1559 @@
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { createGitRunner } from "../../src/infra/git-runner.js";
+import type { GitRunner } from "../../src/types.js";
+import ompUndoRedo from "../../src/index.js";
+import {
+  context,
+  FakeExtensionApi,
+  git,
+  gitRepository,
+  makeRepository,
+  privateRefs,
+  rmRetry as rmRetryTimes,
+  type TestContext,
+  type TestEntry,
+} from "../helpers/index.js";
+import { runtimeRootDirectory, checkpointNamespace } from "../../src/infra/paths.js";
+
+/** Lifecycle tests tear down whole workspaces whose captures may still be
+ *  settling, so they retry longer than the shared default. */
+const rmRetry = (path: string): Promise<void> => rmRetryTimes(path, 10);
+
+async function makeUnbornRepository(): Promise<string> {
+  const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-unborn-"));
+  await git(cwd, ["init", "-q"]);
+  await git(cwd, ["config", "user.name", "test"]);
+  await git(cwd, ["config", "user.email", "test@example.com"]);
+  await git(cwd, ["config", "core.autocrlf", "false"]);
+  return cwd;
+}
+
+async function runtimeState(sessionId: string): Promise<Record<string, unknown>> {
+  const path = join(
+    runtimeRootDirectory(),
+    String(process.pid),
+    "sessions",
+    `${checkpointNamespace(sessionId)}.json`,
+  );
+  return JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+}
+
+async function prepareUndoneSession(
+  pi: FakeExtensionApi,
+  cwd: string,
+  sessionId: string,
+): Promise<TestContext> {
+  const ctx = context(cwd, sessionId);
+  await pi.emit("session_start", ctx);
+  await pi.emit("before_agent_start", ctx);
+  await writeFile(join(cwd, "tracked.txt"), "changed\n");
+  ctx.leaf = "turn";
+  await pi.emit("agent_end", ctx);
+  ctx.navigateTree = async (targetId) => {
+    const oldLeafId = ctx.leaf;
+    ctx.leaf = targetId;
+    await pi.emit("session_tree", ctx, {
+      type: "session_tree",
+      oldLeafId,
+      newLeafId: targetId,
+    });
+    return { cancelled: false };
+  };
+  await pi.runCommand("undo", ctx);
+  return ctx;
+}
+
+describe("session-only lifecycle fallback", () => {
+  it("restores non-Git files during undo and redo", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-non-git-lifecycle-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = await prepareUndoneSession(pi, cwd, "non-git-session");
+
+      await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("restores files for turns in an unborn repository", async () => {
+    const cwd = await makeUnbornRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = await prepareUndoneSession(pi, cwd, "unborn-session");
+
+      await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. Restored files: tracked.txt.",
+      );
+      expect(await privateRefs(cwd)).toHaveLength(2);
+      const refs = await privateRefs(cwd);
+      expect(refs.every((ref) => ref.startsWith("refs/omp-undo-redo/history/"))).toBe(true);
+      await pi.runCommand("redo", ctx);
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("names every restored file, including one edited outside the agent during the turn", async () => {
+    const cwd = await makeRepository();
+    try {
+      await writeFile(join(cwd, "notes.md"), "user draft v1\n");
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "external-edit-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "agent\n");
+      // The user saves notes.md in an editor while the turn runs.
+      await writeFile(join(cwd, "notes.md"), "user draft v2\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      await pi.emit("before_agent_start", ctx);
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. No files changed.",
+      );
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "notes.md"), "utf8")).toBe("user draft v1\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. Restored files: notes.md, tracked.txt.",
+      );
+
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "notes.md"), "utf8")).toBe("user draft v2\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: notes.md, tracked.txt.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("snapshots files once a store that failed at session start becomes available", async () => {
+    // A launch that lost the race for a new store stayed session-only for the
+    // whole session: the failed backend was cached.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-store-recovers-"));
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-undo-redo-store-recovers-store-"));
+    try {
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      await writeFile(join(storeRoot, "repos"), "not a directory");
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "store-recovers-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("could not be initialized");
+      await pi.emit("before_agent_start", ctx);
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      await rm(join(storeRoot, "repos"));
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+
+      await pi.runCommand("undo", ctx);
+      await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      vi.unstubAllEnvs();
+      await rmRetry(cwd);
+      await rmRetry(storeRoot);
+    }
+  });
+
+  it("retries a Git-mode snapshot store that failed at session start", async () => {
+    const cwd = await makeRepository();
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-undo-redo-git-store-recovers-"));
+    try {
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      await writeFile(join(storeRoot, "repos"), "not a directory");
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "git-store-recovers-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain(
+        "The snapshot store for this Git repository could not be initialized.",
+      );
+
+      await rm(join(storeRoot, "repos"));
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      vi.unstubAllEnvs();
+      await rmRetry(cwd);
+      await rmRetry(storeRoot);
+    }
+  });
+
+  it("lists the first five restored files and counts the rest", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "many-files-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      for (let index = 1; index <= 7; index++) {
+        await writeFile(join(cwd, `f${index}.txt`), `${index}\n`);
+      }
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. Restored files: f1.txt, f2.txt, f3.txt, f4.txt, f5.txt and 2 more.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("retains a session boundary when after-snapshot creation fails", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "after-failure-session");
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(1);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await writeFile(join(cwd, ".git", "HEAD"), "not-a-head\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      await writeFile(join(cwd, ".git", "HEAD"), "ref: refs/heads/master\n");
+      expect(await privateRefs(cwd)).toEqual([]);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the Git repository has an invalid HEAD.",
+      );
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("keeps undo and redo traversable across a file-history gap", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "file-history-gap-session");
+      await pi.emit("session_start", ctx);
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "B\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "C\n");
+      const head = await readFile(join(cwd, ".git", "HEAD"), "utf8");
+      await writeFile(join(cwd, ".git", "HEAD"), "not-a-head\n");
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+      await writeFile(join(cwd, ".git", "HEAD"), head);
+      // Turn 1's checkpoint survives turn 2's missing one.
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "D\n");
+      ctx.leaf = "turn-3";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(4);
+
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the Git repository has an invalid HEAD.",
+      );
+      // Turn 1 still owns a file checkpoint, so its restore is attempted and
+      // refused: the gapped turn's edit to the same file is unrecorded and
+      // would be lost. Nothing is written.
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Worktree changed; nothing was undone. Conflicting files: tracked.txt.",
+      );
+
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("C\n");
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("D\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("restores files outside the session cwd when the session starts in a subdirectory", async () => {
+    // Regression: `git apply` ignores patched paths outside its working
+    // directory, so a session started in a subdirectory restored only that
+    // subtree — and still reported "file snapshot restored".
+    const cwd = await makeRepository("omp-undo-redo-subdir-");
+    try {
+      const nested = join(cwd, "sub");
+      await mkdir(nested);
+      await writeFile(join(nested, "inside.txt"), "base\n");
+      await git(cwd, ["add", "."]);
+      await git(cwd, ["commit", "-qm", "nested"]);
+
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(nested, "subdir-session");
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await writeFile(join(nested, "inside.txt"), "changed\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(await readFile(join(nested, "inside.txt"), "utf8")).toBe("base\n");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  describe("nested repositories", () => {
+    const NOT_RESTORED =
+      "files inside nested Git repositories are outside the snapshot and were not restored";
+
+    async function nestedRepository(path: string, commit: boolean): Promise<void> {
+      await mkdir(path, { recursive: true });
+      await writeFile(join(path, "inner.txt"), "base\n");
+      await git(path, ["init", "-q"]);
+      if (!commit) return;
+      await git(path, ["add", "."]);
+      await git(path, ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"]);
+    }
+
+    /** One turn that edits `top.txt` and `<nested>/inner.txt`, then `/undo`. */
+    async function undoTurn(cwd: string, nested: string, sessionId: string): Promise<TestContext> {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, sessionId);
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "top.txt"), "turn\n");
+      await writeFile(join(cwd, nested, "inner.txt"), "turn\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", ctx);
+      expect(await readFile(join(cwd, "top.txt"), "utf8")).toBe("base\n");
+      expect(await readFile(join(cwd, nested, "inner.txt"), "utf8")).toBe("turn\n");
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "top.txt"), "utf8")).toBe("turn\n");
+      return ctx;
+    }
+
+    it("names a submodule as not restored instead of claiming a full restore", async () => {
+      const cwd = await makeRepository("omp-undo-redo-submodule-");
+      const source = await mkdtemp(join(tmpdir(), "omp-undo-redo-submodule-source-"));
+      try {
+        await nestedRepository(source, true);
+        await writeFile(join(cwd, "top.txt"), "base\n");
+        await git(cwd, [
+          "-c",
+          "protocol.file.allow=always",
+          "submodule",
+          "add",
+          "-q",
+          source,
+          "mod",
+        ]);
+        await git(cwd, ["add", "."]);
+        await git(cwd, ["commit", "-qm", "submodule"]);
+
+        const ctx = await undoTurn(cwd, "mod", "submodule-session");
+        const [undo, redo] = ctx.ui.notifications.slice(-2);
+        expect(undo).toEqual({
+          message: `Undid last turn: session moved back and file snapshot restored, but ${NOT_RESTORED}: mod. Restored files: top.txt.`,
+          level: "warning",
+        });
+        expect(redo?.message).toContain(`${NOT_RESTORED}: mod.`);
+      } finally {
+        await rmRetry(cwd);
+        await rmRetry(source);
+      }
+    });
+
+    for (const commit of [true, false]) {
+      it(`Private-Git ${commit ? "reports a committed" : "still captures around a commitless"} nested repository`, async () => {
+        const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-nested-private-"));
+        try {
+          await writeFile(join(cwd, "top.txt"), "base\n");
+          await nestedRepository(join(cwd, "app"), commit);
+
+          const ctx = await undoTurn(cwd, "app", `nested-private-${commit}`);
+          expect(ctx.ui.notifications.at(-2)?.message).toContain(`${NOT_RESTORED}: app.`);
+        } finally {
+          await rmRetry(cwd);
+        }
+      });
+    }
+  });
+
+  it("binds separate git runners to linked worktrees of the same repository", async () => {
+    // Linked worktrees share `repository.commonDir`. `resolveBackend` must
+    // cache them by `repository.worktree`, or the second linked worktree would
+    // run its git operations inside the first worktree.
+    const mainWs = await makeRepository("omp-undo-redo-main-wt-");
+    const linkedWs = await mkdtemp(join(tmpdir(), "omp-undo-redo-linked-wt-"));
+    try {
+      await git(mainWs, ["worktree", "add", "-b", "linked", linkedWs]);
+      await writeFile(join(linkedWs, "linked.txt"), "linked-base\n");
+      await git(linkedWs, ["add", "."]);
+      await git(linkedWs, ["commit", "-qm", "linked-base"]);
+
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+
+      const mainCtx = context(mainWs, "main-session");
+      const linkedCtx = context(linkedWs, "linked-session");
+      await pi.emit("session_start", mainCtx);
+      await pi.emit("session_start", linkedCtx);
+
+      // Modify only the linked worktree and undo
+      await pi.emit("before_agent_start", linkedCtx);
+      await writeFile(join(linkedWs, "linked.txt"), "linked-changed\n");
+      linkedCtx.leaf = "linked-turn";
+      await pi.emit("agent_end", linkedCtx);
+      linkedCtx.navigateTree = async (targetId) => {
+        linkedCtx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.runCommand("undo", linkedCtx);
+
+      expect(linkedCtx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(await readFile(join(linkedWs, "linked.txt"), "utf8")).toBe("linked-base\n");
+      expect(await readFile(join(mainWs, "tracked.txt"), "utf8")).toBe("base\n");
+    } finally {
+      await rmRetry(linkedWs);
+      await rmRetry(mainWs);
+    }
+  });
+
+  it("switches to the real git runner when a workspace runs git init mid-session", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-init-mid-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "init-mid-session");
+      await pi.emit("session_start", ctx);
+
+      // Turn 1: non-Git mode (uses private repo)
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "first.txt"), "first\n");
+      ctx.leaf = "turn1";
+      await pi.emit("agent_end", ctx);
+
+      // User initializes Git in the workspace:
+      await git(cwd, ["init", "-q"]);
+      await git(cwd, ["config", "user.name", "test"]);
+      await git(cwd, ["config", "user.email", "test@example.com"]);
+      await git(cwd, ["config", "core.autocrlf", "false"]);
+
+      // Turn 2: must resolve the real Git repo, not reuse the private repo runner
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "second.txt"), "second\n");
+      ctx.leaf = "turn2";
+      await pi.emit("agent_end", ctx);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      await expect(readFile(join(cwd, "second.txt"))).rejects.toThrow();
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+});
+
+describe("runtime action-state lifecycle", () => {
+  it("publishes non-Git turn availability and active leaf", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-runtime-lifecycle-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const sessionId = "runtime-turn-session";
+      const ctx = context(cwd, sessionId);
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+
+      const published = await runtimeState(sessionId);
+      expect(published.actions).toEqual([
+        { id: "undo", enabled: true },
+        { id: "redo", enabled: false },
+      ]);
+      expect(published.activeSessionLeaf).toBe("turn");
+      expect(published.actionResult).toBeUndefined();
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("publishes Undo and Redo results with selected leaves", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-runtime-navigation-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const sessionId = "runtime-navigation-session";
+      const ctx = await prepareUndoneSession(pi, cwd, sessionId);
+
+      const undone = await runtimeState(sessionId);
+      expect(undone.actions).toEqual([
+        { id: "undo", enabled: false },
+        { id: "redo", enabled: true },
+      ]);
+      expect(undone.activeSessionLeaf).toBe("leaf");
+      expect(undone.actionResult).toMatchObject({ id: "undo", applied: true });
+
+      await pi.runCommand("redo", ctx);
+      const redone = await runtimeState(sessionId);
+      expect(redone.actions).toEqual([
+        { id: "undo", enabled: true },
+        { id: "redo", enabled: false },
+      ]);
+      expect(redone.activeSessionLeaf).toBe("turn");
+      expect(redone.actionResult).toMatchObject({ id: "redo", applied: true });
+
+      await pi.emit("session_start", ctx);
+      expect((await runtimeState(sessionId)).actionResult).toBeUndefined();
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("publishes fresh failed results without changing navigation revision", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-runtime-results-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const sessionId = "runtime-result-session";
+      const ctx = await prepareUndoneSession(pi, cwd, sessionId);
+      const first = await runtimeState(sessionId);
+      const firstToken = (first.actionResult as { token: string }).token;
+
+      await pi.runCommand("undo", ctx);
+      const empty = await runtimeState(sessionId);
+      expect(empty.actionResult).toMatchObject({ id: "undo", applied: false });
+      expect((empty.actionResult as { token: string }).token).not.toBe(firstToken);
+      expect(empty.sessionRevision).toBe(first.sessionRevision);
+
+      const cancelledId = "runtime-cancelled-session";
+      const cancelled = context(cwd, cancelledId);
+      await pi.emit("session_start", cancelled);
+      await pi.emit("before_agent_start", cancelled);
+      cancelled.leaf = "cancelled-turn";
+      await pi.emit("agent_end", cancelled);
+      const beforeCancel = await runtimeState(cancelledId);
+      await pi.runCommand("undo", cancelled);
+      const afterCancel = await runtimeState(cancelledId);
+      expect(afterCancel.actionResult).toMatchObject({ id: "undo", applied: false });
+      expect(afterCancel.sessionRevision).toBe(beforeCancel.sessionRevision);
+
+      const busyId = "runtime-busy-session";
+      const busy = context(cwd, busyId);
+      await pi.emit("session_start", busy);
+      busy.isIdle = () => false;
+      await pi.runCommand("undo", busy);
+      const afterBusy = await runtimeState(busyId);
+      expect(afterBusy.actionResult).toMatchObject({ id: "undo", applied: false });
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("clears Redo and publishes new leaf after unrelated navigation", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const sessionId = "runtime-branch-session";
+      const ctx = await prepareUndoneSession(pi, cwd, sessionId);
+      const oldLeafId = ctx.leaf;
+      ctx.leaf = "unrelated";
+      await pi.emit("session_tree", ctx, {
+        type: "session_tree",
+        oldLeafId,
+        newLeafId: ctx.leaf,
+      });
+
+      const published = await runtimeState(sessionId);
+      expect(published.actions).toEqual([
+        { id: "undo", enabled: false },
+        { id: "redo", enabled: false },
+      ]);
+      expect(published.activeSessionLeaf).toBe("unrelated");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+});
+
+describe("navigation invalidation lifecycle", () => {
+  it("clears redo after unrelated session tree navigation", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = await prepareUndoneSession(pi, cwd, "tree-session");
+
+      const oldLeafId = ctx.leaf;
+      ctx.leaf = "unrelated";
+      await pi.emit("session_tree", ctx, {
+        type: "session_tree",
+        oldLeafId,
+        newLeafId: ctx.leaf,
+      });
+      await pi.runCommand("redo", ctx);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
+      expect(await privateRefs(cwd)).toEqual([]);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("keeps redo when undo of a turn started on a custom_message lands on its parent", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "custom-message-session");
+      await pi.emit("session_start", ctx);
+      // pi.sendMessage while idle appends a custom_message; the next prompt
+      // starts on it.
+      ctx.entries = [
+        { id: "custom", parentId: "leaf", type: "custom_message", customType: "note" },
+        { id: "prompt", parentId: "custom", type: "message", message: { role: "user" } },
+        { id: "turn", parentId: "prompt", type: "message", message: { role: "assistant" } },
+      ];
+      ctx.leaf = "custom";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      // OMP rule: user and non-skill custom_message targets land on the parent.
+      ctx.navigateTree = async (targetId) => {
+        const oldLeafId = ctx.leaf;
+        const target = ctx.sessionManager.getEntry(targetId);
+        const landsOnParent =
+          target?.type === "custom_message" ||
+          (target?.type === "message" && target.message?.role === "user");
+        ctx.leaf = landsOnParent ? (target.parentId as string) : targetId;
+        await pi.emit("session_tree", ctx, {
+          type: "session_tree",
+          oldLeafId,
+          newLeafId: ctx.leaf,
+        });
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      await pi.runCommand("redo", ctx);
+      expect(ctx.leaf).toBe("turn");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("clears redo for successful source session switches and branches", async () => {
+    for (const event of ["session_switch", "session_branch"] as const) {
+      const cwd = await makeRepository();
+      try {
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never);
+        const ctx = await prepareUndoneSession(pi, cwd, `${event}-session`);
+        const beforeEvent =
+          event === "session_switch" ? "session_before_switch" : "session_before_branch";
+        await pi.emit(beforeEvent, ctx);
+        await pi.emit(event, ctx);
+        await pi.runCommand("redo", ctx);
+
+        expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
+      } finally {
+        await rmRetry(cwd);
+      }
+    }
+  });
+
+  it("preserves redo when a switch is cancelled before its post-event", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = await prepareUndoneSession(pi, cwd, "cancelled-switch-session");
+
+      await pi.emit("session_before_switch", ctx);
+      await pi.runCommand("redo", ctx);
+
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+});
+
+describe("resumed session history", () => {
+  it("restores undo and redo checkpoints across runtime restarts", async () => {
+    const cwd = await makeRepository();
+    const sessionId = "resumed-session";
+    const prompt: TestEntry = {
+      id: "prompt",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: TestEntry = {
+      id: "response",
+      parentId: prompt.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    const firstExit: TestEntry = {
+      id: "first-exit",
+      parentId: response.id,
+      type: "custom",
+      customType: "session_exit",
+    };
+    const secondExit: TestEntry = {
+      id: "second-exit",
+      parentId: prompt.id,
+      type: "custom",
+      customType: "session_exit",
+    };
+    try {
+      const firstApi = new FakeExtensionApi();
+      ompUndoRedo(firstApi as never);
+      const first = context(cwd, sessionId);
+      first.leaf = prompt.id;
+      first.branch = [prompt];
+      first.entries = [prompt];
+      await firstApi.emit("session_start", first);
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      first.leaf = response.id;
+      first.branch = [prompt, response];
+      first.entries = [prompt, response];
+      await firstApi.emit("agent_end", first);
+      await firstApi.emit("session_shutdown", first);
+
+      const secondApi = new FakeExtensionApi();
+      ompUndoRedo(secondApi as never);
+      const second = context(cwd, sessionId);
+      second.leaf = firstExit.id;
+      second.branch = [prompt, response, firstExit];
+      second.entries = [prompt, response, firstExit];
+      second.navigateTree = async (targetId) => {
+        second.leaf = targetId;
+        second.branch = targetId === prompt.id ? [prompt] : [prompt, response];
+        return { cancelled: false };
+      };
+      await secondApi.emit("session_start", second);
+      await writeFile(join(cwd, "tracked.txt"), "manual\n");
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(firstExit.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("manual\n");
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Worktree changed; nothing was undone. Conflicting files: tracked.txt.",
+      );
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(prompt.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      await secondApi.emit("session_shutdown", second);
+
+      const thirdApi = new FakeExtensionApi();
+      ompUndoRedo(thirdApi as never);
+      const third = context(cwd, sessionId);
+      third.leaf = secondExit.id;
+      third.branch = [prompt, secondExit];
+      third.entries = [prompt, response, firstExit, secondExit];
+      third.navigateTree = async (targetId) => {
+        third.leaf = targetId;
+        third.branch = targetId === prompt.id ? [prompt] : [prompt, response];
+        return { cancelled: false };
+      };
+      await thirdApi.emit("session_start", third);
+      await thirdApi.runCommand("redo", third);
+      expect(third.leaf).toBe(response.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(third.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
+      );
+      await thirdApi.emit("session_shutdown", third);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  describe("an undo or redo killed between the file restore and the session move", () => {
+    const prompt: TestEntry = {
+      id: "prompt",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: TestEntry = {
+      id: "response",
+      parentId: prompt.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    const exit: TestEntry = {
+      id: "exit",
+      parentId: response.id,
+      type: "custom",
+      customType: "session_exit",
+    };
+
+    /** Runs a two-file turn, then an `/undo` (or an undo and a `/redo`) whose
+     *  session move never returns: the process "dies" there, with no shutdown. */
+    async function killed(cwd: string, sessionId: string, command: "undo" | "redo"): Promise<void> {
+      await writeFile(join(cwd, "other.txt"), "base\n");
+      await git(cwd, ["add", "."]);
+      await git(cwd, ["commit", "-qm", "other"]);
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, sessionId);
+      ctx.leaf = prompt.id;
+      ctx.branch = [prompt];
+      ctx.entries = [prompt];
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await writeFile(join(cwd, "other.txt"), "changed\n");
+      ctx.leaf = response.id;
+      ctx.branch = [prompt, response];
+      ctx.entries = [prompt, response];
+      await pi.emit("agent_end", ctx);
+      if (command === "redo") {
+        ctx.navigateTree = async (targetId) => {
+          ctx.leaf = targetId;
+          return { cancelled: false };
+        };
+        await pi.runCommand("undo", ctx);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      }
+      const { promise: navigating, resolve } = Promise.withResolvers<void>();
+      ctx.navigateTree = () => {
+        resolve();
+        return Promise.withResolvers<{ cancelled: boolean }>().promise;
+      };
+      void pi.runCommand(command, ctx);
+      await navigating;
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(
+        command === "undo" ? "base\n" : "changed\n",
+      );
+    }
+
+    /** The next process, resumed where the session file ends. */
+    async function restart(cwd: string, sessionId: string) {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, sessionId);
+      ctx.leaf = exit.id;
+      ctx.branch = [prompt, response, exit];
+      ctx.entries = [prompt, response, exit];
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        ctx.branch = targetId === prompt.id ? [prompt] : [prompt, response];
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      return { pi, ctx };
+    }
+
+    it("moves the cursor when every file was restored", async () => {
+      const cwd = await makeRepository();
+      const sessionId = "killed-undo-completed";
+      try {
+        await killed(cwd, sessionId, "undo");
+        const { pi, ctx } = await restart(cwd, sessionId);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(
+          "The /undo interrupted by the last exit had already restored the files; undo history now matches them.",
+        );
+        await pi.runCommand("redo", ctx);
+        expect(ctx.leaf).toBe(response.id);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+        expect(await readFile(join(cwd, "other.txt"), "utf8")).toBe("changed\n");
+        await pi.runCommand("undo", ctx);
+        expect(ctx.leaf).toBe(prompt.id);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+        await pi.emit("session_shutdown", ctx);
+
+        // Settled once: the next start finds nothing to recover.
+        const again = await restart(cwd, sessionId);
+        expect(again.ctx.ui.notifications).toEqual([]);
+        await again.pi.emit("session_shutdown", again.ctx);
+      } finally {
+        await rmRetry(cwd);
+      }
+    });
+
+    it("names both snapshots and keeps the cursor when files are half restored", async () => {
+      const cwd = await makeRepository();
+      const sessionId = "killed-undo-partial";
+      try {
+        await killed(cwd, sessionId, "undo");
+        // As if apply had been killed before reaching other.txt.
+        await writeFile(join(cwd, "other.txt"), "changed\n");
+        const { pi, ctx } = await restart(cwd, sessionId);
+        const warning = ctx.ui.notifications.at(-1);
+        expect(warning?.level).toBe("warning");
+        expect(warning?.message).toMatch(
+          /^The \/undo interrupted by the last exit left files partly restored; undo history was left as it was\. Restore them by hand from the snapshots in .+: [0-9a-f]{40} \(before the \/undo\) and [0-9a-f]{40} \(its result\)\.$/,
+        );
+        await pi.runCommand("undo", ctx);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(
+          "Worktree changed; nothing was undone. Conflicting files: tracked.txt.",
+        );
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(cwd);
+      }
+    });
+
+    it("moves the cursor forward after a killed redo", async () => {
+      const cwd = await makeRepository();
+      const sessionId = "killed-redo-completed";
+      try {
+        await killed(cwd, sessionId, "redo");
+        const { pi, ctx } = await restart(cwd, sessionId);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(
+          "The /redo interrupted by the last exit had already restored the files; undo history now matches them.",
+        );
+        await pi.runCommand("redo", ctx);
+        expect(ctx.ui.notifications.at(-1)?.message).toBe("Nothing to redo in this session.");
+        await pi.runCommand("undo", ctx);
+        expect(ctx.leaf).toBe(prompt.id);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+        expect(await readFile(join(cwd, "other.txt"), "utf8")).toBe("base\n");
+        await pi.emit("session_shutdown", ctx);
+      } finally {
+        await rmRetry(cwd);
+      }
+    });
+  });
+
+  it("restores multi-turn undo and redo checkpoints across runtime restarts when undone turns exist", async () => {
+    const cwd = await makeRepository();
+    const sessionId = "resumed-multi-turn-session";
+    const p1: TestEntry = {
+      id: "p1",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const r1: TestEntry = {
+      id: "r1",
+      parentId: p1.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    const p2: TestEntry = {
+      id: "p2",
+      parentId: r1.id,
+      type: "message",
+      message: { role: "user" },
+    };
+    const r2: TestEntry = {
+      id: "r2",
+      parentId: p2.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    try {
+      const firstApi = new FakeExtensionApi();
+      ompUndoRedo(firstApi as never);
+      const first = context(cwd, sessionId);
+      first.leaf = p1.id;
+      first.branch = [p1];
+      first.entries = [p1];
+      await firstApi.emit("session_start", first);
+
+      // Turn 1
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "turn1\n");
+      first.leaf = r1.id;
+      first.branch = [p1, r1];
+      first.entries = [p1, r1];
+      await firstApi.emit("agent_end", first);
+
+      // Turn 2
+      first.leaf = p2.id;
+      first.branch = [p1, r1, p2];
+      first.entries = [p1, r1, p2];
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "turn2\n");
+      first.leaf = r2.id;
+      first.branch = [p1, r1, p2, r2];
+      first.entries = [p1, r1, p2, r2];
+      await firstApi.emit("agent_end", first);
+
+      // Undo turn 2 before shutdown
+      first.navigateTree = async (targetId) => {
+        first.leaf = targetId;
+        first.branch = targetId === p2.id ? [p1, r1, p2] : [p1];
+        return { cancelled: false };
+      };
+      await firstApi.runCommand("undo", first);
+      expect(first.leaf).toBe(p2.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn1\n");
+      await firstApi.emit("session_shutdown", first);
+
+      // Resume in a fresh extension process at leaf p2
+      const secondApi = new FakeExtensionApi();
+      ompUndoRedo(secondApi as never);
+      const second = context(cwd, sessionId);
+      second.leaf = p2.id;
+      second.branch = [p1, r1, p2];
+      second.entries = [p1, r1, p2, r2];
+      second.navigateTree = async (targetId) => {
+        second.leaf = targetId;
+        if (targetId === r2.id) second.branch = [p1, r1, p2, r2];
+        else if (targetId === p2.id) second.branch = [p1, r1, p2];
+        else if (targetId === p1.id) second.branch = [p1];
+        return { cancelled: false };
+      };
+      await secondApi.emit("session_start", second);
+
+      // Redo turn 2
+      await secondApi.runCommand("redo", second);
+      expect(second.leaf).toBe(r2.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn2\n");
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Redid last turn: session moved forward and file snapshot restored. Restored files: tracked.txt.",
+      );
+
+      // Undo turn 2 again
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(p2.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn1\n");
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. Restored files: tracked.txt.",
+      );
+
+      // Undo turn 1
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(p1.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Undid last turn: session moved back and file snapshot restored. Restored files: tracked.txt.",
+      );
+
+      await secondApi.emit("session_shutdown", second);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("reconstructs conversation-only undo when no durable file history exists", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-resumed-session-only-"));
+    const prompt: TestEntry = {
+      id: "prompt",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: TestEntry = {
+      id: "response",
+      parentId: prompt.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "resumed-session-only");
+      ctx.leaf = response.id;
+      ctx.branch = [prompt, response];
+      ctx.entries = [prompt, response];
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        ctx.branch = [prompt];
+        return { cancelled: false };
+      };
+
+      await pi.emit("session_start", ctx);
+      await pi.runCommand("undo", ctx);
+
+      expect(ctx.leaf).toBe(prompt.id);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the resumed turn has no usable file checkpoint.",
+      );
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("notifies the user when durable history exists but cannot be loaded", async () => {
+    const cwd = await makeRepository();
+    const sessionId = "corrupt-history-session";
+    const prompt: TestEntry = {
+      id: "prompt",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    const response: TestEntry = {
+      id: "response",
+      parentId: prompt.id,
+      type: "message",
+      message: { role: "assistant" },
+    };
+    try {
+      const firstApi = new FakeExtensionApi();
+      ompUndoRedo(firstApi as never);
+      const first = context(cwd, sessionId);
+      first.leaf = prompt.id;
+      first.branch = [prompt];
+      first.entries = [prompt];
+      await firstApi.emit("session_start", first);
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      first.leaf = response.id;
+      first.branch = [prompt, response];
+      first.entries = [prompt, response];
+      await firstApi.emit("agent_end", first);
+      await firstApi.emit("session_shutdown", first);
+
+      // Corrupt the durable history file so the next resume hits the
+      // unavailable path (distinct from the expired tombstone path).
+      const { historyPath } = await import("../../src/history/layout.js");
+      const repo = await gitRepository(cwd);
+      await writeFile(historyPath(repo, sessionId), "{corrupted history");
+
+      const secondApi = new FakeExtensionApi();
+      ompUndoRedo(secondApi as never);
+      const second = context(cwd, sessionId);
+      second.leaf = response.id;
+      second.branch = [prompt, response];
+      second.entries = [prompt, response];
+      await secondApi.emit("session_start", second);
+
+      expect(
+        second.ui.notifications.some((n) =>
+          n.message.includes("Undo/redo file history for this session could not be loaded."),
+        ),
+      ).toBe(true);
+
+      // Undo still works in session-only mode after the warning.
+      second.navigateTree = async (targetId) => {
+        second.leaf = targetId;
+        second.branch = [prompt];
+        return { cancelled: false };
+      };
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(prompt.id);
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the resumed turn has no usable file checkpoint.",
+      );
+
+      await secondApi.emit("session_shutdown", second);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  // OMP's in-app `/resume` emits `session_switch`, not `session_start`.
+  it.each(["session_start", "session_switch"] as const)(
+    "handles session history expiration on %s and notifies user",
+    async (resumeEvent) => {
+      const cwd = await makeRepository();
+      const sessionId1 = `expired-lifecycle-session-1-${resumeEvent}`;
+      const sessionId2 = `active-lifecycle-session-2-${resumeEvent}`;
+      const prompt: TestEntry = {
+        id: "prompt",
+        parentId: null,
+        type: "message",
+        message: { role: "user" },
+      };
+      const response: TestEntry = {
+        id: "response",
+        parentId: prompt.id,
+        type: "message",
+        message: { role: "assistant" },
+      };
+
+      try {
+        const originalEnv = process.env.OMP_UNDO_REDO_RETENTION_DAYS;
+        process.env.OMP_UNDO_REDO_RETENTION_DAYS = "30";
+
+        // 1. Initial run for session 1: create a turn checkpoint
+        const firstApi = new FakeExtensionApi();
+        ompUndoRedo(firstApi as never);
+        const firstCtx = context(cwd, sessionId1);
+        firstCtx.leaf = prompt.id;
+        firstCtx.branch = [prompt];
+        firstCtx.entries = [prompt];
+
+        await firstApi.emit("session_start", firstCtx);
+        await firstApi.emit("before_agent_start", firstCtx);
+        await writeFile(join(cwd, "tracked.txt"), "changed\n");
+        firstCtx.leaf = response.id;
+        firstCtx.branch = [prompt, response];
+        firstCtx.entries = [prompt, response];
+        await firstApi.emit("agent_end", firstCtx);
+        await firstApi.emit("session_shutdown", firstCtx);
+
+        // 2. Overwrite history file timestamp for session 1 to 40 days ago
+        const { historyPath } = await import("../../src/history/layout.js");
+        const repo = await gitRepository(cwd);
+        const hPath = historyPath(repo, sessionId1);
+        const content = JSON.parse(await readFile(hPath, "utf8"));
+        content.lastAccessedAt = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+        await writeFile(hPath, JSON.stringify(content));
+        // The turn saves left a fresh cross-process heartbeat marker; drop it
+        // so no live owner is implied and the dormant session is sweepable.
+        const { activeHeartbeatPath } = await import("../../src/history/liveness.js");
+        await rm(
+          activeHeartbeatPath(
+            join(repo.storeDir, "omp-undo-redo", "history"),
+            checkpointNamespace(sessionId1),
+          ),
+          { force: true },
+        );
+
+        // 3. Start session 2 to trigger background expiration of dormant session 1
+        const secondApi = new FakeExtensionApi();
+        ompUndoRedo(secondApi as never);
+        const secondCtx = context(cwd, sessionId2);
+        await secondApi.emit("session_start", secondCtx);
+
+        // The expiration sweep runs in the background; wait until it has
+        // written the tombstone for session 1 before resuming it.
+        const { tombstonePath } = await import("../../src/history/layout.js");
+        const expirationDeadline = Date.now() + 10_000;
+        for (;;) {
+          try {
+            await access(tombstonePath(repo, sessionId1));
+            break;
+          } catch {
+            if (Date.now() > expirationDeadline) {
+              throw new Error("session 1 history was not expired within the deadline");
+            }
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+        }
+
+        // 4. Resume session 1 (now expired)
+        const resumeCtx = context(cwd, sessionId1);
+        resumeCtx.leaf = response.id;
+        resumeCtx.branch = [prompt, response];
+        resumeCtx.entries = [prompt, response];
+        resumeCtx.navigateTree = async (targetId) => {
+          resumeCtx.leaf = targetId;
+          resumeCtx.branch = [prompt];
+          return { cancelled: false };
+        };
+
+        if (resumeEvent === "session_switch") {
+          await secondApi.emit("session_before_switch", secondCtx);
+        }
+        await secondApi.emit(resumeEvent, resumeCtx);
+
+        // Verify expiration notification was shown on resume
+        expect(
+          resumeCtx.ui.notifications.some((n) =>
+            n.message.includes("Undo/redo file history for this session expired"),
+          ),
+        ).toBe(true);
+
+        // Run undo on resumed session 1
+        await secondApi.runCommand("undo", resumeCtx);
+        expect(resumeCtx.leaf).toBe(prompt.id);
+        expect(resumeCtx.ui.notifications.at(-1)?.message).toBe(
+          "Undid the session turn, but files were not restored because the resumed turn has no usable file checkpoint.",
+        );
+
+        await secondApi.emit("session_shutdown", secondCtx);
+        await secondApi.emit("session_shutdown", resumeCtx);
+
+        if (originalEnv !== undefined) {
+          process.env.OMP_UNDO_REDO_RETENTION_DAYS = originalEnv;
+        } else {
+          delete process.env.OMP_UNDO_REDO_RETENTION_DAYS;
+        }
+      } finally {
+        await rmRetry(cwd);
+      }
+    },
+  );
+});
+
+describe("extension lifecycle cleanup", () => {
+  it("retains completed checkpoints, releases pending checkpoints, and preserves unrelated refs", async () => {
+    const cwd = await makeRepository();
+    try {
+      await git(cwd, ["update-ref", "refs/keep", "HEAD"]);
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "session-one");
+
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      await pi.emit("session_shutdown", ctx);
+      await pi.emit("session_shutdown", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+      expect(await git(cwd, ["rev-parse", "refs/keep"])).toBe(
+        await git(cwd, ["rev-parse", "HEAD"]),
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("drains pending checkpoints when shutdown interrupts a turn", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "pending-session");
+
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(1);
+      await pi.emit("session_shutdown", ctx);
+      expect(await privateRefs(cwd)).toEqual([]);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("retains resumable history for every in-memory session and repository", async () => {
+    const first = await makeRepository();
+    const second = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const firstContext = context(first, "first-session");
+      const secondContext = context(second, "second-session");
+
+      await pi.emit("session_start", firstContext);
+      await pi.emit("before_agent_start", firstContext);
+      await writeFile(join(first, "tracked.txt"), "first change\n");
+      await pi.emit("agent_end", firstContext);
+      await pi.emit("session_start", secondContext);
+      await pi.emit("before_agent_start", secondContext);
+      await writeFile(join(second, "tracked.txt"), "second change\n");
+      await pi.emit("agent_end", secondContext);
+      expect(await privateRefs(first)).toHaveLength(2);
+      expect(await privateRefs(second)).toHaveLength(2);
+
+      await pi.emit("session_shutdown", secondContext);
+      expect(await privateRefs(first)).toHaveLength(2);
+      expect(await privateRefs(second)).toHaveLength(2);
+    } finally {
+      await Promise.all([rmRetry(first), rmRetry(second)]);
+    }
+  });
+
+  it("degrades to session-only navigation when git is unavailable", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      const gitUnavailableRunner: GitRunner = Object.assign(
+        async () => ({
+          stdout: "",
+          stderr: "git: command not found",
+          code: 1,
+          error: "unavailable" as const,
+        }),
+        { cwd },
+      );
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: () => gitUnavailableRunner,
+      });
+      const ctx = context(cwd, "git-unavailable-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.emit("session_start", ctx);
+      expect(ctx.ui.notifications).toContainEqual({
+        message:
+          "Git is not available.\nSession navigation still works, but file changes cannot be restored.",
+        level: "warning",
+      });
+
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed-without-git\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      const warnings = ctx.ui.notifications.filter((n) => n.level === "warning");
+      expect(warnings).toHaveLength(1);
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed-without-git\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because Git was unavailable when the checkpoint was created.",
+      );
+
+      await pi.runCommand("redo", ctx);
+      expect(ctx.leaf).toBe("turn-1");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid the session turn, but files were not restored because Git was unavailable when the checkpoint was created.",
+      );
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  // OMP binds a separate copy of the extension to every in-process subagent
+  // session; the copies share this process (and, on Windows, module state).
+  it("keeps the main session's pooled index when a subagent's copy shuts down", async () => {
+    const cwd = await makeRepository();
+    const commands: string[][] = [];
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: (dir, env) => {
+          const inner = env ? createGitRunner(dir, { env }) : createGitRunner(dir);
+          const runner: GitRunner = async (args, options) => {
+            commands.push(args);
+            return inner(args, options);
+          };
+          runner.cwd = dir;
+          if (env) runner.env = env;
+          return runner;
+        },
+      });
+      const ctx = context(cwd, "main-session");
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "first\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      const subagent = new FakeExtensionApi();
+      ompUndoRedo(subagent as never);
+      await subagent.emit("session_shutdown", context(cwd, "subagent-session"));
+
+      commands.length = 0;
+      await pi.emit("before_agent_start", ctx);
+      // Reused index: no `read-tree` reseed, so no full worktree re-hash.
+      expect(commands.some((args) => args.includes("read-tree"))).toBe(false);
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("captures nothing for a subagent session and refuses its /undo", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = Object.assign(context(cwd, "subagent-only-session"), {
+        agent: { kind: "sub" as const },
+      });
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toEqual([]);
+      // A subagent prompt that starts with `/undo` runs the command.
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("turn");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "/undo is unavailable in a subagent session.",
+      );
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+});

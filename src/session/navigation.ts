@@ -1,0 +1,306 @@
+import type {
+  GitCheckpoint,
+  GitRepository,
+  GitRunner,
+  GitRunnerFactory,
+  NavigationPort,
+  NavigationResult,
+  NavigationState,
+  RestoreIntent,
+  SessionOnlyCheckpoint,
+  TreeNavigationResult,
+  TurnCheckpoint,
+} from "../types.js";
+import { HISTORY_REF_ROOT } from "../store/refs.js";
+import { releaseCheckpoints } from "../snapshot/checkpoint-refs.js";
+import { applyCheckpoint } from "../snapshot/restore.js";
+import type { CheckpointApplyResult } from "../snapshot/restore.js";
+import { landsOnParent } from "../host-contract.js";
+
+type ExpectedTreeNavigation = {
+  oldLeafId: string | null;
+  /** Every leaf the host may land on for this target. */
+  landingLeafIds: ReadonlyArray<string | null>;
+};
+
+type ApplyCheckpoint = (
+  checkpoint: GitCheckpoint,
+  sourceHash: string,
+  targetHash: string,
+) => Promise<CheckpointApplyResult>;
+
+export type RestoreIntentPort = {
+  save(intent: RestoreIntent): Promise<void>;
+  clear(): Promise<void>;
+};
+
+export class SessionNavigation {
+  private checkpoints: TurnCheckpoint[] = [];
+  private currentIndex = -1;
+  private navigateTree: NavigationPort["navigateTree"] = async () => ({ cancelled: true });
+  private expectedTreeNavigation: ExpectedTreeNavigation | null = null;
+  private readonly gitForRepository: GitRunnerFactory;
+  private navigationTail: Promise<void> = Promise.resolve();
+  private readonly stateChanged: (state: NavigationState) => Promise<void>;
+  private readonly applyGit: ApplyCheckpoint;
+  private readonly intents: RestoreIntentPort;
+
+  constructor(
+    private readonly port: Omit<NavigationPort, "navigateTree"> & {
+      navigateTree?: NavigationPort["navigateTree"];
+    },
+    git: GitRunner,
+    gitFactory?: GitRunnerFactory,
+    stateChanged?: (state: NavigationState) => Promise<void>,
+    applyGit?: ApplyCheckpoint,
+    intents?: RestoreIntentPort,
+  ) {
+    this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git);
+    this.stateChanged = stateChanged ?? (async () => undefined);
+    this.applyGit =
+      applyGit ??
+      ((checkpoint, sourceHash, targetHash) =>
+        applyCheckpoint(this.gitForRepository(checkpoint.repository), sourceHash, targetHash));
+    this.intents = intents ?? { save: async () => undefined, clear: async () => undefined };
+    if (port.navigateTree) this.navigateTree = port.navigateTree.bind(port);
+  }
+
+  /** Teardown-only: runs outside the navigation chain. Callers guarantee no
+   *  concurrent undo/redo/turn finalization touches this instance yet
+   *  (initializeNavigation owns the object until it publishes it). */
+  restoreState(state: NavigationState): void {
+    this.checkpoints = [...state.checkpoints];
+    this.currentIndex = state.currentIndex;
+  }
+
+  snapshot(): NavigationState {
+    return { checkpoints: [...this.checkpoints], currentIndex: this.currentIndex };
+  }
+
+  /** False when the state could not be saved. */
+  private async persistState(): Promise<boolean> {
+    return this.stateChanged({
+      checkpoints: [...this.checkpoints],
+      currentIndex: this.currentIndex,
+    }).then(
+      () => true,
+      () => false,
+    );
+  }
+
+  setNavigateTree(navigateTree: NavigationPort["navigateTree"]): void {
+    this.navigateTree = navigateTree;
+  }
+
+  private serializeNavigation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.navigationTail.then(operation);
+    this.navigationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private async navigateTo(targetId: string): Promise<TreeNavigationResult> {
+    const target = this.port.getEntry(targetId);
+    this.expectedTreeNavigation = {
+      oldLeafId: this.port.getLeafId(),
+      landingLeafIds: landsOnParent(target) ? [targetId, target.parentId] : [targetId],
+    };
+    try {
+      return await this.navigateTree(targetId);
+    } catch {
+      return { cancelled: true };
+    } finally {
+      this.expectedTreeNavigation = null;
+    }
+  }
+
+  async handleSessionTreeNavigation(
+    oldLeafId: string | null,
+    newLeafId: string | null,
+  ): Promise<void> {
+    // Must run before any queueing: the host awaits this handler inside its
+    // navigateTree call, so an undo/redo's own navigation has to be recognized
+    // synchronously or it would deadlock against itself on navigationTail.
+    const expected = this.expectedTreeNavigation;
+    if (
+      expected &&
+      expected.oldLeafId === oldLeafId &&
+      expected.landingLeafIds.includes(newLeafId)
+    ) {
+      this.expectedTreeNavigation = null;
+      return;
+    }
+    if (oldLeafId === newLeafId) return;
+    await this.serializeNavigation(() => this.performInvalidateRedo());
+  }
+
+  async invalidateRedo(): Promise<void> {
+    await this.serializeNavigation(() => this.performInvalidateRedo());
+  }
+
+  private async performInvalidateRedo(): Promise<void> {
+    const discarded = this.checkpoints.splice(this.currentIndex + 1);
+    await this.persistState();
+    await this.releaseFileCheckpoints(discarded);
+  }
+
+  private async releaseFileCheckpoints(entries: readonly TurnCheckpoint[]): Promise<void> {
+    await releaseCheckpoints(
+      this.gitForRepository,
+      entries.filter((entry): entry is GitCheckpoint => entry.kind === "git"),
+    );
+  }
+
+  /** A session-only turn is a hole in the file history, not a reason to
+   *  discard the turns around it. The one genuinely unrestorable case — an
+   *  after-snapshot that raced the next turn's edits — is detected where it
+   *  happens and recorded as `file_history_gap` for that turn alone.
+   *  Checkpoints on the far side of a hole stay restorable: `applyCheckpoint`
+   *  patches instead of checking out, so an un-snapshotted turn's edits
+   *  survive when they are disjoint and produce a `conflict` when they are
+   *  not. */
+  async recordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
+    await this.serializeNavigation(() => this.performRecordTurnEnd(checkpoint));
+  }
+
+  private async performRecordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
+    const discarded = this.checkpoints.splice(
+      this.currentIndex + 1,
+      this.checkpoints.length - this.currentIndex - 1,
+    );
+    this.checkpoints.push(checkpoint);
+    this.currentIndex = this.checkpoints.length - 1;
+    await this.persistState();
+    await this.releaseFileCheckpoints(discarded);
+  }
+
+  /** Teardown-only: runs outside the navigation chain (suspend/resume path). */
+  async suspend(): Promise<void> {
+    const checkpoints = this.checkpoints;
+    this.checkpoints = [];
+    this.currentIndex = -1;
+    await releaseCheckpoints(
+      this.gitForRepository,
+      checkpoints.filter(
+        (checkpoint): checkpoint is GitCheckpoint =>
+          checkpoint.kind === "git" && !checkpoint.beforeRef.startsWith(HISTORY_REF_ROOT),
+      ),
+    );
+  }
+
+  private async navigateSession(targetId: string | null): Promise<boolean> {
+    if (!targetId) return true;
+    const result = await this.navigateTo(targetId);
+    return !result.cancelled;
+  }
+
+  private sessionOnlyResult(checkpoint: SessionOnlyCheckpoint): NavigationResult {
+    return { status: "moved", files: "unavailable", reason: checkpoint.reason };
+  }
+
+  private async applyFileCheckpoint(
+    checkpoint: GitCheckpoint,
+    source: "before" | "after",
+  ): Promise<CheckpointApplyResult> {
+    return this.applyGit(
+      checkpoint,
+      source === "before" ? checkpoint.afterHash : checkpoint.beforeHash,
+      source === "before" ? checkpoint.beforeHash : checkpoint.afterHash,
+    );
+  }
+
+  private async saveIntent(direction: "undo" | "redo", checkpoint: GitCheckpoint): Promise<void> {
+    const { beforeRef, beforeHash, afterRef, afterHash } = checkpoint;
+    await this.intents
+      .save({ direction, beforeRef, beforeHash, afterRef, afterHash })
+      .catch(() => undefined);
+  }
+
+  private async clearIntent(): Promise<void> {
+    await this.intents.clear().catch(() => undefined);
+  }
+
+  private restoredResult(applied: {
+    restoredFiles: string[];
+    nestedRepositories: string[];
+    unreadableFiles: string[];
+  }): NavigationResult {
+    const { restoredFiles, nestedRepositories, unreadableFiles } = applied;
+    return nestedRepositories.length > 0 || unreadableFiles.length > 0
+      ? { status: "moved", files: "partial", restoredFiles, nestedRepositories, unreadableFiles }
+      : { status: "moved", files: "restored", restoredFiles };
+  }
+
+  private restoreFailedResult(
+    applied: Exclude<CheckpointApplyResult, { status: "applied" }>,
+  ): NavigationResult {
+    return applied.status === "conflict"
+      ? { status: "git_failed", failure: "conflict", conflictedFiles: applied.conflictedFiles }
+      : { status: "git_failed", failure: "failed" };
+  }
+
+  undo(): Promise<NavigationResult> {
+    return this.serializeNavigation(() => this.performUndo());
+  }
+
+  private async performUndo(): Promise<NavigationResult> {
+    if (this.currentIndex < 0) return { status: "empty" };
+    const checkpoint = this.checkpoints[this.currentIndex];
+    if (checkpoint.kind === "session") {
+      if (!(await this.navigateSession(checkpoint.parentLeafId))) return { status: "cancelled" };
+      this.currentIndex--;
+      await this.persistState();
+      return this.sessionOnlyResult(checkpoint);
+    }
+
+    await this.saveIntent("undo", checkpoint);
+    const applied = await this.applyFileCheckpoint(checkpoint, "before");
+    if (applied.status !== "applied") {
+      await this.clearIntent();
+      return this.restoreFailedResult(applied);
+    }
+    if (!(await this.navigateSession(checkpoint.parentLeafId))) {
+      const compensated = await this.applyFileCheckpoint(checkpoint, "after");
+      await this.clearIntent();
+      if (compensated.status !== "applied") return { status: "rollback_failed" };
+      return { status: "cancelled" };
+    }
+    this.currentIndex--;
+    // Unsaved, the cursor dies with the process: the intent lets the next load move it.
+    if (await this.persistState()) await this.clearIntent();
+    return this.restoredResult(applied);
+  }
+
+  redo(): Promise<NavigationResult> {
+    return this.serializeNavigation(() => this.performRedo());
+  }
+
+  private async performRedo(): Promise<NavigationResult> {
+    if (this.currentIndex >= this.checkpoints.length - 1) return { status: "empty" };
+    const checkpoint = this.checkpoints[this.currentIndex + 1];
+    if (checkpoint.kind === "session") {
+      if (!(await this.navigateSession(checkpoint.leafId))) return { status: "cancelled" };
+      this.currentIndex++;
+      await this.persistState();
+      return this.sessionOnlyResult(checkpoint);
+    }
+
+    await this.saveIntent("redo", checkpoint);
+    const applied = await this.applyFileCheckpoint(checkpoint, "after");
+    if (applied.status !== "applied") {
+      await this.clearIntent();
+      return this.restoreFailedResult(applied);
+    }
+    if (!(await this.navigateSession(checkpoint.leafId))) {
+      const compensated = await this.applyFileCheckpoint(checkpoint, "before");
+      await this.clearIntent();
+      if (compensated.status !== "applied") return { status: "rollback_failed" };
+      return { status: "cancelled" };
+    }
+    this.currentIndex++;
+    if (await this.persistState()) await this.clearIntent();
+    return this.restoredResult(applied);
+  }
+}

@@ -1,6 +1,36 @@
 import tsParser from "@typescript-eslint/parser";
 import tsPlugin from "@typescript-eslint/eslint-plugin";
 
+const layer = (files, forbidden) => ({
+  files,
+  rules: {
+    "no-restricted-imports": [
+      "error",
+      {
+        patterns: [
+          {
+            group: forbidden,
+            message: "Layer violation: see docs/architecture.md (Allowed imports).",
+          },
+        ],
+      },
+    ],
+  },
+});
+
+const ALL = [
+  "**/infra/**",
+  "**/store/**",
+  "**/snapshot/**",
+  "**/history/**",
+  "**/runtime/**",
+  "**/session/**",
+  "**/host/**",
+  "**/extension.js",
+  "**/index.js",
+];
+const above = (...allowed) => ALL.filter((p) => !allowed.includes(p));
+
 export default [
   {
     ignores: ["dist/**", "coverage/**", "node_modules/**"],
@@ -31,4 +61,12 @@ export default [
       "@typescript-eslint/no-floating-promises": "error",
     },
   },
+  layer(["src/types.ts", "src/host-contract.ts"], ALL),
+  layer(["src/infra/**/*.ts"], above()),
+  layer(["src/store/**/*.ts"], above("**/infra/**")),
+  layer(["src/snapshot/**/*.ts"], above("**/infra/**", "**/store/**")),
+  layer(["src/history/**/*.ts"], above("**/infra/**", "**/store/**")),
+  layer(["src/runtime/**/*.ts"], above("**/infra/**")),
+  layer(["src/session/**/*.ts"], ["**/host/**", "**/extension.js", "**/index.js"]),
+  layer(["src/host/**/*.ts"], ["**/extension.js", "**/index.js"]),
 ];

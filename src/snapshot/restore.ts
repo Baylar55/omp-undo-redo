@@ -1,0 +1,287 @@
+import { lstat, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { GitRunner } from "../types.js";
+import { invoke } from "../infra/git-runner.js";
+import { autocrlfSetting, autocrlfOffConfig } from "./markers.js";
+import {
+  pathsOutsideSnapshots,
+  RESTORE_TIMEOUT_MS,
+  shieldIgnoredPaths,
+  pinnedTree,
+  changedPaths,
+  applyCheckPaths,
+} from "./restore-scope.js";
+
+/** `nestedRepositories` and `unreadableFiles`: paths whose contents the
+ *  restore could not touch, relative to the worktree root (see
+ *  `pathsOutsideSnapshots`). `restoredFiles`: every path the restore wrote,
+ *  created or deleted, relative to the worktree root. The snapshots cover the
+ *  whole worktree, so this includes edits made during the turn by anyone
+ *  else (an editor, another process), not only the agent's.
+ *  `conflictedFiles`: the paths `git apply --check` refused, relative to the
+ *  worktree root; empty when its output named none. */
+export type CheckpointApplyResult =
+  | {
+      status: "applied";
+      nestedRepositories: string[];
+      unreadableFiles: string[];
+      restoredFiles: string[];
+    }
+  | { status: "conflict"; conflictedFiles: string[] }
+  | { status: "failed" };
+
+/** Restores `targetHash`'s content over a worktree that currently matches
+ *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
+ *  Nested repositories and unreadable files are outside the snapshots: the
+ *  patch leaves them as they are, and an `applied` result lists them so the
+ *  caller never reports their contents as restored. Worktree files are read
+ *  and written the way the snapshots were captured: with `core.autocrlf` off
+ *  (`autocrlfOffConfig`), or through it for snapshots of earlier versions.
+ *  `checkOnly` stops after `git apply --check`: `applied` then means the
+ *  restore would apply to the worktree as it is, and nothing was written. */
+export async function applyCheckpoint(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+  checkOnly = false,
+): Promise<CheckpointApplyResult> {
+  // Read first: failing after the patch landed would misreport a restore.
+  const outside = await pathsOutsideSnapshots(git, sourceHash, targetHash);
+  if (!outside) return { status: "failed" };
+  const { nestedRepositories, unreadableFiles, unreadablePins } = outside;
+  let config: string[] = [];
+  if (outside.autocrlfOff) {
+    const setting = await autocrlfSetting(git);
+    if (!setting) return { status: "failed" };
+    config = autocrlfOffConfig(setting);
+  }
+  const applied = await applyPatch(git, sourceHash, targetHash, unreadablePins, config, checkOnly);
+  if (applied === "failed") return { status: "failed" };
+  if ("conflictedFiles" in applied) return { status: "conflict", ...applied };
+  return { status: "applied", nestedRepositories, unreadableFiles, ...applied };
+}
+
+/** `git apply` without an index first deletes every path it modifies, then
+ *  writes them back, so a failed write (locked file, full disk, killed child)
+ *  leaves paths missing and the rest at target content. Undoes exactly what
+ *  apply did, from `sourceHash` through a scratch index: paths it removed,
+ *  paths it wrote (content equals the target blob), paths it left empty (a
+ *  failed smudge filter) and paths it created. A
+ *  path still holding other content is left alone: `apply --check` accepts
+ *  drift outside the hunks, and overwriting it would destroy that edit. The
+ *  hash and the checkout run with apply's `config`, so they convert exactly
+ *  as apply did (clean filters, CRLF under `core.autocrlf` for snapshots of
+ *  earlier versions) while tree blobs hold the cleaned form.
+ *  Best effort: gitlinks are never touched by apply; a path with a newline in
+ *  its name cannot be hashed; symlinks, typechanges and a directory sitting
+ *  where a deleted file was are left as found. The hash-then-checkout window
+ *  cannot be locked, so an edit landing inside it is overwritten. */
+async function rollbackPartialApply(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+  directory: string,
+  config: readonly string[],
+): Promise<void> {
+  const worktree = git.cwd;
+  if (!worktree) return;
+  const timeoutMs = RESTORE_TIMEOUT_MS;
+  const changes = await invoke(
+    git,
+    ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
+    { timeoutMs },
+  );
+  if (changes.error || changes.code !== 0) return;
+
+  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
+  const restore: string[] = [];
+  const written = new Map<string, string>();
+  const fields = changes.stdout.split("\0");
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const [sourceMode, targetMode, , targetSha, status] = fields[index]!.slice(1).split(" ");
+    const path = fields[index + 1]!;
+    if (sourceMode === "160000" || targetMode === "160000") continue;
+    const present = await lstat(join(worktree, path)).catch(() => null);
+    if (status === "A") {
+      // `apply --check` proved the path absent, so anything there is apply's.
+      if (present && !present.isDirectory()) {
+        await rm(join(worktree, path), { force: true }).catch(() => undefined);
+      }
+    } else if (!present) {
+      restore.push(path);
+    } else if (status !== "D" && present.isFile() && present.size === 0) {
+      // Apply creates a file before converting its content, so a failed
+      // smudge filter (Git LFS missing an object) leaves it empty. `apply
+      // --check` proved the path held its hunks' preimage, so an empty file
+      // is apply's write or an empty source: restoring the source is safe.
+      restore.push(path);
+    } else if (status !== "D" && present.isFile() && !path.includes("\n")) {
+      written.set(path, targetSha!);
+    }
+  }
+  if (written.size > 0) {
+    const paths = [...written.keys()];
+    const hashed = await invoke(git, [...config, "hash-object", "--stdin-paths"], {
+      stdin: `${paths.join("\n")}\n`,
+      timeoutMs,
+    });
+    if (hashed.code === 0 && !hashed.error) {
+      const ids = hashed.stdout.split("\n");
+      paths.forEach((path, index) => {
+        if (ids[index] === written.get(path)) restore.push(path);
+      });
+    }
+  }
+  if (restore.length === 0) return;
+
+  const env: Record<string, string> = { GIT_INDEX_FILE: join(directory, "rollback-index") };
+  if (git.env?.GIT_DIR) env.GIT_WORK_TREE = worktree;
+  if ((await invoke(git, ["read-tree", sourceHash], { env })).code !== 0) return;
+  await invoke(git, [...config, "checkout-index", "-f", "-z", "--stdin"], {
+    env,
+    stdin: restore.map((path) => `${path}\0`).join(""),
+    timeoutMs,
+  });
+}
+
+/** Every flag pins the plumbing contract against the user's own
+ *  configuration, each of which otherwise kills restoration outright on that
+ *  machine: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` produce a patch
+ *  `git apply -p1` cannot resolve; `color.diff=always` prefixes it with ANSI
+ *  escapes ("No valid patches in input"); `diff.external` and textconv
+ *  filters replace it with another program's output; `diff.submodule=log`
+ *  replaces a gitlink hunk with a commit listing, which invalidates the whole
+ *  patch; `diff.context=0` yields hunks `git apply` refuses without
+ *  `--unidiff-zero`; `apply.whitespace=error` rejects content git itself
+ *  snapshotted. `config`: `-c` args for every command that reads or writes
+ *  worktree files (see `applyCheckpoint`). */
+async function applyPatch(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+  unreadablePins: readonly string[],
+  config: readonly string[],
+  checkOnly: boolean,
+): Promise<{ restoredFiles: string[] } | { conflictedFiles: string[] } | "failed"> {
+  let tempDirectory: string | null = null;
+  try {
+    tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
+    const patchPath = join(tempDirectory, "checkpoint.patch");
+    const restore = { timeoutMs: RESTORE_TIMEOUT_MS };
+    const ignoredPins = await shieldIgnoredPaths(git, sourceHash, targetHash, tempDirectory);
+    if (!ignoredPins) return "failed";
+    const effectiveTarget = await pinnedTree(
+      git,
+      targetHash,
+      [...ignoredPins, ...unreadablePins],
+      tempDirectory,
+    );
+    if (!effectiveTarget) return "failed";
+    const diff = await invoke(
+      git,
+      [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-relative",
+        "--ignore-submodules=none",
+        "--submodule=short",
+        "-U3",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--exit-code",
+        "--binary",
+        sourceHash,
+        effectiveTarget,
+        `--output=${patchPath}`,
+      ],
+      restore,
+    );
+    // A killed or unspawnable child also exits 1, which is `--exit-code`'s
+    // "there were differences": without this the truncated patch `--output`
+    // already wrote would be applied and reported as a complete restore.
+    if (diff.error) return "failed";
+    if (diff.code === 0) return { restoredFiles: [] };
+    if (diff.code !== 1) return "failed";
+    // Listed before applying: failing after the patch landed would misreport.
+    const restoredFiles = await changedPaths(git, sourceHash, effectiveTarget);
+    if (!restoredFiles) return "failed";
+
+    const check = await invoke(
+      git,
+      [...config, "apply", "--whitespace=nowarn", "--check", patchPath],
+      {
+        ...restore,
+        env: { LC_ALL: "C" },
+      },
+    );
+    if (check.code !== 0) {
+      if (check.error) return "failed";
+      // `apply --check` failing does not prove the worktree drifted: a patch
+      // git cannot parse fails identically. When the worktree still matches
+      // the source snapshot, the patch is at fault — report that instead of
+      // blaming the worktree and sending the user to clean an already clean
+      // one.
+      //
+      // The probe runs against its own index seeded from `sourceHash`, never
+      // the repository's: a private repo never writes its index at all (its
+      // snapshots use alternates), so `git diff <commit>` there reports every
+      // path as deleted, and a user's real index may carry staged adds or
+      // deletes that are not worktree drift. `read-tree` records no stat data,
+      // so the comparison must fall back to content — which is what
+      // `diff.autoRefreshIndex` controls, hence pinning it. Reading the
+      // worktree side is the one restore step `core.safecrlf` reaches (apply,
+      // `hash-object` without `-w` and `checkout-index` never consult it):
+      // pinned off as in `addWorktree`, so a text attribute cannot buffer one
+      // warning per file.
+      const probeEnv: Record<string, string> = {
+        GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
+      };
+      if (git.env?.GIT_DIR && git.cwd) probeEnv.GIT_WORK_TREE = git.cwd;
+      const seeded = await invoke(git, ["read-tree", sourceHash], { env: probeEnv });
+      if (seeded.error || seeded.code !== 0) return "failed";
+      const tracked = await invoke(
+        git,
+        [
+          ...config,
+          "-c",
+          "core.safecrlf=false",
+          "-c",
+          "diff.autoRefreshIndex=true",
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--quiet",
+          sourceHash,
+          "--",
+        ],
+        { env: probeEnv, timeoutMs: RESTORE_TIMEOUT_MS },
+      );
+      if (tracked.error) return "failed";
+      const conflict = { conflictedFiles: applyCheckPaths(check.stderr) };
+      if (tracked.code !== 0) return conflict;
+      if (check.stderr.includes("already exists in working directory")) return conflict;
+      return "failed";
+    }
+
+    if (checkOnly) return { restoredFiles };
+    const applied = await invoke(
+      git,
+      [...config, "apply", "--whitespace=nowarn", patchPath],
+      restore,
+    );
+    if (applied.code === 0) return { restoredFiles };
+    await rollbackPartialApply(git, sourceHash, effectiveTarget, tempDirectory, config).catch(
+      () => undefined,
+    );
+    return "failed";
+  } catch {
+    return "failed";
+  } finally {
+    if (tempDirectory !== null) {
+      await rm(tempDirectory, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+}

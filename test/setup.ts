@@ -33,8 +33,8 @@ if (!process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
 // Snapshot index leases live in %TEMP%/omp-undo-redo-index-* until
 // session_shutdown, which most suites never emit. Each test file runs in its
 // own worker process, so its leases are all released here. Imported late:
-// a static import would load checkpoints.js before a suite's vi.mock applies.
+// a static import would load index-leases.js before a suite's vi.mock applies.
 afterAll(async () => {
-  const { releaseAllPersistentSnapshotIndices } = await import("../src/core/checkpoints.js");
+  const { releaseAllPersistentSnapshotIndices } = await import("../src/snapshot/index-leases.js");
   await releaseAllPersistentSnapshotIndices();
 });
