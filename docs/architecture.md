@@ -75,7 +75,7 @@ src/
 │       ├── gc.ts                runPrivateGc, runCaptureGc, storeNeedsGc, GcQueue
 │       ├── eviction.ts          evictStalePrivateRepos, storeSource
 │       ├── temp-sweep.ts        sweepOrphanTempIndexes
-│       └── legacy.ts            pre-1.6 cleanup + legacy snapshot migration (delete at 1.7.0)
+│       └── legacy.ts            legacy snapshot migration (refs an earlier version left in .git)
 │
 ├── snapshot/
 │   ├── markers.ts               commit-message markers, autocrlf helpers, OutsideSnapshot

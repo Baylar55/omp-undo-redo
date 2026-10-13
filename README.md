@@ -35,7 +35,7 @@ omp plugin install @baylarsadigov/omp-undo-redo
 To pin an exact release:
 
 ```sh
-omp plugin install @baylarsadigov/omp-undo-redo@1.6.6
+omp plugin install @baylarsadigov/omp-undo-redo@1.7.0
 ```
 
 OMP discovers the compiled entry through the package manifest:
@@ -61,7 +61,7 @@ pi install npm:@baylarsadigov/omp-undo-redo
 To pin a release:
 
 ```sh
-pi install npm:@baylarsadigov/omp-undo-redo@1.6.6
+pi install npm:@baylarsadigov/omp-undo-redo@1.7.0
 ```
 
 To update installed Pi packages:

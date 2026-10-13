@@ -7,7 +7,6 @@ import { track } from "../infra/async.js";
 import { canonicalCwd, checkpointNamespace, storeRootDirectory } from "../infra/paths.js";
 import { evictStalePrivateRepos, storeSource } from "../store/maintenance/eviction.js";
 import { runCaptureGc, storeNeedsGc } from "../store/maintenance/gc.js";
-import { cleanLegacyGitIndexes, purgeLegacyBlobStore } from "../store/maintenance/legacy.js";
 import { sweepOrphanTempIndexes } from "../store/maintenance/temp-sweep.js";
 import type { GitRepository, GitRunner } from "../types.js";
 import type { ExtensionServices } from "./services.js";
@@ -45,7 +44,7 @@ function storeWorkInFlight(services: ExtensionServices): boolean {
   );
 }
 
-/** Boot housekeeping (eviction, legacy cleanup, orphaned temp indexes)
+/** Boot housekeeping (eviction, orphaned temp indexes)
  *  starts with the copy's first main-session event instead of at load, so
  *  a subagent's copy skips it: the main session's copy already ran it.
  *  ponytail: a copy that sees no session event within
@@ -58,10 +57,8 @@ export function startBootHousekeeping(services: ExtensionServices): Promise<void
   services.bootEviction = evictStalePrivateRepos(services.gitRunnerFactory, () =>
     storeWorkInFlight(services),
   ).catch(() => undefined);
-  void cleanLegacyGitIndexes().catch(() => undefined);
   const t = setTimeout(() => {
     void sweepOrphanTempIndexes().catch(() => undefined);
-    void purgeLegacyBlobStore().catch(() => undefined);
   }, 2_000);
   t.unref?.();
   return services.bootEviction;

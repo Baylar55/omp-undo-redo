@@ -11,9 +11,8 @@ import { GIT_STORE_SOURCE_KEY } from "../git-store.js";
 import { storeHasRefs } from "./gc.js";
 
 /** Delay riding out short flaps: between the two workspace stats,
- *  between retries when removing legacy blob dirs or evicted repos, and
- *  between retries when a git child still holds a directory handle on
- *  Windows. */
+ *  between retries when removing evicted repos, and between retries when a
+ *  git child still holds a directory handle on Windows. */
 const EVICTION_RETRY_DELAY_MS = 200;
 
 /** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */

@@ -4,10 +4,6 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 ## [Unreleased]
 
-### Added
-
-- **`OMP_UNDO_REDO_DEBUG=1` logs every git command.** Failures were caught and turned into a generic notice, so a bug report carried nothing to diagnose. With the variable set to `1`, each git invocation appends one JSON line to `<storeRoot>/debug.log`: working directory, arguments, the environment overrides the extension sets, exit code, duration and up to 8 KiB of stderr; a turn whose recording failed logs its error there too (it previously went only to the console). Lines are written synchronously, so a process that dies right after a failure keeps them. Stdin and stdout (snapshot content) are never logged. The log is written outside any snapshot store, so a store that cannot be set up is logged too, and it is not rotated.
-
 ### Changed
 
 - **Source reorganized into layers.** Internal only: files moved from `src/core` into
@@ -19,6 +15,15 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - **A history file written by a newer version was refused whole.** A session-only checkpoint whose reason this version did not know (one a later release added) made the file fail validation, so the session reported "Undo/redo file history for this session could not be loaded" and lost every file checkpoint in it. Such a row now loads as an unavailable checkpoint (`resumed_checkpoint_unavailable`), and the rest of the history, file checkpoints included, loads as before.
 - **The startup sweep of `runtime/` could delete a directory that was not a runtime directory.** A numerically named directory without a readable `runtime.json` (missing or corrupt) was deleted once it was 24 h old, so a configured runtime root shared with other files could lose them. Only a directory whose marker names the `omp-undo-redo/runtime` protocol is now ever reaped; everything else is left alone.
 - **Startup deleted whatever already sat at `runtime/<pid>/`.** Each process removed the directory named after its own pid before writing its marker, whatever it held. It is now replaced only when it is a runtime directory an earlier process with the same pid left (its marker names the `omp-undo-redo/runtime` protocol); otherwise it is left alone and this process publishes no runtime action state, which is observational.
+
+## [1.7.0] - 2026-10-12
+
+### Added
+
+- **`OMP_UNDO_REDO_DEBUG=1` logs every git command.** Failures were caught and turned into a generic notice, so a bug report carried nothing to diagnose. With the variable set to `1`, each git invocation appends one JSON line to `<storeRoot>/debug.log`: working directory, arguments, the environment overrides the extension sets, exit code, duration and up to 8 KiB of stderr; a turn whose recording failed logs its error there too (it previously went only to the console). Lines are written synchronously, so a process that dies right after a failure keeps them. Stdin and stdout (snapshot content) are never logged. The log is written outside any snapshot store, so a store that cannot be set up is logged too, and it is not rotated.
+
+### Fixed
+
 - **A refused undo/redo said "Worktree changed" without saying where.** It now names the files `git apply --check` refused ("Worktree changed; nothing was undone. Conflicting files: notes.md.", the first five, then "and N more"); the message is unchanged when git names none.
 - **A Git repository whose snapshot store could not be set up reported a private snapshot repository.** The session-start notice and `/undo` both said "the private snapshot repository could not be initialized", which is Private-Git's store, in a Git project. Git mode now says "The snapshot store for this Git repository could not be initialized" (reason `store_unavailable`) and is retried at every turn as before. A history file holding a checkpoint with that reason is refused by earlier versions, as with any reason added since.
 - **`/undo` reverted files someone else edited during the turn and said only "file snapshot restored".** A turn's restore patch is the difference between two whole-worktree snapshots, so a file saved in an editor (or written by a watcher, a formatter or another OMP process) while the agent ran was set back to its pre-turn content with no sign of it. Undo and redo now name every file they restored ("…file snapshot restored. Restored files: notes.md, src/app.ts.", the first five, then "and N more"), or say "No files changed."; the list leaves out paths the restore did not touch (ignored, unreadable, nested repositories). The README documents the hazard. Snapshots are unchanged: the patch still covers the whole worktree, since edits the agent makes through `bash`, `eval`, subagents or MCP tools cannot be told apart from anyone else's.
@@ -33,6 +38,18 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 ### Security
 
 - **An exported `GIT_DIR` or `GIT_WORK_TREE` decided what was snapshotted and restored.** Every git command inherited OMP's environment. With `GIT_DIR` exported for a bare dotfiles repository (`core.worktree=$HOME`), a session in an unrelated non-Git `~/proj` ran in Git mode with the home folder as its worktree: snapshots copied `.bashrc`, `secret.key` and everything else not ignored into the store, `/undo` restored across the whole home folder, and the Private-Git home-folder refusal never ran. An inherited `GIT_WORK_TREE`, which git hooks export, made a Git project resolve to that folder as its worktree (its checkpoints then fell back to session-only) and ran Private-Git's path-relative commands against the wrong folder. Git commands now start without git's repository-location variables (`git rev-parse --local-env-vars`, keeping `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` as git does for other repositories), so the working directory alone picks the repository. An exported `GIT_DIR` no longer points OMP at another repository.
+
+### Removed
+
+- **Startup no longer reclaims the pre-1.6 store layout.** The 1.6.x boot cleanup is gone, along with the `purgeLegacyBlobStore` export. It deleted the blob-mode store (once untouched for 7 days) and the pre-1.5.1 `git-indexes` directory. Anyone upgrading straight from 1.5.x keeps those directories, and the blob-mode ones hold plaintext copies of workspace files. Nothing in 1.6 or later reads them. Close every 1.5.x OMP process first (deleting a live store loses its undo history), then remove them by hand. The store root is `~/.omp/omp-undo-redo` unless `OMP_UNDO_REDO_STORE_DIR` (or `OMP_UNDO_REDO_BLOB_DIR`) sets it, or `OMP_UNDO_REDO_RUNTIME_DIR` does without a store variable. Delete these entries in it: `blobs`, `trees`, `refs`, `locks`, `leases`, `journals`, `history`, `git-indexes`. Keep `repos/`, `runtime/` and `debug.log`, which are current data.
+
+  ```bash
+  cd ~/.omp/omp-undo-redo && rm -rf blobs trees refs locks leases journals history git-indexes
+  ```
+
+  ```powershell
+  'blobs','trees','refs','locks','leases','journals','history','git-indexes' | ForEach-Object { Remove-Item -Recurse -Force (Join-Path "$HOME\.omp\omp-undo-redo" $_) -ErrorAction SilentlyContinue }
+  ```
 
 ## [1.6.6] - 2026-10-10
 
