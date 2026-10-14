@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ompUndoRedo from "../../src/index.js";
 import { finishAfterTurn, prepareBeforeTurn } from "../../src/snapshot/capture.js";
+import { defaultPool } from "../../src/snapshot/index-leases.js";
 import { createGitRunner } from "../../src/infra/git-runner.js";
 import { SessionNavigation } from "../../src/session/navigation.js";
 import type { GitRunner } from "../../src/types.js";
@@ -330,14 +331,20 @@ describe("temp-directory failure resilience", () => {
       const gitRunner = makeGitRunner(cwd, { env: await snapshotEnv(cwd) });
       mockState.failRmForMockDirs = true;
 
-      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-cleanup-fail");
+      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-cleanup-fail", defaultPool);
       expect(beforeRes.status).toBe("git");
       if (beforeRes.status !== "git") return;
       expect(await privateRefs(cwd)).toHaveLength(1);
 
       await writeFile(join(cwd, "tracked.txt"), "changed\n");
 
-      const afterRes = await finishAfterTurn(gitRunner, beforeRes.checkpoint, "leaf", "turn-1");
+      const afterRes = await finishAfterTurn(
+        gitRunner,
+        beforeRes.checkpoint,
+        "leaf",
+        "turn-1",
+        defaultPool,
+      );
       expect(afterRes.status).toBe("git");
       if (afterRes.status !== "git") return;
       expect(await privateRefs(cwd)).toHaveLength(2);
@@ -375,7 +382,7 @@ describe("temp-directory failure resilience", () => {
       const env = await snapshotEnv(cwd);
       const gitRunner = makeGitRunner(cwd, { env });
 
-      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-op-and-cleanup-fail");
+      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-op-and-cleanup-fail", defaultPool);
       expect(beforeRes.status).toBe("git");
       if (beforeRes.status !== "git") return;
 
@@ -387,6 +394,7 @@ describe("temp-directory failure resilience", () => {
         beforeRes.checkpoint,
         "leaf",
         "turn-1",
+        defaultPool,
       );
 
       expect(afterRes.status).toBe("session_only");
@@ -446,12 +454,18 @@ describe("temp-directory failure resilience", () => {
     try {
       const gitRunner = makeGitRunner(cwd, { env: await snapshotEnv(cwd) });
 
-      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-patch-cleanup");
+      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-patch-cleanup", defaultPool);
       expect(beforeRes.status).toBe("git");
       if (beforeRes.status !== "git") return;
 
       await writeFile(join(cwd, "tracked.txt"), "modified\n");
-      const afterRes = await finishAfterTurn(gitRunner, beforeRes.checkpoint, "leaf", "t1");
+      const afterRes = await finishAfterTurn(
+        gitRunner,
+        beforeRes.checkpoint,
+        "leaf",
+        "t1",
+        defaultPool,
+      );
       expect(afterRes.status).toBe("git");
       if (afterRes.status !== "git") return;
 

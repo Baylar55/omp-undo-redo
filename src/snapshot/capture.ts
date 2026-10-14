@@ -12,7 +12,7 @@ import { run } from "../infra/git-runner.js";
 import { storeEnv, boundStore } from "../store/git-store.js";
 import { resolveRepository, canonicalPath } from "../store/discovery.js";
 import { pinBorrowedObjects } from "../store/pinning.js";
-import { defaultPool, persistentIndexKey } from "./index-leases.js";
+import { persistentIndexKey } from "./index-leases.js";
 import type { IndexLeasePool } from "./index-leases.js";
 import { createSnapshotCommitFromLease, createSnapshotCommit } from "./tree.js";
 import type { SnapshotResult } from "./tree.js";
@@ -33,9 +33,9 @@ export type FinishAfterTurnResult =
 export async function prepareBeforeTurn(
   git: GitRunner,
   sessionId: string,
+  pool: IndexLeasePool,
   ownerRegistry?: CheckpointOwnerRegistry,
   known?: GitRepository,
-  pool: IndexLeasePool = defaultPool,
 ): Promise<PrepareBeforeTurnResult> {
   let repository: GitRepository;
   if (known) {
@@ -142,7 +142,7 @@ export async function finishAfterTurn(
   >,
   parentLeafId: string | null,
   leafId: string | null,
-  pool: IndexLeasePool = defaultPool,
+  pool: IndexLeasePool,
 ): Promise<FinishAfterTurnResult> {
   let snapshot: SnapshotResult;
   let lease = before.snapshotIndexLease;
@@ -177,14 +177,14 @@ export async function finishAfterTurn(
   }
   const pending = { ...before, snapshotIndexLease: lease };
   if (!("hash" in snapshot)) {
-    await releasePendingCheckpoint(git, pending, false, pool);
+    await releasePendingCheckpoint(git, pending, pool);
     return {
       status: "session_only",
       reason: snapshot.reason === "invalid_head" ? "invalid_head" : "after_snapshot_failed",
     };
   }
   if (!(await pinBorrowedObjects(git, before.repository, snapshot.tree))) {
-    await releasePendingCheckpoint(git, pending, false, pool);
+    await releasePendingCheckpoint(git, pending, pool);
     return { status: "session_only", reason: "after_snapshot_failed" };
   }
   const afterRef = before.beforeRef.replace(/\/before$/, "/after");
@@ -195,7 +195,7 @@ export async function finishAfterTurn(
       { env: storeEnv(before.repository) },
     ))
   ) {
-    await releasePendingCheckpoint(git, pending, false, pool);
+    await releasePendingCheckpoint(git, pending, pool);
     return { status: "session_only", reason: "after_ref_failed" };
   }
   await pool.returnLeaseToPool(lease);

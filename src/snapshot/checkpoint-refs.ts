@@ -17,7 +17,6 @@ import {
   releaseLooseRef,
   historyRefPrefix,
 } from "../store/refs.js";
-import { defaultPool } from "./index-leases.js";
 import type { IndexLeasePool } from "./index-leases.js";
 
 /** 16-hex checkpoint ids (64 random bits) and no session hash in v2 refs
@@ -74,8 +73,8 @@ export async function releasePendingCheckpoint(
     PendingGitCheckpoint,
     "repository" | "beforeHash" | "beforeRef" | "snapshotIndexLease"
   >,
+  pool: IndexLeasePool,
   keepIndex = false,
-  pool: IndexLeasePool = defaultPool,
 ): Promise<boolean> {
   await markGcPending(pending.repository.storeDir);
   const [releasedRef, releasedLease] = await Promise.all([

@@ -28,8 +28,8 @@ export async function releasePending(
     await releasePendingCheckpoint(
       services.gitRunnerFor(pendingCheckpoint.repository),
       pendingCheckpoint,
-      keepIndex,
       services.leasePool,
+      keepIndex,
     );
   }
 }
@@ -129,9 +129,9 @@ export async function beforeAgentStart(
         ? await prepareBeforeTurn(
             backend.git,
             sessionId,
+            services.leasePool,
             services.ownerRegistry,
             backend.repository,
-            services.leasePool,
           )
         : { status: "session_only" as const, reason: backend.reason };
     // Bound to the leaf recorded above, never a fresh getLeafId(): the

@@ -115,8 +115,8 @@ export class IndexLeasePool {
   }
 }
 
-/** The pool of callers that pass none: test call sites only. Every call in
- *  `src/` passes its extension copy's pool. */
+/** The pool tests pass when capturing without an extension copy. Nothing
+ *  releases it at shutdown, so `src/` must always pass its copy's pool. */
 export const defaultPool = new IndexLeasePool();
 
 /** `defaultPool.releasePersistentSnapshotIndices`, for tests that capture

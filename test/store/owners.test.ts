@@ -10,6 +10,7 @@ import {
 } from "../../src/store/owners.js";
 import { createGitRunner } from "../../src/infra/git-runner.js";
 import { finishAfterTurn, prepareBeforeTurn } from "../../src/snapshot/capture.js";
+import { defaultPool } from "../../src/snapshot/index-leases.js";
 import { SessionNavigation } from "../../src/session/navigation.js";
 import type { GitRepository, GitRunner, NavigationPort } from "../../src/types.js";
 import { gitRepository, privateRefs, snapshotEnv } from "../helpers/index.js";
@@ -415,11 +416,11 @@ describe("checkpoint owner boundaries", () => {
         runtimeScope,
       });
 
-      const prepared = await prepareBeforeTurn(snap, "legacy-fallback", registry);
+      const prepared = await prepareBeforeTurn(snap, "legacy-fallback", defaultPool, registry);
       expect(prepared.status).toBe("git");
       if (prepared.status !== "git") return;
       expect(prepared.checkpoint.beforeRef).not.toContain("/v2/");
-      expect(await releasePendingCheckpoint(snap, prepared.checkpoint)).toBe(true);
+      expect(await releasePendingCheckpoint(snap, prepared.checkpoint, defaultPool)).toBe(true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -435,11 +436,17 @@ describe("checkpoint owner boundaries", () => {
       runtimeScope,
     });
     try {
-      const prepared = await prepareBeforeTurn(git, "live-navigation", ownerRegistry);
+      const prepared = await prepareBeforeTurn(git, "live-navigation", defaultPool, ownerRegistry);
       expect(prepared.status).toBe("git");
       if (prepared.status !== "git") return;
       await writeFile(join(cwd, "tracked.txt"), "after\n");
-      const finished = await finishAfterTurn(git, prepared.checkpoint, "parent", "leaf");
+      const finished = await finishAfterTurn(
+        git,
+        prepared.checkpoint,
+        "parent",
+        "leaf",
+        defaultPool,
+      );
       expect(finished.status).toBe("git");
       if (finished.status !== "git") return;
 
@@ -501,12 +508,18 @@ describe("checkpoint owner boundaries", () => {
         runtimeScope,
       });
       try {
-        const prepared = await prepareBeforeTurn(git, "long-path", ownerRegistry);
+        const prepared = await prepareBeforeTurn(git, "long-path", defaultPool, ownerRegistry);
         expect(prepared).toMatchObject({ status: "git" });
         if (prepared.status !== "git") return;
         expect(prepared.checkpoint.beforeRef).toContain("/v2/");
         await writeFile(join(cwd, "tracked.txt"), "after\n");
-        const finished = await finishAfterTurn(git, prepared.checkpoint, "parent", "leaf");
+        const finished = await finishAfterTurn(
+          git,
+          prepared.checkpoint,
+          "parent",
+          "leaf",
+          defaultPool,
+        );
         expect(finished).toMatchObject({ status: "git" });
         if (finished.status !== "git") return;
         const retained = await retainCheckpointForResume(git, "long-path", finished.checkpoint);
