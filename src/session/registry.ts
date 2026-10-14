@@ -9,8 +9,15 @@ import { ensureNavigation, initializeNavigation, stateOf } from "./controller.js
 import { isMainSession, runShutdownHousekeeping } from "./housekeeping.js";
 import type { SessionNavigation } from "./navigation.js";
 import type { ExtensionServices } from "./services.js";
-import { releasePending } from "./turn-start.js";
+import { agentEnd } from "./turn-end.js";
+import { beforeAgentStart, releasePending, toolCall } from "./turn-start.js";
 
+/** Why `/undo` or `/redo` cannot run now, or the navigation to run it on. */
+export type CommandNavigation =
+  | { status: "ready"; navigation: SessionNavigation }
+  | { status: "subagent" | "capturing" | "finalizing" | "closing" };
+
+/** The one entry point `host/` uses into `session/`. */
 export type SessionRegistry = {
   publishActionResult(
     sessionId: string,
@@ -20,6 +27,10 @@ export type SessionRegistry = {
     token: string,
     applied: boolean,
   ): Promise<void>;
+  commandNavigation(
+    typed: AnyContext,
+    waitForIdle: () => Promise<void>,
+  ): Promise<CommandNavigation>;
   sessionStart(typed: AnyContext): Promise<void>;
   sessionTree(
     typed: AnyContext,
@@ -27,6 +38,9 @@ export type SessionRegistry = {
   ): Promise<void>;
   rememberNavigationSource(event: unknown, ctx: unknown): void;
   adoptSwitchedSession(typed: AnyContext): Promise<void>;
+  beforeAgentStart(typed: AnyContext): Promise<void>;
+  toolCall(typed: AnyContext): Promise<void>;
+  agentEnd(typed: AnyContext): Promise<void>;
   shutdown(): Promise<void>;
 };
 
@@ -77,6 +91,29 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       ctx.sessionManager.getLeafId(),
       { id, applied, token },
     );
+  }
+
+  /** `/undo` and `/redo`: the session's navigation once the last turn's
+   *  capture and finalize settled. */
+  async function commandNavigation(
+    typed: AnyContext,
+    waitForIdle: () => Promise<void>,
+  ): Promise<CommandNavigation> {
+    if (!isMainSession(services, typed)) return { status: "subagent" };
+    const sessionId = typed.sessionManager.getSessionId();
+    // Commands run even mid-stream: the turn's finalize only registers at
+    // agent_end, so the guards below must be read after the idle wait.
+    await waitForIdle();
+    const state = sessions.get(sessionId);
+    const guards: [Promise<unknown> | undefined, "capturing" | "finalizing"][] = [
+      [state?.capture?.complete, "capturing"],
+      [state?.finalize, "finalizing"],
+    ];
+    for (const [work, status] of guards) {
+      if (work && (await timedOutAfter(work, services.captureDeadlineMs))) return { status };
+    }
+    const navigation = await ensureNavigation(services, typed);
+    return navigation ? { status: "ready", navigation } : { status: "closing" };
   }
 
   async function suspendDetached(
@@ -247,10 +284,14 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
 
   return {
     publishActionResult,
+    commandNavigation,
     sessionStart,
     sessionTree,
     rememberNavigationSource,
     adoptSwitchedSession,
+    beforeAgentStart: (typed) => beforeAgentStart(services, typed),
+    toolCall: (typed) => toolCall(services, typed),
+    agentEnd: (typed) => agentEnd(services, typed),
     shutdown,
   };
 }

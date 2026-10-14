@@ -1,3 +1,4 @@
+import type { CommandNavigation } from "../session/registry.js";
 import type { FileCheckpointUnavailableReason, ActionId } from "../types.js";
 
 export interface NavigationVerbs {
@@ -99,11 +100,18 @@ export function restoredFilesMessage(paths: readonly string[]): string {
   return paths.length > 0 ? ` Restored files: ${listed(paths)}.` : " No files changed.";
 }
 
-export function subagentUnavailableMessage(id: ActionId): string {
-  return `/${id} is unavailable in a subagent session.`;
-}
-
-export function closingUnavailableMessage(id: ActionId): string {
-  const label = id === "undo" ? "Undo" : "Redo";
-  return `${label} is unavailable while the session is closing.`;
+export function commandBlockedMessage(
+  id: ActionId,
+  status: Exclude<CommandNavigation["status"], "ready">,
+): string {
+  switch (status) {
+    case "subagent":
+      return `/${id} is unavailable in a subagent session.`;
+    case "capturing":
+      return `Cannot ${id} while the file checkpoint is still being captured; try again shortly.`;
+    case "finalizing":
+      return `Cannot ${id} while the last turn is still being finalized; try again shortly.`;
+    case "closing":
+      return `${id === "undo" ? "Undo" : "Redo"} is unavailable while the session is closing.`;
+  }
 }

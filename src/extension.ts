@@ -12,7 +12,7 @@ export default function ompUndoRedo(pi: ExtensionAPI, deps: OmpUndoRedoDependenc
   const services = createServices(deps);
   const registry = createRegistry(services);
   registerEvents(pi, services, registry);
-  registerCommands(pi, services, registry);
+  registerCommands(pi, registry);
 
   const bootFallback = setTimeout(() => {
     if (!services.flags.servesSubagent && !services.flags.closing) {

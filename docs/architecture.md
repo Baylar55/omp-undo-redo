@@ -1,7 +1,8 @@
 # Architecture
 
 The source is split into layers. A file imports only from its own folder and from the layers
-below it; `npm run lint` enforces this (`eslint.config.mjs`, the `layer(...)` entries).
+below it; `npm run lint` enforces this (`eslint.config.mjs`: the `layer(...)` entries, plus the
+type-only rule for `host/`).
 
 ## Layers
 
@@ -30,18 +31,18 @@ below it; `npm run lint` enforces this (`eslint.config.mjs`, the `layer(...)` en
 A file may import only from its own folder, from the folders listed for it, and from Node / the
 host package types.
 
-| Importing folder / file                | May import from                                             |
-| -------------------------------------- | ----------------------------------------------------------- |
-| `src/types.ts`, `src/host-contract.ts` | `@oh-my-pi/pi-coding-agent` (type-only), each other         |
-| `src/infra/`                           | L0                                                          |
-| `src/store/` (incl. `maintenance/`)    | `infra/`, L0                                                |
-| `src/snapshot/`                        | `store/`, `infra/`, L0                                      |
-| `src/history/`                         | `store/`, `infra/`, L0                                      |
-| `src/runtime/`                         | `infra/`, L0                                                |
-| `src/session/`                         | `snapshot/`, `history/`, `runtime/`, `store/`, `infra/`, L0 |
-| `src/host/`                            | `session/` and everything below                             |
-| `src/extension.ts`                     | everything except `src/index.ts`                            |
-| `src/index.ts`                         | everything                                                  |
+| Importing folder / file                | May import from                                                            |
+| -------------------------------------- | -------------------------------------------------------------------------- |
+| `src/types.ts`, `src/host-contract.ts` | `@oh-my-pi/pi-coding-agent` (type-only), each other                        |
+| `src/infra/`                           | L0                                                                         |
+| `src/store/` (incl. `maintenance/`)    | `infra/`, L0                                                               |
+| `src/snapshot/`                        | `store/`, `infra/`, L0                                                     |
+| `src/history/`                         | `store/`, `infra/`, L0                                                     |
+| `src/runtime/`                         | `infra/`, L0                                                               |
+| `src/session/`                         | `snapshot/`, `history/`, `runtime/`, `store/`, `infra/`, L0                |
+| `src/host/`                            | `session/registry.ts` (+ `services`, `navigation` types), below `session/` |
+| `src/extension.ts`                     | everything except `src/index.ts`                                           |
+| `src/index.ts`                         | everything                                                                 |
 
 ## Files
 
@@ -108,7 +109,7 @@ src/
 │   ├── turn-start.ts            before_agent_start + tool_call logic, capture tracking
 │   ├── turn-end.ts              agent_end logic, deferred finalize
 │   ├── housekeeping.ts          boot/shutdown housekeeping, retention sweep orchestration
-│   └── registry.ts              SessionRegistry: session events, switch/release, heartbeat, shutdown
+│   └── registry.ts              SessionRegistry: session and turn events, /undo and /redo guards, switch/release, heartbeat, shutdown
 │
 └── host/
     ├── messages.ts              command result texts
@@ -132,4 +133,5 @@ src/
   are never removed, only their fields cleared. `services.ts` holds data only; logic lives in the
   other session modules, which take `services` as their first parameter.
 - **`host/`**: the only place that calls `pi.on` and `pi.registerCommand`. Each handler delegates to
-  `session/`.
+  the `SessionRegistry` (`session/registry.ts`); from the rest of `session/`, `host/` imports only
+  the `ExtensionServices` and `SessionNavigation` types (`npm run lint` enforces this).

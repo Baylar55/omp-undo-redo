@@ -3,8 +3,6 @@ import type { AnyContext } from "../host-contract.js";
 import { track } from "../infra/async.js";
 import type { SessionRegistry } from "../session/registry.js";
 import type { ExtensionServices } from "../session/services.js";
-import { agentEnd } from "../session/turn-end.js";
-import { beforeAgentStart, toolCall } from "../session/turn-start.js";
 
 /** The only place that subscribes to host events. */
 export function registerEvents(
@@ -31,18 +29,15 @@ export function registerEvents(
   pi.on("session_branch", adoptSwitchedSession);
 
   pi.on("before_agent_start", (_event, ctx) =>
-    track(
-      () => beforeAgentStart(services, ctx as unknown as AnyContext),
-      services.activeOperations,
-    ),
+    track(() => registry.beforeAgentStart(ctx as unknown as AnyContext), services.activeOperations),
   );
 
   // Every tool (built-in, custom, MCP, subagent) passes through the host's
   // `tool_call` gate before executing. Returning undefined never blocks it.
-  pi.on("tool_call", (_event, ctx) => toolCall(services, ctx as unknown as AnyContext));
+  pi.on("tool_call", (_event, ctx) => registry.toolCall(ctx as unknown as AnyContext));
 
   pi.on("agent_end", (_event, ctx) =>
-    track(() => agentEnd(services, ctx as unknown as AnyContext), services.activeOperations),
+    track(() => registry.agentEnd(ctx as unknown as AnyContext), services.activeOperations),
   );
 
   pi.on("session_shutdown", () => registry.shutdown());

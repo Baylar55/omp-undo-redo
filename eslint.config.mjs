@@ -68,5 +68,33 @@ export default [
   layer(["src/history/**/*.ts"], above("**/infra/**", "**/store/**")),
   layer(["src/runtime/**/*.ts"], above("**/infra/**")),
   layer(["src/session/**/*.ts"], ["**/host/**", "**/extension.js", "**/index.js"]),
-  layer(["src/host/**/*.ts"], ["**/extension.js", "**/index.js"]),
+  // host/ reaches session logic only through the SessionRegistry.
+  layer(
+    ["src/host/**/*.ts"],
+    [
+      "**/extension.js",
+      "**/index.js",
+      "**/session/**",
+      "!**/session/registry.js",
+      "!**/session/services.js",
+      "!**/session/navigation.js",
+    ],
+  ),
+  {
+    files: ["src/host/**/*.ts"],
+    rules: {
+      "@typescript-eslint/no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["**/session/services.js", "**/session/navigation.js"],
+              allowTypeImports: true,
+              message: "host/ imports only types from these: see docs/architecture.md.",
+            },
+          ],
+        },
+      ],
+    },
+  },
 ];

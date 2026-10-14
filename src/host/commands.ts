@@ -1,20 +1,15 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import type { AnyContext } from "../host-contract.js";
-import { timedOutAfter } from "../infra/async.js";
-import { ensureNavigation } from "../session/controller.js";
-import { isMainSession } from "../session/housekeeping.js";
 import type { SessionNavigation } from "../session/navigation.js";
 import type { SessionRegistry } from "../session/registry.js";
-import type { ExtensionServices } from "../session/services.js";
 import type { ActionId, CommandNavigationResult, NavigationResult } from "../types.js";
 import {
   VERBS,
-  closingUnavailableMessage,
+  commandBlockedMessage,
   listed,
   notRestoredMessage,
   restoredFilesMessage,
-  subagentUnavailableMessage,
   unavailableMessage,
 } from "./messages.js";
 
@@ -73,39 +68,16 @@ export async function runNavigation(
   return outcome;
 }
 
-export function registerCommands(
-  pi: ExtensionAPI,
-  services: ExtensionServices,
-  registry: SessionRegistry,
-): void {
+export function registerCommands(pi: ExtensionAPI, registry: SessionRegistry): void {
   const makeHandler = (id: ActionId) => async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
     const typed = ctx as unknown as AnyContext;
-    if (!isMainSession(services, typed)) {
-      ctx.ui.notify(subagentUnavailableMessage(id), "warning");
+    const prepared = await registry.commandNavigation(typed, () => ctx.waitForIdle());
+    if (prepared.status !== "ready") {
+      ctx.ui.notify(commandBlockedMessage(id, prepared.status), "warning");
       return;
     }
-    const sessionId = typed.sessionManager.getSessionId();
-    // Commands run even mid-stream: the turn's finalize only registers at
-    // agent_end, so the guards below must be read after the idle wait.
-    await ctx.waitForIdle();
-    const state = services.sessions.get(sessionId);
-    const guards: [Promise<unknown> | undefined, string][] = [
-      [state?.capture?.complete, "the file checkpoint is still being captured"],
-      [state?.finalize, "the last turn is still being finalized"],
-    ];
-    for (const [work, reason] of guards) {
-      if (!work) continue;
-      if (await timedOutAfter(work, services.captureDeadlineMs)) {
-        ctx.ui.notify(`Cannot ${id} while ${reason}; try again shortly.`, "warning");
-        return;
-      }
-    }
-    const nav = await ensureNavigation(services, typed);
-    if (!nav) {
-      ctx.ui.notify(closingUnavailableMessage(id), "warning");
-      return;
-    }
+    const nav = prepared.navigation;
     nav.setNavigateTree(ctx.navigateTree);
     const outcome = await runNavigation(nav, ctx, id);
     await registry.publishActionResult(
