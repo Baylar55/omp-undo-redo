@@ -28,6 +28,8 @@ const rmGate = vi.hoisted(() => ({
 }));
 /** `stat` of any path in `fail` rejects, as an unreadable directory would. */
 const statGate = vi.hoisted(() => ({ fail: new Set<string>() }));
+/** `writeFile` of a runtime marker rejects while set, as a full disk would. */
+const markerGate = vi.hoisted(() => ({ fail: false }));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof Fs>();
   return {
@@ -48,6 +50,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       statGate.fail.has(String(args[0]))
         ? Promise.reject(Object.assign(new Error("EACCES"), { code: "EACCES" }))
         : actual.stat(...args),
+    writeFile: (...args: Parameters<typeof actual.writeFile>) =>
+      markerGate.fail && String(args[0]).includes("runtime.json")
+        ? Promise.reject(Object.assign(new Error("ENOSPC"), { code: "ENOSPC" }))
+        : actual.writeFile(...args),
   };
 });
 
@@ -92,6 +98,7 @@ function state(currentIndex: number): NavigationState {
 afterEach(async () => {
   Object.assign(rmGate, { hold: undefined, entered: undefined, mkdirsWhileHeld: 0 });
   statGate.fail.clear();
+  markerGate.fail = false;
   vi.restoreAllMocks();
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -248,6 +255,8 @@ describe("runtime action-state store", () => {
     await second.publishNavigation("two", state(1), "turn-2");
 
     await expect(access(join(root, "105", "stale.json"))).rejects.toThrow();
+    // The replaced directory was moved aside and removed, not left as `105.*.tmp`.
+    expect((await readdir(root)).sort()).toEqual(["105", "106"]);
     expect(await readFile(join(root, "105", "runtime.json"), "utf8")).toContain('"first"');
     expect(await readFile(join(root, "106", "runtime.json"), "utf8")).toContain('"second"');
     await expect(
@@ -272,6 +281,52 @@ describe("runtime action-state store", () => {
 
     expect(await readFile(join(root, "109", "precious.txt"), "utf8")).toBe("keep me");
     expect(await readdir(join(root, "109"))).toEqual(["precious.txt"]);
+  });
+
+  it("publishes over leftovers of an install a killed process left", async () => {
+    const root = await makeRoot();
+    const marked = join(root, "120.dead-install.tmp");
+    const unmarked = join(root, "120.early-kill.tmp");
+    await mkdir(join(marked, "sessions"), { recursive: true });
+    await writeFile(
+      join(marked, "runtime.json"),
+      JSON.stringify({ schemaVersion: 1, protocol: "omp-undo-redo/runtime", pid: 120 }),
+    );
+    await mkdir(join(unmarked, "sessions"), { recursive: true });
+    const store = new RuntimeActionStateStore({ rootDirectory: root, pid: 120, runtimeId: "new" });
+
+    await store.publishNavigation("session", state(0), "turn");
+
+    expect((await readState(store, "session")).runtimeId).toBe("new");
+    expect(await readFile(join(root, "120", "runtime.json"), "utf8")).toContain('"new"');
+    expect((await readdir(root)).sort()).toEqual(
+      ["120", "120.dead-install.tmp", "120.early-kill.tmp"].sort(),
+    );
+    await store.shutdown();
+    expect((await readdir(root)).sort()).toEqual(
+      ["120.dead-install.tmp", "120.early-kill.tmp"].sort(),
+    );
+  });
+
+  it("leaves no unmarked directory when the marker cannot be written", async () => {
+    const root = await makeRoot();
+    markerGate.fail = true;
+    const failed = new RuntimeActionStateStore({ rootDirectory: root, pid: 122 });
+    await failed.publishNavigation("session", state(0), "turn");
+    markerGate.fail = false;
+    // The process dies without shutting down: forget its in-process share.
+    (
+      (globalThis as Record<symbol, unknown>)[
+        Symbol.for("omp-undo-redo/runtime-directories/v1")
+      ] as Map<string, unknown>
+    ).delete(failed.runtimeDirectory);
+    expect(await readdir(root)).toEqual([]);
+
+    // A later process given the same pid must not find it foreign.
+    const next = new RuntimeActionStateStore({ rootDirectory: root, pid: 122, runtimeId: "next" });
+    await next.publishNavigation("session", state(0), "turn");
+    expect((await readState(next, "session")).runtimeId).toBe("next");
+    await next.shutdown();
   });
 
   it("shuts down idempotently and removes only its own runtime directory", async () => {
@@ -368,10 +423,11 @@ describe("runtime action-state store", () => {
     const ancient = new Date(now - 48 * 60 * 60 * 1_000);
     // pid -> process.kill outcome: an errno code, "" for alive and ours.
     const killCodes: Record<number, string> = {};
-    // Each fixture: dir name = pid; mtime applied last since writes bump it.
-    // `code` unset = no numeric marker pid, so the sweep must never probe it.
+    // Each fixture: dir name = pid + suffix; mtime applied last since writes bump it.
+    // `code` unset = the sweep must never probe that pid.
     const fixtures: Array<{
       pid: number;
+      suffix?: string;
       code?: string;
       startedAt: Date;
       mtime: Date;
@@ -379,6 +435,7 @@ describe("runtime action-state store", () => {
       unreadable?: boolean;
       marker?: "none" | "corrupt" | "string-pid";
       precious?: boolean;
+      tmpFile?: boolean;
     }> = [
       { pid: 301, code: "ESRCH", startedAt: recent, mtime: recent }, // gone
       { pid: 302, code: "EPERM", startedAt: recent, mtime: recent }, // foreign, recent
@@ -394,9 +451,16 @@ describe("runtime action-state store", () => {
       { pid: 312, startedAt: ancient, mtime: ancient, marker: "corrupt" },
       { pid: 313, startedAt: recent, mtime: recent, marker: "string-pid" },
       { pid: 314, startedAt: ancient, mtime: ancient, marker: "none", precious: true },
+      // Only sessions/ and a temp file: still not provably ours.
+      { pid: 315, startedAt: ancient, mtime: ancient, marker: "none", tmpFile: true },
+      // Install/discard leftovers: reaped by marker like `<pid>`.
+      { pid: 316, suffix: ".a.tmp", code: "ESRCH", startedAt: recent, mtime: recent },
+      { pid: 317, suffix: ".a.tmp", code: "", startedAt: recent, mtime: recent }, // installing
+      { pid: 318, suffix: ".a.tmp", startedAt: ancient, mtime: ancient, marker: "none" },
+      { pid: 200, suffix: ".a.tmp", startedAt: ancient, mtime: ancient }, // own pid
     ];
     for (const f of fixtures) {
-      const dir = join(root, String(f.pid));
+      const dir = join(root, `${f.pid}${f.suffix ?? ""}`);
       await mkdir(join(dir, "sessions"), { recursive: true });
       if (f.marker !== "none") {
         await writeFile(
@@ -414,12 +478,15 @@ describe("runtime action-state store", () => {
         );
       }
       if (f.precious) await writeFile(join(dir, "precious.txt"), "keep me");
+      if (f.tmpFile) await writeFile(join(dir, ".runtime.json.x.tmp"), "{");
       await utimes(dir, f.mtime, f.mtime);
       if (f.unreadable) statGate.fail.add(resolve(dir));
       if (f.code !== undefined) killCodes[f.pid] = f.code;
     }
     await mkdir(join(root, "not-a-pid"));
     await utimes(join(root, "not-a-pid"), ancient, ancient);
+    await mkdir(join(root, "321.tmp"));
+    await utimes(join(root, "321.tmp"), ancient, ancient);
 
     const kill = vi.spyOn(process, "kill").mockImplementation((pid) => {
       const code = killCodes[Number(pid)];
@@ -445,14 +512,20 @@ describe("runtime action-state store", () => {
         "312",
         "313",
         "314",
+        "315",
+        "317.a.tmp",
+        "318.a.tmp",
+        "200.a.tmp",
         "not-a-pid",
+        "321.tmp",
       ].sort(),
     );
     // Signal 0 only probes. Exactly the same-host numeric marker pids are probed:
-    // never itself (200), the other host's (304) or a dir without a numeric pid.
+    // never itself (200, its leftover too), the other host's (304) or a dir
+    // without a numeric pid.
     expect(kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
     expect(kill.mock.calls.map(([pid]) => pid).sort((a, b) => a - b)).toEqual([
-      301, 302, 303, 305, 306, 307, 308, 309,
+      301, 302, 303, 305, 306, 307, 308, 309, 316, 317,
     ]);
     await store.shutdown();
   });

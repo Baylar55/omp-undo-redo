@@ -39,14 +39,19 @@ export async function reapStaleRuntimes(rootDirectory: string, ownPid: number): 
   } catch {
     return;
   }
-  const candidates = entries.filter((e) => e.isDirectory() && /^\d+$/.test(e.name));
+  // `<pid>.<uuid>.tmp`: a runtime directory a process was installing or
+  // discarding when it died or failed. Its marker decides, as for `<pid>`.
+  const candidates = entries.flatMap((e) => {
+    const match = e.isDirectory() ? /^(\d+)(?:\.[^.]+\.tmp)?$/.exec(e.name) : null;
+    return match ? [{ name: e.name, pid: Number(match[1]) }] : [];
+  });
   // Batch with limited concurrency to avoid EMFILE on extreme leak (100+ dirs)
   const concurrency = 16;
   let index = 0;
   const worker = async (): Promise<void> => {
     while (index < candidates.length) {
       const entry = candidates[index++];
-      if (Number(entry.name) === ownPid) continue;
+      if (entry.pid === ownPid) continue;
       const dir = join(rootDirectory, entry.name);
       let marker: Partial<RuntimeMarker> | null;
       try {

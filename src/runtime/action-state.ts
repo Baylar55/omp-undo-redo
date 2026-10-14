@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rm, stat } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { writeFileAtomic } from "../infra/fs.js";
+import { renameWithRetry, writeFileAtomic } from "../infra/fs.js";
+import { debugLog } from "../infra/debug-log.js";
 import type { ActionInvocationResult, NavigationState, RuntimeActionState } from "../types.js";
 import { runtimeRootDirectory, defaultRuntimeRoot, checkpointNamespace } from "../infra/paths.js";
 import { RUNTIME_SCHEMA, RUNTIME_PROTOCOL, reapStaleRuntimes } from "./reaper.js";
@@ -53,9 +54,9 @@ function navigationRevision(state: NavigationState, activeSessionLeaf: string | 
  *  id every copy then publishes under; the last one out removes it. `tail`
  *  orders those steps, so a copy joining during a teardown keeps its
  *  directory. Held on `globalThis` because module state can be per copy.
- *  `foreign`: the directory existed without this extension's marker, so it
- *  is left alone and nothing is published (copies that predate the field
- *  never set it). */
+ *  `foreign`: this process did not install the directory (it existed without
+ *  this extension's marker, or installing failed), so it is left alone and
+ *  nothing is published (copies that predate the field never set it). */
 type SharedRuntimeDirectory = {
   users: number;
   runtimeId: string;
@@ -127,6 +128,7 @@ export class RuntimeActionStateStore {
 
   private async prepareRuntimeDirectory(shared: SharedRuntimeDirectory): Promise<void> {
     shared.foreign = false;
+    let staging: string | null = null;
     try {
       await mkdir(this.rootDirectory, { recursive: true, mode: 0o700 });
       // A configured root may be a shared directory (`/tmp` as root in a
@@ -138,13 +140,17 @@ export class RuntimeActionStateStore {
       // delete; runtime state is observational, so this process skips it.
       if (!(await this.runtimeDirectoryReplaceable())) {
         shared.foreign = true;
-        this.scheduleStaleRuntimeSweep();
+        debugLog({ event: "runtime-dir-foreign", dir: this.runtimeDirectory });
         return;
       }
-      await rm(this.runtimeDirectory, { recursive: true, force: true });
-      await mkdir(this.sessionsDirectory, { recursive: true, mode: 0o700 });
-      await chmod(this.runtimeDirectory, 0o700);
-      await chmod(this.sessionsDirectory, 0o700);
+      // Built under a temporary name and renamed into place, so `runtime/<pid>/`
+      // never exists without its marker: an unmarked one reads as foreign to
+      // every later process with this pid, and the sweep never reaps it.
+      staging = this.temporaryRuntimePath();
+      const sessions = join(staging, "sessions");
+      await mkdir(sessions, { recursive: true, mode: 0o700 });
+      await chmod(staging, 0o700);
+      await chmod(sessions, 0o700);
       const marker: RuntimeMarker = {
         schemaVersion: RUNTIME_SCHEMA,
         protocol: RUNTIME_PROTOCOL,
@@ -153,11 +159,44 @@ export class RuntimeActionStateStore {
         hostname: hostname(),
         startedAt: this.clock().toISOString(),
       };
-      await this.writeJsonAtomic(join(this.runtimeDirectory, "runtime.json"), marker);
+      await this.writeJsonAtomic(join(staging, "runtime.json"), marker);
+      await this.discardRuntimeDirectory();
+      await renameWithRetry(staging, this.runtimeDirectory);
+      staging = null;
+    } catch (error) {
+      // Runtime state is observational. Keep extension operations independent;
+      // a directory this process did not install is not its to write or remove.
+      shared.foreign = true;
+      debugLog({ event: "runtime-dir-failed", dir: this.runtimeDirectory, error: String(error) });
+      if (staging) await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    } finally {
+      // Other processes' leftovers are reaped whether or not this one installed.
       this.scheduleStaleRuntimeSweep();
-    } catch {
-      // Runtime state is observational. Keep extension operations independent.
     }
+  }
+
+  /** `<root>/<pid>.<uuid>.tmp`: a runtime directory being installed or discarded.
+   *  Not `this.uuid`: tests inject a constant one, and the staging and aside
+   *  paths of one replacement must differ. */
+  private temporaryRuntimePath(): string {
+    return `${this.runtimeDirectory}.${randomUUID()}.tmp`;
+  }
+
+  /** Removes `runtime/<pid>/` without ever leaving it there unmarked: it is
+   *  renamed aside first (a failed rename leaves it whole), and `sessions/`
+   *  goes before the marker, so a leftover that keeps files keeps its marker
+   *  and the sweep reaps it once its pid is dead. */
+  private async discardRuntimeDirectory(): Promise<void> {
+    const aside = this.temporaryRuntimePath();
+    try {
+      await renameWithRetry(this.runtimeDirectory, aside);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    await rm(join(aside, "sessions"), { recursive: true, force: true })
+      .then(() => rm(aside, { recursive: true, force: true }))
+      .catch(() => undefined);
   }
 
   /** `runtime/<pid>/` is absent, or holds this extension's runtime marker. */
@@ -320,9 +359,7 @@ export class RuntimeActionStateStore {
         return;
       }
       shared.tail = shared.tail.then(() =>
-        shared.foreign
-          ? undefined
-          : rm(this.runtimeDirectory, { recursive: true, force: true }).catch(() => undefined),
+        shared.foreign ? undefined : this.discardRuntimeDirectory().catch(() => undefined),
       );
       await shared.tail;
     })();

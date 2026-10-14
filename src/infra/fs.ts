@@ -60,3 +60,22 @@ export async function removeDirWithRetry(path: string): Promise<boolean> {
   }
   return false;
 }
+
+/** Rename, retried while Windows refuses it because another handle (an
+ *  antivirus scan, a reader) is open under `from`. */
+export async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (attempt === 4 || !(code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
+        throw error;
+      }
+      const { promise, resolve } = Promise.withResolvers<void>();
+      setTimeout(resolve, RETRY_DELAY_MS);
+      await promise;
+    }
+  }
+}
