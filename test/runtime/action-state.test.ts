@@ -16,6 +16,7 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "../../src/infra/compat.js";
 import { RuntimeActionStateStore } from "../../src/runtime/action-state.js";
+import { reapStaleRuntimes } from "../../src/runtime/reaper.js";
 import type { NavigationState } from "../../src/types.js";
 import { checkpointNamespace } from "../../src/infra/paths.js";
 
@@ -414,9 +415,9 @@ describe("runtime action-state store", () => {
   });
 
   it("reaps only runtime directories that are dead or ancient on this host", async () => {
+    // The free sweep, not `store.initialize()`: that also arms the store's own
+    // delayed sweep, which a slow fixture setup lets race this one.
     const root = await makeRoot();
-    const store = new RuntimeActionStateStore({ rootDirectory: root, pid: 200 });
-    await store.initialize();
 
     const now = Date.now();
     const recent = new Date(now - 60_000);
@@ -457,6 +458,7 @@ describe("runtime action-state store", () => {
       { pid: 316, suffix: ".a.tmp", code: "ESRCH", startedAt: recent, mtime: recent },
       { pid: 317, suffix: ".a.tmp", code: "", startedAt: recent, mtime: recent }, // installing
       { pid: 318, suffix: ".a.tmp", startedAt: ancient, mtime: ancient, marker: "none" },
+      { pid: 200, startedAt: ancient, mtime: ancient }, // own pid: never probed or reaped
       { pid: 200, suffix: ".a.tmp", startedAt: ancient, mtime: ancient }, // own pid
     ];
     for (const f of fixtures) {
@@ -494,8 +496,7 @@ describe("runtime action-state store", () => {
       if (code) throw Object.assign(new Error(code), { code });
       return true;
     });
-    // Bracket access reaches the private sweep with its real, checked signature.
-    await store["reapStaleRuntimes"]();
+    await reapStaleRuntimes(root, 200);
 
     expect((await readdir(root)).sort()).toEqual(
       [
@@ -527,7 +528,6 @@ describe("runtime action-state store", () => {
     expect(kill.mock.calls.map(([pid]) => pid).sort((a, b) => a - b)).toEqual([
       301, 302, 303, 305, 306, 307, 308, 309, 316, 317,
     ]);
-    await store.shutdown();
   });
 
   it("swallows filesystem failures", async () => {

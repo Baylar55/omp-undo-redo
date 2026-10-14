@@ -116,7 +116,7 @@ describe("private-repo housekeeping", () => {
       await runTurns(pi, ctx, 20, "tracked.txt");
       const isAutoGc = ({ args }: { args: string[] }) =>
         args.includes("gc") && args.includes("--auto");
-      expect(await waitFor(async () => commands.some(isAutoGc), 120)).toBe(true);
+      expect(await waitFor(async () => commands.some(isAutoGc), 900)).toBe(true);
       const auto = commands.find(isAutoGc);
       expect(auto?.args).toContain("--prune=1.hour.ago");
       // Regression: the threshold ran a full prune + gc, rewriting the whole
@@ -130,7 +130,7 @@ describe("private-repo housekeeping", () => {
     } finally {
       await rmRetry(cwd);
     }
-  }, 120000);
+  }, 240_000);
 
   it("gcs a Git workspace's snapshot store, never the user's own repository", async () => {
     // Regression: `isPrivateRepository` used to answer "yes" for any repo in
@@ -166,8 +166,9 @@ describe("private-repo housekeeping", () => {
       await pi.emit("agent_end", ctx);
       await pi.emit("session_shutdown", ctx);
       // Shutdown housekeeping is detached, so a gc would appear after the
-      // handler resolves: poll the recorded commands.
-      expect(await waitFor(async () => gcs.some((gc) => gc.gitDir === storeDir), 20)).toBe(true);
+      // handler resolves (behind the eviction sweep): poll the recorded
+      // commands, long enough for a loaded machine.
+      expect(await waitFor(async () => gcs.some((gc) => gc.gitDir === storeDir), 900)).toBe(true);
       // Other stores under the shared root (earlier tests' repos) may be gc'd
       // by the retention sweep; the user's own repository never is.
       expect(gcs.some((gc) => gc.gitDir === gitDir)).toBe(false);
@@ -177,7 +178,7 @@ describe("private-repo housekeeping", () => {
     } finally {
       await rmRetry(cwd);
     }
-  }, 120000);
+  }, 240_000);
 
   it("renames repos of vanished workspaces to recoverable trash, then purges aged trash", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-"));

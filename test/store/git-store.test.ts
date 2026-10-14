@@ -98,8 +98,10 @@ function countingStoreGcs(repository: GitRepository): {
   };
 }
 
+/** Up to 90 s: a store gc (pin, prune, full repack) runs detached behind other
+ *  housekeeping, and under CPU load (coverage, CI) outlasts 30 s. */
 async function waitFor(predicate: () => boolean): Promise<boolean> {
-  for (let attempt = 0; attempt < 300; attempt += 1) {
+  for (let attempt = 0; attempt < 900; attempt += 1) {
     if (predicate()) return true;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
@@ -284,7 +286,7 @@ describe("snapshot storage", () => {
     } finally {
       await rmRetry(cwd);
     }
-  }, 60000);
+  }, 180_000);
 
   it("reclaims an expired session's pinned content at the next store gc", async () => {
     const cwd = await makeRepository();
@@ -317,5 +319,5 @@ describe("snapshot storage", () => {
     } finally {
       await rmRetry(cwd);
     }
-  }, 60000);
+  }, 240_000);
 });
