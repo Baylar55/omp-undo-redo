@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -95,6 +96,11 @@ describe("leaving a session", () => {
       await pi.emit("session_before_switch", ctx);
       await pi.emit("session_switch", ctx);
       expect(heartbeatTick()).toContain(hashA);
+      // The finalized turn pooled its index; the reload keeps it.
+      const pool = created.at(-1)!.leasePool;
+      const idle = [...pool["persistentSnapshotIndices"].values()];
+      expect(idle).toHaveLength(1);
+      expect(existsSync(idle[0]!.directory)).toBe(true);
 
       await pi.emit("session_before_switch", ctx);
       liveId = "new-b";
@@ -103,6 +109,9 @@ describe("leaving a session", () => {
       // The left session's record is dropped, not kept empty forever.
       await Promise.allSettled([...created.at(-1)!.activeOperations]);
       expect(created.at(-1)!.sessions.has("left-a")).toBe(false);
+      // Its pooled index is deleted now, not at shutdown.
+      expect(pool["persistentSnapshotIndices"].size).toBe(0);
+      expect(existsSync(idle[0]!.directory)).toBe(false);
 
       // Resume A: its turn survived the release and is undoable again.
       await pi.emit("session_before_switch", ctx);

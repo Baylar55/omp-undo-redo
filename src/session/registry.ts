@@ -173,6 +173,11 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     await Promise.all([
       services.runtimeStore.releaseSession(sessionId),
       suspendDetached(navigation ? [navigation] : [], left ? [left] : []),
+      // Its pooled index would otherwise sit in the temp dir until shutdown;
+      // a resume reseeds one. Idle only: a checked-out lease (`left`'s, which
+      // suspendDetached releases) may still be under a running git. The id
+      // stays in `leaseSessionIds` so shutdown still finds any such lease.
+      services.leasePool.releasePersistentSnapshotIndices([sessionId], { inUse: false }),
     ]);
   }
 
