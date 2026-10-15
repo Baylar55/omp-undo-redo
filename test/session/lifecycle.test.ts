@@ -985,7 +985,7 @@ describe("resumed session history", () => {
         const warning = ctx.ui.notifications.at(-1);
         expect(warning?.level).toBe("warning");
         expect(warning?.message).toMatch(
-          /^The \/undo interrupted by the last exit left files partly restored; undo history was left as it was\. Restore them by hand from the snapshots in .+: [0-9a-f]{40} \(before the \/undo\) and [0-9a-f]{40} \(its result\)\.$/,
+          /^The \/undo interrupted by the last exit left files partly restored; undo history was left as it was\. Restore them by hand from the snapshots in .+: [0-9a-f]{40} \(before the \/undo\) and [0-9a-f]{40} \(its result\)\. Steps: https:\/\/github\.com\/Baylar55\/omp-undo-redo\/blob\/main\/docs\/troubleshooting\.md#restoring-files-after-an-interrupted-undo-or-redo$/,
         );
         await pi.runCommand("undo", ctx);
         expect(ctx.ui.notifications.at(-1)?.message).toBe(

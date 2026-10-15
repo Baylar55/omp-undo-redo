@@ -44,6 +44,7 @@
   "files": [
     "index.js",
     "dist",
+    "docs",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",

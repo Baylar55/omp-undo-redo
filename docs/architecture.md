@@ -136,10 +136,87 @@ src/
   the `SessionRegistry` (`session/registry.ts`); from the rest of `session/`, `host/` imports only
   the `ExtensionServices` and `SessionNavigation` types (`npm run lint` enforces this).
 
+## Snapshot behavior
+
+What users see of this is in the README ("Usage" and "What gets stored and what isn't restored");
+this is how it works.
+
+### Snapshot modes
+
+- **Git mode.** Snapshots go to a separate store at `<storeRoot>/repos/<sha256(commonDir)>.git`,
+  shared by linked worktrees (see [Git-mode snapshot store](#git-mode-snapshot-store)). `HEAD`,
+  branch refs and the real index are never touched.
+- **Private-Git mode.** A non-Git workspace gets an isolated repository at
+  `<storeRoot>/repos/<sha256(cwd)>.git` with the workspace as its worktree, snapshotted through the
+  same alternate-index engine. It is seeded with the built-in ignore list so churn is bounded. The
+  store root and `repos/` are created `0700` and the repository sets `core.sharedRepository=0600`.
+- **Session-only fallback.** With no Git binary, or when store setup fails, only the session moves;
+  the user is notified once per session. Store setup is retried at the start of every turn, and
+  several processes setting up the same new store retry instead of failing. A non-Git home
+  directory (or any folder above it), a filesystem root and the OS temp directory are refused
+  outright (`store/private-store.ts`); only the current user's home and temp directory are
+  recognized. A store an earlier version created for one of them is evicted once idle for 24 hours.
+
+In an unborn repository (no commit yet), the checkpoint index is seeded from the first snapshot's
+own tree and the index lease is kept until `HEAD` is born, so later turns reuse the stat cache
+instead of re-hashing the workspace.
+
+### Snapshot timing
+
+Every wait has a limit; hosts embedding the extension can change the defaults. All stay under OMP's
+30 s limit on extension handlers, so a very large or slow workspace cannot time the extension out.
+
+| What waits                                                                                | Limit              | When the limit is reached                                                                                                                                |
+| ----------------------------------------------------------------------------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Prompt start (`before_agent_start`) and turn end (`agent_end`), for an in-flight snapshot | 3 s                | The snapshot keeps running in the background; the turn's undo boundary is recorded when it finishes.                                                     |
+| `/undo` and `/redo`, for an in-flight snapshot or the previous turn's after-snapshot      | 3 s                | Nothing changes; the command says to try again shortly instead of acting on a half-recorded state.                                                       |
+| Each tool call, for the turn's before-snapshot                                            | 25 s per tool call | The tool runs; the snapshot is discarded and the turn is recorded session-only, so `/undo` moves the conversation back and says files were not restored. |
+| Turn end (`agent_end`), for the after-snapshot and history write                          | 25 s               | They finish in the background.                                                                                                                           |
+
+Tools wait because a tool that edits a file before Git has read it would make the snapshot record
+the edit as the pre-turn state; recording the turn session-only is safer than restoring a wrong
+baseline. A turn whose snapshot only finishes after the next turn has started keeps its
+conversation boundary but loses file restoration for that turn alone (its snapshot already contains
+the next turn's edits); the turns before and after it stay restorable.
+
+### Session history file
+
+Completed checkpoints and the undo/redo cursor are saved per session in the store, so a resumed
+session keeps both `/undo` and `/redo`. If that metadata is missing or unusable, completed turns
+are reconstructed from the active session branch as session-only checkpoints, with a warning
+(`history/reconstruct.ts`). The file is capped at 4 MiB, roughly 9,000 Git turns: a session that
+outgrows it keeps the checkpoint at the cursor and drops the oldest turns first; their snapshots
+stay until retention removes the session.
+
+Before restoring files, `/undo` and `/redo` save a restore intent next to the history. On the next
+load `session/recovery.ts` checks whether the restore patch still applies from either snapshot:
+from the source means nothing changed, from the target moves the cursor, from neither leaves the
+cursor and warns with the store and both hashes. Loading never writes the worktree.
+
+### Subagents
+
+Subagent sessions (the `task` tool, eval `agent()`, `/tan` clones) run in the same process with
+their own copy of the extension. They cannot be undone, so that copy captures no snapshots, writes
+no history, never delays a subagent's tool calls, and answers `/undo`/`/redo` with a warning. A
+subagent's edits in the parent's workspace land in the running parent turn's after-snapshot. This
+needs a host that reports `ctx.agent`; older hosts checkpoint subagent sessions like any other.
+
+### Runtime action state
+
+While running, the extension publishes normalized Undo/Redo action state for external clients in a
+private process-scoped directory, `~/.omp/omp-undo-redo/runtime/<pid>/` (root overridable with
+`OMP_UNDO_REDO_RUNTIME_DIR`). It is shared by every session of the process (for example several
+ACP sessions) under one runtime ID and removed when the last of them shuts down. Session filenames
+use SHA-256 session namespaces; state holds action availability, selected leaf, navigation
+revision and the latest action result. Per-session writes larger than 64 KiB are skipped.
+Publication is observational and never adds file restoration to session-only mode. A
+`runtime/<pid>/` without a `runtime.json` marker is never replaced or deleted
+(`runtime-dir-foreign`).
+
 ## Storage maintenance
 
-What users see of this is in the README ("Limitations" and "Expiration behavior"); this is how it
-works.
+What users see of this is in the README ("What gets stored and what isn't restored" and
+"Configuration"); this is how it works.
 
 ### Git-mode snapshot store
 

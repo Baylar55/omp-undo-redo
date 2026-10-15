@@ -9,6 +9,12 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 - **Source reorganized into layers.** Internal only: files moved from `src/core` into
   `infra/`, `store/`, `snapshot/`, `history/`, `runtime/`, `session/` and `host/`. No
   behavior, storage or API change.
+- **README split.** The README now covers what users need: install, usage, what gets stored and
+  configuration. Recovery steps, manual ref cleanup, the `MM` walkthrough and debug logging moved
+  to `docs/troubleshooting.md`; timeouts, modes and runtime state to `docs/architecture.md`.
+  `docs/` now ships in the package, and the interrupted-restore warning links to the recovery
+  steps. The README also no longer says snapshots are kept only "until … idle for 2
+  days": they are deleted at the next OMP start after that, and their data at a later `git gc`.
 
 ### Fixed
 

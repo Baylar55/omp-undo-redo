@@ -17,18 +17,20 @@ import { git, gitRepository, makeRepository, rmRetry } from "./helpers/index.js"
 
 const execFileAsync = promisify(execFile);
 
-// The commands under the README's "Restoring files after an interrupted undo or
-// redo" heading, exactly as users copy them.
+// The commands under docs/troubleshooting.md's "Restoring files after an
+// interrupted undo or redo" heading, exactly as users copy them. The heading's
+// anchor is linked from recoveryPartialNotice (src/session/notices.ts): rename
+// both together.
 const section =
-  readFileSync(new URL("../README.md", import.meta.url), "utf8")
+  readFileSync(new URL("../docs/troubleshooting.md", import.meta.url), "utf8")
     .replace(/\r\n/g, "\n")
-    .split("\n### Restoring files after an interrupted undo or redo\n")[1]
-    ?.split("\n### ")[0] ?? "";
+    .split("\n## Restoring files after an interrupted undo or redo\n")[1]
+    ?.split("\n## ")[0] ?? "";
 const bashCommands = /```sh\n([\s\S]*?)\n```/.exec(section)?.[1];
 const powershellCommands = /```powershell\n([\s\S]*?)\n```/.exec(section)?.[1];
 
 // Without this, a renamed heading or fence would skip every case below.
-it("finds the README's recovery commands", () => {
+it("finds the documented recovery commands", () => {
   expect(bashCommands).toContain("git read-tree");
   expect(powershellCommands).toContain("git read-tree");
 });
@@ -93,11 +95,11 @@ async function privateWorkspace(): Promise<Workspace> {
 
 const UNICODE = "sp ace ü.txt";
 
-/** The README's procedure against snapshots the extension really took: a turn,
+/** The documented procedure against snapshots the extension really took: a turn,
  *  then an `/undo` of it killed halfway, then the commands with the hashes the
  *  recovery warning prints (before = the turn's after-snapshot, result = its
  *  before-snapshot). */
-describe.each(shells)("README recovery commands ($name)", ({ commands, extension, run }) => {
+describe.each(shells)("documented recovery commands ($name)", ({ commands, extension, run }) => {
   it.each([
     ["Git mode", gitWorkspace],
     ["Private-Git mode", privateWorkspace],

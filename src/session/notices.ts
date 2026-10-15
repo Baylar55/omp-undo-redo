@@ -29,5 +29,5 @@ export function recoveryPartialNotice(
   sourceHash: string,
   targetHash: string,
 ): string {
-  return `The ${command} interrupted by the last exit left files partly restored; undo history was left as it was. Restore them by hand from the snapshots in ${storeDir}: ${sourceHash} (before the ${command}) and ${targetHash} (its result).`;
+  return `The ${command} interrupted by the last exit left files partly restored; undo history was left as it was. Restore them by hand from the snapshots in ${storeDir}: ${sourceHash} (before the ${command}) and ${targetHash} (its result). Steps: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#restoring-files-after-an-interrupted-undo-or-redo`;
 }
