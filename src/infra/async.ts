@@ -1,3 +1,4 @@
+import "./compat.js";
 /** True when `ms` elapsed before `promise` settled. The promise keeps running;
  *  callers use this only to stop waiting, never to abandon the work. */
 export async function timedOutAfter(promise: Promise<unknown>, ms: number): Promise<boolean> {

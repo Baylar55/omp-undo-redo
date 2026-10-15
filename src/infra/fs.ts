@@ -1,3 +1,4 @@
+import "./compat.js";
 import { rename, rm, writeFile, mkdir, open } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
