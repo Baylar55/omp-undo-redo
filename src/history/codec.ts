@@ -196,15 +196,15 @@ export function parseHistory(
     return null;
   // Legacy rows carried their own repository; one that is not the live
   // repository can never be restored from this store.
-  const checkpoints = (candidate.checkpoints as (StoredSessionCheckpoint | ReadGitCheckpoint)[]).map(
-    (checkpoint): StoredCheckpoint => {
-      if (checkpoint.kind === "session") return checkpoint;
-      const stored = storedGitCheckpoint(checkpoint);
-      return legacy && !(checkpoint.repository && sameRepository(checkpoint.repository, repository))
-        ? unavailableCheckpoint(stored)
-        : stored;
-    },
-  );
+  const checkpoints = (
+    candidate.checkpoints as (StoredSessionCheckpoint | ReadGitCheckpoint)[]
+  ).map((checkpoint): StoredCheckpoint => {
+    if (checkpoint.kind === "session") return checkpoint;
+    const stored = storedGitCheckpoint(checkpoint);
+    return legacy && !(checkpoint.repository && sameRepository(checkpoint.repository, repository))
+      ? unavailableCheckpoint(stored)
+      : stored;
+  });
   const currentIndex = candidate.currentIndex as number;
   if (currentIndex < -1 || currentIndex >= checkpoints.length) return null;
   const lastAccessedAt =
