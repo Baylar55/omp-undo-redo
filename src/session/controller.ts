@@ -6,13 +6,7 @@ import { checkpointNamespace } from "../infra/paths.js";
 import type { RuntimeActionStateStore } from "../runtime/action-state.js";
 import { defaultGitRunnerFactory, resolveBackend } from "../store/backend.js";
 import type { FileBackend, SessionOnlyReason } from "../store/backend.js";
-import type {
-  CwdGitRunnerFactory,
-  GitRepository,
-  GitRunner,
-  NavigationState,
-  PendingTurnCheckpoint,
-} from "../types.js";
+import type { CwdGitRunnerFactory, GitRepository, GitRunner, NavigationState } from "../types.js";
 import {
   expireRepository,
   startBootHousekeeping,
@@ -25,37 +19,7 @@ import {
   NOTIFICATION_MESSAGES,
 } from "./notices.js";
 import { settleInterruptedRestore } from "./recovery.js";
-import type { ExtensionServices } from "./services.js";
-import type { PendingCapture } from "./turn-start.js";
-
-/** One session's turn and navigation state. A field left `undefined` means
- *  "no entry": `turnStartLeaf` may hold `null` (a turn started on an empty
- *  session), which is a value, not an absence. */
-export type SessionState = {
-  navigation?: SessionNavigation;
-  initialization?: Promise<SessionNavigation>;
-  backend?: FileBackend;
-  /** The CURRENT turn's checkpoint while no finalize owns it. Anything left
-   *  here when the next turn starts is released: ownership is what keeps a
-   *  deferred finalize's checkpoint alive (see `PendingCapture.owned`). */
-  pending?: PendingTurnCheckpoint;
-  capture?: PendingCapture;
-  finalize?: Promise<void>;
-  /** Leaf the current turn started from. Used to bind a checkpoint to the
-   *  turn that captured it: a deferred finalize whose checkpoint predates the
-   *  current turn is released, never recorded with the wrong leaf. */
-  turnStartLeaf?: string | null;
-  /** Monotonic turn counter. A turn whose after-snapshot finishes only after
-   *  the next turn already started snapshotted that turn's edits too, which
-   *  is what makes such a checkpoint unrestorable. */
-  turnSequence?: number;
-  /** The current turn's in-flight before-snapshot. `before_agent_start`
-   *  stops waiting at the handler deadline, so the agent's tools can run while
-   *  git is still reading the workspace. Tool calls wait on `complete`; one
-   *  that gives up sets `late`, and the capture then discards its snapshot
-   *  (it may hold the turn's own edits) instead of recording a wrong baseline. */
-  beforeSnapshotGate?: { complete: Promise<void>; late: boolean };
-};
+import type { ExtensionServices, SessionState } from "./services.js";
 
 /** The record of `sessionId`, created on first use. */
 export function stateOf(services: ExtensionServices, sessionId: string): SessionState {

@@ -6,18 +6,7 @@ import { runCaptureGc } from "../store/maintenance/gc.js";
 import type { PendingTurnCheckpoint } from "../types.js";
 import { notifySessionOnly, stateOf, turnBackend } from "./controller.js";
 import { gcKey, isMainSession } from "./housekeeping.js";
-import type { ExtensionServices } from "./services.js";
-
-export type PendingCapture = {
-  complete: Promise<void>;
-  checkpoint: PendingTurnCheckpoint | null;
-  /** Set when a finalize claims this capture. An owned capture's checkpoint
-   *  belongs to that finalize alone: it is never published into `pending`
-   *  (where the next turn would release it mid-finalize), and it is never
-   *  released by the capture itself. An unowned capture whose turn is gone
-   *  has no finalize coming, so it releases its own checkpoint. */
-  owned?: boolean;
-};
+import type { ExtensionServices, PendingCapture } from "./services.js";
 
 export async function releasePending(
   services: ExtensionServices,

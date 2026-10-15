@@ -7,13 +7,58 @@ import { readRetentionDays } from "../history/retention.js";
 import { RuntimeActionStateStore } from "../runtime/action-state.js";
 import { IndexLeasePool } from "../snapshot/index-leases.js";
 import { defaultGitRunnerFactory } from "../store/backend.js";
-import type { PrivateRepoEntry } from "../store/backend.js";
+import type { FileBackend, PrivateRepoEntry } from "../store/backend.js";
 import { snapshotRunnerEnv } from "../store/git-store.js";
 import { resolvePersistentHostId, resolveRuntimeScope } from "../store/host-identity.js";
 import { GcQueue } from "../store/maintenance/gc.js";
 import { CheckpointOwnerRegistry } from "../store/owners.js";
-import type { CwdGitRunnerFactory, GitRepository, GitRunner } from "../types.js";
-import type { SessionState } from "./controller.js";
+import type {
+  CwdGitRunnerFactory,
+  GitRepository,
+  GitRunner,
+  PendingTurnCheckpoint,
+} from "../types.js";
+import type { SessionNavigation } from "./navigation.js";
+
+export type PendingCapture = {
+  complete: Promise<void>;
+  checkpoint: PendingTurnCheckpoint | null;
+  /** Set when a finalize claims this capture. An owned capture's checkpoint
+   *  belongs to that finalize alone: it is never published into `pending`
+   *  (where the next turn would release it mid-finalize), and it is never
+   *  released by the capture itself. An unowned capture whose turn is gone
+   *  has no finalize coming, so it releases its own checkpoint. */
+  owned?: boolean;
+};
+
+/** One session's turn and navigation state. A field left `undefined` means
+ *  "no entry": `turnStartLeaf` may hold `null` (a turn started on an empty
+ *  session), which is a value, not an absence. */
+export type SessionState = {
+  navigation?: SessionNavigation;
+  initialization?: Promise<SessionNavigation>;
+  backend?: FileBackend;
+  /** The CURRENT turn's checkpoint while no finalize owns it. Anything left
+   *  here when the next turn starts is released: ownership is what keeps a
+   *  deferred finalize's checkpoint alive (see `PendingCapture.owned`). */
+  pending?: PendingTurnCheckpoint;
+  capture?: PendingCapture;
+  finalize?: Promise<void>;
+  /** Leaf the current turn started from. Used to bind a checkpoint to the
+   *  turn that captured it: a deferred finalize whose checkpoint predates the
+   *  current turn is released, never recorded with the wrong leaf. */
+  turnStartLeaf?: string | null;
+  /** Monotonic turn counter. A turn whose after-snapshot finishes only after
+   *  the next turn already started snapshotted that turn's edits too, which
+   *  is what makes such a checkpoint unrestorable. */
+  turnSequence?: number;
+  /** The current turn's in-flight before-snapshot. `before_agent_start`
+   *  stops waiting at the handler deadline, so the agent's tools can run while
+   *  git is still reading the workspace. Tool calls wait on `complete`; one
+   *  that gives up sets `late`, and the capture then discards its snapshot
+   *  (it may hold the turn's own edits) instead of recording a wrong baseline. */
+  beforeSnapshotGate?: { complete: Promise<void>; late: boolean };
+};
 
 export type OmpUndoRedoDependencies = {
   /** Overrides how git runners are created, letting hosts and tests inject

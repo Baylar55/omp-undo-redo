@@ -6,9 +6,8 @@ import { releaseCheckpoint, retainCheckpointForResume } from "../snapshot/checkp
 import type { SessionOnlyCheckpoint } from "../types.js";
 import { createNavigation, ensureNavigation, stateOf } from "./controller.js";
 import type { SessionNavigation } from "./navigation.js";
-import type { ExtensionServices } from "./services.js";
+import type { ExtensionServices, PendingCapture } from "./services.js";
 import { releasePending } from "./turn-start.js";
-import type { PendingCapture } from "./turn-start.js";
 
 function beginFinalizeTurn(
   services: ExtensionServices,
