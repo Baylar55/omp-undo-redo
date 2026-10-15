@@ -51,9 +51,10 @@ export type ExtensionServices = {
   leasePool: IndexLeasePool;
   bootEviction: Promise<void> | null;
   privateRetentionSweep: Promise<void> | null;
-  /** One record per session id. Records are never removed, only their
-   *  fields cleared, so a record read before an `await` is still the
-   *  session's record after it. */
+  /** One record per session id. Only `releaseLeftSession` removes one, and
+   *  only once the session's finalize, initialization and capture settled (the
+   *  only work that writes to a record it read before an `await`), the
+   *  session is no longer current, and every field is empty. */
   sessions: Map<string, SessionState>;
   /** Turn work (captures, finalizes, session events) shutdown waits on. */
   activeOperations: Set<Promise<void>>;

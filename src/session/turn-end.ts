@@ -182,7 +182,7 @@ async function finalizeTurn(
       // stays restorable, and `applyCheckpoint` patches rather than checks
       // out, so it reports a conflict instead of clobbering unrecorded
       // edits when an older restore crosses this gap.
-      if (stateOf(services, sessionId).turnSequence !== turnSequence) {
+      if (services.sessions.get(sessionId)?.turnSequence !== turnSequence) {
         await releaseCheckpoint(
           services.gitRunnerFor(result.checkpoint.repository),
           result.checkpoint,
@@ -225,7 +225,10 @@ async function finalizeTurn(
 
 export async function agentEnd(services: ExtensionServices, typed: AnyContext): Promise<void> {
   const sessionId = typed.sessionManager.getSessionId();
-  const state = stateOf(services, sessionId);
+  // A lookup, not stateOf: a turn with no record (a subagent's) has nothing to
+  // finalize and must not leave an empty record behind.
+  const state = services.sessions.get(sessionId);
+  if (!state) return;
   const turnStartLeaf = state.turnStartLeaf ?? null;
   const own = state.pending ?? null;
   // Prefer this turn's own boundary. An in-flight capture belonging to an

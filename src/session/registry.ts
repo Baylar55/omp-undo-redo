@@ -163,6 +163,12 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     state.backend = undefined;
     state.turnStartLeaf = undefined;
     state.turnSequence = undefined;
+    // Nothing in flight (the loop above) and nothing left: drop the record, as
+    // a later resume rebuilds it. Only this exact record: a concurrent release
+    // of the same id may already have replaced it with a resumed session's.
+    if (sessions.get(sessionId) === state && Object.values(state).every((v) => v === undefined)) {
+      sessions.delete(sessionId);
+    }
     services.explicitActiveHashes.delete(checkpointNamespace(sessionId));
     await Promise.all([
       services.runtimeStore.releaseSession(sessionId),

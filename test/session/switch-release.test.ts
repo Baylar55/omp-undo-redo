@@ -2,6 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as HistoryLiveness from "../../src/history/liveness.js";
+import type * as Services from "../../src/session/services.js";
 import ompUndoRedo from "../../src/index.js";
 import {
   context,
@@ -20,6 +21,19 @@ vi.mock("../../src/history/liveness.js", async (importOriginal) => {
     touchSessionHeartbeat: (dir: string, hash: string) => {
       beats.push(hash);
       return actual.touchSessionHeartbeat(dir, hash);
+    },
+  };
+});
+
+const created = vi.hoisted(() => [] as Services.ExtensionServices[]);
+vi.mock("../../src/session/services.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof Services>();
+  return {
+    ...actual,
+    createServices: (deps: Parameters<typeof actual.createServices>[0]) => {
+      const services = actual.createServices(deps);
+      created.push(services);
+      return services;
     },
   };
 });
@@ -86,6 +100,9 @@ describe("leaving a session", () => {
       liveId = "new-b";
       await pi.emit("session_switch", ctx);
       expect(heartbeatTick()).not.toContain(hashA);
+      // The left session's record is dropped, not kept empty forever.
+      await Promise.allSettled([...created.at(-1)!.activeOperations]);
+      expect(created.at(-1)!.sessions.has("left-a")).toBe(false);
 
       // Resume A: its turn survived the release and is undoable again.
       await pi.emit("session_before_switch", ctx);
@@ -98,6 +115,21 @@ describe("leaving a session", () => {
       await pi.emit("session_shutdown", ctx);
     } finally {
       await rmRetry(cwd, 10);
+    }
+  });
+
+  it("keeps no record for a subagent's turn", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = Object.assign(context(cwd, "subagent-turn"), { agent: { kind: "sub" as const } });
+      await pi.emit("before_agent_start", ctx);
+      await pi.emit("agent_end", ctx);
+      expect(created.at(-1)!.sessions.size).toBe(0);
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rmRetry(cwd);
     }
   });
 });
