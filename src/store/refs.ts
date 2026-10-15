@@ -75,7 +75,7 @@ export function historyRefPrefix(sessionHash: string): string {
   return `${HISTORY_REF_ROOT}${sessionHash}/`;
 }
 
-export interface RefRelease {
+interface RefRelease {
   repository: GitRepository;
   ref: string;
   expectedHash: string;

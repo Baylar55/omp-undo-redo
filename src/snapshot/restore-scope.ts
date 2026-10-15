@@ -125,7 +125,7 @@ export async function pinnedTree(
   return tree.code === 0 && treeHash ? treeHash : null;
 }
 
-export interface SnapshotsOutside extends OutsideSnapshot {
+interface SnapshotsOutside extends OutsideSnapshot {
   /** `--index-info -z` entries pinning every unreadable file to its source
    *  entry (a removal when the source has none). */
   unreadablePins: string[];

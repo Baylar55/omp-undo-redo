@@ -26,7 +26,7 @@ const PRIVATE_SWEEP_PRUNE = "1.hour.ago";
  *  gc can never hit the host's timeout. The prune drops unreferenced
  *  objects: expiring sessions would otherwise leave recoverable file
  *  content behind indefinitely. */
-export async function runPrivateGc(
+async function runPrivateGc(
   repository: GitRepository,
   gitRunnerFactory: CwdGitRunnerFactory,
 ): Promise<void> {

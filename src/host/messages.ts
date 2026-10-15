@@ -1,7 +1,7 @@
 import type { CommandNavigation } from "../session/registry.js";
 import type { FileCheckpointUnavailableReason, ActionId } from "../types.js";
 
-export interface NavigationVerbs {
+interface NavigationVerbs {
   busy: string;
   movedUnavailablePrefix: string;
   movedSuccess: string;
@@ -68,7 +68,7 @@ export function unavailableMessage(reason: FileCheckpointUnavailableReason): str
   }
 }
 
-export const LISTED_PATHS = 5;
+const LISTED_PATHS = 5;
 
 export function listed(paths: readonly string[]): string {
   const more = paths.length - LISTED_PATHS;

@@ -13,12 +13,10 @@ import {
   unavailableMessage,
 } from "./messages.js";
 
-export type NavigationDirection = "undo" | "redo";
-
 export async function runNavigation(
   navigation: SessionNavigation,
   ctx: ExtensionCommandContext,
-  direction: NavigationDirection,
+  direction: ActionId,
 ): Promise<CommandNavigationResult> {
   const verbs = VERBS[direction];
   if (!ctx.isIdle()) {
