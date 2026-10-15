@@ -24,6 +24,7 @@ import {
   storedGitCheckpoint,
   sameRepository,
   isRestoreIntent,
+  isUnavailableReason,
 } from "./codec.js";
 import type { StoredHistory, StoredCheckpoint } from "./codec.js";
 import { entryExists, effectiveLeaf } from "./reconstruct.js";
@@ -76,7 +77,13 @@ export class SessionHistoryStore {
       const refs = await existingRefs(this.git, this.repository, refPrefix);
       if (refs === null) return { status: "unavailable", reason: "unusable" };
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
-        if (checkpoint.kind === "session") return checkpoint;
+        if (checkpoint.kind === "session") {
+          const { reason } = checkpoint;
+          return {
+            ...checkpoint,
+            reason: isUnavailableReason(reason) ? reason : "resumed_checkpoint_unavailable",
+          };
+        }
         if (
           refs.get(checkpoint.beforeRef) === checkpoint.beforeHash &&
           refs.get(checkpoint.afterRef) === checkpoint.afterHash
@@ -101,7 +108,8 @@ export class SessionHistoryStore {
       // Refresh lastAccessedAt without persisting the runtime-mapped
       // checkpoints: a concurrent expiration that deleted refs mid-load would
       // otherwise be written back as permanent session-only rows, destroying
-      // recoverable git coordinates. The mapping is re-derived on every load.
+      // recoverable git coordinates, and a newer version's session reason
+      // would be lost. The mapping is re-derived on every load.
       await this.refreshStoredTimestamp(parsed).catch(() => undefined);
       return { status: "loaded", state };
     } catch {
@@ -109,10 +117,11 @@ export class SessionHistoryStore {
     }
   }
 
-  /** Rewrites the stored document with the original (unmapped) checkpoints
-   *  and a fresh lastAccessedAt, preserving schema migration. Skips the write
-   *  when a tombstone appeared mid-load so a completed expiration is never
-   *  resurrected. */
+  /** Rewrites the stored document with the checkpoints as parsed (not
+   *  runtime-mapped; only legacy rows of another repository are already
+   *  unavailable) and a fresh lastAccessedAt, preserving schema migration.
+   *  Skips the write when a tombstone appeared mid-load so a completed
+   *  expiration is never resurrected. */
   private async refreshStoredTimestamp(parsed: StoredHistory): Promise<void> {
     const tombstoneFile = tombstonePath(this.repository, this.sessionId);
     const claimed = await stat(tombstoneFile)

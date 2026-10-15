@@ -1,9 +1,9 @@
 import type {
+  FileCheckpointUnavailableReason,
   GitCheckpoint,
   GitRepository,
   SessionOnlyCheckpoint,
   RestoreIntent,
-  TurnCheckpoint,
 } from "../types.js";
 import { UNAVAILABLE_REASONS } from "../types.js";
 import { checkpointNamespace } from "../infra/paths.js";
@@ -26,7 +26,15 @@ export const HASH = /^[0-9a-f]{64}$/;
 /** A git checkpoint as stored: the repository is the live one, never persisted per row. */
 export type StoredGitCheckpoint = Omit<GitCheckpoint, "repository">;
 
-export type StoredCheckpoint = SessionOnlyCheckpoint | StoredGitCheckpoint;
+/** A session row as stored: a newer version may have written a reason this
+ *  version does not know, so it is any string until `load()` maps it. */
+export type StoredSessionCheckpoint = Omit<SessionOnlyCheckpoint, "reason"> & { reason: string };
+
+export type StoredCheckpoint = StoredSessionCheckpoint | StoredGitCheckpoint;
+
+export function isUnavailableReason(reason: string): reason is FileCheckpointUnavailableReason {
+  return (UNAVAILABLE_REASONS as readonly string[]).includes(reason);
+}
 
 /** A git row as read from disk: schema 1 and 2 rows still carry their own repository. */
 export type ReadGitCheckpoint = StoredGitCheckpoint & { repository?: GitRepository };
@@ -114,9 +122,9 @@ function isRepository(value: unknown): value is GitRepository {
   );
 }
 
-/** Any string `reason` is accepted: a newer version may record one this
- *  version does not know, which `parseHistory` maps to an unavailable one. */
-function isSessionCheckpoint(value: unknown): value is TurnCheckpoint {
+/** Any string `reason` is accepted and kept as read, so a load's write-back
+ *  preserves a newer version's reason. */
+function isSessionCheckpoint(value: unknown): value is StoredSessionCheckpoint {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   return (
@@ -188,13 +196,9 @@ export function parseHistory(
     return null;
   // Legacy rows carried their own repository; one that is not the live
   // repository can never be restored from this store.
-  const checkpoints = (candidate.checkpoints as (SessionOnlyCheckpoint | ReadGitCheckpoint)[]).map(
+  const checkpoints = (candidate.checkpoints as (StoredSessionCheckpoint | ReadGitCheckpoint)[]).map(
     (checkpoint): StoredCheckpoint => {
-      if (checkpoint.kind === "session") {
-        return (UNAVAILABLE_REASONS as readonly string[]).includes(checkpoint.reason)
-          ? checkpoint
-          : { ...checkpoint, reason: "resumed_checkpoint_unavailable" };
-      }
+      if (checkpoint.kind === "session") return checkpoint;
       const stored = storedGitCheckpoint(checkpoint);
       return legacy && !(checkpoint.repository && sameRepository(checkpoint.repository, repository))
         ? unavailableCheckpoint(stored)

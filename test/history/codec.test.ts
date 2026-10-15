@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -89,6 +89,13 @@ describe("history codec", () => {
         leafId: "r1",
       },
       { ...gitRow, repository },
+    ]);
+    // The load's lastAccessedAt write-back keeps the newer version's reason.
+    const onDisk = JSON.parse(await readFile(historyPath(repository, sessionId), "utf8"));
+    expect(typeof onDisk.lastAccessedAt).toBe("string");
+    expect(onDisk.checkpoints).toEqual([
+      { kind: "session", reason: "some_future_reason", parentLeafId: "p1", leafId: "r1" },
+      gitRow,
     ]);
   });
 });
