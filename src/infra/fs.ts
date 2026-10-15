@@ -45,7 +45,10 @@ export async function writeExclusive(path: string, contents: string): Promise<bo
   }
 }
 
-const RETRY_DELAY_MS = 200;
+/** Delay between repeated filesystem attempts, riding out short flaps such
+ *  as a handle (a git child, an antivirus scan, a reader) that Windows holds
+ *  open for a moment. */
+export const RETRY_DELAY_MS = 200;
 
 export async function removeDirWithRetry(path: string): Promise<boolean> {
   for (let attempt = 0; attempt < 5; attempt += 1) {

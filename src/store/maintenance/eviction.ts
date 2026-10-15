@@ -5,15 +5,10 @@ import { promisify } from "node:util";
 import { refusedPrivateWorkspace } from "../private-store.js";
 import type { CwdGitRunnerFactory } from "../../types.js";
 import { canonicalCwd, storeRootDirectory } from "../../infra/paths.js";
-import { removeDirWithRetry } from "../../infra/fs.js";
+import { RETRY_DELAY_MS, removeDirWithRetry } from "../../infra/fs.js";
 import { setupFinished } from "../setup.js";
 import { GIT_STORE_SOURCE_KEY } from "../git-store.js";
 import { storeHasRefs } from "./gc.js";
-
-/** Delay riding out short flaps: between the two workspace stats,
- *  between retries when removing evicted repos, and between retries when a
- *  git child still holds a directory handle on Windows. */
-const EVICTION_RETRY_DELAY_MS = 200;
 
 /** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */
 const nativeRealpath = promisify(realpath.native);
@@ -178,7 +173,7 @@ export async function evictStalePrivateRepos(
           refusedPrivateWorkspace(await nativeRealpath(source).catch(() => source));
         if (!refused) {
           if (!(await vanished())) continue;
-          await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
           if (!(await vanished())) continue;
         }
       } else if ((await setupFinished(path)) !== false || (await storeHasRefs(path))) {
@@ -199,7 +194,7 @@ export async function evictStalePrivateRepos(
           break;
         } catch {
           if (attempt === 4) break; // Stranded until a later sweep.
-          await new Promise((resolve) => setTimeout(resolve, EVICTION_RETRY_DELAY_MS));
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
         }
       }
     } catch {
