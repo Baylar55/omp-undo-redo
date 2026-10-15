@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { historyPath } from "../../src/history/layout.js";
 import { SessionHistoryStore } from "../../src/history/store.js";
-import type { GitRepository, GitRunner } from "../../src/types.js";
+import type { GitRepository, GitRunner, SessionEntryLike } from "../../src/types.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -97,5 +97,70 @@ describe("history codec", () => {
       { kind: "session", reason: "some_future_reason", parentLeafId: "p1", leafId: "r1" },
       gitRow,
     ]);
+  });
+});
+
+describe("empty history load after session_exit", () => {
+  async function loadEmpty(entries: SessionEntryLike[], leafId: string | null) {
+    const gitDir = await mkdtemp(join(tmpdir(), "history-exit-"));
+    temporaryDirectories.push(gitDir);
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    const sessionId = "exit-session";
+    await mkdir(join(gitDir, "omp-undo-redo", "history"), { recursive: true });
+    await writeFile(
+      historyPath(repository, sessionId),
+      JSON.stringify({
+        schemaVersion: 3,
+        sessionHash: createHash("sha256").update(sessionId).digest("hex"),
+        repository,
+        checkpoints: [],
+        currentIndex: -1,
+      }),
+    );
+    const git: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+    return new SessionHistoryStore(sessionId, repository, git).load({
+      getLeafId: () => leafId,
+      getBranch: () => entries,
+      getEntry: (id: string) => entries.find((entry) => entry.id === id),
+    });
+  }
+  // Literal, not SESSION_EXIT_CUSTOM_TYPE: pins the value hosts actually write.
+  const exit = (id: string, parentId: string | null): SessionEntryLike => ({
+    id,
+    parentId,
+    type: "custom",
+    customType: "session_exit",
+  });
+
+  it("loads when only session_exit entries sit above the empty root", async () => {
+    await expect(loadEmpty([exit("x1", null), exit("x2", "x1")], "x2")).resolves.toEqual({
+      status: "loaded",
+      state: { checkpoints: [], currentIndex: -1 },
+    });
+  });
+
+  it("rejects when a session_exit leaf hides real conversation", async () => {
+    const prompt: SessionEntryLike = {
+      id: "p1",
+      parentId: null,
+      type: "message",
+      message: { role: "user" },
+    };
+    await expect(loadEmpty([prompt, exit("x1", "p1")], "x1")).resolves.toEqual({
+      status: "unavailable",
+      reason: "unusable",
+    });
+  });
+
+  it("terminates and fails closed on a session_exit parent cycle", async () => {
+    await expect(loadEmpty([exit("x1", "x2"), exit("x2", "x1")], "x1")).resolves.toEqual({
+      status: "unavailable",
+      reason: "unusable",
+    });
   });
 });
