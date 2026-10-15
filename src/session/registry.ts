@@ -246,31 +246,36 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       // Priority order: whatever OMP's cap cuts off runs on in the background
       // and is lost only if the process exits first.
       const teardown = (async () => {
-        // Local cleanup first: idle index leases (a checked-out one may sit
-        // under a running git) and the runtime directory.
-        await Promise.all([
-          services.leasePool.releasePersistentSnapshotIndices(services.leaseSessionIds, {
-            inUse: false,
-          }),
-          services.runtimeStore.shutdown(),
-        ]);
-        await suspendDetached(detachedNavigations, detachedPending);
-        // Turn work only, never gcs or sweeps. A capture or finalize still
-        // running after this releases its own checkpoint on completion
-        // (closing is set); the boot sweep reclaims an index it leaves behind.
-        await timedOutAfter(
-          Promise.allSettled([
-            ...services.activeOperations,
-            ...[...sessions.values()].flatMap((s) =>
-              s.finalize === undefined ? [] : [s.finalize],
-            ),
-          ]),
-          SHUTDOWN_TURN_DRAIN_MS,
-        );
-        await services.leasePool.releasePersistentSnapshotIndices(services.leaseSessionIds);
-        await drainState();
-        await services.ownerRegistry.shutdown();
-        services.leasePool.dispose();
+        try {
+          // Local cleanup first: idle index leases (a checked-out one may sit
+          // under a running git) and the runtime directory.
+          await Promise.all([
+            services.leasePool.releasePersistentSnapshotIndices(services.leaseSessionIds, {
+              inUse: false,
+            }),
+            services.runtimeStore.shutdown(),
+          ]);
+          await suspendDetached(detachedNavigations, detachedPending);
+          // Turn work only, never gcs or sweeps. A capture or finalize still
+          // running after this releases its own checkpoint on completion
+          // (closing is set); the boot sweep reclaims an index it leaves behind.
+          await timedOutAfter(
+            Promise.allSettled([
+              ...services.activeOperations,
+              ...[...sessions.values()].flatMap((s) =>
+                s.finalize === undefined ? [] : [s.finalize],
+              ),
+            ]),
+            SHUTDOWN_TURN_DRAIN_MS,
+          );
+          await services.leasePool.releasePersistentSnapshotIndices(services.leaseSessionIds);
+          await drainState();
+          await services.ownerRegistry.shutdown();
+        } finally {
+          // Even when a step above rejected: a failed subagent shutdown must
+          // not pin its pool in `livePools` for the process's lifetime.
+          services.leasePool.dispose();
+        }
       })();
       // A git step that overran the budget must not cost the checked-out
       // leases: drop them now, filesystem only.
