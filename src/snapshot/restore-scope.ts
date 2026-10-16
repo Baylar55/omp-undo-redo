@@ -47,11 +47,12 @@ async function ignoredUnder(
 /** Snapshots omit ignored paths, so a path can be missing from a tree only
  *  because that tree's rules ignored it while the file stayed on disk.
  *  Restoring must leave such a path alone: deleting it destroys the user's
- *  ignored file (undoing a turn that un-ignored `.env`), and creating it
- *  collides with the file still on disk (redoing that turn). Returns the
- *  `--index-info` entries pinning those paths to their `sourceHash` state.
- *  Only a `.gitignore` change between the two trees can produce such a path,
- *  so every other restore costs one `diff-tree`. */
+ *  ignored file (undoing a turn that un-ignored `.env` or force-added it), and
+ *  creating it collides with the file still on disk (redoing that turn).
+ *  Returns the `--index-info` entries pinning those paths to their
+ *  `sourceHash` state. No `.gitignore` change is needed for this (`git add -f`
+ *  alone does it), so every added or deleted path is checked; a restore with
+ *  neither costs one `diff-tree`. */
 export async function shieldIgnoredPaths(
   git: GitRunner,
   sourceHash: string,
@@ -68,15 +69,13 @@ export async function shieldIgnoredPaths(
   const fields = changes.stdout.split("\0");
   const deleted = new Map<string, string>();
   const added = new Map<string, string>();
-  let rulesChanged = false;
   for (let index = 0; index + 1 < fields.length; index += 2) {
     const [sourceMode, , sourceSha, , status] = fields[index]!.slice(1).split(" ");
     const path = fields[index + 1]!;
-    if (path === ".gitignore" || path.endsWith("/.gitignore")) rulesChanged = true;
     if (status === "D") deleted.set(path, `${sourceMode} ${sourceSha}`);
     else if (status === "A") added.set(path, `${sourceMode} ${sourceSha}`);
   }
-  if (!rulesChanged || (deleted.size === 0 && added.size === 0)) return [];
+  if (deleted.size === 0 && added.size === 0) return [];
 
   const keptOnDisk = await ignoredUnder(git, targetHash, [...deleted.keys()], directory, "target");
   const hiddenInSource = await ignoredUnder(

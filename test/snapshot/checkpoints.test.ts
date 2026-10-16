@@ -692,6 +692,53 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("keeps a pre-existing ignored file across undo/redo of a turn that force-adds it", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const envPath = join(cwd, ".env");
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, ".gitignore"), ".env\n");
+      await git(["add", ".gitignore"]);
+      await git(["commit", "-qm", "ignore fixture"]);
+      await writeFile(envPath, "SECRET=1\n");
+
+      const pending = pendingCheckpoint(
+        await prepareBeforeTurn(snap, "force-add-turn", defaultPool),
+      );
+      await git(["add", "-f", ".env"]);
+      await git(["commit", "-qm", "track env"]);
+      const checkpoint = completedCheckpoint(
+        await finishAfterTurn(snap, pending, null, null, defaultPool),
+      );
+
+      // No `.gitignore` changed, yet `.env` is only in the after snapshot.
+      await expect(
+        applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
+      ).resolves.toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: [],
+      });
+      expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+
+      await expect(
+        applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
+      ).resolves.toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: [],
+      });
+      expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+
+      await releaseCheckpoint(snap, checkpoint);
+      await releasePersistentSnapshotIndices(["force-add-turn"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("reuses and normalizes the alternate index without changing fresh snapshot semantics", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {
