@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narrow scope of the extension: session-tree navigation and Git-backed file restoration, using public OMP extension APIs.
+Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narrow scope of the extension: session-tree navigation and Git-backed file restoration, using public OMP extension APIs. Host sources: Oh My Pi ([can1357/oh-my-pi](https://github.com/can1357/oh-my-pi)) and Pi ([badlogic/pi-mono](https://github.com/badlogic/pi-mono)).
 
 ## Before opening a change
 
