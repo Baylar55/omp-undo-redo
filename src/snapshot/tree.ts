@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { GitRunner, SnapshotIndexLease } from "../types.js";
 import { invoke } from "../infra/git-runner.js";
-import { autocrlfSetting, snapshotMessage } from "./markers.js";
+import { autocrlfSetting, excludeRules, snapshotMessage } from "./markers.js";
 import type { OutsideSnapshot } from "./markers.js";
 
 const GIT_AUTHOR = ["-c", "user.name=omp-undo-redo", "-c", "user.email=omp-undo-redo@local"];
@@ -104,7 +104,11 @@ async function createCommitForTree(
   treeHash: string,
   message: string,
 ): Promise<SnapshotResult> {
-  const commit = await invoke(git, [...GIT_AUTHOR, "commit-tree", treeHash, "-m", message]);
+  // Through stdin: the message carries the exclude rules, which can outgrow
+  // Windows' 32K command line. `-m` would end it with the same newline.
+  const commit = await invoke(git, [...GIT_AUTHOR, "commit-tree", treeHash, "-F", "-"], {
+    stdin: `${message}\n`,
+  });
   if (commit.code !== 0) return { reason: "snapshot_failed" };
   const commitHash = commit.stdout.trim();
   return commitHash ? { hash: commitHash, tree: treeHash } : { reason: "snapshot_failed" };
@@ -274,13 +278,20 @@ export async function createSnapshotCommit(
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const outside = await addWorktree(git, addEnv, ownedPaths);
+    const [outside, rules] = await Promise.all([
+      addWorktree(git, addEnv, ownedPaths),
+      excludeRules(git, addEnv),
+    ]);
     if (!outside) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     if (tree.code !== 0) return { reason: "snapshot_failed" };
     const treeHash = tree.stdout.trim();
     if (!treeHash) return { reason: "snapshot_failed" };
-    const commit = await createCommitForTree(git, treeHash, snapshotMessage(message, outside));
+    const commit = await createCommitForTree(
+      git,
+      treeHash,
+      snapshotMessage(message, outside, rules),
+    );
     if (!("hash" in commit)) return commit;
     if (retainIndex && (seeded.status === "seeded" || seeded.status === "empty")) {
       const snapshotIndexLease: SnapshotIndexLease =
@@ -375,7 +386,10 @@ export async function createSnapshotCommitFromLease(
 
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const outside = await addWorktree(git, addEnv, ownedPaths);
+    const [outside, rules] = await Promise.all([
+      addWorktree(git, addEnv, ownedPaths),
+      excludeRules(git, addEnv),
+    ]);
     if (!outside) return { reason: "snapshot_failed" };
     // `add -A` cannot drop an entry that became ignored after it was staged, so
     // prune those explicitly; a fresh snapshot never holds one unless HEAD
@@ -388,7 +402,7 @@ export async function createSnapshotCommitFromLease(
     if (tree.code !== 0 || !treeHash) return { reason: "snapshot_failed" };
 
     if (!(await leaseBaselineCurrent(git, lease))) return { reason: "snapshot_failed" };
-    return createCommitForTree(git, treeHash, snapshotMessage(message, outside));
+    return createCommitForTree(git, treeHash, snapshotMessage(message, outside, rules));
   } catch {
     return { reason: "snapshot_failed" };
   } finally {

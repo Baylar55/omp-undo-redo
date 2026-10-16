@@ -739,6 +739,56 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it.each(["info/exclude", "core.excludesFile"])(
+    "keeps a pre-existing excluded file across undo/redo of a turn that edits %s",
+    async (source) => {
+      const { cwd, git, snap } = await makeRepo();
+      const envPath = join(cwd, ".env");
+      const rules =
+        source === "info/exclude"
+          ? resolve(cwd, await text(git, ["rev-parse", "--git-path", "info/exclude"]))
+          : join(cwd, "..", `${cwd.slice(cwd.lastIndexOf(sep) + 1)}-excludes`);
+      try {
+        await initializeBranch(git, cwd);
+        if (source === "core.excludesFile") {
+          await git(["config", "core.excludesFile", rules.replaceAll("\\", "/")]);
+        }
+        await mkdir(join(rules, ".."), { recursive: true });
+        await writeFile(rules, "# excludes\n.env\n");
+        await writeFile(envPath, "SECRET=1\n");
+
+        const pending = pendingCheckpoint(
+          await prepareBeforeTurn(snap, "exclude-turn", defaultPool),
+        );
+        // A negation today must not override the rule the before snapshot ran under.
+        await writeFile(rules, "!.env\n");
+        const checkpoint = completedCheckpoint(
+          await finishAfterTurn(snap, pending, null, null, defaultPool),
+        );
+
+        // Only the after snapshot holds `.env`; no tree's ignore rules exclude it.
+        for (const [from, to] of [
+          [checkpoint.afterHash, checkpoint.beforeHash],
+          [checkpoint.beforeHash, checkpoint.afterHash],
+        ] as const) {
+          await expect(applyCheckpoint(snap, from, to)).resolves.toEqual({
+            status: "applied",
+            nestedRepositories: [],
+            unreadableFiles: [],
+            restoredFiles: [],
+          });
+          expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+        }
+
+        await releaseCheckpoint(snap, checkpoint);
+        await releasePersistentSnapshotIndices(["exclude-turn"]);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        if (source === "core.excludesFile") await rm(rules, { force: true });
+      }
+    },
+  );
+
   it("reuses and normalizes the alternate index without changing fresh snapshot semantics", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {

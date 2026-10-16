@@ -1,8 +1,13 @@
-import { lstat, mkdir } from "node:fs/promises";
+import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { GitRunner } from "../types.js";
 import { invoke } from "../infra/git-runner.js";
-import { AUTOCRLF_OFF_LINE, NESTED_REPOSITORY_LINE, UNREADABLE_FILE_LINE } from "./markers.js";
+import {
+  AUTOCRLF_OFF_LINE,
+  NESTED_REPOSITORY_LINE,
+  UNREADABLE_FILE_LINE,
+  recordedExcludeRules,
+} from "./markers.js";
 import type { OutsideSnapshot } from "./markers.js";
 
 /** Restore invocations get a far larger ceiling than the runner's default:
@@ -11,13 +16,17 @@ import type { OutsideSnapshot } from "./markers.js";
  *  exists only so a wedged child cannot hang the process forever. */
 export const RESTORE_TIMEOUT_MS = 10 * 60 * 1000;
 
-/** Paths of `paths` that `tree`'s own ignore rules exclude. The rules are
- *  materialized into a scratch worktree (`tree`'s `.gitignore` files only) so
- *  `check-ignore` evaluates them exactly as git would have when that tree was
- *  snapshotted, alongside the repository's `info/exclude` and global excludes. */
+/** Paths of `paths` that `commit`'s own ignore rules exclude. The rules are
+ *  materialized into a scratch worktree (`commit`'s `.gitignore` files only)
+ *  so `check-ignore` evaluates them exactly as git would have when that
+ *  commit was snapshotted. The exclude rules it recorded
+ *  (`recordedExcludeRules`) head the root `.gitignore`: the same precedence
+ *  as an excludes file (every `.gitignore` line overrides them), but above
+ *  the repository's current `info/exclude` and global excludes, which still
+ *  apply after them. Those are all a snapshot recording no rules gets. */
 async function ignoredUnder(
   git: GitRunner,
-  tree: string,
+  commit: string,
   paths: readonly string[],
   directory: string,
   label: string,
@@ -26,7 +35,7 @@ async function ignoredUnder(
   const rules = join(directory, `${label}-rules`);
   await mkdir(rules);
   const env = { GIT_INDEX_FILE: join(directory, `${label}-index`), GIT_WORK_TREE: rules };
-  if ((await invoke(git, ["read-tree", tree], { env })).code !== 0) return null;
+  if ((await invoke(git, ["read-tree", commit], { env })).code !== 0) return null;
   const files = await invoke(git, ["ls-files", "-z", "--", ":(glob)**/.gitignore"], { env });
   if (files.code !== 0) return null;
   if (files.stdout) {
@@ -35,6 +44,19 @@ async function ignoredUnder(
       stdin: files.stdout,
     });
     if (written.code !== 0) return null;
+  }
+  const recorded = await recordedExcludeRules(git, commit);
+  if (!recorded) return null;
+  if (recorded.length > 0) {
+    const root = join(rules, ".gitignore");
+    // git reads no symlinked `.gitignore`; removing the link keeps writes in the scratch dir.
+    const own = await lstat(root).then(
+      (stats) => (stats.isFile() ? readFile(root) : Buffer.alloc(0)),
+      () => Buffer.alloc(0),
+    );
+    await rm(root, { force: true });
+    const bom = own.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? 3 : 0;
+    await writeFile(root, Buffer.concat([recorded, Buffer.from("\n"), own.subarray(bom)]));
   }
   const ignored = await invoke(git, ["check-ignore", "--no-index", "-z", "--stdin"], {
     env,
