@@ -193,6 +193,19 @@ load `session/recovery.ts` checks whether the restore patch still applies from e
 from the source means nothing changed, from the target moves the cursor, from neither leaves the
 cursor and warns with the store and both hashes. Loading never writes the worktree.
 
+### Links in the worktree
+
+Git for Windows treats a junction (`mklink /J`) as a plain directory: `add -A` snapshots the files
+it points at, and `git apply` writes and deletes through it without its "beyond a symbolic link"
+check firing. Before `git apply --check`, `applyPatch` (`snapshot/restore.ts`) passes every path
+the restore touches to `pathsBeyondLinks` (`snapshot/restore-scope.ts`), which `lstat`s each
+directory above it inside the worktree, once per directory (Node reports junctions as symlinks).
+Any link there makes the result `linked`: nothing is written, and the check-only probe of
+`session/recovery.ts` does not count the restore as applicable. The path itself is not checked, so
+a tracked symlink is still restored as a link. A runner without `cwd` gets the worktree from
+`git rev-parse --show-toplevel`. The scan reads the disk once: a link created between it and
+`git apply` is not caught (git's own check still covers real symlinks). Capture is unchanged.
+
 ### Subagents
 
 Subagent sessions (the `task` tool, eval `agent()`, `/tan` clones) run in the same process with

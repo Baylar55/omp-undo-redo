@@ -58,7 +58,9 @@ export async function runNavigation(
       ctx.ui.notify(
         outcome.failure === "conflict"
           ? `${verbs.conflict}${outcome.conflictedFiles.length > 0 ? ` Conflicting files: ${listed(outcome.conflictedFiles)}.` : ""}`
-          : "Could not restore the Git checkpoint.",
+          : outcome.failure === "linked"
+            ? `${verbs.linked} Linked files: ${listed(outcome.linkedFiles)}. Replace the link with a real folder to restore them: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#undo-or-redo-refused-files-under-a-symlink-or-junction`
+            : "Could not restore the Git checkpoint.",
         "warning",
       );
       break;

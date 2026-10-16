@@ -10,6 +10,7 @@ interface NavigationVerbs {
   cancelled: string;
   rollbackFailed: string;
   conflict: string;
+  linked: string;
 }
 
 export const VERBS: Record<ActionId, NavigationVerbs> = {
@@ -23,6 +24,8 @@ export const VERBS: Record<ActionId, NavigationVerbs> = {
     rollbackFailed:
       "Undo navigation was cancelled, but file rollback failed; inspect the session and worktree manually.",
     conflict: "Worktree changed; nothing was undone.",
+    linked:
+      "Files sit under a symlink or junction, which undo never writes through; nothing was undone.",
   },
   redo: {
     busy: "Cannot redo while the agent is busy.",
@@ -34,6 +37,8 @@ export const VERBS: Record<ActionId, NavigationVerbs> = {
     rollbackFailed:
       "Redo navigation was cancelled, but file rollback failed; inspect the session and worktree manually.",
     conflict: "Worktree changed; nothing was redone.",
+    linked:
+      "Files sit under a symlink or junction, which redo never writes through; nothing was redone.",
   },
 };
 

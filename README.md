@@ -9,7 +9,7 @@ Know this before relying on it:
 
 - **Snapshots are plaintext copies of your worktree**, kept outside the repository: in Git projects, unignored files such as `.env.local`; in non-Git folders, `.env` and private keys too. They are deleted 2 days (configurable) after the session's last use, not securely erased.
 - **`/undo` reverts every file changed during the turn**, including edits from your editor or a build watcher, and lists what it restored.
-- **Not restored:** ignored files, nested Git repositories, files locked by another program, Git LFS content removed by `git lfs prune`.
+- **Not restored:** ignored files, nested Git repositories, files locked by another program, Git LFS content removed by `git lfs prune`. A turn that touched files under a symlink or Windows junction cannot be undone or redone until the link is replaced.
 - **No file snapshots** in a non-Git home directory, drive root or temp directory: only the conversation moves back.
 
 Details: [What gets stored and what isn't restored](#what-gets-stored-and-what-isnt-restored). Problems: [Troubleshooting](./docs/troubleshooting.md).
@@ -56,6 +56,7 @@ Snapshots are plaintext Git objects in the store (`~/.omp/omp-undo-redo/repos/` 
 
 - **Git projects:** tracked files plus untracked files `.gitignore` does not exclude. Your `HEAD`, branches and index are never touched, and mirror push/clone, `git bundle create --all` and `git log --all` never see the snapshots.
 - **Non-Git folders:** everything except the built-in ignore list (`.git`, `.hg`, `.svn`, `node_modules`, `.history`, `dist`, `coverage`, `.omp`, `.next`, `build`, `out`, `target`, `.vs`, `.idea`, `__pycache__`, `.venv`, `.gradle`), matched at any depth. So `.env`, `id_rsa`, `*.pem` are included, and a hand-written `docs/build/` is not.
+- **Through a Windows junction** (`mklink /J`): Git reads it as a plain folder, so snapshots also copy the files it points at, even outside the workspace. Directory symlinks are stored as links and never followed.
 - **Skipped entirely:** your own home directory without Git (and folders above it such as `C:\Users` or `/home`), drive roots and your OS temp directory, since snapshotting would copy `.ssh`, `AppData` and browser profiles. Their subfolders are normal workspaces. Running `git init` there does not make it safe: Git mode then snapshots everything not gitignored.
 
 Left as they are by `/undo` and `/redo`:
@@ -65,6 +66,8 @@ Left as they are by `/undo` and `/redo`:
 - **Files Git could not read** at snapshot time (locked, e.g. Visual Studio's `.vs` databases, or no read permission); the result names them.
 - **Pruned Git LFS files:** snapshotting runs clean filters like `git add`, writing LFS objects to `.git/lfs/objects` (or the store's `lfs/` for non-Git folders). If `git lfs prune` removed one and LFS cannot download it again, the restore is rolled back; if the file's current version was pruned too, it is left empty.
 - **Rewritten history:** in Git mode, content reachable from `HEAD` is shared with your repository until the next store gc. Rewriting and pruning it before then (`git filter-repo`, BFG) makes those checkpoints unrestorable; undo/redo reports the failure rather than restoring part of them. Normal `git gc --prune=now` is safe.
+
+Refused whole: an undo or redo that would write, create or delete a file under a symlink or junction in the workspace writes nothing and names those files. See [Undo or redo refused: files under a symlink or junction](./docs/troubleshooting.md#undo-or-redo-refused-files-under-a-symlink-or-junction).
 
 ## Configuration
 

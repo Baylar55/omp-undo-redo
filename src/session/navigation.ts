@@ -236,9 +236,17 @@ export class SessionNavigation {
   private restoreFailedResult(
     applied: Exclude<CheckpointApplyResult, { status: "applied" }>,
   ): NavigationResult {
-    return applied.status === "conflict"
-      ? { status: "git_failed", failure: "conflict", conflictedFiles: applied.conflictedFiles }
-      : { status: "git_failed", failure: "failed" };
+    if (applied.status === "conflict") {
+      return {
+        status: "git_failed",
+        failure: "conflict",
+        conflictedFiles: applied.conflictedFiles,
+      };
+    }
+    if (applied.status === "linked") {
+      return { status: "git_failed", failure: "linked", linkedFiles: applied.linkedFiles };
+    }
+    return { status: "git_failed", failure: "failed" };
   }
 
   undo(): Promise<NavigationResult> {

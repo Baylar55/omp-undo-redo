@@ -58,6 +58,9 @@ export type NavigationResult =
   /** `conflictedFiles` (worktree root relative): the paths the restore
    *  refused; empty when git named none. */
   | { status: "git_failed"; failure: "conflict"; conflictedFiles: string[] }
+  /** `linkedFiles` (worktree root relative): paths below a symlink or
+   *  junction, which a restore never writes through; nothing was written. */
+  | { status: "git_failed"; failure: "linked"; linkedFiles: string[] }
   | { status: "git_failed"; failure: "failed" }
   | { status: "rollback_failed" };
 

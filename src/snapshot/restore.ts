@@ -11,6 +11,7 @@ import {
   pinnedTree,
   changedPaths,
   applyCheckPaths,
+  pathsBeyondLinks,
 } from "./restore-scope.js";
 
 /** `nestedRepositories` and `unreadableFiles`: paths whose contents the
@@ -20,7 +21,9 @@ import {
  *  whole worktree, so this includes edits made during the turn by anyone
  *  else (an editor, another process), not only the agent's.
  *  `conflictedFiles`: the paths `git apply --check` refused, relative to the
- *  worktree root; empty when its output named none. */
+ *  worktree root; empty when its output named none. `linkedFiles`: the paths
+ *  the restore would reach through a symlink or junction in the worktree
+ *  (see `pathsBeyondLinks`); nothing was written. */
 export type CheckpointApplyResult =
   | {
       status: "applied";
@@ -29,6 +32,7 @@ export type CheckpointApplyResult =
       restoredFiles: string[];
     }
   | { status: "conflict"; conflictedFiles: string[] }
+  | { status: "linked"; linkedFiles: string[] }
   | { status: "failed" };
 
 /** Restores `targetHash`'s content over a worktree that currently matches
@@ -59,6 +63,7 @@ export async function applyCheckpoint(
   const applied = await applyPatch(git, sourceHash, targetHash, unreadablePins, config, checkOnly);
   if (applied === "failed") return { status: "failed" };
   if ("conflictedFiles" in applied) return { status: "conflict", ...applied };
+  if ("linkedFiles" in applied) return { status: "linked", ...applied };
   return { status: "applied", nestedRepositories, unreadableFiles, ...applied };
 }
 
@@ -163,7 +168,9 @@ async function applyPatch(
   unreadablePins: readonly string[],
   config: readonly string[],
   checkOnly: boolean,
-): Promise<{ restoredFiles: string[] } | { conflictedFiles: string[] } | "failed"> {
+): Promise<
+  { restoredFiles: string[] } | { conflictedFiles: string[] } | { linkedFiles: string[] } | "failed"
+> {
   let tempDirectory: string | null = null;
   try {
     tempDirectory = await mkdtemp(join(tmpdir(), "omp-undo-redo-patch-"));
@@ -208,6 +215,19 @@ async function applyPatch(
     // Listed before applying: failing after the patch landed would misreport.
     const restoredFiles = await changedPaths(git, sourceHash, effectiveTarget);
     if (!restoredFiles) return "failed";
+    // Before `--check` too: recovery's check-only probe must not call such a
+    // restore applicable. A runner from a host's `gitRunnerFactory` may carry
+    // no cwd: git then names the worktree. A scan of the disk as it is now: a
+    // link created between here and `git apply` is not caught (git's own
+    // guard still covers real symlinks).
+    let worktree = git.cwd;
+    if (!worktree) {
+      const top = await invoke(git, ["rev-parse", "--show-toplevel"]);
+      worktree = top.code === 0 && !top.error ? top.stdout.trim() : "";
+      if (!worktree) return "failed";
+    }
+    const linked = await pathsBeyondLinks(worktree, restoredFiles);
+    if (linked.length > 0) return { linkedFiles: linked };
 
     const check = await invoke(
       git,

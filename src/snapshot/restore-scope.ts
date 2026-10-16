@@ -244,3 +244,43 @@ export async function changedPaths(
   }
   return paths;
 }
+
+/** Paths of `paths` (worktree root relative, `/`-separated) with a symlink or
+ *  junction above them in `worktree`. Git for Windows takes a junction for a
+ *  folder: `add -A` snapshots what it points at, and `git apply` writes and
+ *  deletes through it without its "beyond a symbolic link" guard firing, so
+ *  undoing a turn that created one deleted the files outside the worktree.
+ *  Node's `lstat` reports junctions as symlinks. The path itself is not
+ *  checked: a tracked symlink is restored as a link, never followed. Throws
+ *  when an ancestor cannot be inspected, so an unknown is never applied. */
+export async function pathsBeyondLinks(
+  worktree: string,
+  paths: readonly string[],
+): Promise<string[]> {
+  const linked = new Map<string, Promise<boolean>>();
+  const isLink = (directory: string) => {
+    let result = linked.get(directory);
+    if (!result) {
+      result = lstat(join(worktree, directory)).then(
+        (stats) => stats.isSymbolicLink(),
+        (error: NodeJS.ErrnoException) => {
+          // Absent: apply creates a real directory there.
+          if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+          throw error;
+        },
+      );
+      linked.set(directory, result);
+    }
+    return result;
+  };
+  const beyond: string[] = [];
+  for (const path of paths) {
+    for (let end = path.indexOf("/"); end !== -1; end = path.indexOf("/", end + 1)) {
+      if (await isLink(path.slice(0, end))) {
+        beyond.push(path);
+        break;
+      }
+    }
+  }
+  return beyond;
+}

@@ -50,6 +50,19 @@ Remove-Item -LiteralPath $env:GIT_INDEX_FILE
 
 For example, if `f.txt` is committed as `base`, a turn changes it to `turn` and stages it, and `/undo` restores the worktree to `base`, Git reports `MM f.txt`: `git diff --cached` still shows `base -> turn`, while `git diff` shows `turn -> base`. This is a visible staged/unstaged divergence, not corruption or data loss.
 
+## Undo or redo refused: files under a symlink or junction
+
+"Files sit under a symlink or junction, which undo never writes through; nothing was undone. Linked files: …" means the restore would reach those files through a link in the workspace, almost always a Windows junction (`mklink /J`). Git for Windows treats a junction as a plain folder, so the snapshot holds the files it points at, and restoring them would write or delete them there, outside the workspace. Nothing was written.
+
+Deleting the link does not help: the restore then finds those files missing and refuses with "Worktree changed". Replace the link with a real folder holding the same files instead. In `cmd.exe`, from the workspace root, with `shared` the link and `C:\x` the folder it points at:
+
+```bat
+rmdir shared
+robocopy C:\x shared /E
+```
+
+`rmdir` without `/S` removes only the junction, never the files it points at; robocopy exits with 1 when it copied files. Run `/undo` or `/redo` again: it now writes or deletes the copy, and `C:\x` stays as it is. Recreate the link afterwards if you still want it.
+
 ## Inspecting and deleting checkpoint refs by hand
 
 Checkpoint refs live under `refs/omp-undo-redo/` in the snapshot store, and pending refs left by an exited process are deleted automatically (rules: [Checkpoint refs and owner leases](./architecture.md#checkpoint-refs-and-owner-leases)). For manual inspection, stop all OMP/Pi processes that use the repository, then use Git commands only, against the store (`<storeRoot>/repos/<hash>.git` for a Private-Git workspace or a Git repository; a Git-mode store records its repository in its `config` as `omp-undo-redo.commondir`):

@@ -36,7 +36,7 @@ import { releaseRefs } from "../../src/store/refs.js";
 import { resolveRepository } from "../../src/store/discovery.js";
 import { defaultPool, releasePersistentSnapshotIndices } from "../../src/snapshot/index-leases.js";
 import { releaseCheckpoint, releasePendingCheckpoint } from "../../src/snapshot/checkpoint-refs.js";
-import { applyCheckPaths } from "../../src/snapshot/restore-scope.js";
+import { applyCheckPaths, pathsBeyondLinks } from "../../src/snapshot/restore-scope.js";
 import { applyCheckpoint } from "../../src/snapshot/restore.js";
 import { historyDirectory } from "../../src/history/layout.js";
 
@@ -509,6 +509,38 @@ describe("history-safe Git checkpoints", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  // Git for Windows reads and writes through a junction as through a folder:
+  // undoing a turn that created one deleted the files it points at.
+  it.runIf(process.platform === "win32")(
+    "refuses to restore through a junction created during the turn",
+    async () => {
+      const { cwd, git, snap } = await makeRepo();
+      const outside = await mkdtemp(join(tmpdir(), "omp-undo-redo-outside-"));
+      try {
+        await initializeBranch(git, cwd);
+        await writeFile(join(outside, "keep.txt"), "outside\n");
+        const before = pendingCheckpoint(await prepareBeforeTurn(snap, "junction", defaultPool));
+        await symlink(outside, join(cwd, "shared"), "junction");
+        const after = completedCheckpoint(
+          await finishAfterTurn(snap, before, null, null, defaultPool),
+        );
+        const linked = { status: "linked", linkedFiles: ["shared/keep.txt"] };
+
+        expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash, true)).toEqual(
+          linked,
+        );
+        expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual(linked);
+        // Redo writes the same path: refused too, not "already exists".
+        expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual(linked);
+        expect((await lstat(join(cwd, "shared"))).isSymbolicLink()).toBe(true);
+        expect(await readFile(join(outside, "keep.txt"), "utf8")).toBe("outside\n");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(outside, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("navigates a completed turn with no file changes", async () => {
     const { cwd, git, snap } = await makeRepo();
@@ -2488,5 +2520,29 @@ describe("applyCheckPaths", () => {
       "link",
       "run.sh",
     ]);
+  });
+});
+
+describe("pathsBeyondLinks", () => {
+  // A directory link: a junction on Windows (no privilege needed), a symlink elsewhere.
+  it("names paths below a link, never the link itself or a missing directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omp-undo-redo-links-"));
+    try {
+      await mkdir(join(root, "real", "deep"), { recursive: true });
+      await mkdir(join(root, "target"));
+      await symlink(join(root, "target"), join(root, "real", "link"), "junction");
+      expect(
+        await pathsBeyondLinks(root, [
+          "real/link/a.txt",
+          "real/deep/b.txt",
+          "real/link",
+          "real/link/sub/c.txt",
+          "missing/d.txt",
+          "top.txt",
+        ]),
+      ).toEqual(["real/link/a.txt", "real/link/sub/c.txt"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
