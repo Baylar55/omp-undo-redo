@@ -549,6 +549,38 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it.each([
+    { stderr: "fatal: detected dubious ownership in repository at '/repo'\n" },
+    { stderr: "", error: "timeout" as const },
+  ])("stays session-only when rev-parse fails inside a repository subfolder (%j)", async (failure) => {
+    const repo = await makeRepository();
+    const pkg = join(repo, "pkg");
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-unresolvable-store-"));
+    try {
+      await mkdir(pkg);
+      vi.stubEnv("OMP_UNDO_REDO_STORE_DIR", storeRoot);
+      const failing = (cwd: string, env?: Record<string, string>): GitRunner => {
+        const inner = createGitRunner(cwd, { env });
+        return Object.assign(
+          async (args: string[], options?: Parameters<GitRunner>[1]) =>
+            args.includes("--show-toplevel")
+              ? { stdout: "", code: 128, ...failure }
+              : inner(args, options),
+          { cwd: inner.cwd, env: inner.env },
+        );
+      };
+      expect(await resolveBackend(pkg, new Map(), failing)).toEqual({
+        kind: "session",
+        reason: "repository_unresolvable",
+      });
+      expect(await readdir(join(storeRoot, "repos")).catch(() => [])).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(repo, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("refuses Private-Git in the home directory, above it, in the temp directory and at a root", async () => {
     const parent = await mkdtemp(join(tmpdir(), "omp-private-home-"));
     const home = join(parent, "home");

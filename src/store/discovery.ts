@@ -18,12 +18,12 @@ export type RepositoryResolution =
 
 export async function resolveRepository(git: GitRunner): Promise<RepositoryResolution> {
   // One spawn: rev-parse prints each flag's answer on its own stdout line, in order.
-  const result = await invoke(git, [
-    "rev-parse",
-    "--show-toplevel",
-    "--git-dir",
-    "--git-common-dir",
-  ]);
+  const result = await invoke(
+    git,
+    ["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"],
+    // Pins the "not a git repository" message matched below.
+    { env: { LC_ALL: "C" } },
+  );
   if (result.error === "unavailable") return { reason: "git_unavailable" };
   const lines = result.code === 0 ? result.stdout.trim().split("\n") : [];
   const [worktree = "", gitDir = "", commonDir = ""] = lines.map((line) => line.trim());
@@ -43,7 +43,12 @@ export async function resolveRepository(git: GitRunner): Promise<RepositoryResol
         },
       };
     } catch {
-      return { reason: "not_repository" };
+      // Only git's own verdict means "outside any repository": any other failure
+      // (timeout, dubious ownership, unreadable config) may hide an enclosing
+      // repository whose .gitignore a Private-Git snapshot would not honor.
+      const outside =
+        result.code !== 0 && !result.error && /not a git repository/i.test(result.stderr);
+      return { reason: outside ? "not_repository" : "repository_unresolvable" };
     }
   }
   if (!gitDir || !commonDir) return { reason: "repository_unresolvable" };

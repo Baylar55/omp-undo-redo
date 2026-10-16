@@ -202,7 +202,8 @@ export async function ensureNavigation(
 
 /** The backend a turn snapshots with. An unavailable store is not cached: a
  *  launch racing this one for it, or a store directory fixed meanwhile, may
- *  let a later turn snapshot. */
+ *  let a later turn snapshot. Nor is an unresolvable repository: a transient
+ *  git failure or a fixed `safe.directory` may resolve on a later turn. */
 export async function turnBackend(
   services: ExtensionServices,
   typed: AnyContext,
@@ -214,7 +215,9 @@ export async function turnBackend(
     cached &&
     !(
       cached.kind === "session" &&
-      (cached.reason === "private_repository_unavailable" || cached.reason === "store_unavailable")
+      (cached.reason === "private_repository_unavailable" ||
+        cached.reason === "store_unavailable" ||
+        cached.reason === "repository_unresolvable")
     )
   )
     return cached;

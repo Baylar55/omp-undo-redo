@@ -150,9 +150,12 @@ this is how it works.
   `<storeRoot>/repos/<sha256(cwd)>.git` with the workspace as its worktree, snapshotted through the
   same alternate-index engine. It is seeded with the built-in ignore list so churn is bounded. The
   store root and `repos/` are created `0700` and the repository sets `core.sharedRepository=0600`.
-- **Session-only fallback.** With no Git binary, or when store setup fails, only the session moves;
-  the user is notified once per session. Store setup is retried at the start of every turn, and
-  several processes setting up the same new store retry instead of failing. A non-Git home
+- **Session-only fallback.** With no Git binary, when store setup fails, or when `git rev-parse`
+  fails for any reason but "not a git repository" (timeout, dubious ownership: Private-Git there
+  could ignore an enclosing repository's `.gitignore`), only the session moves; the user is
+  notified once per session. Store setup and an unresolvable repository are retried at the start
+  of every turn (no Git binary and refused workspaces are not), and several processes setting up
+  the same new store retry instead of failing. A non-Git home
   directory (or any folder above it), a filesystem root and the OS temp directory are refused
   outright (`store/private-store.ts`); only the current user's home and temp directory are
   recognized. A store an earlier version created for one of them is evicted once idle for 24 hours.
