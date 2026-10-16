@@ -51,3 +51,28 @@ export function reconstructSessionHistory(
   }
   return { checkpoints, currentIndex: checkpoints.length - 1 };
 }
+
+/** A turn whose finalize never ran (no `agent_end`, a shutdown mid-finalize)
+ *  is missing from the stored history; undo would rewind it together with the
+ *  turn before it while restoring only that turn's files. Appends such turns
+ *  of the branch ending at `leafId` as session-only. Only with the cursor at
+ *  the end and the last recorded turn on that branch: anywhere else the
+ *  history and the branch do not describe the same line of turns. */
+export function appendUnrecordedTurns(
+  reader: SessionReader,
+  state: NavigationState,
+  leafId: string | null,
+): NavigationState {
+  const last = state.checkpoints.at(-1);
+  if (!last || leafId === null || state.currentIndex !== state.checkpoints.length - 1) return state;
+  const branch = reader.getBranch(leafId);
+  const lastIndex = branch.findIndex((entry) => entry.id === last.leafId);
+  if (lastIndex < 0) return state;
+  const recorded = new Set(branch.slice(0, lastIndex + 1).map((entry) => entry.id));
+  const later = reconstructSessionHistory(reader, leafId).checkpoints.filter(
+    (checkpoint) => checkpoint.parentLeafId !== null && !recorded.has(checkpoint.parentLeafId),
+  );
+  if (later.length === 0) return state;
+  const checkpoints = [...state.checkpoints, ...later];
+  return { checkpoints, currentIndex: checkpoints.length - 1 };
+}

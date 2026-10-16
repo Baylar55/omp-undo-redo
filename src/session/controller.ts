@@ -1,5 +1,5 @@
 import type { AnyContext } from "../host-contract.js";
-import { reconstructSessionHistory } from "../history/reconstruct.js";
+import { appendUnrecordedTurns, reconstructSessionHistory } from "../history/reconstruct.js";
 import { SessionHistoryStore } from "../history/store.js";
 import { track } from "../infra/async.js";
 import { checkpointNamespace } from "../infra/paths.js";
@@ -76,19 +76,25 @@ export function notifySessionOnly(
   ctx.ui.notify(NOTIFICATION_MESSAGES[reason], "warning");
 }
 
-/** `historyLeafId` bounds the history rebuilt when no stored one loads: a
+/** `historyLeafId` bounds the history rebuilt or extended from the branch: a
  *  finalize passes its turn-start leaf, or the turn it is about to record
- *  would be rebuilt from the branch and then recorded a second time. */
+ *  would be taken from the branch and then recorded a second time. */
 export async function initializeNavigation(
   services: ExtensionServices,
   ctx: AnyContext,
   replaceExisting: boolean,
-  historyLeafId: string | null = ctx.sessionManager.getLeafId(),
+  historyLeafId?: string | null,
 ): Promise<SessionNavigation> {
   const sessionId = ctx.sessionManager.getSessionId();
   const sessionHash = checkpointNamespace(sessionId);
   services.explicitActiveHashes.add(sessionHash);
   const state = stateOf(services, sessionId);
+  // Unbounded, a turn still capturing or finalizing is on the branch and
+  // records itself: taking it from the branch too would record it twice.
+  const extendFromBranch =
+    historyLeafId !== undefined ||
+    (state.capture === undefined && state.pending === undefined && state.finalize === undefined);
+  const leafId = historyLeafId === undefined ? ctx.sessionManager.getLeafId() : historyLeafId;
   if (!replaceExisting) {
     const current = state.navigation;
     if (current) return current;
@@ -150,7 +156,7 @@ export async function initializeNavigation(
     } else {
       restored = null;
     }
-    let navigationState = restored ?? reconstructSessionHistory(ctx.sessionManager, historyLeafId);
+    let navigationState = restored ?? reconstructSessionHistory(ctx.sessionManager, leafId);
     // ponytail: without loaded history (expired, unusable, missing) the intent
     // matches no git checkpoint and is dropped unreported, even over a
     // half-restored worktree. Probe the intent's own hashes if that ever matters.
@@ -163,6 +169,10 @@ export async function initializeNavigation(
         intent,
         services.gitRunnerFor,
       );
+    }
+    // After the intent settled: it names the stored cursor's checkpoint.
+    if (restored && extendFromBranch) {
+      navigationState = appendUnrecordedTurns(ctx.sessionManager, navigationState, leafId);
     }
     navigation.restoreState(navigationState);
     await services.runtimeStore.initializeSession(

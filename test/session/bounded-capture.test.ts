@@ -2,7 +2,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
+import type * as Capture from "../../src/snapshot/capture.js";
 import { createGitRunner } from "../../src/infra/git-runner.js";
 import type { GitRunner } from "../../src/types.js";
 import ompUndoRedo, { type OmpUndoRedoDependencies } from "../../src/index.js";
@@ -14,6 +15,18 @@ import {
   rmRetry,
   type TestContext,
 } from "../helpers/index.js";
+
+const captureFailure = vi.hoisted(() => ({ armed: false }));
+vi.mock("../../src/snapshot/capture.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof Capture>();
+  return {
+    ...actual,
+    prepareBeforeTurn: (...args: Parameters<typeof actual.prepareBeforeTurn>) =>
+      captureFailure.armed
+        ? Promise.reject(new Error("capture failed"))
+        : actual.prepareBeforeTurn(...args),
+  };
+});
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-test-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -255,6 +268,42 @@ describe("bounded capture lifecycle", () => {
     } finally {
       await waitForAdds(3).catch(() => undefined);
       await new Promise((resolve) => setTimeout(resolve, 100));
+      await rmRetry(cwd);
+    }
+  });
+
+  it("records a session-only boundary for a turn whose before-capture threw", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "throwing-capture");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      ctx.leaf = "p1";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "r1";
+      await pi.emit("agent_end", ctx);
+      captureFailure.armed = true;
+      ctx.leaf = "p2";
+      await pi.emit("before_agent_start", ctx);
+      captureFailure.armed = false;
+      await writeFile(join(cwd, "other.txt"), "turn 2\n");
+      ctx.leaf = "r2";
+      await pi.emit("agent_end", ctx);
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("p2");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("files were not restored");
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("p1");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      captureFailure.armed = false;
       await rmRetry(cwd);
     }
   });

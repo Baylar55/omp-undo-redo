@@ -1,5 +1,6 @@
 import type { AnyContext } from "../host-contract.js";
 import { timedOutAfter, track } from "../infra/async.js";
+import { debugLog } from "../infra/debug-log.js";
 import { prepareBeforeTurn } from "../snapshot/capture.js";
 import { releasePendingCheckpoint } from "../snapshot/checkpoint-refs.js";
 import { runCaptureGc } from "../store/maintenance/gc.js";
@@ -29,11 +30,21 @@ export function beginCapture(
   task: () => Promise<PendingTurnCheckpoint>,
 ): PendingCapture {
   const state = stateOf(services, sessionId);
+  // Read before the task runs: the next turn may move turnStartLeaf on.
+  const parentLeafId = state.turnStartLeaf ?? null;
   const { promise: complete, resolve } = Promise.withResolvers<void>();
   const capture: PendingCapture = { complete, checkpoint: null };
   void track(async () => {
     try {
-      const checkpoint = await task();
+      // A capture that throws still owes its turn a boundary, or the turn
+      // drops out of the history and undo rewinds it with the turn before.
+      const checkpoint = await task().catch((error: unknown): PendingTurnCheckpoint => {
+        debugLog({
+          event: "capture failed",
+          error: error instanceof Error ? (error.stack ?? error.message) : String(error),
+        });
+        return { kind: "session", reason: "before_snapshot_failed", parentLeafId };
+      });
       // The capture's own turn is over once turnStartLeaf moved on. Its
       // checkpoint then belongs to the finalize that claimed this capture —
       // and to nobody at all if no `agent_end` ever claimed it (two
@@ -62,8 +73,7 @@ export function beginCapture(
         }
       }
     } catch {
-      // Nothing to unwind: the finally below unblocks waiters and the turn
-      // falls back to session-only.
+      // Nothing to unwind: the finally below unblocks waiters.
     } finally {
       resolve();
       if (state.capture === capture) state.capture = undefined;

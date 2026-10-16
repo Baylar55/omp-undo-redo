@@ -870,6 +870,79 @@ describe("resumed session history", () => {
     }
   });
 
+  it("adds a turn the last exit left unrecorded as session-only", async () => {
+    const cwd = await makeRepository();
+    const sessionId = "unrecorded-turn";
+    const entry = (id: string, parentId: string | null, role: string): TestEntry => ({
+      id,
+      parentId,
+      type: "message",
+      message: { role },
+    });
+    const p1 = entry("p1", null, "user");
+    const r1 = entry("r1", p1.id, "assistant");
+    const p2 = entry("p2", r1.id, "user");
+    const r2 = entry("r2", p2.id, "assistant");
+    const exit: TestEntry = {
+      id: "exit",
+      parentId: r2.id,
+      type: "custom",
+      customType: "session_exit",
+    };
+    const all = [p1, r1, p2, r2, exit];
+    try {
+      const firstApi = new FakeExtensionApi();
+      ompUndoRedo(firstApi as never);
+      const first = context(cwd, sessionId);
+      first.leaf = p1.id;
+      first.branch = [p1];
+      first.entries = [p1];
+      await firstApi.emit("session_start", first);
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      first.leaf = r1.id;
+      first.branch = first.entries = [p1, r1];
+      await firstApi.emit("agent_end", first);
+      // Turn 2 never reaches agent_end: the process shuts down mid-turn.
+      first.leaf = p2.id;
+      first.branch = first.entries = [p1, r1, p2];
+      await firstApi.emit("before_agent_start", first);
+      await writeFile(join(cwd, "other.txt"), "turn 2\n");
+      first.leaf = r2.id;
+      first.branch = first.entries = [p1, r1, p2, r2];
+      await firstApi.emit("session_shutdown", first);
+
+      const secondApi = new FakeExtensionApi();
+      ompUndoRedo(secondApi as never);
+      const second = context(cwd, sessionId);
+      second.leaf = exit.id;
+      second.branch = second.entries = all;
+      second.navigateTree = async (targetId) => {
+        second.leaf = targetId;
+        second.branch = all.slice(0, all.findIndex((e) => e.id === targetId) + 1);
+        return { cancelled: false };
+      };
+      await secondApi.emit("session_start", second);
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(p2.id);
+      expect(second.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the resumed turn has no usable file checkpoint.",
+      );
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      await secondApi.runCommand("undo", second);
+      expect(second.leaf).toBe(p1.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      expect(await readFile(join(cwd, "other.txt"), "utf8")).toBe("turn 2\n");
+      await secondApi.runCommand("redo", second);
+      await secondApi.runCommand("redo", second);
+      expect(second.leaf).toBe(r2.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      await secondApi.emit("session_shutdown", second);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
   describe("an undo or redo killed between the file restore and the session move", () => {
     const prompt: TestEntry = {
       id: "prompt",
