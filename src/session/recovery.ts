@@ -1,6 +1,7 @@
 import type { AnyContext } from "../host-contract.js";
 import type { SessionHistoryStore } from "../history/store.js";
 import { applyCheckpoint } from "../snapshot/restore.js";
+import { ownedPathsInWorktree } from "../store/git-store.js";
 import type {
   GitCheckpoint,
   GitRepository,
@@ -71,7 +72,13 @@ export async function settleInterruptedRestore(
   gitRunnerFor: (repository: GitRepository) => GitRunner,
 ): Promise<NavigationState> {
   const recovery = await recoverInterruptedRestore(state, intent, async (checkpoint, from, to) => {
-    const { status } = await applyCheckpoint(gitRunnerFor(checkpoint.repository), from, to, true);
+    const { status } = await applyCheckpoint(
+      gitRunnerFor(checkpoint.repository),
+      from,
+      to,
+      true,
+      ownedPathsInWorktree(checkpoint.repository),
+    );
     return status === "failed" ? null : status === "applied";
   }).catch(() => ({ outcome: "unknown" as const }));
   if (recovery.outcome === "unknown") return state;

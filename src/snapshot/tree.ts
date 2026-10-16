@@ -183,11 +183,31 @@ async function pruneIgnoredEntries(
  *  file, so restoring an LF file wrote CRLF and a turn that only changed
  *  line endings recorded nothing. Text/eol attributes still apply: the
  *  repository asked for that normalization, and a restore writes what
- *  `git checkout` would. */
+ *  `git checkout` would. `ownedPaths`: the extension's directories inside the
+ *  worktree (`ownedPathsInWorktree`), left out of the snapshot; entries the
+ *  index already holds for them (a HEAD that tracks them) are dropped, since
+ *  `add -A` leaves excluded paths as they are. Literal: such a path may hold
+ *  glob characters. */
 async function addWorktree(
   git: GitRunner,
   env: Record<string, string>,
+  ownedPaths: readonly string[],
 ): Promise<OutsideSnapshot | null> {
+  if (ownedPaths.length > 0) {
+    const stored = await invoke(
+      git,
+      ["ls-files", "-z", "--cached", "--", ...ownedPaths.map((path) => `:(top,literal)${path}`)],
+      { env },
+    );
+    if (stored.code !== 0) return null;
+    if (stored.stdout) {
+      const removed = await invoke(git, ["update-index", "--force-remove", "-z", "--stdin"], {
+        env,
+        stdin: stored.stdout,
+      });
+      if (removed.code !== 0) return null;
+    }
+  }
   // Under a text attribute, `core.safecrlf` only warns (one stderr line per
   // converted file) or, set to true, aborts the add; the blobs written are
   // the same either way.
@@ -203,6 +223,7 @@ async function addWorktree(
       "--ignore-errors",
       "--",
       WORKTREE_PATHSPEC,
+      ...ownedPaths.map((path) => `:(top,exclude,literal)${path}`),
     ],
     { env: { ...env, LC_ALL: "C" } },
   );
@@ -241,6 +262,7 @@ export async function createSnapshotCommit(
   message: string,
   retainIndex = false,
   gitDir?: string,
+  ownedPaths: readonly string[] = [],
 ): Promise<SnapshotResult> {
   let tempDirectory: string | null = null;
   try {
@@ -252,7 +274,7 @@ export async function createSnapshotCommit(
     if (seeded.status === "failed") return { reason: "snapshot_failed" };
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const outside = await addWorktree(git, addEnv);
+    const outside = await addWorktree(git, addEnv, ownedPaths);
     if (!outside) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     if (tree.code !== 0) return { reason: "snapshot_failed" };
@@ -310,6 +332,7 @@ export async function createSnapshotCommitFromLease(
   git: GitRunner,
   lease: SnapshotIndexLease,
   message: string,
+  ownedPaths: readonly string[] = [],
 ): Promise<SnapshotResult> {
   const normalizationPath = join(lease.directory, `normalize-${randomUUID()}.nul`);
   const env = { GIT_INDEX_FILE: lease.indexPath };
@@ -352,7 +375,7 @@ export async function createSnapshotCommitFromLease(
 
     const addEnv: Record<string, string> = { ...env };
     if (git.env?.GIT_DIR && git.cwd) addEnv.GIT_WORK_TREE = git.cwd;
-    const outside = await addWorktree(git, addEnv);
+    const outside = await addWorktree(git, addEnv, ownedPaths);
     if (!outside) return { reason: "snapshot_failed" };
     // `add -A` cannot drop an entry that became ignored after it was staged, so
     // prune those explicitly; a fresh snapshot never holds one unless HEAD

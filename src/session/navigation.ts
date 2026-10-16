@@ -12,6 +12,7 @@ import type {
   TurnCheckpoint,
 } from "../types.js";
 import { HISTORY_REF_ROOT } from "../store/refs.js";
+import { ownedPathsInWorktree } from "../store/git-store.js";
 import { releaseCheckpoints } from "../snapshot/checkpoint-refs.js";
 import { applyCheckpoint } from "../snapshot/restore.js";
 import type { CheckpointApplyResult } from "../snapshot/restore.js";
@@ -60,7 +61,13 @@ export class SessionNavigation {
     this.applyGit =
       applyGit ??
       ((checkpoint, sourceHash, targetHash) =>
-        applyCheckpoint(this.gitForRepository(checkpoint.repository), sourceHash, targetHash));
+        applyCheckpoint(
+          this.gitForRepository(checkpoint.repository),
+          sourceHash,
+          targetHash,
+          false,
+          ownedPathsInWorktree(checkpoint.repository),
+        ));
     this.intents = intents ?? { save: async () => undefined, clear: async () => undefined };
     if (port.navigateTree) this.navigateTree = port.navigateTree.bind(port);
   }

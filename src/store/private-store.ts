@@ -4,7 +4,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { CwdGitRunnerFactory, GitRepository } from "../types.js";
-import { canonicalCwd } from "../infra/paths.js";
+import { canonicalCwd, pathInside } from "../infra/paths.js";
 import {
   SETUP_RETRIES,
   SETUP_RETRY_MS,
@@ -112,12 +112,8 @@ async function updateExclude(gitDir: string, worktree: string, storeRoot: string
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   const managed: string[] = [];
-  const canonicalStoreRoot = canonicalCwd(storeRoot);
-  const canonicalWorktree = canonicalCwd(worktree);
-  const rel = relative(canonicalWorktree, canonicalStoreRoot);
-  if (rel && rel !== "." && !rel.startsWith("..") && !isAbsolute(rel)) {
-    managed.push(`${rel.replace(/\\/g, "/")}/`);
-  }
+  const rel = pathInside(worktree, storeRoot);
+  if (rel) managed.push(`${rel}/`);
   managed.push(...DEFAULT_EXCLUDES);
 
   const lines = content.split(/\r?\n/);

@@ -9,7 +9,7 @@ import type {
   SnapshotIndexLease,
 } from "../types.js";
 import { run } from "../infra/git-runner.js";
-import { storeEnv, boundStore } from "../store/git-store.js";
+import { storeEnv, boundStore, ownedPathsInWorktree } from "../store/git-store.js";
 import { resolveRepository, canonicalPath } from "../store/discovery.js";
 import { pinBorrowedObjects } from "../store/pinning.js";
 import { persistentIndexKey } from "./index-leases.js";
@@ -64,6 +64,7 @@ export async function prepareBeforeTurn(
   const checkpointId = newCheckpointId();
   const indexKey = persistentIndexKey(repository, sessionId);
   const priorLease = pool.checkOutIdleLease(indexKey);
+  const ownedPaths = ownedPathsInWorktree(repository);
   let snapshot: SnapshotResult;
   let lease: SnapshotIndexLease | undefined;
   if (priorLease) {
@@ -71,6 +72,7 @@ export async function prepareBeforeTurn(
       git,
       priorLease,
       "omp-undo-redo: before turn",
+      ownedPaths,
     );
     if ("hash" in reused) {
       snapshot = reused;
@@ -82,6 +84,7 @@ export async function prepareBeforeTurn(
         "omp-undo-redo: before turn",
         true,
         repository.gitDir,
+        ownedPaths,
       );
       if ("hash" in snapshot) lease = snapshot.snapshotIndexLease;
     }
@@ -91,6 +94,7 @@ export async function prepareBeforeTurn(
       "omp-undo-redo: before turn",
       true,
       repository.gitDir,
+      ownedPaths,
     );
     if ("hash" in snapshot) lease = snapshot.snapshotIndexLease;
   }
@@ -146,8 +150,14 @@ export async function finishAfterTurn(
 ): Promise<FinishAfterTurnResult> {
   let snapshot: SnapshotResult;
   let lease = before.snapshotIndexLease;
+  const ownedPaths = ownedPathsInWorktree(before.repository);
   if (lease) {
-    snapshot = await createSnapshotCommitFromLease(git, lease, "omp-undo-redo: after turn");
+    snapshot = await createSnapshotCommitFromLease(
+      git,
+      lease,
+      "omp-undo-redo: after turn",
+      ownedPaths,
+    );
     if (!("hash" in snapshot)) {
       // HEAD moved (or another failure occurred) since the turn began: the
       // retained alternate index is stale, so drop it and fall back to a fresh
@@ -161,6 +171,7 @@ export async function finishAfterTurn(
         "omp-undo-redo: after turn",
         key !== undefined,
         before.repository.gitDir,
+        ownedPaths,
       );
       lease = "hash" in snapshot ? snapshot.snapshotIndexLease : undefined;
       if (lease && key !== undefined) pool.markLeaseInUse(lease, key);
@@ -173,6 +184,7 @@ export async function finishAfterTurn(
       "omp-undo-redo: after turn",
       false,
       before.repository.gitDir,
+      ownedPaths,
     );
   }
   const pending = { ...before, snapshotIndexLease: lease };

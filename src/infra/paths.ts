@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 
 /** Canonical (long-form, symlink-resolved) absolute path. Sync because the
@@ -29,6 +29,15 @@ export function canonicalCwd(cwd: string): string {
       }
     }
   }
+}
+
+/** `path` relative to `root`, `/`-separated, when it lies strictly inside
+ *  `root`; null otherwise. Both are canonicalized first, so a short-form or
+ *  symlinked spelling of either still matches. */
+export function pathInside(root: string, path: string): string | null {
+  const rel = relative(canonicalCwd(root), canonicalCwd(path));
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  return rel.replace(/\\/g, "/");
 }
 
 function basenameIsRuntime(value: string): boolean {

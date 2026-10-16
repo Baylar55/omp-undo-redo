@@ -129,6 +129,12 @@ interface SnapshotsOutside extends OutsideSnapshot {
   /** `--index-info -z` entries pinning every unreadable file to its source
    *  entry (a removal when the source has none). */
   unreadablePins: string[];
+  /** `--index-info -z` entries pinning every path under the extension's own
+   *  directories that the two commits disagree on to its source entry (a
+   *  removal when the source has none). Only snapshots taken before those
+   *  were left out hold such paths; restoring them would delete the store's
+   *  objects. */
+  ownedPins: string[];
   /** Both commits carry `AUTOCRLF_OFF_LINE`. */
   autocrlfOff: boolean;
 }
@@ -138,7 +144,9 @@ interface SnapshotsOutside extends OutsideSnapshot {
  *  only, and `git apply` without an index skips gitlink hunks) plus the ones a
  *  snapshot left out for having no commit. Unreadable files: a snapshot's
  *  entry for one is stale or missing, so the restore must leave the file on
- *  disk alone. Null when a commit is unreadable. Also reads how both commits
+ *  disk alone. `ownedPaths`: the extension's directories inside the worktree
+ *  (`ownedPathsInWorktree`), whose paths get `ownedPins`. Null when a commit
+ *  is unreadable. Also reads how both commits
  *  were captured (`autocrlfOff`). The listings are streamed,
  *  so memory stays bounded by what is kept, not by the tree's size.
  *  ponytail: lists every tree entry per restore; record gitlinks at capture
@@ -147,6 +155,7 @@ export async function pathsOutsideSnapshots(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
+  ownedPaths: readonly string[] = [],
 ): Promise<SnapshotsOutside | null> {
   const nested = new Set<string>();
   const unreadable = new Set<string>();
@@ -166,7 +175,10 @@ export async function pathsOutsideSnapshots(
     }
   }
   const sourceEntries = new Map<string, string>();
-  for (const commit of [sourceHash, targetHash]) {
+  // Entries under the owned paths: [source, target].
+  const ownedEntries = [new Map<string, string>(), new Map<string, string>()] as const;
+  const ownedPrefixes = ownedPaths.map((path) => `${path}/`);
+  for (const [side, commit] of [sourceHash, targetHash].entries()) {
     // Entries: "<mode> <type> <object>\t<path>", a format `--index-info` reads.
     let partial = "";
     const feed = (chunk: string) => {
@@ -176,6 +188,9 @@ export async function pathsOutsideSnapshots(
         const path = entry.slice(entry.indexOf("\t") + 1);
         if (entry.startsWith("160000 ")) nested.add(path);
         if (commit === sourceHash && unreadable.has(path)) sourceEntries.set(path, entry);
+        if (ownedPaths.includes(path) || ownedPrefixes.some((prefix) => path.startsWith(prefix))) {
+          ownedEntries[side]!.set(path, entry);
+        }
       }
     };
     const tree = await invoke(git, ["ls-tree", "-r", "-z", "--full-tree", commit], {
@@ -188,12 +203,22 @@ export async function pathsOutsideSnapshots(
   }
   // Mode 0 with an all-zero id of the repository's hash length removes a path.
   const removal = `0 ${"0".repeat(sourceHash.length)}`;
+  const [sourceOwned, targetOwned] = ownedEntries;
+  const ownedPins: string[] = [];
+  // Removals first: a source file may sit where the target has a directory.
+  for (const path of targetOwned.keys()) {
+    if (!sourceOwned.has(path)) ownedPins.push(`${removal}\t${path}\0`);
+  }
+  for (const [path, entry] of sourceOwned) {
+    if (targetOwned.get(path) !== entry) ownedPins.push(`${entry}\0`);
+  }
   return {
     nestedRepositories: [...nested].sort(),
     unreadableFiles: [...unreadable].sort(),
     unreadablePins: [...unreadable].map(
       (path) => `${sourceEntries.get(path) ?? `${removal}\t${path}`}\0`,
     ),
+    ownedPins,
     autocrlfOff,
   };
 }

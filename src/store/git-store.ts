@@ -5,6 +5,7 @@ import type {
   GitRepository,
   GitRunner,
 } from "../types.js";
+import { pathInside, runtimeRootDirectory, storeRootDirectory } from "../infra/paths.js";
 import { privateRepositoryPath, ensureReposDirectory, setUpStore, applyConfig } from "./setup.js";
 
 /** Config key naming the repository a Git-mode store belongs to (its
@@ -68,6 +69,24 @@ export async function ensureGitSnapshotStore(
 /** A Git-mode store borrows the user's objects instead of copying them. */
 export function borrowsObjects(repository: GitRepository): boolean {
   return repository.storeDir !== repository.gitDir;
+}
+
+/** The extension's own directories inside `repository`'s worktree
+ *  (`/`-separated): the store root, the `repos/` dir holding every store, and
+ *  the runtime root, each from where it is written. A home directory that is a
+ *  Git repository, or `OMP_UNDO_REDO_STORE_DIR`/`OMP_UNDO_REDO_RUNTIME_DIR` set
+ *  inside one, puts them there: snapshots must leave them out and restores
+ *  leave them alone, or each snapshot captures the store's own objects and an
+ *  undo deletes the ones its target still needs. `repos/` covers a store root
+ *  that is the worktree itself (`OMP_UNDO_REDO_RUNTIME_DIR=<repo>/runtime`),
+ *  which no path inside it can name. Nested entries are harmless: every
+ *  consumer takes their union.
+ *  shortcut: a runtime root that is the worktree itself stays captured (its
+ *  `<pid>/` dirs have no fixed name); exclude those by pattern if it is ever seen. */
+export function ownedPathsInWorktree(repository: GitRepository): string[] {
+  return [storeRootDirectory(), dirname(repository.storeDir), runtimeRootDirectory()]
+    .map((path) => pathInside(repository.worktree, path))
+    .filter((path) => path !== null);
 }
 
 function userObjects(repository: GitRepository): string {

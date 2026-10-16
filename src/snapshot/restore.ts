@@ -43,24 +43,36 @@ export type CheckpointApplyResult =
  *  and written the way the snapshots were captured: with `core.autocrlf` off
  *  (`autocrlfOffConfig`), or through it for snapshots of earlier versions.
  *  `checkOnly` stops after `git apply --check`: `applied` then means the
- *  restore would apply to the worktree as it is, and nothing was written. */
+ *  restore would apply to the worktree as it is, and nothing was written.
+ *  `ownedPaths`: the extension's directories inside the worktree
+ *  (`ownedPathsInWorktree`); their paths keep their `sourceHash` state, so a
+ *  snapshot taken before they were left out can never rewrite the store. */
 export async function applyCheckpoint(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
   checkOnly = false,
+  ownedPaths: readonly string[] = [],
 ): Promise<CheckpointApplyResult> {
   // Read first: failing after the patch landed would misreport a restore.
-  const outside = await pathsOutsideSnapshots(git, sourceHash, targetHash);
+  const outside = await pathsOutsideSnapshots(git, sourceHash, targetHash, ownedPaths);
   if (!outside) return { status: "failed" };
-  const { nestedRepositories, unreadableFiles, unreadablePins } = outside;
+  const { nestedRepositories, unreadableFiles, unreadablePins, ownedPins } = outside;
   let config: string[] = [];
   if (outside.autocrlfOff) {
     const setting = await autocrlfSetting(git);
     if (!setting) return { status: "failed" };
     config = autocrlfOffConfig(setting);
   }
-  const applied = await applyPatch(git, sourceHash, targetHash, unreadablePins, config, checkOnly);
+  const applied = await applyPatch(
+    git,
+    sourceHash,
+    targetHash,
+    [...unreadablePins, ...ownedPins],
+    ownedPaths,
+    config,
+    checkOnly,
+  );
   if (applied === "failed") return { status: "failed" };
   if ("conflictedFiles" in applied) return { status: "conflict", ...applied };
   if ("linkedFiles" in applied) return { status: "linked", ...applied };
@@ -160,12 +172,14 @@ async function rollbackPartialApply(
  *  patch; `diff.context=0` yields hunks `git apply` refuses without
  *  `--unidiff-zero`; `apply.whitespace=error` rejects content git itself
  *  snapshotted. `config`: `-c` args for every command that reads or writes
- *  worktree files (see `applyCheckpoint`). */
+ *  worktree files (see `applyCheckpoint`). `pins`: `--index-info -z` entries
+ *  applied over `targetHash`. */
 async function applyPatch(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
-  unreadablePins: readonly string[],
+  pins: readonly string[],
+  ownedPaths: readonly string[],
   config: readonly string[],
   checkOnly: boolean,
 ): Promise<
@@ -181,7 +195,7 @@ async function applyPatch(
     const effectiveTarget = await pinnedTree(
       git,
       targetHash,
-      [...ignoredPins, ...unreadablePins],
+      [...ignoredPins, ...pins],
       tempDirectory,
     );
     if (!effectiveTarget) return "failed";
@@ -255,7 +269,9 @@ async function applyPatch(
       // worktree side is the one restore step `core.safecrlf` reaches (apply,
       // `hash-object` without `-w` and `checkout-index` never consult it):
       // pinned off as in `addWorktree`, so a text attribute cannot buffer one
-      // warning per file.
+      // warning per file. The extension's own directories are left out: their
+      // files drift every turn, and an old snapshot holding them would always
+      // read as a conflict.
       const probeEnv: Record<string, string> = {
         GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
       };
@@ -276,6 +292,7 @@ async function applyPatch(
           "--quiet",
           sourceHash,
           "--",
+          ...ownedPaths.map((path) => `:(top,exclude,literal)${path}`),
         ],
         { env: probeEnv, timeoutMs: RESTORE_TIMEOUT_MS },
       );

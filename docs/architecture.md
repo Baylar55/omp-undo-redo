@@ -238,6 +238,13 @@ Snapshot commands run against the user's repository (its `HEAD`, config, `.gitig
 (`GIT_OBJECT_DIRECTORY`), refs under `refs/omp-undo-redo/` live only there, and the user's objects
 are borrowed through `GIT_ALTERNATE_OBJECT_DIRECTORIES` instead of copied (`store/git-store.ts`).
 
+The extension's own directories inside the worktree (the store root, its `repos/` and the runtime
+root; a home directory that is a Git repository, or `OMP_UNDO_REDO_STORE_DIR`/
+`OMP_UNDO_REDO_RUNTIME_DIR` set inside one, puts them there) are left out of every snapshot with
+literal `:(exclude)` pathspecs, and index entries for them (a `HEAD` that tracks them) are dropped.
+Restores pin every path under them to its state in the source snapshot, so snapshots taken before
+this exclusion existed cannot rewrite the store either.
+
 Each capture copies into the store every snapshot object the user's `HEAD` does not reach (content
 of a reset or amended commit, a staged-then-dropped file, an old version a file was reverted to),
 and before every store gc the extension packs every snapshot object `HEAD` then does not reach into
