@@ -2366,6 +2366,39 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("reports a conflict instead of overwriting a re-indent under apply.ignoreWhitespace", async () => {
+    // Regression: `apply.ignoreWhitespace=change` let the restore patch match
+    // a line the user re-indented after the turn, and undo wrote the old
+    // indentation back over it — a silent behavior change in Python or YAML.
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "code.py"), "def f():\n    a = 1\n    return a\n");
+      await git(["add", "code.py"]);
+      await git(["commit", "-qm", "code"]);
+      expect((await git(["config", "apply.ignoreWhitespace", "change"])).code).toBe(0);
+      const prepared = await prepareBeforeTurn(snap, "ignore-ws-session", defaultPool);
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      await writeFile(join(cwd, "code.py"), "def f():\n    a = 2\n    return a\n");
+      const finished = await finishAfterTurn(snap, prepared.checkpoint, null, null, defaultPool);
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+      const { beforeHash, afterHash } = finished.checkpoint;
+
+      // The user re-indents the turn's lines after the turn.
+      const reindented = "def f():\n\ta = 2\n\treturn a\n";
+      await writeFile(join(cwd, "code.py"), reindented);
+      expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual({
+        status: "conflict",
+        conflictedFiles: ["code.py"],
+      });
+      expect(await readFile(join(cwd, "code.py"), "utf8")).toBe(reindented);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("blames the patch, not the worktree, when the worktree still matches the snapshot", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {

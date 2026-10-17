@@ -184,7 +184,9 @@ async function rollbackPartialApply(
  *  replaces a gitlink hunk with a commit listing, which invalidates the whole
  *  patch; `diff.context=0` yields hunks `git apply` refuses without
  *  `--unidiff-zero`; `apply.whitespace=error` rejects content git itself
- *  snapshotted. `config`: `-c` args for every command that reads or writes
+ *  snapshotted; `apply.ignoreWhitespace=change` lets a hunk match lines the
+ *  user re-indented and silently writes the old whitespace back over them.
+ *  `config`: `-c` args for every command that reads or writes
  *  worktree files (see `applyCheckpoint`). `pins`: `--index-info -z` entries
  *  applied over `targetHash`. */
 async function applyPatch(
@@ -258,7 +260,7 @@ async function applyPatch(
 
     const check = await invoke(
       git,
-      [...config, "apply", "--whitespace=nowarn", "--check", patchPath],
+      [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace", "--check", patchPath],
       {
         ...restore,
         env: { LC_ALL: "C" },
@@ -319,7 +321,7 @@ async function applyPatch(
     if (checkOnly) return { restoredFiles };
     const applied = await invoke(
       git,
-      [...config, "apply", "--whitespace=nowarn", patchPath],
+      [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace", patchPath],
       restore,
     );
     if (applied.code === 0) return { restoredFiles };
