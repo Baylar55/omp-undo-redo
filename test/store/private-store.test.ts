@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, parse, resolve } from "node:path";
+import { basename, dirname, join, parse, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGitRunner } from "../../src/infra/git-runner.js";
 import { DEFAULT_EXCLUDES, ensurePrivateGitRepository } from "../../src/store/private-store.js";
@@ -21,7 +21,11 @@ import type { GitRunner } from "../../src/types.js";
 import { makeRepository } from "../helpers/index.js";
 import { storeRootDirectory } from "../../src/infra/paths.js";
 import { privateRepositoryPath } from "../../src/store/setup.js";
-import { ensureGitSnapshotStore, GIT_STORE_SOURCE_KEY } from "../../src/store/git-store.js";
+import {
+  ensureGitSnapshotStore,
+  GIT_STORE_SOURCE_KEY,
+  storeEnv,
+} from "../../src/store/git-store.js";
 import { resolveRepository } from "../../src/store/discovery.js";
 import { resolveBackend } from "../../src/store/backend.js";
 import { createSnapshotCommit } from "../../src/snapshot/tree.js";
@@ -391,6 +395,120 @@ describe("private per-workspace git repositories", () => {
       await rm(storeRoot, { recursive: true, force: true });
     }
   });
+
+  it.each([
+    [
+      "sha1",
+      {
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "init.defaultObjectFormat",
+        GIT_CONFIG_VALUE_0: "sha256",
+      },
+    ],
+    ["sha1", { GIT_DEFAULT_HASH: "sha256" }],
+    ["sha256", { GIT_DEFAULT_HASH: "sha1" }],
+  ])("gives a %s repository a store of its own hash under %o", async (hash, env) => {
+    // The store took the user's default hash instead, so every ref naming a
+    // snapshot failed ("not a valid SHA1") and the repository stayed session-only.
+    vi.stubEnv("GIT_DEFAULT_HASH", hash);
+    const cwd = await makeRepository();
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    try {
+      vi.unstubAllEnvs();
+      for (const [name, value] of Object.entries(env)) vi.stubEnv(name, value);
+      const resolved = await resolveRepository(createGitRunner(cwd));
+      if (!("repository" in resolved)) throw new Error("not a repository");
+      const { repository } = resolved;
+      const storeDir = await ensureGitSnapshotStore(factory, repository, storeRoot);
+      expect(storeDir).not.toBeNull();
+      const store = createGitRunner(cwd, { env: storeEnv({ ...repository, storeDir: storeDir! }) });
+      expect((await store(["rev-parse", "--show-object-format"])).stdout.trim()).toBe(hash);
+      const head = (await createGitRunner(cwd)(["rev-parse", "HEAD"])).stdout.trim();
+      const update = await store(["update-ref", "refs/omp-undo-redo/probe", head]);
+      expect(update.code, update.stderr).toBe(0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["no refs", null],
+    ["a loose ref", "refs/omp-undo-redo/kept"],
+    ["a packed ref", "packed-refs"],
+  ])(
+    "repairs a SHA-256 store an earlier version made for a SHA-1 repository only without refs (%s)",
+    async (_, refFile) => {
+      // Such a store was finished, so a fix to `git init` alone left the
+      // repository session-only for good. One holding refs is never moved.
+      const cwd = await makeRepository();
+      const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+      try {
+        const resolved = await resolveRepository(createGitRunner(cwd));
+        if (!("repository" in resolved)) throw new Error("not a repository");
+        const { repository } = resolved;
+        const storeDir = privateRepositoryPath(storeRoot, repository.commonDir);
+        await mkdir(dirname(storeDir), { recursive: true });
+        await gitInStore(cwd, storeDir, ["init", "--bare", "-q", "--object-format=sha256"]);
+        await gitInStore(cwd, storeDir, ["config", GIT_STORE_SOURCE_KEY, repository.commonDir]);
+        if (refFile) {
+          const id = "a".repeat(64);
+          const line = refFile === "packed-refs" ? `${id} refs/omp-undo-redo/kept` : id;
+          await mkdir(dirname(join(storeDir, refFile)), { recursive: true });
+          await writeFile(join(storeDir, refFile), `${line}\n`);
+        }
+
+        expect(await ensureGitSnapshotStore(factory, repository, storeRoot)).toBe(storeDir);
+        const store = createGitRunner(cwd, { env: storeEnv({ ...repository, storeDir }) });
+        const format = (await store(["rev-parse", "--show-object-format"])).stdout.trim();
+        const trash = (await readdir(dirname(storeDir))).filter(
+          (name) => name !== basename(storeDir),
+        );
+        if (refFile) {
+          expect(format).toBe("sha256");
+          expect(trash).toEqual([]);
+          return;
+        }
+        expect(format).toBe("sha1");
+        const head = (await createGitRunner(cwd)(["rev-parse", "HEAD"])).stdout.trim();
+        const update = await store(["update-ref", "refs/omp-undo-redo/probe", head]);
+        expect(update.code, update.stderr).toBe(0);
+        // The name the eviction sweep reaps.
+        expect(trash).toEqual([expect.stringMatching(/^[0-9a-f]{64}\.git\.evicted-\d+$/)]);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    { stdout: "", stderr: "", code: 1, error: "timeout" as const },
+    { stdout: "", stderr: "fatal: bad config line 1", code: 128 },
+  ])(
+    "creates no store while the repository's object format cannot be read (%j)",
+    async (failure) => {
+      // Reading a failure as "not set" would pin SHA-1 on a SHA-256 repository.
+      const cwd = await makeRepository();
+      const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+      try {
+        const resolved = await resolveRepository(createGitRunner(cwd));
+        if (!("repository" in resolved)) throw new Error("not a repository");
+        const failing = (dir: string, env?: Record<string, string>): GitRunner => {
+          const inner = createGitRunner(dir, { env });
+          return Object.assign(
+            async (args: string[], options?: Parameters<GitRunner>[1]) =>
+              args.includes("extensions.objectformat") ? failure : inner(args, options),
+            { cwd: inner.cwd, env: inner.env },
+          );
+        };
+        expect(await ensureGitSnapshotStore(failing, resolved.repository, storeRoot)).toBeNull();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   // POSIX-only: Windows ignores these mode bits, so the assertion is
   // meaningless there (and this fix is POSIX-only exposure).

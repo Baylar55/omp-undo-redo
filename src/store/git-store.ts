@@ -1,3 +1,5 @@
+import { rename } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { dirname, join } from "node:path";
 import type {
   CwdGitRunnerFactory,
@@ -6,7 +8,16 @@ import type {
   GitRunner,
 } from "../types.js";
 import { pathInside, runtimeRootDirectory, storeRootDirectory } from "../infra/paths.js";
-import { privateRepositoryPath, ensureReposDirectory, setUpStore, applyConfig } from "./setup.js";
+import { RETRY_DELAY_MS } from "../infra/fs.js";
+import { debugLog } from "../infra/debug-log.js";
+import {
+  privateRepositoryPath,
+  ensureReposDirectory,
+  setUpStore,
+  applyConfig,
+  readStoreConfig,
+  storeHasRefs,
+} from "./setup.js";
 
 /** Config key naming the repository a Git-mode store belongs to (its
  *  `commonDir`); eviction treats the store as abandoned once that path is gone. */
@@ -31,23 +42,79 @@ export async function ensureGitSnapshotStore(
 ): Promise<string | null> {
   const storeDir = privateRepositoryPath(storeRoot, repository.commonDir);
   const storeGit = gitRunnerFactory(repository.worktree, { GIT_DIR: storeDir });
+  // Objects written against the user's repository use its hash, so the store
+  // must too or its refs could not name them. Exit 1 is "not set", which is
+  // SHA-1; any other failure is "cannot tell" (null) and never picks one.
+  const repositoryFormat = async (): Promise<string | null> => {
+    const format = await gitRunnerFactory(repository.worktree, {
+      GIT_DIR: repository.commonDir,
+    })(["config", "--get", "extensions.objectformat"]);
+    if (format.error) return null;
+    if (format.code === 1) return "sha1";
+    return (format.code === 0 && format.stdout.trim()) || null;
+  };
   try {
     await ensureReposDirectory(dirname(storeDir), storeRoot);
+    // Earlier versions gave a SHA-1 repository a SHA-256 store under a sha256
+    // `init.defaultObjectFormat`/`GIT_DEFAULT_HASH`. No ref could ever be
+    // written to it, so it is renamed aside as eviction trash (reaped after
+    // 7 days) and set up again. Only a store declaring a non-SHA-1 format is
+    // checked: no version made a SHA-1 store for a SHA-256 repository while
+    // it could read the repository's format, and a failed read now stops setup.
+    const storeFormat = (await readStoreConfig(storeDir))?.get("extensions.objectformat");
+    if (storeFormat && storeFormat !== "sha1") {
+      const expected = await repositoryFormat();
+      if (expected && expected !== storeFormat) {
+        // Unreadable refs count as refs: never move a store on a guess.
+        const hasRefs = await storeHasRefs(storeDir).catch(() => null);
+        let outcome = hasRefs === null ? "refs-unreadable" : "has-refs";
+        let attempts = 0;
+        if (hasRefs === false) {
+          // Each try first re-reads the store, which a concurrent launch may
+          // have replaced; tries repeat while Windows refuses the read or the
+          // rename (a scanner holding a file of the store).
+          while (attempts < 5) {
+            if (attempts > 0) await sleep(RETRY_DELAY_MS);
+            attempts += 1;
+            const config = await readStoreConfig(storeDir);
+            if (config === null) {
+              outcome = "config-unreadable";
+              continue;
+            }
+            if (config.get("extensions.objectformat") !== storeFormat) {
+              outcome = "replaced";
+              break;
+            }
+            try {
+              await rename(storeDir, `${storeDir}.evicted-${Date.now()}`);
+              outcome = "moved";
+              break;
+            } catch (error) {
+              outcome = (error as NodeJS.ErrnoException).code ?? "rename-failed";
+              if (!["EPERM", "EACCES", "EBUSY"].includes(outcome)) break;
+            }
+          }
+        }
+        debugLog({
+          event: "store-format-repair",
+          storeDir,
+          storeFormat,
+          expected,
+          outcome,
+          attempts,
+        });
+      }
+    }
     const ready = await setUpStore(
       storeDir,
       async () => {
-        // Objects written against the user's repository use its hash, so the
-        // store must too or its refs could not name them.
-        const format = await gitRunnerFactory(repository.worktree, {
-          GIT_DIR: repository.commonDir,
-        })(["config", "--get", "extensions.objectformat"]);
-        const objectFormat = format.code === 0 ? format.stdout.trim() : "";
-        const init = await storeGit([
-          "init",
-          "--bare",
-          "-q",
-          ...(objectFormat ? [`--object-format=${objectFormat}`] : []),
-        ]);
+        // The env pins the hash over the user's `init.defaultObjectFormat`
+        // and `GIT_DEFAULT_HASH`; git before 2.29 ignores it and only knows SHA-1.
+        const objectFormat = await repositoryFormat();
+        if (!objectFormat) return false;
+        const init = await storeGit(["init", "--bare", "-q"], {
+          env: { GIT_DEFAULT_HASH: objectFormat },
+        });
         return init.code === 0;
       },
       () =>

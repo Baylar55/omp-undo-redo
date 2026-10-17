@@ -6,9 +6,8 @@ import { refusedPrivateWorkspace } from "../private-store.js";
 import type { CwdGitRunnerFactory } from "../../types.js";
 import { canonicalCwd, storeRootDirectory } from "../../infra/paths.js";
 import { RETRY_DELAY_MS, removeDirWithRetry } from "../../infra/fs.js";
-import { setupFinished } from "../setup.js";
+import { setupFinished, storeHasRefs } from "../setup.js";
 import { GIT_STORE_SOURCE_KEY } from "../git-store.js";
-import { storeHasRefs } from "./gc.js";
 
 /** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */
 const nativeRealpath = promisify(realpath.native);

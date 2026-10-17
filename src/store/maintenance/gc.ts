@@ -1,9 +1,10 @@
-import { readdir, readFile, rename, rm, stat } from "node:fs/promises";
+import { readdir, rename, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CwdGitRunnerFactory, GitRepository } from "../../types.js";
 import { borrowsObjects, storeEnv } from "../git-store.js";
 import { gcPendingPath } from "../refs.js";
+import { storeHasRefs } from "../setup.js";
 import { pinStoreObjects } from "../pinning.js";
 
 /** Repacking a large snapshot repo legitimately outruns the runner's
@@ -137,24 +138,6 @@ async function storeExceedsAutoGcLimits(storeDir: string): Promise<boolean> {
   // SHA-1 or SHA-256 object names, minus their two-digit fan-out.
   const looseObjects = loose.filter((name) => /^(?:[0-9a-f]{38}|[0-9a-f]{62})$/.test(name));
   return looseObjects.length > Math.ceil(GC_AUTO_LOOSE_OBJECTS / 256);
-}
-
-/** Whether a store holds any ref, loose or packed. Errors other than ENOENT
- *  propagate, which the sweep reads as "keep". */
-export async function storeHasRefs(gitDir: string): Promise<boolean> {
-  try {
-    const loose = await readdir(join(gitDir, "refs"), { recursive: true, withFileTypes: true });
-    if (loose.some((entry) => entry.isFile())) return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  try {
-    const packed = await readFile(join(gitDir, "packed-refs"), "utf8");
-    return packed.split(/\r?\n/).some((line) => line !== "" && !line.startsWith("#"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return false;
-  }
 }
 
 /** Whether a store holds garbage only a gc reclaims. Packed objects a

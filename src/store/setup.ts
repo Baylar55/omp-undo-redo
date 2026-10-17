@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { join } from "node:path";
 import type { GitRunner } from "../types.js";
@@ -42,17 +42,18 @@ const SETUP_MARKERS: ReadonlyArray<readonly [section: string, key: string]> = [
   ["omp-undo-redo", "commondir"],
 ];
 
-/** Whether `gitDir`'s setup finished, read from its config file without a git
- *  process: true when a setup marker is present, false when absent (a missing
- *  file included), null when the file cannot be read. Only the plain
- *  `[section]` headers and `key = value` lines git writes are recognised. */
-export async function setupFinished(gitDir: string): Promise<boolean | null> {
+/** `gitDir`'s config file as `section.key` → value, read without a git
+ *  process: empty when the file is missing, null when it cannot be read.
+ *  Only the plain `[section]` headers and `key = value` lines git writes are
+ *  recognised. */
+export async function readStoreConfig(gitDir: string): Promise<Map<string, string> | null> {
   let text: string;
   try {
     text = await readFile(join(gitDir, "config"), "utf8");
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? false : null;
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? new Map() : null;
   }
+  const values = new Map<string, string>();
   let section = "";
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
@@ -61,10 +62,36 @@ export async function setupFinished(gitDir: string): Promise<boolean | null> {
       section = header[1].trim().toLowerCase();
       continue;
     }
-    const key = /^[A-Za-z][A-Za-z0-9-]*/.exec(line)?.[0].toLowerCase();
-    if (SETUP_MARKERS.some(([s, k]) => s === section && k === key)) return true;
+    const entry = /^([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*(.*))?$/.exec(line);
+    if (entry) values.set(`${section}.${entry[1].toLowerCase()}`, entry[2]?.trim() ?? "");
   }
-  return false;
+  return values;
+}
+
+/** Whether `gitDir`'s setup finished: true when a setup marker is present,
+ *  false when absent (a missing config file included), null when the file
+ *  cannot be read. */
+export async function setupFinished(gitDir: string): Promise<boolean | null> {
+  const config = await readStoreConfig(gitDir);
+  return config && SETUP_MARKERS.some(([section, key]) => config.has(`${section}.${key}`));
+}
+
+/** Whether a store holds any ref, loose or packed. Errors other than ENOENT
+ *  propagate, which callers read as "keep". */
+export async function storeHasRefs(gitDir: string): Promise<boolean> {
+  try {
+    const loose = await readdir(join(gitDir, "refs"), { recursive: true, withFileTypes: true });
+    if (loose.some((entry) => entry.isFile())) return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    const packed = await readFile(join(gitDir, "packed-refs"), "utf8");
+    return packed.split(/\r?\n/).some((line) => line !== "" && !line.startsWith("#"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return false;
+  }
 }
 
 /** How long a store must sit untouched before an unfinished setup counts as
