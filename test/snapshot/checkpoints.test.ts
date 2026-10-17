@@ -2520,23 +2520,34 @@ describe("history-safe Git checkpoints", () => {
       expect(await read("second.txt")).toBe(lines("L1"));
       expect(await read("created.txt")).toBe("created\n");
 
-      // Redo: apply created a partial file and deleted another.
-      await rm(join(cwd, "created.txt"));
-      await writeFile(join(cwd, "tracked.txt"), "base\n");
-      await writeFile(join(cwd, "second.txt"), lines("l1"));
-      expect(
-        await applyCheckpoint(
-          failingApply(async () => {
-            await writeFile(join(cwd, "created.txt"), "partial");
-            await rm(join(cwd, "tracked.txt"));
-          }),
-          beforeHash,
-          afterHash,
-        ),
-      ).toEqual({ status: "failed" });
-      expect(await read("tracked.txt")).toBe("base\n");
-      expect(await read("second.txt")).toBe(lines("l1"));
-      await expect(lstat(join(cwd, "created.txt"))).rejects.toThrow();
+      // Redo: apply created a file and deleted another. What it wrote in full
+      // (target content) is removed; anything else at the added path is kept,
+      // even an empty file: apply writes nothing when the path already
+      // exists, so it may be a user's, created after `apply --check`.
+      for (const [content, kept] of [
+        ["created\n", false],
+        ["", true],
+        ["partial", true],
+        ["user file\n", true],
+      ] as const) {
+        await rm(join(cwd, "created.txt"), { force: true });
+        await writeFile(join(cwd, "tracked.txt"), "base\n");
+        await writeFile(join(cwd, "second.txt"), lines("l1"));
+        expect(
+          await applyCheckpoint(
+            failingApply(async () => {
+              await writeFile(join(cwd, "created.txt"), content);
+              await rm(join(cwd, "tracked.txt"));
+            }),
+            beforeHash,
+            afterHash,
+          ),
+        ).toEqual({ status: "failed" });
+        expect(await read("tracked.txt")).toBe("base\n");
+        expect(await read("second.txt")).toBe(lines("l1"));
+        if (kept) expect(await read("created.txt")).toBe(content);
+        else await expect(lstat(join(cwd, "created.txt"))).rejects.toThrow();
+      }
 
       // Undo under CRLF conversion (a text attribute with core.autocrlf):
       // apply smudges what it writes. One file it wrote must revert, one it

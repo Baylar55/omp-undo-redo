@@ -84,16 +84,19 @@ export async function applyCheckpoint(
  *  leaves paths missing and the rest at target content. Undoes exactly what
  *  apply did, from `sourceHash` through a scratch index: paths it removed,
  *  paths it wrote (content equals the target blob), paths it left empty (a
- *  failed smudge filter) and paths it created. A
- *  path still holding other content is left alone: `apply --check` accepts
- *  drift outside the hunks, and overwriting it would destroy that edit. The
- *  hash and the checkout run with apply's `config`, so they convert exactly
- *  as apply did (clean filters, CRLF under `core.autocrlf` for snapshots of
- *  earlier versions) while tree blobs hold the cleaned form.
+ *  failed smudge filter) and paths it created (content equals the target
+ *  blob). A path still holding other content is left alone: `apply --check`
+ *  accepts drift outside the hunks, and overwriting it would destroy that
+ *  edit; a file created at an added path after `apply --check` makes apply
+ *  fail before writing anything, and deleting it would destroy that file.
+ *  The hash and the checkout run with apply's `config`, so they convert
+ *  exactly as apply did (clean filters, CRLF under `core.autocrlf` for
+ *  snapshots of earlier versions) while tree blobs hold the cleaned form.
  *  Best effort: gitlinks are never touched by apply; a path with a newline in
  *  its name cannot be hashed; symlinks, typechanges and a directory sitting
- *  where a deleted file was are left as found. The hash-then-checkout window
- *  cannot be locked, so an edit landing inside it is overwritten. */
+ *  where a deleted file was are left as found, as is an added file apply
+ *  wrote partially or left empty. The hash-then-checkout window cannot be
+ *  locked, so an edit landing inside it is overwritten. */
 async function rollbackPartialApply(
   git: GitRunner,
   sourceHash: string,
@@ -113,7 +116,9 @@ async function rollbackPartialApply(
 
   // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
   const restore: string[] = [];
+  const remove: string[] = [];
   const written = new Map<string, string>();
+  const added = new Set<string>();
   const fields = changes.stdout.split("\0");
   for (let index = 0; index + 1 < fields.length; index += 2) {
     const [sourceMode, targetMode, , targetSha, status] = fields[index]!.slice(1).split(" ");
@@ -121,9 +126,13 @@ async function rollbackPartialApply(
     if (sourceMode === "160000" || targetMode === "160000") continue;
     const present = await lstat(join(worktree, path)).catch(() => null);
     if (status === "A") {
-      // `apply --check` proved the path absent, so anything there is apply's.
-      if (present && !present.isDirectory()) {
-        await rm(join(worktree, path), { force: true }).catch(() => undefined);
+      // Apply writes nothing when an added path already exists, so a file
+      // there is apply's only if it holds the target blob. Anything else,
+      // even an empty file (a failed smudge, as below, or a user's lock or
+      // marker file), may have been created after `apply --check`: kept.
+      if (present?.isFile() && !path.includes("\n")) {
+        written.set(path, targetSha!);
+        added.add(path);
       }
     } else if (!present) {
       restore.push(path);
@@ -146,9 +155,13 @@ async function rollbackPartialApply(
     if (hashed.code === 0 && !hashed.error) {
       const ids = hashed.stdout.split("\n");
       paths.forEach((path, index) => {
-        if (ids[index] === written.get(path)) restore.push(path);
+        if (ids[index] !== written.get(path)) return;
+        (added.has(path) ? remove : restore).push(path);
       });
     }
+  }
+  for (const path of remove) {
+    await rm(join(worktree, path), { force: true }).catch(() => undefined);
   }
   if (restore.length === 0) return;
 
