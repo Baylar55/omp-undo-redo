@@ -140,6 +140,40 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it("sets up with a hooks-only init template and recreates a missing info/", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-private-template-"));
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    const template = await mkdtemp(join(tmpdir(), "omp-template-"));
+    try {
+      await mkdir(join(template, "hooks"));
+      await writeFile(join(template, "hooks", "pre-commit"), "#!/bin/sh\n");
+      const withTemplate: typeof factory = (cwd2, env) =>
+        createGitRunner(cwd2, {
+          env: {
+            ...env,
+            GIT_TEMPLATE_DIR: template,
+            GIT_CONFIG_COUNT: "1",
+            GIT_CONFIG_KEY_0: "init.templateDir",
+            GIT_CONFIG_VALUE_0: template,
+          },
+        });
+      const repository = await ensurePrivateGitRepository(withTemplate, cwd, storeRoot);
+      expect(repository).not.toBeNull();
+      const gitDir = repository!.gitDir;
+      expect(await readdir(gitDir)).not.toContain("hooks");
+      expect(await readFile(join(gitDir, "info", "exclude"), "utf8")).toContain("node_modules");
+
+      // A store an older version left without info/ is repaired on the next launch.
+      await rm(join(gitDir, "info"), { recursive: true, force: true });
+      expect(await ensurePrivateGitRepository(withTemplate, cwd, storeRoot)).not.toBeNull();
+      expect(await readFile(join(gitDir, "info", "exclude"), "utf8")).toContain("node_modules");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+      await rm(template, { recursive: true, force: true });
+    }
+  });
+
   it("finishes a store whose setup was abandoned after git init", async () => {
     // `git init` writes HEAD before the config calls: a crash or a held
     // config.lock in between left a store that looked initialized and stayed

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -136,6 +136,8 @@ async function updateExclude(gitDir: string, worktree: string, storeRoot: string
 
   while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
   const updated = `${[...kept, ...missing].join("\n")}\n`;
+  // A repository made from a template without `info/` (or by any other tool) lacks it.
+  await mkdir(dirname(excludePath), { recursive: true, mode: 0o700 });
   // Temp + rename: a crash or concurrent launch never leaves a truncated file.
   const tempPath = `${excludePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   try {
@@ -165,7 +167,10 @@ export async function ensurePrivateGitRepository(
     await ensureReposDirectory(dirname(gitDir), storeRoot);
     const ready = await setUpStore(
       gitDir,
-      async () => (await envGit(["init", "-q"])).code === 0,
+      // `--template=`: no user template (`init.templateDir`, `GIT_TEMPLATE_DIR`) may
+      // seed hooks into the private repo, where the extension's `git commit` would
+      // run them. It does not create `info/`: `updateExclude` does that itself.
+      async () => (await envGit(["init", "-q", "--template="])).code === 0,
       // `core.worktree` goes last: `setupFinished` reads it as proof the rest ran.
       () => applyConfig(envGit, [...PRIVATE_REPO_CONFIG, ["core.worktree", worktree]]),
       // Ensure repositories created by earlier versions write future objects
