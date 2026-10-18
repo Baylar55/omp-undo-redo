@@ -11,7 +11,7 @@ export type AnyContext = {
   ui?: {
     notify(message: string, level: string): void;
   };
-  /** Absent on hosts older than OMP's agent identity: read as the main agent. */
+  /** Set by OMP 18.3.2+; hosts that don't set it (Pi included) read as the main agent. */
   agent?: { kind: "main" | "sub" };
 };
 

@@ -22,7 +22,7 @@ export function gcKey(repository: GitRepository): string {
  *  its copy captures nothing, keeps no history, waits on no tool call,
  *  refuses `/undo`/`/redo` (a subagent prompt starting with one runs it),
  *  and leaves boot and shutdown housekeeping to the main session's copy.
- *  Hosts without `ctx.agent` read as main. */
+ *  Hosts without `ctx.agent` (Pi; OMP before 18.3.2) read as main. */
 export function isMainSession(services: ExtensionServices, ctx: AnyContext): boolean {
   if (ctx.agent?.kind === "sub") {
     services.flags.servesSubagent = true;

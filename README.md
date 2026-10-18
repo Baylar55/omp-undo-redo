@@ -16,7 +16,7 @@ Details: [What gets stored and what isn't restored](#what-gets-stored-and-what-i
 
 ## Installation
 
-Requires OMP 16.5.2+ (extensions run under Bun) or Pi with Node.js 20+, and Git. Without Git, or if the snapshot store cannot be set up, undo/redo moves only the conversation; you are told once per session and setup is retried every turn.
+Requires OMP 18.3.2+ (extensions run under Bun) or Pi with Node.js 20+, and Git. Without Git, or if the snapshot store cannot be set up, undo/redo moves only the conversation; you are told once per session and setup is retried every turn.
 
 Install through the agent; a plain `npm install` does not register the extension.
 

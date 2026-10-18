@@ -215,7 +215,7 @@ Subagent sessions (the `task` tool, eval `agent()`, `/tan` clones) run in the sa
 their own copy of the extension. They cannot be undone, so that copy captures no snapshots, writes
 no history, never delays a subagent's tool calls, and answers `/undo`/`/redo` with a warning. A
 subagent's edits in the parent's workspace land in the running parent turn's after-snapshot. This
-needs a host that reports `ctx.agent`; older hosts checkpoint subagent sessions like any other.
+needs `ctx.agent` (OMP 18.3.2+); older hosts checkpoint subagent sessions like any other.
 
 ### Runtime action state
 

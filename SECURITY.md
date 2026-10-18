@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest published version is supported. The extension is tested with OMP 16.5.2 and Node.js 20 or newer.
+Only the latest published version is supported. The extension is tested with OMP 18.3.2 and Node.js 20 or newer.
 
 ## Reporting a vulnerability
 
