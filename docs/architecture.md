@@ -228,7 +228,11 @@ use SHA-256 session namespaces; state holds action availability, selected leaf, 
 revision and the latest action result. Per-session writes larger than 64 KiB are skipped.
 Publication is observational and never adds file restoration to session-only mode. A
 `runtime/<pid>/` without a `runtime.json` marker is never replaced or deleted
-(`runtime-dir-foreign`).
+(`runtime-dir-foreign`). The marker records the writer's hostname and runtime scope (boot and PID
+namespace on Linux, as owner leases do). Only a marker from this host and scope is pid-probed: such
+a `runtime/<pid>/` is replaced by the process now holding that pid, and reaped once the pid is
+gone. One from another scope (a container sharing `~/.omp`, a previous boot) or without a scope
+is replaced or reaped only once its marker and directory are both 24 h old; another host's never.
 
 ## Storage maintenance
 

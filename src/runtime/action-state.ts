@@ -6,7 +6,13 @@ import { renameWithRetry, writeFileAtomic } from "../infra/fs.js";
 import { debugLog } from "../infra/debug-log.js";
 import type { ActionInvocationResult, NavigationState, RuntimeActionState } from "../types.js";
 import { runtimeRootDirectory, defaultRuntimeRoot, checkpointNamespace } from "../infra/paths.js";
-import { RUNTIME_SCHEMA, RUNTIME_PROTOCOL, reapStaleRuntimes } from "./reaper.js";
+import {
+  RUNTIME_SCHEMA,
+  RUNTIME_PROTOCOL,
+  isAncient,
+  reapStaleRuntimes,
+  sharesProcessTable,
+} from "./reaper.js";
 import type { RuntimeMarker } from "./reaper.js";
 
 const ACTION_STATE_SCHEMA = 2;
@@ -32,6 +38,9 @@ export type RuntimeActionStateStoreOptions = {
   runtimeId?: string;
   clock?: () => Date;
   uuid?: () => string;
+  /** Injected (`store/` is off-limits to this layer); without it no marker's
+   *  pid is probed, so only ancient directories are replaced or reaped. */
+  resolveRuntimeScope?: () => Promise<string | null>;
 };
 
 function navigationRevision(state: NavigationState, activeSessionLeaf: string | null): string {
@@ -76,6 +85,9 @@ export class RuntimeActionStateStore {
   private readonly rootDirectory: string;
   private readonly clock: () => Date;
   private readonly uuid: () => string;
+  private readonly resolveRuntimeScope: () => Promise<string | null>;
+  /** Resolved by the copy that prepares the directory, before it is used. */
+  private runtimeScope: string | null = null;
   private readonly tails = new Map<string, Promise<void>>();
   private readonly latest = new Map<
     string,
@@ -92,6 +104,7 @@ export class RuntimeActionStateStore {
     this.runtimeId = options.runtimeId ?? randomUUID();
     this.clock = options.clock ?? (() => new Date());
     this.uuid = options.uuid ?? randomUUID;
+    this.resolveRuntimeScope = options.resolveRuntimeScope ?? (async () => null);
     this.runtimeDirectory = join(this.rootDirectory, String(this.pid));
     this.sessionsDirectory = join(this.runtimeDirectory, "sessions");
   }
@@ -131,13 +144,16 @@ export class RuntimeActionStateStore {
     let staging: string | null = null;
     try {
       await mkdir(this.rootDirectory, { recursive: true, mode: 0o700 });
+      this.runtimeScope = await this.resolveRuntimeScope().catch(() => null);
       // A configured root may be a shared directory (`/tmp` as root in a
       // container) whose permissions are not ours to strip; the per-process
       // directories below are owner-only either way.
       if (this.rootDirectory === defaultRuntimeRoot()) await chmod(this.rootDirectory, 0o700);
-      // Only a directory a previous process with this pid left (a recycled
-      // pid) is replaced. Anything else under that name is not ours to
-      // delete; runtime state is observational, so this process skips it.
+      // Only a directory a previous process with this pid in this process
+      // table left (a recycled pid), or an ancient one, is replaced. Anything
+      // else under that name is not ours to delete (a container sharing this
+      // root may own it); runtime state is observational, so this process
+      // skips it.
       if (!(await this.runtimeDirectoryReplaceable())) {
         shared.foreign = true;
         debugLog({ event: "runtime-dir-foreign", dir: this.runtimeDirectory });
@@ -157,6 +173,7 @@ export class RuntimeActionStateStore {
         runtimeId: this.runtimeId,
         pid: this.pid,
         hostname: hostname(),
+        runtimeScope: this.runtimeScope,
         startedAt: this.clock().toISOString(),
       };
       await this.writeJsonAtomic(join(staging, "runtime.json"), marker);
@@ -199,7 +216,9 @@ export class RuntimeActionStateStore {
       .catch(() => undefined);
   }
 
-  /** `runtime/<pid>/` is absent, or holds this extension's runtime marker. */
+  /** `runtime/<pid>/` is absent, or holds this extension's runtime marker from
+   *  this host and either this process table (the pid is ours now, so its
+   *  writer is gone) or long enough ago that the sweep would reap it. */
   private async runtimeDirectoryReplaceable(): Promise<boolean> {
     try {
       await stat(this.runtimeDirectory);
@@ -210,7 +229,10 @@ export class RuntimeActionStateStore {
       const marker = JSON.parse(
         await readFile(join(this.runtimeDirectory, "runtime.json"), "utf8"),
       ) as Partial<RuntimeMarker> | null;
-      return marker?.protocol === RUNTIME_PROTOCOL;
+      if (marker?.protocol !== RUNTIME_PROTOCOL) return false;
+      if (typeof marker.hostname === "string" && marker.hostname !== hostname()) return false;
+      if (sharesProcessTable(marker, this.runtimeScope)) return true;
+      return await isAncient(this.runtimeDirectory, marker.startedAt);
     } catch {
       return false;
     }
@@ -225,7 +247,7 @@ export class RuntimeActionStateStore {
 
   private async reapStaleRuntimes(): Promise<void> {
     if (!this.active) return;
-    return reapStaleRuntimes(this.rootDirectory, this.pid);
+    return reapStaleRuntimes(this.rootDirectory, this.pid, this.runtimeScope);
   }
 
   private async writeJsonAtomic(path: string, value: unknown): Promise<void> {

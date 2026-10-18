@@ -144,7 +144,7 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     resolveHostIdentity: resolvePersistentHostId,
     resolveRuntimeScope,
   });
-  const runtimeStore = new RuntimeActionStateStore();
+  const runtimeStore = new RuntimeActionStateStore({ resolveRuntimeScope });
   return {
     gitRunnerFactory,
     captureDeadlineMs,

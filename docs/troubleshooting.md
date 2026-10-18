@@ -81,6 +81,10 @@ Replace the placeholders with the exact ref and object ID printed by the first c
 
 A `runtime/<pid>/` directory without a `runtime.json` marker is never replaced or deleted, so a process given that pid publishes no runtime action state (logged as `runtime-dir-foreign` with `OMP_UNDO_REDO_DEBUG=1`). Undo and redo work as usual. Version 1.7.0 and earlier could leave such a directory after a crash or a shutdown that could not delete every file; it holds only `sessions/` and `.tmp` files and is safe to delete by hand.
 
+## No runtime action state after an upgrade, a reboot or in a container
+
+A `runtime/<pid>/` whose `runtime.json` comes from another runtime scope (another container sharing `~/.omp`, a previous Linux boot) or from an earlier version that recorded none is not this process's to replace until its marker and its directory are both 24 h old. Until then, a process given that pid publishes no runtime action state (`runtime-dir-foreign` with `OMP_UNDO_REDO_DEBUG=1`), and undo and redo work as usual. A directory whose pid is not running in any container that shares the folder is safe to delete by hand. A directory from another hostname is never replaced or reaped.
+
 ## A snapshot store created with permissive file modes
 
 Stores are created owner-only (`0700`, with `core.sharedRepository=0600`), but private repositories created by an earlier version keep their original object modes. If the store was ever created with a permissive umask, close every OMP and Pi process, then delete `<storeRoot>/repos`. That deletes all undo file history; the store is recreated owner-only on next use.

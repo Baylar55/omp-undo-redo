@@ -59,6 +59,9 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 
 const roots: string[] = [];
+const scope = "c".repeat(64);
+const otherScope = "d".repeat(64);
+const resolveRuntimeScope = async (): Promise<string> => scope;
 
 async function makeRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "omp-undo-redo-runtime-store-"));
@@ -113,6 +116,7 @@ describe("runtime action-state store", () => {
       runtimeId: "runtime-a",
       clock: () => new Date("2026-08-01T12:00:00.000Z"),
       uuid: () => "temporary",
+      resolveRuntimeScope,
     });
     await store.initialize();
     await store.publishNavigation("secret-session", state(0), null);
@@ -130,6 +134,7 @@ describe("runtime action-state store", () => {
       runtimeId: "runtime-a",
       pid: 101,
       hostname: expect.any(String),
+      runtimeScope: scope,
       startedAt: "2026-08-01T12:00:00.000Z",
     });
     expect(files).toEqual([`${checkpointNamespace("secret-session")}.json`]);
@@ -237,17 +242,25 @@ describe("runtime action-state store", () => {
     await writeFile(join(root, "105", "stale.json"), "stale");
     await writeFile(
       join(root, "105", "runtime.json"),
-      JSON.stringify({ schemaVersion: 1, protocol: "omp-undo-redo/runtime", pid: 105 }),
+      JSON.stringify({
+        schemaVersion: 1,
+        protocol: "omp-undo-redo/runtime",
+        pid: 105,
+        hostname: hostname(),
+        runtimeScope: scope,
+      }),
     );
     const first = new RuntimeActionStateStore({
       rootDirectory: root,
       pid: 105,
       runtimeId: "first",
+      resolveRuntimeScope,
     });
     const second = new RuntimeActionStateStore({
       rootDirectory: root,
       pid: 106,
       runtimeId: "second",
+      resolveRuntimeScope,
     });
 
     await first.initialize();
@@ -282,6 +295,51 @@ describe("runtime action-state store", () => {
 
     expect(await readFile(join(root, "109", "precious.txt"), "utf8")).toBe("keep me");
     expect(await readdir(join(root, "109"))).toEqual(["precious.txt"]);
+  });
+
+  it("replaces another runtime scope's directory only once it is ancient", async () => {
+    // A container sharing the root has its own pid 130/131: same number, not ours.
+    const root = await makeRoot();
+    const ancient = new Date(Date.now() - 48 * 60 * 60 * 1_000);
+    for (const [pid, startedAt] of [
+      [130, new Date()],
+      [131, ancient],
+    ] as const) {
+      await mkdir(join(root, String(pid), "sessions"), { recursive: true });
+      await writeFile(
+        join(root, String(pid), "runtime.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          protocol: "omp-undo-redo/runtime",
+          runtimeId: `container-${pid}`,
+          pid,
+          hostname: hostname(),
+          runtimeScope: otherScope,
+          startedAt: startedAt.toISOString(),
+        }),
+      );
+      await utimes(join(root, String(pid)), startedAt, startedAt);
+    }
+    const live = new RuntimeActionStateStore({
+      rootDirectory: root,
+      pid: 130,
+      resolveRuntimeScope,
+    });
+    const stale = new RuntimeActionStateStore({
+      rootDirectory: root,
+      pid: 131,
+      runtimeId: "new",
+      resolveRuntimeScope,
+    });
+
+    await live.publishNavigation("session", state(0), "turn");
+    await stale.publishNavigation("session", state(0), "turn");
+    await live.shutdown();
+
+    expect(await readFile(join(root, "130", "runtime.json"), "utf8")).toContain('"container-130"');
+    await expect(access(live.sessionPath("session"))).rejects.toThrow();
+    expect((await readState(stale, "session")).runtimeId).toBe("new");
+    await stale.shutdown();
   });
 
   it("publishes over leftovers of an install a killed process left", async () => {
@@ -433,6 +491,8 @@ describe("runtime action-state store", () => {
       startedAt: Date;
       mtime: Date;
       host?: string;
+      /** Marker `runtimeScope`; `null` writes a marker from before the field. */
+      scope?: string | null;
       unreadable?: boolean;
       marker?: "none" | "corrupt" | "string-pid";
       precious?: boolean;
@@ -458,6 +518,11 @@ describe("runtime action-state store", () => {
       { pid: 316, suffix: ".a.tmp", code: "ESRCH", startedAt: recent, mtime: recent },
       { pid: 317, suffix: ".a.tmp", code: "", startedAt: recent, mtime: recent }, // installing
       { pid: 318, suffix: ".a.tmp", startedAt: ancient, mtime: ancient, marker: "none" },
+      // Another PID namespace (container) or boot: never probed, only aged out.
+      { pid: 319, startedAt: recent, mtime: recent, scope: otherScope },
+      { pid: 320, startedAt: ancient, mtime: ancient, scope: otherScope },
+      { pid: 322, startedAt: recent, mtime: recent, scope: null },
+      { pid: 323, startedAt: ancient, mtime: ancient, scope: null },
       { pid: 200, startedAt: ancient, mtime: ancient }, // own pid: never probed or reaped
       { pid: 200, suffix: ".a.tmp", startedAt: ancient, mtime: ancient }, // own pid
     ];
@@ -475,6 +540,7 @@ describe("runtime action-state store", () => {
                 runtimeId: `r-${f.pid}`,
                 pid: f.marker === "string-pid" ? String(f.pid) : f.pid,
                 hostname: f.host ?? hostname(),
+                ...(f.scope === null ? {} : { runtimeScope: f.scope ?? scope }),
                 startedAt: f.startedAt.toISOString(),
               }),
         );
@@ -496,7 +562,7 @@ describe("runtime action-state store", () => {
       if (code) throw Object.assign(new Error(code), { code });
       return true;
     });
-    await reapStaleRuntimes(root, 200);
+    await reapStaleRuntimes(root, 200, scope);
 
     expect((await readdir(root)).sort()).toEqual(
       [
@@ -514,6 +580,8 @@ describe("runtime action-state store", () => {
         "313",
         "314",
         "315",
+        "319",
+        "322",
         "317.a.tmp",
         "318.a.tmp",
         "200.a.tmp",
@@ -521,8 +589,9 @@ describe("runtime action-state store", () => {
         "321.tmp",
       ].sort(),
     );
-    // Signal 0 only probes. Exactly the same-host numeric marker pids are probed:
-    // never itself (200, its leftover too), the other host's (304) or a dir
+    // Signal 0 only probes. Exactly the same-host, same-scope numeric marker
+    // pids are probed: never itself (200, its leftover too), the other host's
+    // (304), another scope's or a scopeless marker's (319, 320, 322, 323), or a dir
     // without a numeric pid.
     expect(kill.mock.calls.every(([, signal]) => signal === 0)).toBe(true);
     expect(kill.mock.calls.map(([pid]) => pid).sort((a, b) => a - b)).toEqual([

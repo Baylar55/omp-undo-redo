@@ -12,7 +12,7 @@ export const STALE_RUNTIME_MS = 24 * 60 * 60 * 1_000;
 /** A runtime directory is reapable only when both its marker timestamp and its
  *  own mtime are older than the stale window. An unreadable mtime counts as
  *  fresh: never delete on a failed stat. */
-async function isAncient(dir: string, startedAt: unknown): Promise<boolean> {
+export async function isAncient(dir: string, startedAt: unknown): Promise<boolean> {
   const startedMs = typeof startedAt === "string" ? Date.parse(startedAt) : NaN;
   if (!Number.isNaN(startedMs) && Date.now() - startedMs < STALE_RUNTIME_MS) return false;
   try {
@@ -28,10 +28,29 @@ export type RuntimeMarker = {
   runtimeId: string;
   pid: number;
   hostname: string;
+  /** `resolveRuntimeScope()` of the writer (boot + PID namespace on Linux), as
+   *  owner leases record it; null when it could not be read. */
+  runtimeScope: string | null;
   startedAt: string;
 };
 
-export async function reapStaleRuntimes(rootDirectory: string, ownPid: number): Promise<void> {
+/** The marker's pid is a pid of this process table: same host and runtime
+ *  scope. Otherwise (a container sharing the root, a previous boot, a marker
+ *  from before the field, an unknown scope) probing it here means nothing. */
+export function sharesProcessTable(
+  marker: Partial<RuntimeMarker>,
+  runtimeScope: string | null,
+): boolean {
+  return (
+    runtimeScope !== null && marker.runtimeScope === runtimeScope && marker.hostname === hostname()
+  );
+}
+
+export async function reapStaleRuntimes(
+  rootDirectory: string,
+  ownPid: number,
+  runtimeScope: string | null,
+): Promise<void> {
   const localHostname = hostname();
   let entries: Dirent[];
   try {
@@ -69,7 +88,8 @@ export async function reapStaleRuntimes(rootDirectory: string, ownPid: number): 
       // dead its pid looks locally.
       if (typeof marker.hostname === "string" && marker.hostname !== localHostname) continue;
       let dead = false;
-      if (typeof marker.pid === "number") {
+      // Another PID namespace's pid is unprobeable here: only age decides.
+      if (typeof marker.pid === "number" && sharesProcessTable(marker, runtimeScope)) {
         try {
           process.kill(marker.pid, 0);
           // Alive and ours: never age it out. A live owner does not refresh
@@ -87,8 +107,9 @@ export async function reapStaleRuntimes(rootDirectory: string, ownPid: number): 
           else if (code !== "EPERM") continue;
         }
       }
-      // PID-recycling guard: an unprobeable pid (or a marker without one) only
-      // loses its directory once the marker and the directory are both ancient.
+      // PID-recycling guard: an unprobeable pid (or a marker without one, or
+      // another runtime scope's) only loses its directory once the marker and
+      // the directory are both ancient.
       if (!dead && !(await isAncient(dir, marker.startedAt))) continue;
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
