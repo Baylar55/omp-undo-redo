@@ -1,9 +1,10 @@
 # Release Runbook
 
 `.github/workflows/publish.yml` runs on every `v*.*.*` tag and does the rest: it fails if the tag
-does not match `package.json`, runs `npm run verify`, skips publish if the version already exists on
-npm, publishes with provenance, and creates the GitHub Release. Your job is the version bump and the
-tag.
+does not match `package.json` or the tagged commit is not on `main`, runs the full CI matrix
+(`ci.yml`: every OS, Node and Bun job) plus `npm run verify`, skips publish if the version already
+exists on npm, publishes with provenance, and creates the GitHub Release. Your job is the version
+bump and the tag.
 
 ## Pick the version
 
@@ -65,9 +66,12 @@ The GitHub Release lists merged PRs (`--generate-notes`), not the changelog. If 
 ## Three rules
 
 - **Merge through a PR.** `main` requires the `Quality checks` status. A `workflow_dispatch` run does
-  not satisfy it — only the `pull_request` run counts.
+  not satisfy it — only the `pull_request` run counts. The OS/Node/Bun matrix is not required to
+  merge, but publish reruns it on the tag and stops if any job fails; a red tag means a new patch.
 - **Never move or reuse a tag.** Publish skips any version npm already has, so a re-pushed tag
-  silently does nothing. A failed or partial publish is corrected with a new patch version.
+  silently does nothing. A failed or partial publish is corrected with a new patch version. If a
+  force-push drops the tagged commit from `main`, re-runs of that tag fail the main-ancestry check;
+  release the fix as a new patch from `main`.
 - **Never `npm publish` locally.** The workflow holds `NPM_TOKEN` and provenance requires its OIDC
   identity.
 

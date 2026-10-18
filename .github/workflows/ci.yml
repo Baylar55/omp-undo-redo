@@ -8,6 +8,8 @@ on:
     branches:
       - main
   workflow_dispatch:
+  # publish.yml calls this so a tag cannot publish unless the full matrix passes.
+  workflow_call:
 
 permissions:
   contents: read
