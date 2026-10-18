@@ -677,6 +677,85 @@ describe("bounded capture lifecycle", () => {
     },
   );
 
+  it("records a gap when another session's turn runs during a deferred after-snapshot", async () => {
+    // The workspace is shared across sessions: session B's edits made while
+    // A's after-snapshot is still reading it land in A's checkpoint, and an
+    // /undo in A would then revert B's work.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-cross-session-"));
+    const gate = Promise.withResolvers<void>();
+    const parked = Promise.withResolvers<void>();
+    let parkNextAdd = false;
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        if (parkNextAdd && args.includes("add")) {
+          parkNextAdd = false;
+          parked.resolve();
+          await gate.promise;
+        }
+        return inner(args, options);
+      };
+      gated.cwd = workCwd;
+      return gated;
+    };
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: runner,
+        // Long: before_agent_start must return only after each before-snapshot,
+        // so the parked `add` is A's after-snapshot and nothing else.
+        captureDeadlineMs: 5_000,
+        finalizeDeadlineMs: 200,
+      });
+      const ctx = context(cwd, "fence-a");
+      let liveId = "fence-a";
+      ctx.sessionManager.getSessionId = () => liveId;
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "base\n");
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "A\n");
+      ctx.leaf = "a-turn";
+      // Park A's after-snapshot before it reads the workspace.
+      parkNextAdd = true;
+      const agentEnd = pi.emit("agent_end", ctx);
+      await parked.promise;
+      await agentEnd;
+
+      // /new: session B runs a whole turn while A's finalize is parked.
+      liveId = "fence-b";
+      ctx.leaf = "b-start";
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "B\n");
+      ctx.leaf = "b-turn";
+      await pi.emit("agent_end", ctx);
+      gate.resolve();
+
+      // /resume A: undo waits a bounded time on A's finalize; retry until it settled.
+      await pi.emit("session_before_switch", ctx);
+      liveId = "fence-a";
+      ctx.leaf = "a-turn";
+      await pi.emit("session_switch", ctx);
+      let message = "";
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        await pi.runCommand("undo", ctx);
+        message = ctx.ui.notifications.at(-1)?.message ?? "";
+        if (!message.includes("still being finalized")) break;
+      }
+      expect(message).toBe(
+        "Undid the session turn, but files were not restored because the next turn started before this turn's file snapshot finished.",
+      );
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("B\n");
+    } finally {
+      gate.resolve();
+      await rmRetry(cwd);
+    }
+  });
+
   it("reads the finalize guard after the idle wait when undo is issued mid-stream", async () => {
     // The host runs commands during streaming and stops waiting on an
     // agent_end handler after its cap, while the finalize keeps running.

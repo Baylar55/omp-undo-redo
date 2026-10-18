@@ -48,10 +48,6 @@ export type SessionState = {
    *  turn that captured it: a deferred finalize whose checkpoint predates the
    *  current turn is released, never recorded with the wrong leaf. */
   turnStartLeaf?: string | null;
-  /** Monotonic turn counter. A turn whose after-snapshot finishes only after
-   *  the next turn already started snapshotted that turn's edits too, which
-   *  is what makes such a checkpoint unrestorable. */
-  turnSequence?: number;
   /** The current turn's in-flight before-snapshot. `before_agent_start`
    *  stops waiting at the handler deadline, so the agent's tools can run while
    *  git is still reading the workspace. Tool calls wait on `complete`; one
@@ -101,6 +97,11 @@ export type ExtensionServices = {
    *  only work that writes to a record it read before an `await`), the
    *  session is no longer current, and every field is empty. */
   sessions: Map<string, SessionState>;
+  /** Turns started in this copy, across all its sessions: every session
+   *  shares the workspace, so an after-snapshot still running when ANY next
+   *  turn starts also holds that turn's edits, which makes it unrestorable.
+   *  Never reset, so a session start cannot make a stale value match again. */
+  turnSequence: number;
   /** Turn work (captures, finalizes, session events) shutdown waits on. */
   activeOperations: Set<Promise<void>>;
   /** Background store gcs and retention sweeps: shutdown never waits on them
@@ -158,6 +159,7 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     bootEviction: null,
     privateRetentionSweep: null,
     sessions: new Map(),
+    turnSequence: 0,
     activeOperations: new Set(),
     housekeepingOperations: new Set(),
     expirationPromises: new Map(),

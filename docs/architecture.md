@@ -172,15 +172,16 @@ Every wait has a limit; hosts embedding the extension can change the defaults. A
 | What waits                                                                                | Limit              | When the limit is reached                                                                                                                                |
 | ----------------------------------------------------------------------------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Prompt start (`before_agent_start`) and turn end (`agent_end`), for an in-flight snapshot | 3 s                | The snapshot keeps running in the background; the turn's undo boundary is recorded when it finishes.                                                     |
-| `/undo` and `/redo`, for an in-flight snapshot or the previous turn's after-snapshot      | 3 s                | Nothing changes; the command says to try again shortly instead of acting on a half-recorded state.                                                       |
+| `/undo` and `/redo`, for an in-flight snapshot or any session's unfinished after-snapshot | 3 s                | Nothing changes; the command says to try again shortly instead of acting on a half-recorded state.                                                       |
 | Each tool call, for the turn's before-snapshot                                            | 25 s per tool call | The tool runs; the snapshot is discarded and the turn is recorded session-only, so `/undo` moves the conversation back and says files were not restored. |
 | Turn end (`agent_end`), for the after-snapshot and history write                          | 25 s               | They finish in the background.                                                                                                                           |
 
 Tools wait because a tool that edits a file before Git has read it would make the snapshot record
 the edit as the pre-turn state; recording the turn session-only is safer than restoring a wrong
-baseline. A turn whose snapshot only finishes after the next turn has started keeps its
-conversation boundary but loses file restoration for that turn alone (its snapshot already contains
-the next turn's edits); the turns before and after it stay restorable.
+baseline. A turn whose snapshot only finishes after the next turn has started (in any session of
+the process: after `/new` or `/resume` the sessions share the workspace) keeps its conversation
+boundary but loses file restoration for that turn alone (its snapshot already contains the next
+turn's edits); the turns before and after it stay restorable.
 
 ### Session history file
 

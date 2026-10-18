@@ -105,7 +105,7 @@ export async function beforeAgentStart(
   // in-flight capture and this turn would produce no checkpoint at all.
   const turnStartLeaf = typed.sessionManager.getLeafId();
   state.turnStartLeaf = turnStartLeaf;
-  state.turnSequence = (state.turnSequence ?? 0) + 1;
+  services.turnSequence += 1;
   if (state.capture !== undefined) {
     state.pending = {
       kind: "session",

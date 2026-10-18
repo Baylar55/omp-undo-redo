@@ -29,7 +29,7 @@ function beginFinalizeTurn(
   // Read here, not inside the finalize: a deferred finalize runs after the
   // next turn already bumped the counter, and the comparison below is
   // exactly what detects that.
-  const turnSequence = state.turnSequence;
+  const turnSequence = services.turnSequence;
   // An earlier turn whose capture overran its deadline may still be
   // finalizing. Its checkpoint must land in the history before this turn's,
   // or the recorded order would not match the turn order (and a session-only
@@ -147,7 +147,7 @@ async function finalizeTurn(
   capture: PendingCapture,
   leafId: string | null,
   turnStartLeaf: string | null,
-  turnSequence: number | undefined,
+  turnSequence: number,
 ): Promise<void> {
   await capture.complete;
   const before = capture.checkpoint;
@@ -192,14 +192,15 @@ async function finalizeTurn(
         );
         return;
       }
-      // The next turn started before this after-snapshot finished, so the
+      // A next turn — in this session or any other, since they share the
+      // workspace — started before this after-snapshot finished, so the
       // snapshot also contains that turn's edits: restoring from it would
       // revert two turns of file changes while moving one session boundary.
       // Only this turn loses its file checkpoint — every earlier turn's
       // stays restorable, and `applyCheckpoint` patches rather than checks
       // out, so it reports a conflict instead of clobbering unrecorded
       // edits when an older restore crosses this gap.
-      if (services.sessions.get(sessionId)?.turnSequence !== turnSequence) {
+      if (services.turnSequence !== turnSequence) {
         await releaseCheckpoint(
           services.gitRunnerFor(result.checkpoint.repository),
           result.checkpoint,

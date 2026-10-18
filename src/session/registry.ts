@@ -94,7 +94,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
   }
 
   /** `/undo` and `/redo`: the session's navigation once the last turn's
-   *  capture and finalize settled. */
+   *  capture and every session's finalize settled. */
   async function commandNavigation(
     typed: AnyContext,
     waitForIdle: () => Promise<void>,
@@ -105,9 +105,15 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     // agent_end, so the guards below must be read after the idle wait.
     await waitForIdle();
     const state = sessions.get(sessionId);
+    // Every session's: a session left by /new or /resume may still be taking
+    // its after-snapshot of the shared workspace, and a restore written under
+    // it would land in that session's checkpoint. Finalizes never reject.
+    const finalizes = [...sessions.values()].flatMap((s) =>
+      s.finalize === undefined ? [] : [s.finalize],
+    );
     const guards: [Promise<unknown> | undefined, "capturing" | "finalizing"][] = [
       [state?.capture?.complete, "capturing"],
-      [state?.finalize, "finalizing"],
+      [finalizes.length > 0 ? Promise.all(finalizes) : undefined, "finalizing"],
     ];
     for (const [work, status] of guards) {
       if (work && (await timedOutAfter(work, services.captureDeadlineMs))) return { status };
@@ -162,7 +168,6 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     state.pending = undefined;
     state.backend = undefined;
     state.turnStartLeaf = undefined;
-    state.turnSequence = undefined;
     // Nothing in flight (the loop above) and nothing left: drop the record, as
     // a later resume rebuilds it. Only this exact record: a concurrent release
     // of the same id may already have replaced it with a resumed session's.
@@ -190,7 +195,6 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     state.pending = undefined;
     if (previousPending) await releasePending(services, previousPending);
     state.turnStartLeaf = undefined;
-    state.turnSequence = undefined;
     // An in-flight capture for this session no longer belongs to a live turn:
     // it self-releases on completion via the identity check in beginCapture.
     state.capture = undefined;
