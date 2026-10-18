@@ -22,6 +22,19 @@ const PRIVATE_GC_TIMEOUT_MS = 15 * 60 * 1000;
  *  loses nothing. */
 const PRIVATE_SWEEP_PRUNE = "1.hour.ago";
 
+/** A `packed-refs.lock` from a git killed during pack-refs (a gc past its
+ *  ceiling, or dying with the terminal): git never removes it, and while it
+ *  stands every ref deletion and every gc fails, so refs and objects grow
+ *  without limit. A live holder keeps it for seconds; one older than twice
+ *  the gc ceiling is debris, deleted like setup's stale `config.lock`. */
+export async function removeStalePackedRefsLock(storeDir: string): Promise<void> {
+  const lock = join(storeDir, "packed-refs.lock");
+  const info = await stat(lock).catch(() => null);
+  if (info && Date.now() - info.mtimeMs > 2 * PRIVATE_GC_TIMEOUT_MS) {
+    await rm(lock, { force: true }).catch(() => undefined);
+  }
+}
+
 /** Best-effort `git prune` + `git gc` over a snapshot store. Runs outside
  *  the handler deadline accounting (never awaited by a handler) so a slow
  *  gc can never hit the host's timeout. The prune drops unreferenced

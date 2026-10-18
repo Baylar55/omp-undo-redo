@@ -6,7 +6,7 @@ import { expireGitSessionHistories } from "../history/retention.js";
 import { track } from "../infra/async.js";
 import { canonicalCwd, checkpointNamespace, storeRootDirectory } from "../infra/paths.js";
 import { evictStalePrivateRepos, storeSource } from "../store/maintenance/eviction.js";
-import { runCaptureGc, storeNeedsGc } from "../store/maintenance/gc.js";
+import { removeStalePackedRefsLock, runCaptureGc, storeNeedsGc } from "../store/maintenance/gc.js";
 import { sweepOrphanTempIndexes } from "../store/maintenance/temp-sweep.js";
 import type { GitRepository, GitRunner } from "../types.js";
 import type { ExtensionServices } from "./services.js";
@@ -88,6 +88,8 @@ export function expireRepository(
   const existing = services.expirationPromises.get(key);
   if (existing) return existing;
   const expiration = (async () => {
+    // Before expiry: a stale lock would fail its deletions and the gc below.
+    await removeStalePackedRefsLock(repository.storeDir);
     const refsRemoved = await expireGitSessionHistories(
       repository,
       git,

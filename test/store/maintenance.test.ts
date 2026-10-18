@@ -29,7 +29,13 @@ import {
 } from "../helpers/index.js";
 import { storeRootDirectory, checkpointNamespace } from "../../src/infra/paths.js";
 import { privateRepositoryPath } from "../../src/store/setup.js";
-import { gcPendingPath, historyRefPrefix, releaseRefs } from "../../src/store/refs.js";
+import {
+  deleteRefsBatched,
+  gcPendingPath,
+  historyRefPrefix,
+  releaseRefs,
+} from "../../src/store/refs.js";
+import { removeStalePackedRefsLock } from "../../src/store/maintenance/gc.js";
 
 const testStoreRoot = join(tmpdir(), `omp-undo-redo-gc-store-${process.pid}`);
 process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
@@ -609,6 +615,12 @@ describe("private-repo housekeeping", () => {
         // Unreferenced and fresh: what an in-flight capture has written.
         const inFlight = await out(["hash-object", "-w", "--stdin"], "SECRET=in-flight\n");
         const exists = async (object: string) => (await git(["cat-file", "-e", object])).code === 0;
+        // A gc killed in pack-refs left this behind: the sweep must clear it
+        // first, or the aged session's ref deletion fails on it.
+        const staleLock = join(repository.gitDir, "packed-refs.lock");
+        await writeFile(staleLock, "");
+        const lockAge = new Date(Date.now() - 31 * 60 * 1000);
+        await utimes(staleLock, lockAge, lockAge);
 
         const pi = new FakeExtensionApi();
         ompUndoRedo(pi as never, {});
@@ -846,4 +858,94 @@ describe("private-repo housekeeping", () => {
       }
     });
   }, 60000);
+});
+
+describe("stale packed-refs.lock", () => {
+  /** A bare store holding `count` refs; `packed` of them packed, the rest loose. */
+  async function seedRefs(count: number, packed = 0) {
+    const gitDir = await mkdtemp(join(tmpdir(), "omp-undo-redo-packed-lock-"));
+    const base = createGitRunner(tmpdir(), { env: { GIT_DIR: gitDir } });
+    const counter = { spawns: 0 };
+    const git: GitRunner = (args, options) => {
+      if (args[0] === "update-ref") counter.spawns += 1;
+      return base(args, options);
+    };
+    await base(["init", "--bare", "-q", gitDir]);
+    const tree = (await base(["mktree"], { stdin: "" })).stdout.trim();
+    const commit = (await base(["commit-tree", tree, "-m", "m"])).stdout.trim();
+    const refs = Array.from({ length: count }, (_, index) => ({
+      ref: `refs/omp-undo-redo/r${index}`,
+      expectedHash: commit,
+    }));
+    const create = (slice: typeof refs) =>
+      base(["update-ref", "--stdin"], {
+        stdin: `${slice.map(({ ref }) => `create ${ref} ${commit}`).join("\n")}\n`,
+      });
+    if (packed > 0) {
+      await create(refs.slice(0, packed));
+      await base(["pack-refs", "--all"]);
+    }
+    if (packed < count) await create(refs.slice(packed));
+    const remaining = async () =>
+      (await base(["for-each-ref", "--format=%(refname)", "refs/omp-undo-redo/"])).stdout
+        .split("\n")
+        .filter(Boolean)
+        .sort();
+    return { gitDir, git, refs, counter, remaining };
+  }
+
+  it("fails a blocked deletion in one spawn, and the sweep's cleanup unblocks it", async () => {
+    // A gc killed in pack-refs leaves packed-refs.lock: every deletion then
+    // failed, after 2N−1 halving spawns of ~1 s each.
+    const { gitDir, git, refs, counter, remaining } = await seedRefs(8);
+    try {
+      const lock = join(gitDir, "packed-refs.lock");
+      await writeFile(lock, "");
+
+      expect(await deleteRefsBatched(git, refs)).toBe("failed");
+      expect(counter.spawns).toBe(1);
+      // A lock as young as a live pack-refs' is kept.
+      await removeStalePackedRefsLock(gitDir);
+      await expect(stat(lock)).resolves.toBeDefined();
+      const old = new Date(Date.now() - 31 * 60 * 1000);
+      await utimes(lock, old, old);
+      await removeStalePackedRefsLock(gitDir);
+      await expect(stat(lock)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await deleteRefsBatched(git, refs)).toBe("ok");
+      expect(await remaining()).toEqual([]);
+    } finally {
+      await rmRetry(gitDir);
+    }
+  }, 30000);
+
+  it("still halves around a single ref's own lock", async () => {
+    // `<ref>.lock'` also ends in `.lock'`: it must not skip the halving that
+    // isolates that one ref, or it would block its whole batch.
+    const { gitDir, git, refs, remaining } = await seedRefs(4);
+    try {
+      await writeFile(join(gitDir, "refs", "omp-undo-redo", "r2.lock"), "");
+      expect(await deleteRefsBatched(git, refs)).toBe("failed");
+      expect(await remaining()).toEqual(["refs/omp-undo-redo/r2"]);
+    } finally {
+      await rmRetry(gitDir);
+    }
+  }, 30000);
+
+  it("hands every ref to the loose-ref fallback when the lock is held", async () => {
+    // releaseRefs' fallback unlinks loose refs; packed ones need git and wait.
+    const { gitDir, git, refs, counter, remaining } = await seedRefs(6, 2);
+    try {
+      await writeFile(join(gitDir, "packed-refs.lock"), "");
+      const repository = { worktree: gitDir, gitDir, commonDir: gitDir, storeDir: gitDir };
+      const released = await releaseRefs(
+        () => git,
+        refs.map((ref) => ({ repository, ...ref })),
+      );
+      expect(released).toBe(false);
+      expect(counter.spawns).toBe(1);
+      expect(await remaining()).toEqual(["refs/omp-undo-redo/r0", "refs/omp-undo-redo/r1"]);
+    } finally {
+      await rmRetry(gitDir);
+    }
+  }, 30000);
 });

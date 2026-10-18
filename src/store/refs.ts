@@ -31,7 +31,9 @@ export async function markGcPending(storeDir: string): Promise<void> {
  *  refs that still fail alone — that is how a caller reaches a loose-ref
  *  unlink when git itself is unusable, so a throw falls through to halving
  *  rather than aborting. A timeout aborts the walk instead: the repository is
- *  busy and splitting only multiplies the wait. */
+ *  busy and splitting only multiplies the wait. A held `packed-refs.lock`
+ *  fails every deletion alike (each spawn waiting out git's lock timeout),
+ *  so it skips the halving and hands every ref to `onSingleFailure` at once. */
 export async function deleteRefsBatched(
   git: GitRunner,
   refs: readonly RefSpec[],
@@ -43,19 +45,27 @@ export async function deleteRefsBatched(
 ): Promise<"ok" | "failed" | "timeout"> {
   if (refs.length === 0) return "ok";
   const input = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n");
+  let sharedLock = false;
   try {
+    // LC_ALL=C pins the lock message matched below.
     const result = await git(["update-ref", "--stdin"], {
-      env: options.env,
+      env: { ...options.env, LC_ALL: "C" },
       stdin: `${input}\n`,
       timeoutMs: options.timeoutMs,
     });
     if (result.code === 0) return "ok";
     if (result.error === "timeout") return "timeout";
+    // A per-ref `<ref>.lock'` blocks only that ref, which halving isolates.
+    sharedLock = /[\\/]packed-refs\.lock'/.test(result.stderr);
   } catch {
     // Fall through to halving.
   }
-  if (refs.length === 1) {
-    return options.onSingleFailure && (await options.onSingleFailure(refs[0])) ? "ok" : "failed";
+  if (refs.length === 1 || sharedLock) {
+    const fallback = options.onSingleFailure;
+    if (!fallback) return "failed";
+    let released = true;
+    for (const ref of refs) if (!(await fallback(ref))) released = false;
+    return released ? "ok" : "failed";
   }
   const midpoint = Math.ceil(refs.length / 2);
   const left = await deleteRefsBatched(git, refs.slice(0, midpoint), options);
