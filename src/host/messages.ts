@@ -56,6 +56,8 @@ export function unavailableMessage(reason: FileCheckpointUnavailableReason): str
       return "the next turn started before this turn's file snapshot finished.";
     case "resumed_checkpoint_unavailable":
       return "the resumed turn has no usable file checkpoint.";
+    case "checkpoint_removed":
+      return "this turn's file snapshot was removed from the snapshot store.";
     case "private_repository_unavailable":
       return "the private snapshot repository could not be initialized.";
     case "store_unavailable":

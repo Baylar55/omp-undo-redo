@@ -24,6 +24,7 @@ export const NOTIFICATION_MESSAGES: Record<FileCheckpointUnavailableReason, stri
   after_ref_failed: `${TURN_LOST} the file snapshot taken after this turn could not be saved.${TURN_SUFFIX}`,
   file_history_gap: `${TURN_LOST} the next turn started before this turn's file snapshot finished.${TURN_SUFFIX}`,
   resumed_checkpoint_unavailable: `${TURN_LOST} the resumed turn has no usable file checkpoint.${TURN_SUFFIX}`,
+  checkpoint_removed: `${TURN_LOST} its file snapshot was removed from the snapshot store.${TURN_SUFFIX}`,
 };
 
 export const HISTORY_EXPIRED_NOTICE =

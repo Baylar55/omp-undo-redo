@@ -198,23 +198,6 @@ async function lockFile(path: string): Promise<() => Promise<void>> {
   };
 }
 
-function checkpointWithRepository(
-  beforeHash: string,
-  afterHash: string,
-  repository: GitCheckpoint["repository"],
-): GitCheckpoint {
-  return {
-    kind: "git",
-    repository,
-    beforeHash,
-    beforeRef: "refs/omp-undo-redo/test/before",
-    afterHash,
-    afterRef: "refs/omp-undo-redo/test/after",
-    parentLeafId: null,
-    leafId: null,
-  };
-}
-
 describe("checkpoint namespaces", () => {
   it("hashes session IDs and keeps refs in the private namespace", () => {
     const namespace = checkpointNamespace("session/raw id");
@@ -1753,11 +1736,7 @@ describe("history-safe Git checkpoints", () => {
       );
       expect(after).not.toBeNull();
       if (!after) return;
-      const checkpoint = checkpointWithRepository(
-        after.beforeHash,
-        after.afterHash,
-        after.repository,
-      );
+      const checkpoint = after;
       await writeFile(join(cwd, "tracked.txt"), "manual conflict\n");
       const savedContent = await readFile(join(cwd, "tracked.txt"));
       const savedIndex = await indexState(git, cwd);

@@ -349,6 +349,15 @@ owner's temporary v2 refs when its lease is valid and either:
 - differs in host ID, hostname, or runtime scope (a remote owner: another machine, a regenerated
   `host-id` file, or on Linux a reboot) and has gone 7 days without a refresh.
 
+The 7-day rule compares the scanning runtime's clock with the lease mtime the owner wrote, so an
+owner suspended, clock-skewed or unable to refresh for 7 days can be reaped while still alive. Only
+its v2 refs go: a turn running at the time, or one whose promotion failed. `/undo` and `/redo`
+check such a checkpoint's refs before restoring; once a ref is gone or moved, the turn becomes a
+session-only hole (`checkpoint_removed`) and navigation moves past it instead of failing on
+snapshots a later gc prunes. This applies even while gc has not pruned the snapshots yet: refs
+are the durable record, and restoring from objects that survive by chance would let a transient
+Git failure decide whether a turn is kept.
+
 On Linux, the runtime scope binds cleanup to both the current kernel boot ID and PID namespace,
 preventing a container or WSL process outside that namespace from being mistaken for a dead local
 process. If that scope cannot be resolved, automatic cleanup is disabled while v2 checkpointing and

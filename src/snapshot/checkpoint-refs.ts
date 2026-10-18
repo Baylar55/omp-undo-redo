@@ -6,6 +6,7 @@ import type {
   OwnershipMode,
   PendingGitCheckpoint,
 } from "../types.js";
+import { parseRefLines } from "../infra/git-parse.js";
 import { checkpointNamespace } from "../infra/paths.js";
 import { invoke } from "../infra/git-runner.js";
 import { storeEnv } from "../store/git-store.js";
@@ -111,4 +112,30 @@ export async function retainCheckpointForResume(
   });
   if (retained.code !== 0) return checkpoint;
   return { ...checkpoint, beforeRef, afterRef };
+}
+
+/** False only when the listing proves a ref is gone or moved; an unreadable
+ *  listing keeps the checkpoint (its restore then fails or succeeds on its own). */
+export async function checkpointRefsIntact(
+  git: GitRunner,
+  checkpoint: GitCheckpoint,
+): Promise<boolean> {
+  const listed = await invoke(
+    git,
+    [
+      "for-each-ref",
+      "--format=%(refname)%00%(objectname)",
+      checkpoint.beforeRef,
+      checkpoint.afterRef,
+    ],
+    { env: storeEnv(checkpoint.repository) },
+  );
+  if (listed.error || listed.code !== 0) return true;
+  const refs = parseRefLines(listed.stdout);
+  if (!refs) return true;
+  const hashes = new Map(refs.map(({ ref, expectedHash }) => [ref, expectedHash]));
+  return (
+    hashes.get(checkpoint.beforeRef) === checkpoint.beforeHash &&
+    hashes.get(checkpoint.afterRef) === checkpoint.afterHash
+  );
 }

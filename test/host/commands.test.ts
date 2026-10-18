@@ -71,9 +71,9 @@ function checkpoint(parentLeafId: string | null, leafId: string): GitCheckpoint 
     kind: "git",
     repository,
     beforeHash: `before-${leafId}`,
-    beforeRef: `refs/omp-undo-redo/test/${leafId}/before`,
+    beforeRef: `refs/omp-undo-redo/history/test/${leafId}/before`,
     afterHash: `after-${leafId}`,
-    afterRef: `refs/omp-undo-redo/test/${leafId}/after`,
+    afterRef: `refs/omp-undo-redo/history/test/${leafId}/after`,
     parentLeafId,
     leafId,
   };
@@ -236,12 +236,18 @@ describe("session navigation", () => {
     expect((await navigation.redo()).status).toBe("empty");
   });
 
-  it("reports Git restore failures", async () => {
+  it("reports Git restore failures and keeps a checkpoint whose refs cannot be listed", async () => {
     const session = port();
     const failingGit: GitRunner = async () => ({ stdout: "", stderr: "fatal", code: 128 });
     const navigation = new SessionNavigation(session, failingGit);
-    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    const unpromoted: GitCheckpoint = {
+      ...checkpoint("u1", "a1"),
+      beforeRef: "refs/omp-undo-redo/v2/owner/a1/before",
+      afterRef: "refs/omp-undo-redo/v2/owner/a1/after",
+    };
+    await navigation.recordTurnEnd(unpromoted);
     expect((await navigation.undo()).status).toBe("git_failed");
+    expect(navigation.snapshot().checkpoints).toEqual([unpromoted]);
   });
   it("serializes turn finalization against an in-flight undo", async () => {
     const session = port();

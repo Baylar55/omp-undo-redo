@@ -13,7 +13,7 @@ import type {
 } from "../types.js";
 import { HISTORY_REF_ROOT } from "../store/refs.js";
 import { ownedPathsInWorktree } from "../store/git-store.js";
-import { releaseCheckpoints } from "../snapshot/checkpoint-refs.js";
+import { checkpointRefsIntact, releaseCheckpoints } from "../snapshot/checkpoint-refs.js";
 import { applyCheckpoint } from "../snapshot/restore.js";
 import type { CheckpointApplyResult } from "../snapshot/restore.js";
 import { landsOnParent } from "../host-contract.js";
@@ -207,6 +207,31 @@ export class SessionNavigation {
     return { status: "moved", files: "unavailable", reason: checkpoint.reason };
   }
 
+  /** A checkpoint outside the history namespace (its promotion failed, or the
+   *  turn was running) can lose its refs under a live runtime: another
+   *  runtime reaps owner refs whose lease went 7 days unrefreshed (suspend,
+   *  clock skew), and gc then prunes the snapshots. Becomes a hole here, so
+   *  the undo moves past it instead of failing at it for good.
+   *  shortcut: a missing ref means a hole even while gc has not yet pruned the
+   *  snapshots (restorable by luck); revisit if users lose just-reaped turns. */
+  private async holeIfRemoved(index: number): Promise<TurnCheckpoint> {
+    const checkpoint = this.checkpoints[index];
+    if (checkpoint.kind === "session" || checkpoint.beforeRef.startsWith(HISTORY_REF_ROOT))
+      return checkpoint;
+    if (await checkpointRefsIntact(this.gitForRepository(checkpoint.repository), checkpoint))
+      return checkpoint;
+    const hole: SessionOnlyCheckpoint = {
+      kind: "session",
+      reason: "checkpoint_removed",
+      parentLeafId: checkpoint.parentLeafId,
+      leafId: checkpoint.leafId,
+    };
+    this.checkpoints[index] = hole;
+    await this.persistState();
+    await this.releaseFileCheckpoints([checkpoint]);
+    return hole;
+  }
+
   private async applyFileCheckpoint(
     checkpoint: GitCheckpoint,
     source: "before" | "after",
@@ -262,7 +287,7 @@ export class SessionNavigation {
 
   private async performUndo(): Promise<NavigationResult> {
     if (this.currentIndex < 0) return { status: "empty" };
-    const checkpoint = this.checkpoints[this.currentIndex];
+    const checkpoint = await this.holeIfRemoved(this.currentIndex);
     if (checkpoint.kind === "session") {
       if (!(await this.navigateSession(checkpoint.parentLeafId))) return { status: "cancelled" };
       this.currentIndex--;
@@ -294,7 +319,7 @@ export class SessionNavigation {
 
   private async performRedo(): Promise<NavigationResult> {
     if (this.currentIndex >= this.checkpoints.length - 1) return { status: "empty" };
-    const checkpoint = this.checkpoints[this.currentIndex + 1];
+    const checkpoint = await this.holeIfRemoved(this.currentIndex + 1);
     if (checkpoint.kind === "session") {
       if (!(await this.navigateSession(checkpoint.leafId))) return { status: "cancelled" };
       this.currentIndex++;

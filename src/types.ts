@@ -23,6 +23,7 @@ export const UNAVAILABLE_REASONS = [
   "after_ref_failed",
   "file_history_gap",
   "resumed_checkpoint_unavailable",
+  "checkpoint_removed",
   "private_repository_unavailable",
   "store_unavailable",
   "unsafe_workspace",

@@ -15,6 +15,7 @@ import { SessionNavigation } from "../../src/session/navigation.js";
 import type { GitRepository, GitRunner, NavigationPort } from "../../src/types.js";
 import { gitRepository, privateRefs, snapshotEnv } from "../helpers/index.js";
 import { HISTORY_REF_ROOT } from "../../src/store/refs.js";
+import { storeEnv } from "../../src/store/git-store.js";
 import { resolvePersistentHostId, resolveRuntimeScope } from "../../src/store/host-identity.js";
 import {
   releasePendingCheckpoint,
@@ -479,6 +480,139 @@ describe("checkpoint owner boundaries", () => {
       expect(await navigation.redo()).toEqual(restored);
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("after\n");
       await navigation.suspend();
+    } finally {
+      await ownerRegistry.shutdown();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("turns a live owner's checkpoint reaped by a remote TTL into a hole for undo and redo", async () => {
+    const { cwd } = await makeRepository();
+    const git = createGitRunner(cwd, { env: await snapshotEnv(cwd) });
+    const ownerRegistry = new CheckpointOwnerRegistry({
+      ownerId: ownerA,
+      hostIdentity: { id: hostA, persistent: true },
+      hostname: "test-host",
+      runtimeScope,
+    });
+    try {
+      const prepared = await prepareBeforeTurn(
+        git,
+        "reaped-navigation",
+        defaultPool,
+        ownerRegistry,
+      );
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      await writeFile(join(cwd, "tracked.txt"), "after\n");
+      const finished = await finishAfterTurn(
+        git,
+        prepared.checkpoint,
+        "parent",
+        "leaf",
+        defaultPool,
+      );
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+      const { repository } = prepared.checkpoint;
+
+      // Another host whose clock runs 8 days ahead reaps the live owner.
+      const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1_000);
+      const leaseFile = join(repository.storeDir, "omp-undo-redo", "owners", `${ownerA}.json`);
+      await utimes(leaseFile, eightDaysAgo, eightDaysAgo);
+      const scanner = new CheckpointOwnerRegistry({
+        ownerId: ownerB,
+        hostIdentity: { id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", persistent: true },
+        hostname: "other-host",
+        runtimeScope,
+        shutdownWaitMs: 1_000,
+      });
+      expect(await scanner.ensureInitialized(repository, git)).toBe("v2");
+      await scanner.shutdown();
+      const store = { env: storeEnv(repository) };
+      expect(
+        (await git(["show-ref", "--verify", finished.checkpoint.afterRef], store)).code,
+      ).not.toBe(0);
+
+      let leaf = "leaf";
+      const port: NavigationPort = {
+        getLeafId: () => leaf,
+        getBranch: () => [],
+        getEntry: () => undefined,
+        navigateTree: async (targetId) => {
+          leaf = targetId;
+          return { cancelled: false };
+        },
+      };
+      const navigation = new SessionNavigation(port, git);
+      await navigation.recordTurnEnd(finished.checkpoint);
+
+      const hole = { status: "moved", files: "unavailable", reason: "checkpoint_removed" };
+      expect(await navigation.undo()).toEqual(hole);
+      expect(leaf).toBe("parent");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("after\n");
+      expect(await navigation.redo()).toEqual(hole);
+      expect(leaf).toBe("leaf");
+      expect(navigation.snapshot().checkpoints).toEqual([
+        { kind: "session", reason: "checkpoint_removed", parentLeafId: "parent", leafId: "leaf" },
+      ]);
+    } finally {
+      await ownerRegistry.shutdown();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("turns a half-reaped checkpoint into a hole at redo and releases its surviving ref", async () => {
+    const { cwd } = await makeRepository();
+    const git = createGitRunner(cwd, { env: await snapshotEnv(cwd) });
+    const ownerRegistry = new CheckpointOwnerRegistry({
+      ownerId: ownerA,
+      hostIdentity: { id: hostA, persistent: true },
+      hostname: "test-host",
+      runtimeScope,
+    });
+    try {
+      const prepared = await prepareBeforeTurn(git, "half-reaped", defaultPool, ownerRegistry);
+      expect(prepared.status).toBe("git");
+      if (prepared.status !== "git") return;
+      await writeFile(join(cwd, "tracked.txt"), "after\n");
+      const finished = await finishAfterTurn(
+        git,
+        prepared.checkpoint,
+        "parent",
+        "leaf",
+        defaultPool,
+      );
+      expect(finished.status).toBe("git");
+      if (finished.status !== "git") return;
+      const { beforeRef, beforeHash, afterRef, repository } = finished.checkpoint;
+      const store = { env: storeEnv(repository) };
+
+      let leaf = "leaf";
+      const port: NavigationPort = {
+        getLeafId: () => leaf,
+        getBranch: () => [],
+        getEntry: () => undefined,
+        navigateTree: async (targetId) => {
+          leaf = targetId;
+          return { cancelled: false };
+        },
+      };
+      const navigation = new SessionNavigation(port, git);
+      await navigation.recordTurnEnd(finished.checkpoint);
+      expect((await navigation.undo()).status).toBe("moved");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("before\n");
+
+      // A reap that took only the before ref (the turn was still running).
+      expect((await git(["update-ref", "-d", beforeRef, beforeHash], store)).code).toBe(0);
+      expect(await navigation.redo()).toEqual({
+        status: "moved",
+        files: "unavailable",
+        reason: "checkpoint_removed",
+      });
+      expect(leaf).toBe("leaf");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("before\n");
+      expect((await git(["show-ref", "--verify", afterRef], store)).code).not.toBe(0);
     } finally {
       await ownerRegistry.shutdown();
       await rm(cwd, { recursive: true, force: true });
