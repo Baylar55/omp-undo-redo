@@ -4,7 +4,7 @@ import { debugLog } from "../infra/debug-log.js";
 import { finishAfterTurn } from "../snapshot/capture.js";
 import { releaseCheckpoint, retainCheckpointForResume } from "../snapshot/checkpoint-refs.js";
 import type { SessionOnlyCheckpoint } from "../types.js";
-import { createNavigation, ensureNavigation, stateOf } from "./controller.js";
+import { createNavigation, ensureNavigation, notifySessionOnly, stateOf } from "./controller.js";
 import type { SessionNavigation } from "./navigation.js";
 import type { ExtensionServices, PendingCapture } from "./services.js";
 import { releasePending } from "./turn-start.js";
@@ -122,6 +122,24 @@ async function resolveNavigation(
   return nav;
 }
 
+/** Records a turn without a file checkpoint and warns once per (session,
+ *  reason): otherwise a store that broke mid-session goes unnoticed until
+ *  /undo. Backend reasons were announced at turn start; the key dedupes them. */
+async function recordSessionOnly(
+  services: ExtensionServices,
+  typed: AnyContext,
+  sessionId: string,
+  checkpoint: SessionOnlyCheckpoint,
+): Promise<void> {
+  const nav = await resolveNavigation(services, typed, sessionId, checkpoint.parentLeafId);
+  if (!nav) return;
+  await nav.recordTurnEnd(checkpoint);
+  // A deferred finalize can outlive a session switch: never warn the new one.
+  if (typed.sessionManager.getSessionId() === sessionId) {
+    notifySessionOnly(services, typed, sessionId, checkpoint.reason);
+  }
+}
+
 async function finalizeTurn(
   services: ExtensionServices,
   typed: AnyContext,
@@ -186,8 +204,7 @@ async function finalizeTurn(
           services.gitRunnerFor(result.checkpoint.repository),
           result.checkpoint,
         );
-        const gapped = await resolveNavigation(services, typed, sessionId, before.parentLeafId);
-        await gapped?.recordTurnEnd({
+        await recordSessionOnly(services, typed, sessionId, {
           kind: "session",
           reason: "file_history_gap",
           parentLeafId: before.parentLeafId,
@@ -218,8 +235,7 @@ async function finalizeTurn(
       leafId: leafId,
     };
   }
-  const nav = await resolveNavigation(services, typed, sessionId, before.parentLeafId);
-  await nav?.recordTurnEnd(completed);
+  await recordSessionOnly(services, typed, sessionId, completed);
 }
 
 export async function agentEnd(services: ExtensionServices, typed: AnyContext): Promise<void> {

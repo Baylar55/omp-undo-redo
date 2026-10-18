@@ -5,8 +5,14 @@ import { track } from "../infra/async.js";
 import { checkpointNamespace } from "../infra/paths.js";
 import type { RuntimeActionStateStore } from "../runtime/action-state.js";
 import { defaultGitRunnerFactory, resolveBackend } from "../store/backend.js";
-import type { FileBackend, SessionOnlyReason } from "../store/backend.js";
-import type { CwdGitRunnerFactory, GitRepository, GitRunner, NavigationState } from "../types.js";
+import type { FileBackend } from "../store/backend.js";
+import type {
+  CwdGitRunnerFactory,
+  FileCheckpointUnavailableReason,
+  GitRepository,
+  GitRunner,
+  NavigationState,
+} from "../types.js";
 import {
   expireRepository,
   startBootHousekeeping,
@@ -67,7 +73,7 @@ export function notifySessionOnly(
   services: ExtensionServices,
   ctx: AnyContext,
   sessionId: string,
-  reason: SessionOnlyReason,
+  reason: FileCheckpointUnavailableReason,
 ): void {
   if (!ctx.ui?.notify) return;
   const key = `${sessionId}\0${reason}`;

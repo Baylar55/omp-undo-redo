@@ -281,6 +281,45 @@ describe("temp-directory failure resilience", () => {
     },
   );
 
+  it("A4. a store that breaks mid-session warns once, not every turn", async () => {
+    const cwd = await makeRepository();
+    try {
+      let broken = false;
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: (workCwd, env) => {
+          const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+          const gated: GitRunner = async (args, options) =>
+            broken && args[0] === "update-ref"
+              ? { code: 1, stdout: "", stderr: "simulated update-ref failure" }
+              : inner(args, options);
+          gated.cwd = workCwd;
+          if (env) gated.env = env;
+          return gated;
+        },
+      });
+      const ctx = context(cwd, "sess-breaks-mid-session");
+      await pi.emit("session_start", ctx);
+      for (const turn of [1, 2, 3]) {
+        broken = turn >= 2;
+        await pi.emit("before_agent_start", ctx);
+        await writeFile(join(cwd, "tracked.txt"), `turn-${turn}\n`);
+        ctx.leaf = `turn-${turn}`;
+        await pi.emit("agent_end", ctx);
+        if (turn === 1) expect(ctx.ui.notifications).toEqual([]);
+      }
+      expect(ctx.ui.notifications).toEqual([
+        {
+          message:
+            "Undo cannot restore this turn's file changes: the file snapshot taken before this turn could not be saved.\nSession navigation still works. Shown once per session for each cause.",
+          level: "warning",
+        },
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("B. after-snapshot allocation failure releases the pending ref", async () => {
     const cwd = await makeRepository();
     try {
