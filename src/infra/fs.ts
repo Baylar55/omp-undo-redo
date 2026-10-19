@@ -12,7 +12,7 @@ export async function writeFileAtomic(
 ): Promise<void> {
   try {
     await writeFile(temporary, contents, { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, path);
+    await renameWithRetry(temporary, path);
   } finally {
     await rm(temporary, { force: true }).catch(() => undefined);
   }
@@ -66,7 +66,7 @@ export async function removeDirWithRetry(path: string): Promise<boolean> {
 }
 
 /** Rename, retried while Windows refuses it because another handle (an
- *  antivirus scan, a reader) is open under `from`. */
+ *  antivirus scan, a reader) is open on `from`, on `to`, or inside them. */
 export async function renameWithRetry(from: string, to: string): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
