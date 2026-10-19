@@ -2588,6 +2588,46 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")(
+    "rolls back paths that start with a quote or hold a newline",
+    async () => {
+      // Regression: hash-object --stdin-paths unquotes a line starting with
+      // `"` and died ("badly quoted") on the whole batch, so nothing reverted.
+      const { cwd, git, snap } = await makeRepo();
+      try {
+        await initializeBranch(git, cwd);
+        const names = ['"quoted.txt', "new\nline.txt", "tracked.txt"];
+        // Deleted by the turn, so undo adds them back: the rollback must remove them.
+        const gone = ['"gone.txt', "gone\nline.txt"];
+        for (const name of [...names, ...gone]) await writeFile(join(cwd, name), "base\n");
+        await git(["add", "."]);
+        await git(["commit", "-qm", "odd names"]);
+        const before = pendingCheckpoint(await prepareBeforeTurn(snap, "odd-names", defaultPool));
+        for (const name of names) await writeFile(join(cwd, name), "turn\n");
+        for (const name of gone) await rm(join(cwd, name));
+        const after = completedCheckpoint(
+          await finishAfterTurn(snap, before, null, null, defaultPool),
+        );
+
+        const failingApply: GitRunner = Object.assign(
+          async (args: string[], options?: Parameters<GitRunner>[1]) => {
+            if (!args.includes("apply") || args.includes("--check")) return snap(args, options);
+            for (const name of [...names, ...gone]) await writeFile(join(cwd, name), "base\n");
+            return { stdout: "", stderr: "error: cannot write", code: 1 };
+          },
+          { cwd: snap.cwd, env: snap.env },
+        );
+        expect(await applyCheckpoint(failingApply, after.afterHash, after.beforeHash)).toEqual({
+          status: "failed",
+        });
+        for (const name of names) expect(await readFile(join(cwd, name), "utf8")).toBe("turn\n");
+        for (const name of gone) await expect(lstat(join(cwd, name))).rejects.toThrow();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("rolls back a file a failed smudge filter left empty", async () => {
     // Git LFS missing an object (`git lfs prune`) fails apply's smudge after
     // apply created the file, which emptied the current content of the file.

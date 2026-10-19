@@ -92,11 +92,10 @@ export async function applyCheckpoint(
  *  The hash and the checkout run with apply's `config`, so they convert
  *  exactly as apply did (clean filters, CRLF under `core.autocrlf` for
  *  snapshots of earlier versions) while tree blobs hold the cleaned form.
- *  Best effort: gitlinks are never touched by apply; a path with a newline in
- *  its name cannot be hashed; symlinks, typechanges and a directory sitting
- *  where a deleted file was are left as found, as is an added file apply
- *  wrote partially or left empty. The hash-then-checkout window cannot be
- *  locked, so an edit landing inside it is overwritten. */
+ *  Best effort: gitlinks are never touched by apply; symlinks, typechanges
+ *  and a directory sitting where a deleted file was are left as found, as is
+ *  an added file apply wrote partially or left empty. The hash-then-checkout
+ *  window cannot be locked, so an edit landing inside it is overwritten. */
 async function rollbackPartialApply(
   git: GitRunner,
   sourceHash: string,
@@ -130,7 +129,7 @@ async function rollbackPartialApply(
       // there is apply's only if it holds the target blob. Anything else,
       // even an empty file (a failed smudge, as below, or a user's lock or
       // marker file), may have been created after `apply --check`: kept.
-      if (present?.isFile() && !path.includes("\n")) {
+      if (present?.isFile()) {
         written.set(path, targetSha!);
         added.add(path);
       }
@@ -142,14 +141,19 @@ async function rollbackPartialApply(
       // --check` proved the path held its hunks' preimage, so an empty file
       // is apply's write or an empty source: restoring the source is safe.
       restore.push(path);
-    } else if (status !== "D" && present.isFile() && !path.includes("\n")) {
+    } else if (status !== "D" && present.isFile()) {
       written.set(path, targetSha!);
     }
   }
   if (written.size > 0) {
     const paths = [...written.keys()];
+    // C-quote every line: git unquotes a line starting with `"` and dies on
+    // the whole batch if that fails, and a raw newline would split a path.
+    const quoted = paths.map(
+      (path) => `"${path.replace(/[\\"\n]/g, (c) => (c === "\n" ? "\\n" : `\\${c}`))}"`,
+    );
     const hashed = await invoke(git, [...config, "hash-object", "--stdin-paths"], {
-      stdin: `${paths.join("\n")}\n`,
+      stdin: `${quoted.join("\n")}\n`,
       timeoutMs,
     });
     if (hashed.code === 0 && !hashed.error) {
