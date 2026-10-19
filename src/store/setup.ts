@@ -186,3 +186,31 @@ export async function applyConfig(
   }
   return true;
 }
+
+/** `core.hooksPath` for a store: a directory nothing creates, so no hook runs
+ *  in it, whether seeded by a user template or set by a global/system
+ *  `core.hooksPath`. A failing `reference-transaction` hook would abort `git
+ *  init` (it writes HEAD) and every snapshot ref update. Absolute: git resolves
+ *  a relative one against the process cwd: the user's workspace for
+ *  Private-Git commands, the shared temp dir for the gc sweep.
+ *  shortcut: env-supplied config (`GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`,
+ *  kept by the runner) outranks this key after setup; pass `-c` on every
+ *  store-bound command if that is ever seen. */
+export function storeHooksConfig(gitDir: string): readonly [string, string] {
+  return ["core.hooksPath", join(gitDir, "no-hooks")];
+}
+
+/** `git init` args for a store: no user template (hooks, config) is copied,
+ *  and no hook runs during the init itself. */
+export function storeInitArgs(gitDir: string, ...flags: string[]): string[] {
+  const [key, value] = storeHooksConfig(gitDir);
+  return ["-c", `${key}=${value}`, "init", "-q", "--template=", ...flags];
+}
+
+/** Sets `core.hooksPath` on a finished store that was set up before it was
+ *  part of setup. Read without a git process, so a store that has it costs
+ *  nothing; an unreadable config is left alone. */
+export async function ensureStoreHooksPath(git: GitRunner, gitDir: string): Promise<void> {
+  if ((await readStoreConfig(gitDir))?.has("core.hookspath") !== false) return;
+  await git(["config", ...storeHooksConfig(gitDir)]).catch(() => undefined);
+}

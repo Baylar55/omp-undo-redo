@@ -12,6 +12,9 @@ import {
   ensureReposDirectory,
   setUpStore,
   applyConfig,
+  ensureStoreHooksPath,
+  storeHooksConfig,
+  storeInitArgs,
 } from "./setup.js";
 
 export const DEFAULT_EXCLUDES = [
@@ -43,8 +46,8 @@ export const DEFAULT_EXCLUDES = [
 
 /** Applied once, when a store is set up or its abandoned setup is redone (see
  *  `setupState`). A key added here reaches only stores set up afterwards:
- *  existing stores need a migration like the `core.sharedRepository` re-apply
- *  in `ensurePrivateGitRepository`. */
+ *  existing stores need a migration like the `core.sharedRepository` and
+ *  `core.hooksPath` re-applies in `ensurePrivateGitRepository`. */
 const PRIVATE_REPO_CONFIG: ReadonlyArray<readonly [string, string]> = [
   // `git init` with GIT_DIR set creates a bare repository; flip it to a
   // non-bare repo so `core.worktree` is honored and the index/worktree
@@ -167,16 +170,24 @@ export async function ensurePrivateGitRepository(
     await ensureReposDirectory(dirname(gitDir), storeRoot);
     const ready = await setUpStore(
       gitDir,
-      // `--template=`: no user template (`init.templateDir`, `GIT_TEMPLATE_DIR`) may
-      // seed hooks into the private repo, where the extension's `git commit` would
-      // run them. It does not create `info/`: `updateExclude` does that itself.
-      async () => (await envGit(["init", "-q", "--template="])).code === 0,
+      // No user template may seed hooks into the private repo, where the
+      // extension's own git commands would run them (see `storeInitArgs`). It
+      // does not create `info/`: `updateExclude` does that itself.
+      async () => (await envGit(storeInitArgs(gitDir))).code === 0,
       // `core.worktree` goes last: `setupFinished` reads it as proof the rest ran.
-      () => applyConfig(envGit, [...PRIVATE_REPO_CONFIG, ["core.worktree", worktree]]),
+      () =>
+        applyConfig(envGit, [
+          ...PRIVATE_REPO_CONFIG,
+          storeHooksConfig(gitDir),
+          ["core.worktree", worktree],
+        ]),
       // Ensure repositories created by earlier versions write future objects
-      // owner-only. Not while "busy": the write would contend for the
-      // config.lock a running setup needs.
-      () => envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined),
+      // owner-only and run no hooks. Not while "busy": the writes would contend
+      // for the config.lock a running setup needs.
+      async () => {
+        await envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined);
+        await ensureStoreHooksPath(envGit, gitDir);
+      },
     );
     if (!ready) return null;
     await ensureExclude(gitDir, worktree, storeRoot);

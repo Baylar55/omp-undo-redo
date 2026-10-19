@@ -15,6 +15,9 @@ import {
   ensureReposDirectory,
   setUpStore,
   applyConfig,
+  ensureStoreHooksPath,
+  storeHooksConfig,
+  storeInitArgs,
   readStoreConfig,
   storeHasRefs,
 } from "./setup.js";
@@ -112,7 +115,7 @@ export async function ensureGitSnapshotStore(
         // and `GIT_DEFAULT_HASH`; git before 2.29 ignores it and only knows SHA-1.
         const objectFormat = await repositoryFormat();
         if (!objectFormat) return false;
-        const init = await storeGit(["init", "--bare", "-q"], {
+        const init = await storeGit(storeInitArgs(storeDir, "--bare"), {
           env: { GIT_DEFAULT_HASH: objectFormat },
         });
         return init.code === 0;
@@ -123,9 +126,12 @@ export async function ensureGitSnapshotStore(
           // Only the extension's own git reads these refs, so paths past
           // MAX_PATH cannot hide them from anyone's gc.
           ["core.longpaths", "true"],
+          storeHooksConfig(storeDir),
           // Last: `setupFinished` reads it as proof the rest ran.
           [GIT_STORE_SOURCE_KEY, repository.commonDir],
         ]),
+      // Stores set up by earlier versions run hooks until this is set.
+      () => ensureStoreHooksPath(storeGit, storeDir),
     );
     return ready ? storeDir : null;
   } catch {

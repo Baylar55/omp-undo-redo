@@ -174,6 +174,64 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it("runs no template or global core.hooksPath hook in either store, old stores included", async () => {
+    // A failing reference-transaction hook aborted `git init` (HEAD) and every
+    // snapshot ref update, so neither store could be set up or written.
+    const cwd = await makeRepository();
+    const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+    const outside = await mkdtemp(join(tmpdir(), "omp-hooks-"));
+    try {
+      const resolved = await resolveRepository(createGitRunner(cwd));
+      if (!("repository" in resolved)) throw new Error("not a repository");
+      const marker = join(outside, "marker");
+      const hooks = join(outside, "hooks");
+      await mkdir(hooks);
+      await writeFile(
+        join(hooks, "reference-transaction"),
+        `#!/bin/sh\necho ran >> "${marker.replaceAll("\\", "/")}"\nexit 1\n`,
+        { mode: 0o755 },
+      );
+      const globalConfig = join(outside, "gitconfig");
+      const slashed = (path: string) => path.replaceAll("\\", "/");
+      await writeFile(
+        globalConfig,
+        `[core]\n\thooksPath = ${slashed(hooks)}\n[init]\n\ttemplateDir = ${slashed(outside)}\n`,
+      );
+      /** Sets up both stores, then writes a ref in each the way capture does. */
+      const setUpAndWriteRefs = async (): Promise<string[]> => {
+        const repository = await ensurePrivateGitRepository(factory, cwd, storeRoot);
+        const storeDir = await ensureGitSnapshotStore(factory, resolved.repository, storeRoot);
+        expect(repository).not.toBeNull();
+        expect(storeDir).not.toBeNull();
+        const stores = [
+          { GIT_DIR: repository!.gitDir },
+          storeEnv({ ...resolved.repository, storeDir: storeDir! }),
+        ];
+        for (const env of stores) {
+          const git = createGitRunner(cwd, { env });
+          const blob = (await git(["hash-object", "-w", "--stdin"], { stdin: "x" })).stdout.trim();
+          const result = await git(["update-ref", "refs/omp-test", blob]);
+          expect(result.code, result.stderr).toBe(0);
+        }
+        return [repository!.gitDir, storeDir!];
+      };
+
+      vi.stubEnv("GIT_CONFIG_GLOBAL", globalConfig);
+      const gitDirs = await setUpAndWriteRefs();
+      for (const gitDir of gitDirs) expect(await readdir(gitDir)).not.toContain("hooks");
+
+      // Stores set up by earlier versions get `core.hooksPath` on the next launch.
+      for (const gitDir of gitDirs)
+        await gitInStore(cwd, gitDir, ["config", "--unset", "core.hooksPath"]);
+      await setUpAndWriteRefs();
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(storeRoot, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
   it("finishes a store whose setup was abandoned after git init", async () => {
     // `git init` writes HEAD before the config calls: a crash or a held
     // config.lock in between left a store that looked initialized and stayed
@@ -192,7 +250,7 @@ describe("private per-workspace git repositories", () => {
         await ensurePrivateGitRepository(recordingFactory(commands), cwd, storeRoot),
       ).not.toBeNull();
       // A second `git init` would reset `core.bare`: only the config calls are redone.
-      expect(commands.some((args) => args[0] === "init")).toBe(false);
+      expect(commands.some((args) => args.includes("init"))).toBe(false);
       expect(await storeConfig(gitDir, "core.worktree")).toEqual({
         code: 0,
         value: await realpath(cwd),
@@ -262,7 +320,7 @@ describe("private per-workspace git repositories", () => {
       expect(
         await ensurePrivateGitRepository(recordingFactory(commands), cwd, storeRoot),
       ).not.toBeNull();
-      expect(commands.filter((args) => args[0] === "init" || args[0] === "config")).toEqual([]);
+      expect(commands.filter((args) => args.includes("init") || args[0] === "config")).toEqual([]);
       expect((await storeConfig(gitDir, "core.worktree")).code).toBe(1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -365,10 +423,14 @@ describe("private per-workspace git repositories", () => {
       expect(
         await ensurePrivateGitRepository(recordingFactory(commands), cwd, storeRoot),
       ).not.toBeNull();
-      expect(commands.some((args) => args[0] === "init")).toBe(false);
-      // `core.worktree` is the last key of the config sequence, so a redo shows up as a write to it.
+      expect(commands.some((args) => args.includes("init"))).toBe(false);
+      // `core.worktree` is the last key of the config sequence, so a redo shows up as a write to it;
+      // a store that already has `core.hooksPath` gets no rewrite of it either.
       const rewrote = commands.some(
-        (args) => args[0] === "config" && args.includes("core.worktree") && !args.includes("--get"),
+        (args) =>
+          args[0] === "config" &&
+          (args.includes("core.worktree") || args.includes("core.hooksPath")) &&
+          !args.includes("--get"),
       );
       expect(rewrote).toBe(false);
     } finally {
