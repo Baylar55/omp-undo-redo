@@ -156,9 +156,11 @@ this is how it works.
   notified once per session. Store setup and an unresolvable repository are retried at the start
   of every turn (no Git binary and refused workspaces are not), and several processes setting up
   the same new store retry instead of failing. A non-Git home
-  directory (or any folder above it), a filesystem root and the OS temp directory are refused
-  outright (`store/private-store.ts`); only the current user's home and temp directory are
-  recognized. A store an earlier version created for one of them is evicted once idle for 24 hours.
+  directory (or any folder above it), a filesystem root, the OS temp directory and the shared temp
+  roots (`/tmp`, `/var/tmp`, `%SystemRoot%\Temp`) are refused outright (`store/private-store.ts`);
+  only the folders themselves, not their subfolders. Other users' homes and other shared folders
+  are not recognized. A store an earlier version created for one of them is evicted once idle for
+  24 hours.
 
 In an unborn repository (no commit yet), the checkpoint index is seeded from the first snapshot's
 own tree and the index lease is kept until `HEAD` is born, so later turns reuse the stat cache

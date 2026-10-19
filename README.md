@@ -57,7 +57,7 @@ Snapshots are plaintext Git objects in the store (`~/.omp/omp-undo-redo/repos/` 
 - **Git projects:** tracked files plus untracked files `.gitignore` does not exclude. Your `HEAD`, branches and index are never touched, and mirror push/clone, `git bundle create --all` and `git log --all` never see the snapshots.
 - **Non-Git folders:** everything except the built-in ignore list (`.git`, `.hg`, `.svn`, `node_modules`, `.history`, `dist`, `coverage`, `.omp`, `.next`, `build`, `out`, `target`, `.vs`, `.idea`, `__pycache__`, `.venv`, `.gradle`), matched at any depth. So `.env`, `id_rsa`, `*.pem` are included, and a hand-written `docs/build/` is not.
 - **Through a Windows junction** (`mklink /J`): Git reads it as a plain folder, so snapshots also copy the files it points at, even outside the workspace. Directory symlinks are stored as links and never followed.
-- **Skipped entirely:** your own home directory without Git (and folders above it such as `C:\Users` or `/home`), drive roots and your OS temp directory, since snapshotting would copy `.ssh`, `AppData` and browser profiles. Their subfolders are normal workspaces. Running `git init` there does not make it safe: Git mode then snapshots everything not gitignored.
+- **Skipped entirely:** your own home directory without Git (and folders above it such as `C:\Users` or `/home`), drive roots, your OS temp directory and the shared temp directories (`/tmp`, `/var/tmp`, `C:\Windows\Temp`), since snapshotting would copy `.ssh`, `AppData`, browser profiles or other users' temp files. Their subfolders are normal workspaces. Running `git init` there does not make it safe: Git mode then snapshots everything not gitignored.
 
 Left as they are by `/undo` and `/redo`:
 

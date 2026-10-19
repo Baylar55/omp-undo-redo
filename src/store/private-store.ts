@@ -68,10 +68,12 @@ const PRIVATE_REPO_CONFIG: ReadonlyArray<readonly [string, string]> = [
 
 /** Whether Private-Git must not snapshot `canonical` (a `canonicalCwd`
  *  result): a filesystem root, the home directory or any directory above it,
- *  or the OS temp directory. `git add` there copies credentials (`.ssh`,
- *  `AppData`, browser profiles) into plaintext store objects, and on a large
- *  profile it outruns the runner timeout every turn, so no snapshot completes.
- *  Git mode is unaffected: the repository's own ignore rules decide. */
+ *  or a temp directory (the OS one, plus the shared ones `tmpdir()` misses when
+ *  TMPDIR/TEMP point elsewhere). `git add` there copies credentials (`.ssh`,
+ *  `AppData`, browser profiles) or other users' temp files into plaintext
+ *  store objects, and on a large profile it outruns the runner timeout every
+ *  turn, so no snapshot completes. Git mode is unaffected: the repository's
+ *  own ignore rules decide. */
 export function refusedPrivateWorkspace(canonical: string): boolean {
   if (dirname(canonical) === canonical) return true;
   const home = homedir();
@@ -80,7 +82,11 @@ export function refusedPrivateWorkspace(canonical: string): boolean {
     if (below === "") return true;
     if (below !== ".." && !below.startsWith(`..${sep}`) && !isAbsolute(below)) return true;
   }
-  return relative(canonical, canonicalCwd(tmpdir())) === "";
+  const temps =
+    process.platform === "win32"
+      ? [tmpdir(), join(process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows", "Temp")]
+      : [tmpdir(), "/tmp", "/var/tmp"];
+  return temps.some((temp) => relative(canonical, canonicalCwd(temp)) === "");
 }
 
 /** Appends `<relative-storeRoot>/` to the private repo's info/exclude so a

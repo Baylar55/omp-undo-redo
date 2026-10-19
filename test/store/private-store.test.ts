@@ -16,10 +16,14 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, parse, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGitRunner } from "../../src/infra/git-runner.js";
-import { DEFAULT_EXCLUDES, ensurePrivateGitRepository } from "../../src/store/private-store.js";
+import {
+  DEFAULT_EXCLUDES,
+  ensurePrivateGitRepository,
+  refusedPrivateWorkspace,
+} from "../../src/store/private-store.js";
 import type { GitRunner } from "../../src/types.js";
 import { makeRepository } from "../helpers/index.js";
-import { storeRootDirectory } from "../../src/infra/paths.js";
+import { canonicalCwd, storeRootDirectory } from "../../src/infra/paths.js";
 import { privateRepositoryPath } from "../../src/store/setup.js";
 import {
   ensureGitSnapshotStore,
@@ -828,6 +832,28 @@ describe("private per-workspace git repositories", () => {
       vi.unstubAllEnvs();
       await rm(parent, { recursive: true, force: true });
       await rm(storeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses Private-Git in the shared temp roots, not below them, with TMPDIR elsewhere", async () => {
+    const temp = await mkdtemp(join(tmpdir(), "omp-private-tmpdir-"));
+    try {
+      // macOS /var/folders and a per-user Windows %TEMP% move tmpdir() off the shared roots.
+      vi.stubEnv("TMPDIR", temp);
+      vi.stubEnv("TEMP", temp);
+      vi.stubEnv("TMP", temp);
+      expect(tmpdir()).toBe(temp);
+      const shared =
+        process.platform === "win32"
+          ? [join(process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows", "Temp")]
+          : ["/tmp", "/var/tmp"];
+      for (const dir of shared) {
+        expect(refusedPrivateWorkspace(canonicalCwd(dir)), dir).toBe(true);
+        expect(refusedPrivateWorkspace(canonicalCwd(join(dir, "project"))), dir).toBe(false);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      await rm(temp, { recursive: true, force: true });
     }
   });
 
