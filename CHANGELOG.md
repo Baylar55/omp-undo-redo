@@ -6,6 +6,13 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 ### Changed
 
+- **`npm run smoke:package` now tests the packed tarball.** It packs to a temp directory, fails on
+  any missing or unexpected file, and loads every `main`, `exports`, `omp.extensions` and
+  `pi.extensions` entry from the extracted tarball. Before, it loaded the working tree and
+  `pack:check` only printed a file list, so a `files` or extensions regression still published.
+  `pack:check` is removed. A `Thumbs.db` or `desktop.ini` in `dist/` or `docs/` now fails it too,
+  since npm would publish them.
+
 - **Source reorganized into layers.** Internal only: files moved from `src/core` into
   `infra/`, `store/`, `snapshot/`, `history/`, `runtime/`, `session/` and `host/`. No
   behavior, storage or API change.
