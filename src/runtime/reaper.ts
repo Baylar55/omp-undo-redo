@@ -1,7 +1,10 @@
+import { randomUUID } from "node:crypto";
 import { stat, readdir, readFile, rm } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import type { Dirent } from "node:fs";
+import { renameWithRetry } from "../infra/fs.js";
+import { debugLog } from "../infra/debug-log.js";
 
 export const RUNTIME_SCHEMA = 1;
 
@@ -72,11 +75,11 @@ export async function reapStaleRuntimes(
       const entry = candidates[index++];
       if (entry.pid === ownPid) continue;
       const dir = join(rootDirectory, entry.name);
+      let markerText: string;
       let marker: Partial<RuntimeMarker> | null;
       try {
-        marker = JSON.parse(
-          await readFile(join(dir, "runtime.json"), "utf8"),
-        ) as Partial<RuntimeMarker> | null;
+        markerText = await readFile(join(dir, "runtime.json"), "utf8");
+        marker = JSON.parse(markerText) as Partial<RuntimeMarker> | null;
       } catch {
         // Missing/unreadable marker: nothing proves this directory is ours.
         continue;
@@ -111,7 +114,24 @@ export async function reapStaleRuntimes(
       // another runtime scope's) only loses its directory once the marker and
       // the directory are both ancient.
       if (!dead && !(await isAncient(dir, marker.startedAt))) continue;
-      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      // A recycled pid may have installed a fresh `runtime/<pid>` since the
+      // marker was read. Claim atomically by renaming aside, then delete only
+      // if the claimed directory still carries the marker judged above.
+      const aside = join(rootDirectory, `${entry.pid}.${randomUUID()}.tmp`);
+      try {
+        await renameWithRetry(dir, aside);
+      } catch {
+        // Gone (its new owner or another sweep discarded it) or locked.
+        continue;
+      }
+      const claimed = await readFile(join(aside, "runtime.json"), "utf8").catch(() => null);
+      if (claimed !== markerText) {
+        await renameWithRetry(aside, dir).catch((error: unknown) =>
+          debugLog({ event: "runtime-dir-restore-failed", dir, aside, error: String(error) }),
+        );
+        continue;
+      }
+      await rm(aside, { recursive: true, force: true }).catch(() => undefined);
     }
   };
   await Promise.all(

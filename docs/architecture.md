@@ -235,6 +235,8 @@ namespace on Linux, as owner leases do). Only a marker from this host and scope 
 a `runtime/<pid>/` is replaced by the process now holding that pid, and reaped once the pid is
 gone. One from another scope (a container sharing `~/.omp`, a previous boot) or without a scope
 is replaced or reaped only once its marker and directory are both 24 h old; another host's never.
+The sweep renames a directory aside before deleting it and puts it back if its marker changed
+meanwhile, so a fresh directory a recycled pid just installed is never deleted.
 
 ## Storage maintenance
 

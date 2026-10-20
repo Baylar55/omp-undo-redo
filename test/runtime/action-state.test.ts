@@ -1,4 +1,5 @@
 import type * as Fs from "node:fs/promises";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import {
   access,
   chmod,
@@ -597,6 +598,38 @@ describe("runtime action-state store", () => {
     expect(kill.mock.calls.map(([pid]) => pid).sort((a, b) => a - b)).toEqual([
       301, 302, 303, 305, 306, 307, 308, 309, 316, 317,
     ]);
+  });
+
+  it("spares a fresh directory a recycled pid installs after the probe", async () => {
+    const root = await makeRoot();
+    const dir = join(root, "401");
+    const marker = (runtimeId: string): string =>
+      JSON.stringify({
+        schemaVersion: 1,
+        protocol: "omp-undo-redo/runtime",
+        runtimeId,
+        pid: 401,
+        hostname: hostname(),
+        runtimeScope: scope,
+        startedAt: new Date().toISOString(),
+      });
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    await writeFile(join(dir, "runtime.json"), marker("dead"));
+    // The probe reports the old owner gone; meanwhile the pid's new owner
+    // discards that directory and renames its own into place.
+    vi.spyOn(process, "kill").mockImplementation(() => {
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(join(dir, "sessions"), { recursive: true });
+      writeFileSync(join(dir, "sessions", "s.json"), "{}");
+      writeFileSync(join(dir, "runtime.json"), marker("fresh"));
+      throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+    });
+
+    await reapStaleRuntimes(root, 200, scope);
+
+    expect(await readFile(join(dir, "runtime.json"), "utf8")).toContain('"fresh"');
+    expect(await readFile(join(dir, "sessions", "s.json"), "utf8")).toBe("{}");
+    expect(await readdir(root)).toEqual(["401"]);
   });
 
   it("swallows filesystem failures", async () => {
