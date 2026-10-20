@@ -7,7 +7,7 @@
 
 Know this before relying on it:
 
-- **Snapshots are plaintext copies of your worktree**, kept outside the repository: in Git projects, unignored files such as `.env.local`; in non-Git folders, `.env` and private keys too. They are deleted 2 days (configurable) after the session's last use, not securely erased.
+- **Snapshots are plaintext copies of your worktree**, kept outside the repository: in Git projects, unignored files such as `.env.local`; in non-Git folders, `.env` and private keys too. They are deleted 2 days (configurable) after the session's last use, not securely erased. Git LFS file content is kept longer; see [SECURITY.md](./SECURITY.md#snapshot-storage).
 - **`/undo` reverts every file changed during the turn**, including edits from your editor or a build watcher, and lists what it restored.
 - **Not restored:** ignored files, nested Git repositories, files locked by another program, Git LFS content removed by `git lfs prune`. A turn that touched files under a symlink or Windows junction cannot be undone or redone until the link is replaced.
 - **No file snapshots** in a non-Git home directory, drive root or temp directory: only the conversation moves back.
