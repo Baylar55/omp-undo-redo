@@ -1,6 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
-import type { AnyContext } from "../host-contract.js";
 import type { SessionNavigation } from "../session/navigation.js";
 import type { SessionRegistry } from "../session/registry.js";
 import type { ActionId, CommandNavigationResult, NavigationResult } from "../types.js";
@@ -71,8 +70,7 @@ export async function runNavigation(
 export function registerCommands(pi: ExtensionAPI, registry: SessionRegistry): void {
   const makeHandler = (id: ActionId) => async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
-    const typed = ctx as unknown as AnyContext;
-    const prepared = await registry.commandNavigation(typed, () => ctx.waitForIdle());
+    const prepared = await registry.commandNavigation(ctx, () => ctx.waitForIdle());
     if (prepared.status !== "ready") {
       ctx.ui.notify(commandBlockedMessage(id, prepared.status), "warning");
       return;
@@ -81,9 +79,9 @@ export function registerCommands(pi: ExtensionAPI, registry: SessionRegistry): v
     nav.setNavigateTree(ctx.navigateTree);
     const outcome = await runNavigation(nav, ctx, id);
     await registry.publishActionResult(
-      typed.sessionManager.getSessionId(),
+      ctx.sessionManager.getSessionId(),
       nav,
-      typed,
+      ctx,
       id,
       token,
       outcome.status === "moved",

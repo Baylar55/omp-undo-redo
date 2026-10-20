@@ -36,7 +36,7 @@ export type SessionRegistry = {
     typed: AnyContext,
     event: { oldLeafId: string | null; newLeafId: string | null },
   ): Promise<void>;
-  rememberNavigationSource(event: unknown, ctx: unknown): void;
+  rememberNavigationSource(event: unknown, ctx: AnyContext): void;
   adoptSwitchedSession(typed: AnyContext): Promise<void>;
   beforeAgentStart(typed: AnyContext): Promise<void>;
   toolCall(typed: AnyContext): Promise<void>;
@@ -216,11 +216,9 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
   // Switch and branch share one slot; if it is empty (never set, or clobbered by
   // an interleaved navigation) the post-event invalidates every session's redo,
   // which is a safe superset, and releases no session (unknown source).
-  const rememberNavigationSource = (_event: unknown, ctx: unknown): void => {
+  const rememberNavigationSource = (_event: unknown, ctx: AnyContext): void => {
     if (services.flags.closing) return;
-    services.flags.pendingNavigationSourceSessionId = (
-      ctx as AnyContext
-    ).sessionManager.getSessionId();
+    services.flags.pendingNavigationSourceSessionId = ctx.sessionManager.getSessionId();
   };
 
   // The host emits no `session_start` for the session it switched to, so its
