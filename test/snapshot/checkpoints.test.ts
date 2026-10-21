@@ -29,13 +29,17 @@ import type {
   SessionReader,
   TurnCheckpoint,
 } from "../../src/types.js";
-import { gitRepository, snapshotEnv } from "../helpers/index.js";
+import { gitRepository, privateRefs, snapshotEnv } from "../helpers/index.js";
 import { checkpointNamespace } from "../../src/infra/paths.js";
 import { storeEnv } from "../../src/store/git-store.js";
-import { releaseRefs } from "../../src/store/refs.js";
+import { HISTORY_REF_ROOT, releaseRefs } from "../../src/store/refs.js";
 import { resolveRepository } from "../../src/store/discovery.js";
 import { defaultPool, releasePersistentSnapshotIndices } from "../../src/snapshot/index-leases.js";
-import { releaseCheckpoint, releasePendingCheckpoint } from "../../src/snapshot/checkpoint-refs.js";
+import {
+  releaseCheckpoint,
+  releasePendingCheckpoint,
+  retainCheckpointForResume,
+} from "../../src/snapshot/checkpoint-refs.js";
 import { applyCheckPaths, pathsBeyondLinks } from "../../src/snapshot/restore-scope.js";
 import { applyCheckpoint } from "../../src/snapshot/restore.js";
 import { historyDirectory } from "../../src/history/layout.js";
@@ -2654,6 +2658,90 @@ describe("history-safe Git checkpoints", () => {
       expect(await readFile(join(cwd, "model.dat"), "utf8")).toBe("B\n");
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a checkpoint on its own refs when git refuses the promotion", async () => {
+    // A ref reaped mid-turn fails the transaction's `delete <ref> <hash>`.
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "promotion", defaultPool));
+      await writeFile(join(cwd, "tracked.txt"), "after\n");
+      const checkpoint = completedCheckpoint(
+        await finishAfterTurn(snap, before, null, null, defaultPool),
+      );
+      const store = gitRunner(cwd, storeEnv(checkpoint.repository));
+      await text(store, ["update-ref", "-d", checkpoint.afterRef]);
+
+      expect(await retainCheckpointForResume(snap, "promotion", checkpoint)).toBe(checkpoint);
+      expect(await text(store, ["rev-parse", checkpoint.beforeRef])).toBe(checkpoint.beforeHash);
+      const refs = await privateRefs(cwd);
+      expect(refs.filter((ref) => ref.startsWith(HISTORY_REF_ROOT))).toEqual([]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails an undo whose snapshot lost an object instead of restoring the rest", async () => {
+    // README: the user's history rewritten and pruned (filter-repo, BFG) loses
+    // a blob the store borrows from the repository; notes.txt's is the store's own.
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "notes.txt"), "before-only\n");
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "lost-object", defaultPool));
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      await writeFile(join(cwd, "notes.txt"), "turn\n");
+      const after = completedCheckpoint(
+        await finishAfterTurn(snap, before, null, null, defaultPool),
+      );
+      const blob = await text(snap, ["rev-parse", `${after.beforeHash}:tracked.txt`]);
+      await rm(join(cwd, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
+        status: "failed",
+      });
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("turn\n");
+      expect(await readFile(join(cwd, "notes.txt"), "utf8")).toBe("turn\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("writes nothing outside the worktree for a snapshot tree entry named ..", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const escaped = join(cwd, "..", `${cwd.slice(cwd.lastIndexOf(sep) + 1)}-escaped.txt`);
+    try {
+      await initializeBranch(git, cwd);
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "dotdot", defaultPool));
+      const blob = await text(snap, ["hash-object", "-w", "--stdin"], { stdin: "escaped\n" });
+      const inner = await text(snap, ["mktree"], {
+        stdin: `100644 blob ${blob}\t${escaped.slice(escaped.lastIndexOf(sep) + 1)}\n`,
+      });
+      const tracked = await text(snap, ["rev-parse", `${before.beforeHash}:tracked.txt`]);
+      // Written raw: a Git whose mktree refused `..` must not hide the case,
+      // since a tampered store need not be written by git.
+      const raw = join(cwd, ".git", "dotdot-tree");
+      await writeFile(
+        raw,
+        Buffer.concat([
+          Buffer.from("40000 ..\0"),
+          Buffer.from(inner, "hex"),
+          Buffer.from("100644 tracked.txt\0"),
+          Buffer.from(tracked, "hex"),
+        ]),
+      );
+      const tree = await text(snap, ["hash-object", "-w", "--literally", "-t", "tree", raw]);
+      const crafted = await text(snap, ["commit-tree", tree, "-m", "crafted"]);
+
+      expect(await applyCheckpoint(snap, before.beforeHash, crafted)).toEqual({
+        status: "failed",
+      });
+      await expect(lstat(escaped)).rejects.toThrow();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(escaped, { force: true });
     }
   });
 });
