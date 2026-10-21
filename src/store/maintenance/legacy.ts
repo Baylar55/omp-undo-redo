@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import type { GitRepository, GitRunner } from "../../types.js";
+import { DEFAULT_TIMEOUT_MS, invoke } from "../../infra/git-runner.js";
 import { parseRefLines } from "../../infra/git-parse.js";
 import { snapshotRunnerEnv, storeEnv } from "../git-store.js";
 import { deleteRefsBatched } from "../refs.js";
@@ -32,9 +34,34 @@ export async function migrateLegacySnapshots(
   const refs = parseRefLines(listed.stdout);
   if (!refs) return;
   if (refs.length > 0) {
-    // Edges ("-<id>") are the user's tips; `--objects-edge-aggressive` also
-    // leaves out every object their trees hold.
-    const objects = await git(
+    // The object list grows with the legacy snapshots' content, so rev-list's
+    // output is piped into pack-objects, never held whole (as in
+    // `pinStoreObjects`). pack-objects' clock also runs while rev-list walks:
+    // two steps' budget. `invoke`, not `git`: a throw must not leave
+    // pack-objects waiting on an input nobody ends.
+    const input = new PassThrough();
+    const packing = invoke(
+      git,
+      ["pack-objects", "-q", join(repository.storeDir, "objects", "pack", "pack")],
+      {
+        env: { ...userEnv, ...snapshotRunnerEnv(repository) },
+        input,
+        timeoutMs: 2 * DEFAULT_TIMEOUT_MS,
+      },
+    );
+    let count = 0;
+    let partial = "";
+    const feed = (chunk: string) => {
+      const lines = (partial + chunk).split("\n");
+      partial = lines.pop()!;
+      // Edges ("-<id>") are the user's tips; `--objects-edge-aggressive` also
+      // leaves out every object their trees hold.
+      const owned = lines.filter((line) => line && !line.startsWith("-"));
+      count += owned.length;
+      if (owned.length > 0) input.write(`${owned.join("\n")}\n`);
+    };
+    const objects = await invoke(
+      git,
       [
         "rev-list",
         "--objects",
@@ -44,20 +71,23 @@ export async function migrateLegacySnapshots(
         `--exclude=${LEGACY_REF_ROOT}*`,
         "--all",
       ],
-      { env: userEnv, stdin: `${refs.map(({ expectedHash }) => expectedHash).join("\n")}\n` },
+      {
+        env: userEnv,
+        stdin: `${refs.map(({ expectedHash }) => expectedHash).join("\n")}\n`,
+        onStdout: feed,
+      },
     );
-    if (objects.code !== 0 || objects.error) return;
-    const owned = objects.stdout.split("\n").filter((line) => line && !line.startsWith("-"));
-    if (owned.length > 0) {
-      const packed = await git(
-        ["pack-objects", "-q", join(repository.storeDir, "objects", "pack", "pack")],
-        {
-          env: { ...userEnv, ...snapshotRunnerEnv(repository) },
-          stdin: `${owned.join("\n")}\n`,
-        },
-      );
-      if (packed.code !== 0 || packed.error) return;
-    }
+    // A runner that ignores `onStdout` buffers instead; the newline flushes
+    // the last line.
+    feed(`${objects.stdout}\n`);
+    const complete = objects.code === 0 && !objects.error;
+    // A line that is no object id makes pack-objects die before it writes a
+    // pack: a partial list must not be kept, and an empty one would still
+    // write an empty pack.
+    input.end(complete && count > 0 ? undefined : "abort\n");
+    const packed = await packing;
+    if (!complete) return;
+    if (count > 0 && (packed.code !== 0 || packed.error)) return;
     const copied = await git(["update-ref", "--stdin"], {
       env: storeEnv(repository),
       stdin: `${refs.map(({ ref, expectedHash }) => `update ${ref} ${expectedHash}`).join("\n")}\n`,
