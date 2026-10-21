@@ -10,7 +10,9 @@ Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narr
 
 ## Development
 
-Use Node.js 20 or newer. Install dependencies with npm and use the existing scripts in `package.json`. Keep source changes under `src/` and tests under `test/`, which mirrors the source layout.
+Use Node.js 20 or newer. Install dependencies with `npm ci --ignore-scripts`, matching CI. The `@oh-my-pi/pi-coding-agent` dev dependency is used for types only, and its install scripts fetch native `onnxruntime-node` binaries the build and tests never load.
+
+Use the existing scripts in `package.json`. Keep source changes under `src/` and tests under `test/`, which mirrors the source layout.
 
 Source is layered (see `docs/architecture.md`); `npm run lint` enforces the allowed imports.
 
