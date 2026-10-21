@@ -94,6 +94,35 @@ describe("pinStoreObjects", () => {
     expect(await packedObjects(keeps[0]!.replace(/\.keep$/, ".idx"))).toEqual(expected);
   });
 
+  it("pins every listed object when the runner buffers rev-list output", async () => {
+    await snapshot("draft");
+    // A runner may ignore `onStdout` and return everything in `stdout`.
+    const buffering = revListVia((args, options) =>
+      storeGit(args, { ...options, onStdout: undefined }),
+    );
+
+    await pinStoreObjects(buffering, repository, TIMEOUT_MS);
+
+    const keeps = (await readdir(packDir)).filter((name) => name.endsWith(".keep"));
+    expect(keeps).toHaveLength(1);
+    const head = await git(cwd, ["rev-parse", "HEAD"]);
+    const listed = await storeGit([
+      "rev-list",
+      "--objects",
+      "--objects-edge-aggressive",
+      "--all",
+      "--not",
+      head,
+    ]);
+    const expected = listed.stdout
+      .split("\n")
+      .filter((line) => line && !line.startsWith("-"))
+      .map((line) => line.slice(0, 40))
+      .sort();
+    expect(expected).toHaveLength(6); // commit, root tree, dir tree, 3 blobs
+    expect(await packedObjects(keeps[0]!.replace(/\.keep$/, ".idx"))).toEqual(expected);
+  });
+
   it("keeps the previous pins and writes no pack when rev-list fails after listing", async () => {
     await snapshot("first");
     await pinStoreObjects(storeGit, repository, TIMEOUT_MS);
