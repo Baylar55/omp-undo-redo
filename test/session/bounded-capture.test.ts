@@ -437,52 +437,57 @@ describe("bounded capture lifecycle", () => {
 
   it("keeps the synchronous path when the capture finishes within the deadline", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-bounded-"));
+    // The first update-ref is the before-snapshot's: park it (after git wrote
+    // the ref) so the capture is still in flight when agent_end starts.
+    let updateRefCount = 0;
+    let afterRefWritten = false;
+    const { promise: beforeRefGate, resolve: releaseBeforeRef } = Promise.withResolvers<void>();
+    const { promise: beforeRefParked, resolve: markBeforeRefParked } =
+      Promise.withResolvers<void>();
+    const runner: NonNullable<OmpUndoRedoDependencies["gitRunnerFactory"]> = (workCwd, env) => {
+      const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+      const gated: GitRunner = async (args, options) => {
+        const result = await inner(args, options);
+        if (args.includes("omp-undo-redo: retain after checkpoint")) afterRefWritten = true;
+        if (args[0] === "update-ref" && ++updateRefCount === 1) {
+          markBeforeRefParked();
+          await beforeRefGate;
+        }
+        return result;
+      };
+      gated.cwd = workCwd;
+      return gated;
+    };
     try {
       const pi = new FakeExtensionApi();
-      const { runner, waitForAdds } = slowAddRunnerFactory(10);
-      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 200 });
+      ompUndoRedo(pi as never, { gitRunnerFactory: runner, captureDeadlineMs: 500 });
       const ctx = context(cwd, "bounded-session");
-      await pi.emit("session_start", ctx);
-      await pi.emit("before_agent_start", ctx);
-      await waitForAdds(1);
-      await writeFile(join(cwd, "tracked.txt"), "changed\n");
-      ctx.leaf = "turn";
-      await pi.emit("agent_end", ctx);
-      // The after-capture's git add is the slow phase (delay + git add);
-      // once it is in, the remaining write-tree/commit-tree/update-ref chain
-      // is fast, so the undo's own bounded wait (200ms) will find the
-      // capture complete and take the synchronous path. Waiting on the add
-      // count (not wall-clock) makes this deterministic under parallel load.
-      await waitForAdds(2);
-      // The add count gates only the git-add phase; the subsequent
-      // write-tree/commit-tree/update-ref chain is still async. Give it a
-      // brief window to settle so the navigation has a checkpoint before undo.
-      // On Windows the full commit chain can be >200ms under load, so wait
-      // longer than the capture deadline to ensure the turn is recorded.
-      await new Promise((resolve) => setTimeout(resolve, 800));
       ctx.navigateTree = async (targetId) => {
         ctx.leaf = targetId;
         return { cancelled: false };
       };
-      // Retry once if the finalize is still in flight (Windows Git can be
-      // slower under parallel load); the synchronous path should succeed on
-      // the second attempt without the "still being captured" warning.
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        await pi.runCommand("undo", ctx);
-        const message = ctx.ui.notifications.at(-1)?.message ?? "";
-        if (message.includes("still being captured")) {
-          await new Promise((resolve) => setTimeout(resolve, 200));
-          continue;
-        }
-        if (message.includes("file snapshot restored")) break;
-        // Empty or other: wait a bit and retry, finalize may still be in flight
-        await new Promise((resolve) => setTimeout(resolve, 200));
-      }
-      await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await beforeRefParked;
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn";
+      const ended = pi.emit("agent_end", ctx);
+      // Settle the capture inside agent_end's deadline, not before it: one
+      // already complete would take the synchronous path at any deadline.
+      // Real timer: agent_end's deadline is wall-clock and races this release.
+      setTimeout(releaseBeforeRef, 50);
+      await ended;
+      // Synchronous path: agent_end returned only after the after-snapshot
+      // wrote its ref. A deferred finalize would not have yet; undo alone
+      // cannot tell, since it waits on a pending finalize itself.
+      expect(afterRefWritten).toBe(true);
+      await pi.runCommand("undo", ctx);
       expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      await expect(readFile(join(cwd, "tracked.txt"))).rejects.toThrow();
       await pi.runCommand("redo", ctx);
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("changed\n");
     } finally {
+      releaseBeforeRef();
       await rmRetry(cwd);
     }
   });
