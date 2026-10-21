@@ -22,6 +22,9 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
   `docs/` now ships in the package, and the interrupted-restore warning links to the recovery
   steps. The README also no longer says snapshots are kept only "until … idle for 2
   days": they are deleted at the next OMP start after that, and their data at a later `git gc`.
+  It also no longer says setup is retried every turn without Git (only store setup is), or that
+  `/undo` and `/redo` warn when the agent stays busy (the idle wait has no limit; only the 3 s
+  waits for an in-flight snapshot or finalize warn).
 - **OMP 18.3.2 or later is now required** (was 16.5.2). Subagent detection reads `ctx.agent`,
   which OMP added in 18.3.2: on 16.5.2 to 18.3.1 every subagent session was treated as a main
   session, writing snapshots and refs, and history that no one can `/undo`, waiting up to 25 s per

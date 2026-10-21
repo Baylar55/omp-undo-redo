@@ -16,7 +16,7 @@ Details: [What gets stored and what isn't restored](#what-gets-stored-and-what-i
 
 ## Installation
 
-Requires OMP 18.3.2+ (extensions run under Bun) or Pi with Node.js 20+, and Git. Without Git, or if the snapshot store cannot be set up, undo/redo moves only the conversation; you are told once per session and setup is retried every turn.
+Requires OMP 18.3.2+ (extensions run under Bun) or Pi with Node.js 20+, and Git. Without Git, or if the snapshot store cannot be set up, undo/redo moves only the conversation and you are told once per session. Store setup is retried every turn; a missing Git is not.
 
 Install through the agent; a plain `npm install` does not register the extension.
 
@@ -38,7 +38,7 @@ In Pi, confirm with `pi list` and restart the TUI; `/undo` and `/redo` then appe
 - `/undo` goes back to the latest prompt, dropping the assistant's reply and tool activity and restoring the files changed in that turn. The prompt itself stays in the session tree.
 - `/redo` reapplies the last undo. A new prompt or any other successful tree or session navigation clears redo history; `/undo`, `/redo`, and cancelled or no-op navigation keep it.
 
-Neither command takes arguments or starts a model turn. Both wait for the agent to become idle, and up to 3 s for an in-flight snapshot; if either stays busy, nothing changes and you get a warning.
+Neither command takes arguments or starts a model turn. Both wait for the agent to become idle (no time limit), then up to 3 s each for an in-flight snapshot and for the last turn's finalize; if either is still running, nothing changes and you get a warning.
 
 Snapshots are taken when a turn starts and when it ends, so anything that changes a file mid-turn (a formatter on save, another OMP process in the same repository) is reverted with the agent's edits. Check the restored-file list ("Restored files: notes.md, src/app.ts.") for files the agent did not touch. Edits made after the turn are safe: if they overlap the turn's changes, `/undo` refuses and names the conflicting files; otherwise they stay in place.
 

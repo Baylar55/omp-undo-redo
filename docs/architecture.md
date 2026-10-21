@@ -129,9 +129,10 @@ src/
   markers are the single source of what a snapshot left out.
 - **`history/`**: the per-session history file in a store, its schema, expiry and liveness.
 - **`runtime/`**: the observational `runtime/<pid>/` state for external clients.
-- **`session/`**: one `SessionState` record per session in `ExtensionServices.sessions`. Records
-  are never removed, only their fields cleared. `services.ts` holds data only; logic lives in the
-  other session modules, which take `services` as their first parameter.
+- **`session/`**: one `SessionState` record per session in `ExtensionServices.sessions`. A session
+  left by `/new`, `/resume`, fork or handoff has its record deleted once its in-flight work settles
+  (`releaseLeftSession`); a later resume rebuilds it. `services.ts` holds data only; logic lives in
+  the other session modules, which take `services` as their first parameter.
 - **`host/`**: the only place that calls `pi.on` and `pi.registerCommand`. Each handler delegates to
   the `SessionRegistry` (`session/registry.ts`); from the rest of `session/`, `host/` imports only
   the `ExtensionServices` and `SessionNavigation` types (`npm run lint` enforces this).
