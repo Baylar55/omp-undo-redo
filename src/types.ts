@@ -1,3 +1,5 @@
+import type { Readable } from "node:stream";
+
 export interface SessionEntryLike {
   id: string;
   parentId: string | null;
@@ -89,6 +91,10 @@ export interface NavigationPort extends SessionReader {
 export interface GitRunOptions {
   env?: Record<string, string | undefined>;
   stdin?: string;
+  /** Piped into stdin in place of `stdin` (ignored when this is set), for
+   *  input that grows with the repository. Unlike `onStdout`, a runner must
+   *  honor it: `pack-objects` fed nothing still writes a valid empty pack. */
+  input?: Readable;
   timeoutMs?: number;
   /** Receives stdout as it arrives instead of buffering it; `createGitRunner`
    *  then returns an empty `stdout`. A runner may ignore it and buffer, so

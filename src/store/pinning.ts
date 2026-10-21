@@ -1,5 +1,6 @@
 import { readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import type { GitRepository, GitRunner } from "../types.js";
 import { invoke } from "../infra/git-runner.js";
 import { borrowsObjects, snapshotRunnerEnv } from "./git-store.js";
@@ -114,6 +115,25 @@ export async function pinStoreObjects(
   });
   if (head.error) return;
   const headHash = head.code === 0 ? head.stdout.trim() : "";
+  const packDir = join(repository.storeDir, "objects", "pack");
+  // The object list grows with everything the snapshots hold apart from
+  // HEAD, so rev-list's output is piped into pack-objects, never held whole.
+  // pack-objects' clock also runs while rev-list walks: two steps' budget.
+  const input = new PassThrough();
+  const packing = invoke(git, ["pack-objects", "-q", join(packDir, "pack")], {
+    input,
+    timeoutMs: 2 * timeoutMs,
+  });
+  let count = 0;
+  let partial = "";
+  const feed = (chunk: string) => {
+    const lines = (partial + chunk).split("\n");
+    partial = lines.pop()!;
+    // Edges ("-<id>") are HEAD's commits, not objects to pin.
+    const objects = lines.filter((line) => line && !line.startsWith("-"));
+    count += objects.length;
+    if (objects.length > 0) input.write(`${objects.join("\n")}\n`);
+  };
   // A snapshot whose content the user already pruned stays broken; it must
   // not keep every other snapshot from being pinned.
   const listed = await invoke(
@@ -126,18 +146,20 @@ export async function pinStoreObjects(
       "--all",
       ...(headHash ? ["--not", headHash] : []),
     ],
-    { timeoutMs },
+    { timeoutMs, onStdout: feed },
   );
-  if (listed.code !== 0 || listed.error) return;
-  // Edges ("-<id>") are HEAD's commits, not objects to pin.
-  const objects = listed.stdout.split("\n").filter((line) => line && !line.startsWith("-"));
-  const packDir = join(repository.storeDir, "objects", "pack");
+  // A runner that ignores `onStdout` buffers instead; the newline flushes
+  // the last line.
+  feed(`${listed.stdout}\n`);
+  const complete = listed.code === 0 && !listed.error;
+  // A line that is no object id makes pack-objects die before it writes a
+  // pack: a partial list must not be kept, and an empty one would still
+  // write an empty pack.
+  input.end(complete && count > 0 ? undefined : "abort\n");
+  const packed = await packing;
+  if (!complete) return;
   let kept = "";
-  if (objects.length > 0) {
-    const packed = await invoke(git, ["pack-objects", "-q", join(packDir, "pack")], {
-      stdin: `${objects.join("\n")}\n`,
-      timeoutMs,
-    });
+  if (count > 0) {
     const hash = packed.stdout.trim();
     if (packed.code !== 0 || packed.error || !/^[0-9a-f]{40,64}$/.test(hash)) return;
     kept = `pack-${hash}.keep`;

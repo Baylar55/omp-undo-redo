@@ -32,6 +32,10 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 ### Fixed
 
+- **Store gc no longer holds the whole pin list in memory.** Before a Git-mode store's gc, the
+  object list `rev-list` prints (one line per object the snapshots hold and HEAD does not reach)
+  was buffered, split and joined, about three copies of it at once. It is now piped into
+  `pack-objects` as it arrives.
 - **The runtime sweep could delete a live process's fresh runtime directory.** The sweep read a `runtime/<pid>` marker, found its pid dead and then removed the directory. If the pid was recycled in between and its new process had already installed its own `runtime/<pid>`, that new process's runtime state was deleted. The sweep now renames the directory aside first and deletes it only if the marker is unchanged; otherwise it renames the directory back.
 - **Private-Git snapshotted shared temp directories.** Opening a non-git `/tmp`, `/var/tmp` or `C:\Windows\Temp` was refused only when it was the OS temp directory (`TMPDIR`/`TEMP`), which on macOS is a per-user `/var/folders/…` path and on Windows the per-user `%TEMP%`. Snapshots there copied other programs' and users' readable temp files into the store. Those roots are now always refused, like the home directory (session-only, `unsafe_workspace`); their subdirectories are unaffected. A store an earlier version created for one of them is evicted once idle for 24 hours, taking that workspace's undo history with it.
 - **A failed restore rolled back nothing when a changed path started with `"`.** The rollback hashes the files apply may have written with one `git hash-object --stdin-paths` call, which C-unquotes a line starting with `"` and, when that fails, dies with "line is badly quoted" for the whole batch. One such path (POSIX only) left every path apply had already written in its target state. Every path is now sent C-quoted, which also lets the rollback revert (or, for a file apply created, remove) a path with a newline in its name, which it used to skip.

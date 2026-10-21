@@ -147,7 +147,8 @@ function resolveDirectGit(): Promise<DirectGit | null> {
 /** Every git invocation goes through `spawn`: it handles the stdin-fed
  *  `update-ref --stdin` batches and, unlike `execFile`, imposes no output
  *  buffer cap on large `for-each-ref`/`status` reads. Output that grows with
- *  the whole tree (`ls-tree -r`) is streamed through `onStdout` instead. */
+ *  the whole tree (`ls-tree -r`) is streamed through `onStdout` instead, and
+ *  input that does is piped in through `input`. */
 async function runGit(
   cwd: string,
   args: string[],
@@ -273,7 +274,8 @@ async function runGit(
     settle({ stdout, stderr, code: typeof code === "number" ? code : 1 });
   });
   child.stdin.on("error", () => {});
-  child.stdin.end(options?.stdin);
+  if (options?.input) options.input.pipe(child.stdin);
+  else child.stdin.end(options?.stdin);
   deadlineTimer = setTimeout(terminate, Math.max(1, options?.timeoutMs ?? DEFAULT_TIMEOUT_MS));
   return promise;
 }
