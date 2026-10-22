@@ -47,13 +47,23 @@ export async function pinBorrowedObjects(
     if (changed.error) return false;
     const head = await invoke(git, ["rev-parse", "--verify", "-q", "HEAD"], { env });
     if (head.code === 0 || head.error) return false;
-    const staged = await invoke(git, ["ls-files", "-s", "-z"], { env });
+    // The index lists every staged path, so its listing grows with the tree:
+    // it is streamed and only the ids are kept. Entries are
+    // "<mode> <object> <stage>\t<path>\0"; a chunk may end mid-entry.
+    let partial = "";
+    const feed = (chunk: string) => {
+      const entries = (partial + chunk).split("\0");
+      partial = entries.pop()!;
+      for (const entry of entries) {
+        const [mode, sha] = entry.split(" ", 2);
+        if (sha && mode !== "160000") candidates.add(sha);
+      }
+    };
+    const staged = await invoke(git, ["ls-files", "-s", "-z"], { env, onStdout: feed });
     if (staged.code !== 0) return false;
-    // Entries: "<mode> <object> <stage>\t<path>".
-    for (const entry of staged.stdout.split("\0")) {
-      const [mode, sha] = entry.split(" ");
-      if (sha && mode !== "160000") candidates.add(sha);
-    }
+    // A runner that ignores `onStdout` buffers instead; the NUL flushes the
+    // last entry.
+    feed(`${staged.stdout}\0`);
     candidates.add(tree);
   }
   const objects = join(repository.storeDir, "objects");

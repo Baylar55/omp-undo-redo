@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createGitRunner } from "../../src/infra/git-runner.js";
 import { storeEnv } from "../../src/store/git-store.js";
-import { pinStoreObjects } from "../../src/store/pinning.js";
+import { pinBorrowedObjects, pinStoreObjects } from "../../src/store/pinning.js";
 import type { GitCommandResult, GitRepository, GitRunner, GitRunOptions } from "../../src/types.js";
 import { git, gitRepository, makeRepository, rmRetry } from "../helpers/index.js";
 
@@ -153,4 +153,47 @@ describe("pinStoreObjects", () => {
       pinned.filter((name) => !name.endsWith(".keep")),
     );
   });
+});
+
+describe("pinBorrowedObjects", () => {
+  it.each(["chunked", "buffered"] as const)(
+    "copies every staged blob of an unborn HEAD when ls-files output arrives %s",
+    async (delivery) => {
+      await writeFile(join(cwd, "dir", "with space é.txt"), "spaced\n");
+      await git(cwd, ["add", "-A"]);
+      await git(cwd, ["update-ref", "-d", "HEAD"]);
+      // Written to the user's objects, so the store only borrows it.
+      const tree = await git(cwd, ["write-tree"]);
+      const user = createGitRunner(cwd);
+      // Real ls-files output, handed on in 7-character pieces or, by a
+      // runner that ignores `onStdout`, returned whole in `stdout`.
+      const via: GitRunner = (args, options) =>
+        args[0] !== "ls-files"
+          ? user(args, options)
+          : user(args, {
+              ...options,
+              onStdout:
+                delivery === "buffered"
+                  ? undefined
+                  : (chunk) => {
+                      for (let at = 0; at < chunk.length; at += 7)
+                        options?.onStdout?.(chunk.slice(at, at + 7));
+                    },
+            });
+
+      expect(await pinBorrowedObjects(via, repository, tree)).toBe(true);
+
+      const staged = (await git(cwd, ["ls-files", "-s"]))
+        .split("\n")
+        .map((line) => line.split(" ")[1]!);
+      expect(staged).toHaveLength(4);
+      // Without the alternates env only the store's own objects are visible.
+      const storeOnly = createGitRunner(tmpdir(), { env: { GIT_DIR: repository.storeDir } });
+      const check = await storeOnly(["cat-file", "--batch-check=%(objectname)"], {
+        stdin: `${[...staged, tree].join("\n")}\n`,
+      });
+      expect(check.code).toBe(0);
+      expect(check.stdout.trim().split("\n").sort()).toEqual([...staged, tree].sort());
+    },
+  );
 });
