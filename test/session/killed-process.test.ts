@@ -1,4 +1,4 @@
-import { fork, type ChildProcess } from "node:child_process";
+import { fork, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -96,6 +96,35 @@ async function kill(child: ChildProcess): Promise<void> {
   await exited;
 }
 
+/** Windows hands a freed pid straight to the next new process, so under load
+ *  a short-lived one (another suite's git.exe) could hold a killed child's pid
+ *  just as the scan probes it: the dead owner reads as alive and, scanned
+ *  only once, is never reaped. A pid is not reused while a handle to its
+ *  process is open, so this keeps one open for each of `targets` until the
+ *  holder is killed with the other children. A held dead process still probes
+ *  as gone (ESRCH). Elsewhere pids are handed out in sequence: no holder. */
+async function holdPids(targets: ChildProcess[]): Promise<void> {
+  if (process.platform !== "win32") return;
+  const holder = spawn(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `$ErrorActionPreference = 'Stop'; $held = @(${targets.map((child) => child.pid).join(",")} | ForEach-Object { $p = [System.Diagnostics.Process]::GetProcessById($_); $null = $p.Handle; $p }); 'held'; $null = [Console]::In.ReadLine()`,
+    ],
+    { windowsHide: true },
+  );
+  children.push(holder);
+  let stderr = "";
+  holder.stderr.on("data", (chunk) => (stderr += chunk));
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  holder.stdout.once("data", () => resolve());
+  holder.once("error", reject);
+  holder.once("exit", (code) => reject(new Error(`pid holder exited (${code})\n${stderr}`)));
+  return promise;
+}
+
 /** Owner id of each lease in the store, by the pid it names. */
 async function leaseOwners(storeDir: string): Promise<Map<number, string>> {
   const dir = join(storeDir, "omp-undo-redo", "owners");
@@ -126,6 +155,7 @@ it("reaps only killed owners' refs and settles the /undo a SIGKILL interrupted",
     const live = await launch("mid-turn", cwd, "killed-process-live");
     const undoing = await launch("undo", cwd, undoSession);
     const capturing = await launch("mid-turn", cwd, "killed-process-capture");
+    await holdPids([undoing, capturing]);
     await Promise.all([kill(undoing), kill(capturing)]);
     expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
 
@@ -182,8 +212,8 @@ it("reaps only killed owners' refs and settles the /undo a SIGKILL interrupted",
 
     // This process's first snapshot publishes its lease and scans the others.
     await pi.emit("before_agent_start", ctx);
-    // A dead child's pid reused by a new process before this scan reads as
-    // alive and fails the wait below: rare, a flake rather than a regression.
+    // Their pids are held (`holdPids`), so no new process can take one and
+    // read as alive to this scan.
     await vi.waitFor(
       async () => {
         const owners = [...(await leaseOwners(storeDir)).values()];
