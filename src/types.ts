@@ -1,0 +1,222 @@
+import type { Readable } from "node:stream";
+
+export interface SessionEntryLike {
+  id: string;
+  parentId: string | null;
+  type: string;
+  message?: { role?: string };
+  customType?: string;
+}
+
+export interface SessionReader {
+  getLeafId(): string | null;
+  getBranch(fromId?: string): SessionEntryLike[];
+  getEntry(id: string): SessionEntryLike | undefined;
+}
+
+export const UNAVAILABLE_REASONS = [
+  "git_unavailable",
+  "not_repository",
+  "repository_unresolvable",
+  "invalid_head",
+  "before_snapshot_failed",
+  "before_ref_failed",
+  "after_snapshot_failed",
+  "after_ref_failed",
+  "file_history_gap",
+  "resumed_checkpoint_unavailable",
+  "checkpoint_removed",
+  "private_repository_unavailable",
+  "store_unavailable",
+  "unsafe_workspace",
+] as const;
+
+export type FileCheckpointUnavailableReason = (typeof UNAVAILABLE_REASONS)[number];
+
+export type TreeNavigationResult = {
+  cancelled: boolean;
+};
+
+export type NavigationResult =
+  /** `restoredFiles` (worktree root relative): every path the restore wrote,
+   *  created or deleted, whoever last edited it. */
+  | { status: "moved"; files: "restored"; restoredFiles: string[] }
+  /** Restored everything the snapshot holds; `nestedRepositories` and
+   *  `unreadableFiles` (worktree root relative) are outside it and were not
+   *  restored. */
+  | {
+      status: "moved";
+      files: "partial";
+      restoredFiles: string[];
+      nestedRepositories: string[];
+      unreadableFiles: string[];
+    }
+  | {
+      status: "moved";
+      files: "unavailable";
+      reason: FileCheckpointUnavailableReason;
+    }
+  | { status: "empty" }
+  | { status: "cancelled" }
+  /** `conflictedFiles` (worktree root relative): the paths the restore
+   *  refused; empty when git named none. */
+  | { status: "git_failed"; failure: "conflict"; conflictedFiles: string[] }
+  /** `linkedFiles` (worktree root relative): paths below a symlink or
+   *  junction, which a restore never writes through; nothing was written. */
+  | { status: "git_failed"; failure: "linked"; linkedFiles: string[] }
+  | { status: "git_failed"; failure: "failed" }
+  | { status: "rollback_failed" };
+
+export type ActionId = "undo" | "redo";
+
+export interface ActionInvocationResult {
+  id: ActionId;
+  applied: boolean;
+  token: string;
+}
+
+export interface RuntimeActionState {
+  actions: Array<{ id: ActionId; enabled: boolean }>;
+  sessionRevision: string;
+  activeSessionLeaf: string | null;
+  actionResult?: ActionInvocationResult;
+}
+
+export type CommandNavigationResult = NavigationResult | { status: "busy" };
+
+export interface NavigationPort extends SessionReader {
+  navigateTree(targetId: string): Promise<TreeNavigationResult>;
+}
+
+export interface GitRunOptions {
+  env?: Record<string, string | undefined>;
+  stdin?: string;
+  /** Piped into stdin in place of `stdin` (ignored when this is set), for
+   *  input that grows with the repository. Unlike `onStdout`, a runner must
+   *  honor it: `pack-objects` fed nothing still writes a valid empty pack. */
+  input?: Readable;
+  timeoutMs?: number;
+  /** Receives stdout as it arrives instead of buffering it; `createGitRunner`
+   *  then returns an empty `stdout`. A runner may ignore it and buffer, so
+   *  callers also read the result's `stdout`. For output that grows with the
+   *  repository. */
+  onStdout?: (chunk: string) => void;
+}
+
+export type GitRunError = "unavailable" | "timeout";
+
+export type OwnershipMode = "v2" | "legacy";
+
+export type GitCommandResult = {
+  stdout: string;
+  stderr: string;
+  code: number;
+  error?: GitRunError;
+};
+
+export type GitRunner = ((args: string[], options?: GitRunOptions) => Promise<GitCommandResult>) & {
+  cwd?: string;
+  /** Fixed env merged into every invocation (set via createGitRunner's `env`). */
+  env?: Record<string, string>;
+};
+
+export interface GitRepository {
+  worktree: string;
+  gitDir: string;
+  commonDir: string;
+  /** The extension's own snapshot repository under the store root: every
+   *  snapshot ref, the objects no user ref reaches, history files, and owner
+   *  leases live here, never in the user's `.git`, so all-refs operations
+   *  (`push --mirror`, `clone --mirror`, `bundle --all`, `log --all`) cannot
+   *  export snapshot content. Private-Git: the private repo itself (equal to
+   *  `gitDir`). Git mode: a bare store borrowing the user's objects through
+   *  `GIT_ALTERNATE_OBJECT_DIRECTORIES` (no `objects/info/alternates` file). */
+  storeDir: string;
+}
+
+/** A repository as `git rev-parse` reports it, before a snapshot store is bound. */
+export type DiscoveredRepository = Omit<GitRepository, "storeDir">;
+
+export interface SnapshotIndexLease {
+  directory: string;
+  indexPath: string;
+  /** Normalization baseline: HEAD's tree, or — when HEAD is unborn — the tree
+   *  written by the snapshot that seeded this index. */
+  baseTree: string;
+  /** Seeded against an unborn HEAD; the lease goes stale once HEAD is born. */
+  unborn?: true;
+}
+
+export interface GitCheckpoint {
+  kind: "git";
+  repository: GitRepository;
+  beforeHash: string;
+  beforeRef: string;
+  afterHash: string;
+  afterRef: string;
+  parentLeafId: string | null;
+  leafId: string | null;
+}
+
+export interface SessionOnlyCheckpoint {
+  kind: "session";
+  reason: FileCheckpointUnavailableReason;
+  parentLeafId: string | null;
+  leafId: string | null;
+}
+
+export type TurnCheckpoint = GitCheckpoint | SessionOnlyCheckpoint;
+
+export interface NavigationState {
+  checkpoints: TurnCheckpoint[];
+  currentIndex: number;
+}
+
+/** A file restore in progress, written before `git apply` touches the
+ *  worktree and removed once the cursor is persisted, so a process killed in
+ *  between leaves a record the next load settles. Names the checkpoint by
+ *  its refs and hashes. */
+export interface RestoreIntent {
+  direction: "undo" | "redo";
+  beforeRef: string;
+  beforeHash: string;
+  afterRef: string;
+  afterHash: string;
+}
+
+export interface PendingGitCheckpoint {
+  kind: "git";
+  repository: GitRepository;
+  beforeHash: string;
+  beforeRef: string;
+  checkpointId: string;
+  snapshotIndexLease?: SnapshotIndexLease;
+  parentLeafId: string | null;
+}
+
+interface PendingSessionCheckpoint {
+  kind: "session";
+  reason: FileCheckpointUnavailableReason;
+  parentLeafId: string | null;
+}
+
+export interface ExpirationTombstone {
+  expired: true;
+  sessionHash: string;
+  expiredAt: string;
+  reason: "age";
+}
+
+export type HistoryLoadResult =
+  | { status: "loaded"; state: NavigationState }
+  | { status: "expired" }
+  | { status: "unavailable"; reason?: "missing" | "unusable" };
+
+export type PendingTurnCheckpoint = PendingGitCheckpoint | PendingSessionCheckpoint;
+
+export type GitRunnerFactory = (repository: GitRepository) => GitRunner;
+
+/** Creates a runner bound to a worktree, optionally with a fixed environment
+ *  (used for private per-workspace repositories that pin `GIT_DIR`). Distinct
+ *  from `GitRunnerFactory`, which is keyed by an already-resolved repository. */
+export type CwdGitRunnerFactory = (cwd: string, env?: Record<string, string>) => GitRunner;

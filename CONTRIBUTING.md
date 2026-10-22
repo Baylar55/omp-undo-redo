@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narrow scope of the extension: session-tree navigation and Git-backed or blob-backed file restoration, using public OMP extension APIs.
+Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narrow scope of the extension: session-tree navigation and Git-backed file restoration, using public OMP extension APIs. Host sources: Oh My Pi ([can1357/oh-my-pi](https://github.com/can1357/oh-my-pi)) and Pi ([badlogic/pi-mono](https://github.com/badlogic/pi-mono)).
 
 ## Before opening a change
 
@@ -10,7 +10,11 @@ Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narr
 
 ## Development
 
-Use Node.js 20 or newer. Install dependencies with npm and use the existing scripts in `package.json`; do not modify the OMP dependency package under `package/`. Keep source changes under `src/` and tests under `test/` (or the existing test layout).
+Use Node.js 20 or newer. Install dependencies with `npm ci --ignore-scripts`, matching CI. The `@oh-my-pi/pi-coding-agent` dev dependency is used for types only, and its install scripts fetch native `onnxruntime-node` binaries the build and tests never load.
+
+Use the existing scripts in `package.json`. Keep source changes under `src/` and tests under `test/`, which mirrors the source layout.
+
+Source is layered (see `docs/architecture.md`); `npm run lint` enforces the allowed imports.
 
 At minimum, run the focused tests and type-check for the area you changed. Before submitting a release-oriented change, run `npm run verify`. Do not commit generated files, coverage output, local configuration, or credentials.
 

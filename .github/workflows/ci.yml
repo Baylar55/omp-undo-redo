@@ -8,6 +8,8 @@ on:
     branches:
       - main
   workflow_dispatch:
+  # publish.yml calls this so a tag cannot publish unless the full matrix passes.
+  workflow_call:
 
 permissions:
   contents: read
@@ -47,11 +49,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Smoke test package entry
+      - name: Smoke test packed package
         run: npm run smoke:package
-
-      - name: Check package contents
-        run: npm run pack:check
 
   tests:
     # Windows-only paths (launcher probe, taskkill tree-kill, PATH lookup) and
@@ -118,5 +117,5 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Smoke test package entry under Bun
+      - name: Smoke test packed package under Bun
         run: bun scripts/smoke-package.mjs

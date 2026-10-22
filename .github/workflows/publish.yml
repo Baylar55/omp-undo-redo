@@ -10,6 +10,13 @@ on:
 permissions: {}
 
 jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    # A called workflow can only narrow the caller's token; ci.yml needs contents: read.
+    permissions:
+      contents: read
+
   verify:
     name: Verify package
     runs-on: ubuntu-latest
@@ -24,6 +31,16 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+          # Full history and branches, so the main-ancestry check below can see origin/main.
+          fetch-depth: 0
+
+      - name: Require tagged commit on main
+        shell: bash
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "Tag $GITHUB_REF_NAME points at $(git rev-parse HEAD), which is not on main" >&2
+            exit 1
+          fi
 
       - name: Set up Node.js 22
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -81,7 +98,7 @@ jobs:
 
   publish:
     name: Publish package
-    needs: verify
+    needs: [ci, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,0 +1,435 @@
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, readdir, rename, rm, stat, utimes } from "node:fs/promises";
+import { hostname as systemHostname } from "node:os";
+import { join } from "node:path";
+import type { GitRepository, GitRunner, GitCommandResult, OwnershipMode } from "../types.js";
+import { parseRefLines } from "../infra/git-parse.js";
+import type { RefSpec } from "../infra/git-parse.js";
+import { writeExclusive } from "../infra/fs.js";
+import { deleteRefsBatched, markGcPending } from "./refs.js";
+import { isCanonicalUuid } from "./host-identity.js";
+import type { HostIdentity } from "./host-identity.js";
+
+const CHECKPOINT_OWNER_REF_ROOT = "refs/omp-undo-redo/v2";
+const CHECKPOINT_OWNER_LEASE_SCHEMA = 1;
+const MAX_LEASE_BYTES = 64 * 1024;
+const CLEANUP_TIMEOUT_MS = 1_000;
+const MAX_CONCURRENT_OWNERS = 4;
+const DEFAULT_SHUTDOWN_WAIT_MS = 1_000;
+/** Live owners touch their lease this often; a "remote" lease (unprobeable:
+ *  other host ID, hostname, or runtime scope, e.g. a regenerated host-id file
+ *  or a Linux reboot) untouched for the TTL is treated as stale. */
+const LEASE_HEARTBEAT_MS = 60 * 60 * 1_000;
+const REMOTE_LEASE_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const CHECKPOINT_ID_PATTERN = /^[0-9a-f]{16}$/;
+const OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const RUNTIME_SCOPE_PATTERN = /^[0-9a-f]{64}$/;
+
+export interface ParsedCheckpointRef {
+  ownerId: string;
+  checkpointId: string;
+  phase: "before" | "after";
+}
+
+export interface CheckpointOwnerLease {
+  schemaVersion: 1;
+  ownerId: string;
+  hostId: string;
+  hostname: string;
+  runtimeScope: string;
+  pid: number;
+  startedAt: string;
+}
+
+export type LeaseClassification = "alive" | "remote" | "stale" | "unknown";
+
+export interface LivenessOptions {
+  currentOwnerId: string;
+  currentHostId: string | null;
+  currentHostname: string;
+  currentRuntimeScope: string | null;
+  probePid?: (pid: number) => void;
+}
+
+export interface OwnerRegistryOptions {
+  ownerId?: string;
+  hostIdentity?: HostIdentity;
+  hostname?: string;
+  runtimeScope?: string | null;
+  shutdownWaitMs?: number;
+  now?: () => Date;
+  resolveHostIdentity?: () => Promise<HostIdentity>;
+  resolveRuntimeScope?: () => Promise<string | null>;
+  probePid?: (pid: number) => void;
+}
+
+/** Current layout `v2/<owner>/<16-hex id>/<phase>`; the older
+ *  `v2/<owner>/<session sha256>/<uuid>/<phase>` (too long for Windows
+ *  MAX_PATH) is still accepted so stale owners from older versions are reaped. */
+export function parseCheckpointOwnerRef(ref: string): ParsedCheckpointRef | null {
+  const parts = ref.split("/");
+  if (parts.slice(0, 3).join("/") !== CHECKPOINT_OWNER_REF_ROOT) return null;
+  let ownerId: string, checkpointId: string, phase: string;
+  if (parts.length === 6) {
+    [, , , ownerId, checkpointId, phase] = parts;
+    if (!CHECKPOINT_ID_PATTERN.test(checkpointId)) return null;
+  } else if (parts.length === 7) {
+    let sessionHash: string;
+    [, , , ownerId, sessionHash, checkpointId, phase] = parts;
+    if (!SHA256_PATTERN.test(sessionHash) || !isCanonicalUuid(checkpointId)) return null;
+  } else {
+    return null;
+  }
+  if (!isCanonicalUuid(ownerId)) return null;
+  if (phase !== "before" && phase !== "after") return null;
+  return { ownerId, checkpointId, phase };
+}
+
+function ownerCheckpointPrefix(ownerId: string): string | null {
+  return isCanonicalUuid(ownerId) ? `${CHECKPOINT_OWNER_REF_ROOT}/${ownerId}/` : null;
+}
+
+export function parseCheckpointOwnerLease(
+  filename: string,
+  contents: string,
+): CheckpointOwnerLease | null {
+  if (!filename.endsWith(".json")) return null;
+  const filenameOwner = filename.slice(0, -5);
+  if (!isCanonicalUuid(filenameOwner) || Buffer.byteLength(contents, "utf8") > MAX_LEASE_BYTES)
+    return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(contents);
+  } catch {
+    return null;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort().join(",");
+  if (keys !== "hostId,hostname,ownerId,pid,runtimeScope,schemaVersion,startedAt") return null;
+  if (
+    record.schemaVersion !== CHECKPOINT_OWNER_LEASE_SCHEMA ||
+    record.ownerId !== filenameOwner ||
+    typeof record.ownerId !== "string" ||
+    !isCanonicalUuid(record.ownerId) ||
+    typeof record.hostId !== "string" ||
+    !isCanonicalUuid(record.hostId) ||
+    typeof record.hostname !== "string" ||
+    record.hostname.length === 0 ||
+    record.hostname.length > 255 ||
+    typeof record.pid !== "number" ||
+    !Number.isSafeInteger(record.pid) ||
+    record.pid <= 0 ||
+    typeof record.runtimeScope !== "string" ||
+    !RUNTIME_SCOPE_PATTERN.test(record.runtimeScope) ||
+    typeof record.startedAt !== "string" ||
+    !Number.isFinite(Date.parse(record.startedAt))
+  ) {
+    return null;
+  }
+  return record as unknown as CheckpointOwnerLease;
+}
+
+export function classifyCheckpointOwner(
+  lease: CheckpointOwnerLease,
+  options: LivenessOptions,
+): LeaseClassification {
+  if (lease.ownerId === options.currentOwnerId) return "alive";
+  if (!options.currentHostId || !options.currentRuntimeScope) return "unknown";
+  if (
+    lease.hostId !== options.currentHostId ||
+    lease.hostname !== options.currentHostname ||
+    lease.runtimeScope !== options.currentRuntimeScope
+  )
+    return "remote";
+  try {
+    (options.probePid ?? ((pid) => process.kill(pid, 0)))(lease.pid);
+    return "alive";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "stale";
+    return "unknown";
+  }
+}
+
+function leaseDirectory(repository: GitRepository): string {
+  return join(repository.storeDir, "omp-undo-redo", "owners");
+}
+
+function leasePath(repository: GitRepository, ownerId: string): string {
+  return join(leaseDirectory(repository), `${ownerId}.json`);
+}
+
+function leaseContents(
+  ownerId: string,
+  hostId: string,
+  hostname: string,
+  runtimeScope: string,
+  now: () => Date,
+): string {
+  return JSON.stringify({
+    schemaVersion: CHECKPOINT_OWNER_LEASE_SCHEMA,
+    ownerId,
+    hostId,
+    hostname,
+    pid: process.pid,
+    runtimeScope,
+    startedAt: now().toISOString(),
+  });
+}
+
+async function publishLease(
+  repository: GitRepository,
+  ownerId: string,
+  hostId: string,
+  hostname: string,
+  runtimeScope: string,
+  now: () => Date,
+): Promise<boolean> {
+  const directory = leaseDirectory(repository);
+  const finalPath = leasePath(repository, ownerId);
+  const temporary = join(directory, `.${ownerId}.${randomUUID()}.tmp`);
+  try {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    if (
+      !(await writeExclusive(
+        temporary,
+        leaseContents(ownerId, hostId, hostname, runtimeScope, now),
+      ))
+    )
+      return false;
+    await rename(temporary, finalPath);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+async function enumerateOwnerRefs(
+  git: GitRunner,
+  repository: GitRepository,
+  ownerId: string,
+  timeoutMs: number,
+): Promise<{ ok: true; refs: RefSpec[] } | { ok: false }> {
+  const prefix = ownerCheckpointPrefix(ownerId);
+  if (!prefix) return { ok: false };
+  let result: GitCommandResult;
+  try {
+    result = await git(["for-each-ref", "--format=%(refname)%00%(objectname)", prefix], {
+      env: { GIT_DIR: repository.storeDir },
+      timeoutMs,
+    });
+  } catch {
+    return { ok: false };
+  }
+  if (result.error || result.code !== 0) return { ok: false };
+  const refs = parseRefLines(result.stdout);
+  if (!refs) return { ok: false };
+  for (const { ref, expectedHash } of refs) {
+    const parsed = parseCheckpointOwnerRef(ref);
+    if (!parsed || parsed.ownerId !== ownerId || !OBJECT_ID_PATTERN.test(expectedHash)) {
+      return { ok: false };
+    }
+  }
+  return { ok: true, refs };
+}
+
+async function cleanupStaleOwner(
+  git: GitRunner,
+  repository: GitRepository,
+  ownerId: string,
+  timeoutMs: number,
+): Promise<void> {
+  const first = await enumerateOwnerRefs(git, repository, ownerId, timeoutMs);
+  if (!first.ok) return;
+  if (first.refs.length > 0) await markGcPending(repository.storeDir);
+  const deletion = await deleteRefsBatched(git, first.refs, {
+    env: { GIT_DIR: repository.storeDir },
+    timeoutMs,
+  });
+  if (deletion === "timeout") return;
+  const second = await enumerateOwnerRefs(git, repository, ownerId, timeoutMs);
+  if (!second.ok || second.refs.length !== 0) return;
+  await rm(leasePath(repository, ownerId), { force: true }).catch(() => undefined);
+}
+
+export class CheckpointOwnerRegistry {
+  readonly ownerId: string;
+  private readonly hostname: string;
+  private readonly shutdownWaitMs: number;
+  private readonly now: () => Date;
+  private readonly probePid: (pid: number) => void;
+  private readonly hostIdentityPromise: Promise<HostIdentity>;
+  private readonly runtimeScopePromise: Promise<string | null>;
+  private readonly initializations = new Map<string, Promise<OwnershipMode>>();
+  private readonly initialized = new Map<
+    string,
+    { repository: GitRepository; git: GitRunner; hostId: string; runtimeScope: string }
+  >();
+  private readonly scans = new Set<Promise<void>>();
+  private heartbeat: NodeJS.Timeout | undefined;
+  constructor(options: OwnerRegistryOptions = {}) {
+    const configuredOwnerId = options.ownerId;
+    this.ownerId =
+      configuredOwnerId && isCanonicalUuid(configuredOwnerId) ? configuredOwnerId : randomUUID();
+    this.hostname = options.hostname ?? systemHostname();
+    this.shutdownWaitMs = Math.max(1, options.shutdownWaitMs ?? DEFAULT_SHUTDOWN_WAIT_MS);
+    this.now = options.now ?? (() => new Date());
+    this.probePid = options.probePid ?? ((pid) => process.kill(pid, 0));
+    this.hostIdentityPromise = (
+      options.resolveHostIdentity
+        ? options.resolveHostIdentity()
+        : Promise.resolve(options.hostIdentity ?? { id: null, persistent: false })
+    ).catch(() => ({ id: null, persistent: false }));
+    this.runtimeScopePromise = (
+      options.resolveRuntimeScope
+        ? options.resolveRuntimeScope()
+        : Promise.resolve(options.runtimeScope ?? null)
+    ).catch(() => null);
+  }
+
+  async ensureInitialized(repository: GitRepository, git: GitRunner): Promise<OwnershipMode> {
+    const key = repository.storeDir;
+    if (this.initialized.has(key)) return "v2";
+    const existing = this.initializations.get(key);
+    if (existing) return existing;
+    const attempt = this.initialize(repository, git);
+    this.initializations.set(key, attempt);
+    try {
+      return await attempt;
+    } finally {
+      this.initializations.delete(key);
+    }
+  }
+
+  private async initialize(repository: GitRepository, git: GitRunner): Promise<OwnershipMode> {
+    const [host, resolvedRuntimeScope] = await Promise.all([
+      this.hostIdentityPromise,
+      this.runtimeScopePromise,
+    ]);
+    const hostId = host.id ?? randomUUID();
+    const leaseRuntimeScope =
+      resolvedRuntimeScope ?? createHash("sha256").update(randomUUID()).digest("hex");
+    if (
+      !(await publishLease(
+        repository,
+        this.ownerId,
+        hostId,
+        this.hostname,
+        leaseRuntimeScope,
+        this.now,
+      ))
+    )
+      return "legacy";
+    this.initialized.set(repository.storeDir, {
+      repository,
+      git,
+      hostId,
+      runtimeScope: leaseRuntimeScope,
+    });
+    this.heartbeat ??= setInterval(() => void this.refreshLeases(), LEASE_HEARTBEAT_MS);
+    this.heartbeat.unref();
+    if (host.persistent && resolvedRuntimeScope)
+      this.startScan(repository, git, hostId, resolvedRuntimeScope);
+    return "v2";
+  }
+
+  /** Bumps each lease's mtime so other hosts never expire a live owner;
+   *  re-publishes a lease another host expired while this one slept (the
+   *  refs it reaped stay gone). A tick still in flight after shutdown cleared
+   *  the timer must not re-create the lease shutdown just removed. */
+  private async refreshLeases(): Promise<void> {
+    for (const { repository, hostId, runtimeScope } of this.initialized.values()) {
+      const now = this.now();
+      await utimes(leasePath(repository, this.ownerId), now, now).catch(
+        () =>
+          this.heartbeat &&
+          publishLease(repository, this.ownerId, hostId, this.hostname, runtimeScope, this.now),
+      );
+    }
+  }
+
+  private startScan(
+    repository: GitRepository,
+    git: GitRunner,
+    hostId: string,
+    runtimeScope: string,
+  ): void {
+    const scan = this.scan(repository, git, hostId, runtimeScope).catch(() => undefined);
+    this.scans.add(scan);
+    void scan.finally(() => this.scans.delete(scan));
+  }
+
+  private async scan(
+    repository: GitRepository,
+    git: GitRunner,
+    hostId: string,
+    runtimeScope: string,
+  ): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(leaseDirectory(repository), { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+      return;
+    }
+    const candidates: Array<{ ownerId: string }> = [];
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const filePath = join(leaseDirectory(repository), entry.name);
+      const metadata = await stat(filePath).catch(() => null);
+      if (!metadata || metadata.size > MAX_LEASE_BYTES) continue;
+      const contents = await readFile(filePath, "utf8").catch(() => null);
+      if (contents === null) continue;
+      const lease = parseCheckpointOwnerLease(entry.name, contents);
+      if (!lease) continue;
+      const classification = classifyCheckpointOwner(lease, {
+        currentOwnerId: this.ownerId,
+        currentHostId: hostId,
+        currentHostname: this.hostname,
+        currentRuntimeScope: runtimeScope,
+        probePid: this.probePid,
+      });
+      if (
+        classification === "stale" ||
+        (classification === "remote" &&
+          this.now().getTime() - metadata.mtimeMs >= REMOTE_LEASE_TTL_MS)
+      )
+        candidates.push({ ownerId: lease.ownerId });
+    }
+    let next = 0;
+    const worker = async () => {
+      while (next < candidates.length) {
+        const candidate = candidates[next++];
+        await cleanupStaleOwner(git, repository, candidate.ownerId, CLEANUP_TIMEOUT_MS);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(MAX_CONCURRENT_OWNERS, candidates.length) }, worker),
+    );
+  }
+
+  async shutdown(): Promise<void> {
+    clearInterval(this.heartbeat);
+    this.heartbeat = undefined;
+    const scans = [...this.scans];
+    if (scans.length > 0) {
+      await Promise.race([Promise.allSettled(scans), delay(this.shutdownWaitMs)]);
+    }
+    for (const { repository, git } of this.initialized.values()) {
+      const refs = await enumerateOwnerRefs(git, repository, this.ownerId, CLEANUP_TIMEOUT_MS);
+      if (!refs.ok || refs.refs.length !== 0) continue;
+      await rm(leasePath(repository, this.ownerId), { force: true }).catch(() => undefined);
+    }
+    this.initialized.clear();
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}

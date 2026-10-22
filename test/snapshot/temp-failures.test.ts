@@ -1,0 +1,555 @@
+import { execFile, spawn } from "node:child_process";
+import { once } from "node:events";
+import type * as FsPromises from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import ompUndoRedo from "../../src/index.js";
+import { finishAfterTurn, prepareBeforeTurn } from "../../src/snapshot/capture.js";
+import { defaultPool } from "../../src/snapshot/index-leases.js";
+import { createGitRunner } from "../../src/infra/git-runner.js";
+import { SessionNavigation } from "../../src/session/navigation.js";
+import type { GitRunner } from "../../src/types.js";
+import {
+  context,
+  FakeExtensionApi,
+  git as rawGit,
+  makeRepository,
+  privateRefs,
+  snapshotEnv,
+} from "../helpers/index.js";
+import { applyCheckpoint } from "../../src/snapshot/restore.js";
+
+const execFileAsync = promisify(execFile);
+
+const { mockState, createdMockDirs } = vi.hoisted(() => {
+  return {
+    mockState: {
+      failMkdtempPrefix: null as string | null,
+      failRmForMockDirs: false,
+    },
+    createdMockDirs: new Set<string>(),
+  };
+});
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof FsPromises>();
+  return {
+    ...actual,
+    mkdtemp: vi.fn(async (prefix: string, options?: Parameters<typeof actual.mkdtemp>[1]) => {
+      if (mockState.failMkdtempPrefix && prefix.includes(mockState.failMkdtempPrefix)) {
+        throw new Error(`Simulated mkdtemp failure for prefix ${prefix}`);
+      }
+      const dir = await actual.mkdtemp(prefix, options);
+      if (prefix.includes("omp-undo-redo-index-") || prefix.includes("omp-undo-redo-patch-")) {
+        createdMockDirs.add(dir);
+      }
+      return dir;
+    }),
+    rm: vi.fn(
+      async (path: Parameters<typeof actual.rm>[0], options?: Parameters<typeof actual.rm>[1]) => {
+        const pathStr = String(path);
+        if (mockState.failRmForMockDirs && createdMockDirs.has(pathStr)) {
+          throw new Error(`Simulated rm failure for directory ${pathStr}`);
+        }
+        return actual.rm(path, options);
+      },
+    ),
+  };
+});
+
+function makeGitRunner(
+  cwd: string,
+  options?: { failCommand?: string; env?: Record<string, string> },
+): GitRunner {
+  const runner: GitRunner = async (args, callOpts) => {
+    const runOpts = { ...callOpts, env: { ...options?.env, ...callOpts?.env } };
+    if (options?.failCommand && args.includes(options.failCommand)) {
+      return { code: 1, stdout: "", stderr: "simulated git failure" };
+    }
+    if (runOpts?.stdin !== undefined) {
+      const child = spawn("git", args, {
+        cwd,
+        env: { ...process.env, ...runOpts?.env },
+        windowsHide: true,
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.stdin.on("error", () => {});
+      child.stdin.end(runOpts.stdin);
+      try {
+        const [code] = (await once(child, "close")) as [number | null];
+        return { stdout, stderr, code: typeof code === "number" ? code : 1 };
+      } catch (error) {
+        return { stdout, stderr: `${stderr}${String(error)}`, code: 1 };
+      }
+    }
+    try {
+      const { stdout, stderr } = await execFileAsync("git", args, {
+        cwd,
+        env: { ...process.env, ...runOpts.env },
+        windowsHide: true,
+      });
+      return { code: 0, stdout, stderr };
+    } catch (err: unknown) {
+      const error = err as { code?: number; stdout?: string; stderr?: string };
+      return {
+        code: error.code ?? 1,
+        stdout: error.stdout ?? "",
+        stderr: error.stderr ?? "",
+      };
+    }
+  };
+  if (options?.env) runner.env = options.env;
+  return runner;
+}
+
+describe("temp-directory failure resilience", () => {
+  beforeEach(() => {
+    mockState.failMkdtempPrefix = null;
+    mockState.failRmForMockDirs = false;
+  });
+
+  afterEach(async () => {
+    const actualFs = await vi.importActual<typeof FsPromises>("node:fs/promises");
+    const directories = [...createdMockDirs];
+    mockState.failMkdtempPrefix = null;
+    mockState.failRmForMockDirs = false;
+    try {
+      await Promise.all(
+        directories.map((directory) => actualFs.rm(directory, { recursive: true, force: true })),
+      );
+    } finally {
+      createdMockDirs.clear();
+    }
+  });
+
+  it("A. before-snapshot allocation failure preserves session-only undo/redo", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "sess-before-alloc-fail");
+
+      await pi.emit("session_start", ctx);
+
+      mockState.failMkdtempPrefix = "omp-undo-redo-index-";
+
+      await expect(pi.emit("before_agent_start", ctx)).resolves.toBeUndefined();
+
+      mockState.failMkdtempPrefix = null;
+
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn-1";
+
+      await pi.emit("agent_end", ctx);
+
+      expect(await privateRefs(cwd)).toEqual([]);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the file snapshot before this turn failed or was still running when the turn started.",
+      );
+
+      await pi.runCommand("redo", ctx);
+      expect(ctx.leaf).toBe("turn-1");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid the session turn, but files were not restored because the file snapshot before this turn failed or was still running when the turn started.",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("A2. a later session-only turn does not destroy an earlier file checkpoint", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      let failAdd = false;
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: (workCwd, env) => {
+          const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+          const gated: GitRunner = async (args, options) =>
+            failAdd && args.includes("add")
+              ? { code: 1, stdout: "", stderr: "simulated add failure" }
+              : inner(args, options);
+          gated.cwd = workCwd;
+          if (env) gated.env = env;
+          return gated;
+        },
+      });
+      const ctx = context(cwd, "sess-gap-keeps-history");
+
+      await pi.emit("session_start", ctx);
+      // Turn 1: a complete file checkpoint over tracked.txt.
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "turn-one\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      // Turn 2: its before-snapshot fails, so the turn is session-only.
+      // Turn 1's checkpoint must survive it.
+      failAdd = true;
+      await pi.emit("before_agent_start", ctx);
+      failAdd = false;
+      await writeFile(join(cwd, "other.txt"), "turn-two\n");
+      ctx.leaf = "turn-2";
+      await pi.emit("agent_end", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("turn-1");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("files were not restored");
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      // The un-snapshotted turn's own edit is untouched: the restore patches,
+      // it does not check out.
+      expect(await readFile(join(cwd, "other.txt"), "utf8")).toBe("turn-two\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["before", "after"] as const)(
+    "A3. a %s-ref write failure names the unsaved snapshot on undo/redo",
+    async (side) => {
+      const cwd = await makeRepository();
+      try {
+        const pi = new FakeExtensionApi();
+        ompUndoRedo(pi as never, {
+          gitRunnerFactory: (workCwd, env) => {
+            const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+            const gated: GitRunner = async (args, options) =>
+              args.includes(`omp-undo-redo: retain ${side} checkpoint`)
+                ? { code: 1, stdout: "", stderr: "simulated update-ref failure" }
+                : inner(args, options);
+            gated.cwd = workCwd;
+            if (env) gated.env = env;
+            return gated;
+          },
+        });
+        const ctx = context(cwd, `sess-${side}-ref-fail`);
+        ctx.navigateTree = async (targetId) => {
+          ctx.leaf = targetId;
+          return { cancelled: false };
+        };
+
+        await pi.emit("session_start", ctx);
+        await pi.emit("before_agent_start", ctx);
+        await writeFile(join(cwd, "tracked.txt"), "changed\n");
+        ctx.leaf = "turn-1";
+        await pi.emit("agent_end", ctx);
+        expect(await privateRefs(cwd)).toEqual([]);
+
+        const reason = `files were not restored because the file snapshot taken ${side} this turn could not be saved.`;
+        await pi.runCommand("undo", ctx);
+        expect(ctx.leaf).toBe("leaf");
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(`Undid the session turn, but ${reason}`);
+        await pi.runCommand("redo", ctx);
+        expect(ctx.leaf).toBe("turn-1");
+        expect(ctx.ui.notifications.at(-1)?.message).toBe(`Redid the session turn, but ${reason}`);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("A4. a store that breaks mid-session warns once, not every turn", async () => {
+    const cwd = await makeRepository();
+    try {
+      let broken = false;
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, {
+        gitRunnerFactory: (workCwd, env) => {
+          const inner = env ? createGitRunner(workCwd, { env }) : createGitRunner(workCwd);
+          const gated: GitRunner = async (args, options) =>
+            broken && args[0] === "update-ref"
+              ? { code: 1, stdout: "", stderr: "simulated update-ref failure" }
+              : inner(args, options);
+          gated.cwd = workCwd;
+          if (env) gated.env = env;
+          return gated;
+        },
+      });
+      const ctx = context(cwd, "sess-breaks-mid-session");
+      await pi.emit("session_start", ctx);
+      for (const turn of [1, 2, 3]) {
+        broken = turn >= 2;
+        await pi.emit("before_agent_start", ctx);
+        await writeFile(join(cwd, "tracked.txt"), `turn-${turn}\n`);
+        ctx.leaf = `turn-${turn}`;
+        await pi.emit("agent_end", ctx);
+        if (turn === 1) expect(ctx.ui.notifications).toEqual([]);
+      }
+      expect(ctx.ui.notifications).toEqual([
+        {
+          message:
+            "Undo cannot restore this turn's file changes: the file snapshot taken before this turn could not be saved.\nSession navigation still works. Shown once per session for each cause.",
+          level: "warning",
+        },
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("B. after-snapshot allocation failure releases the pending ref", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "sess-after-alloc-fail");
+
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      expect(await privateRefs(cwd)).toHaveLength(1);
+
+      mockState.failMkdtempPrefix = "omp-undo-redo-index-";
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      await rawGit(cwd, ["add", "tracked.txt"]);
+      await rawGit(cwd, ["commit", "-qm", "move HEAD during turn"]);
+      ctx.leaf = "turn-1";
+
+      await expect(pi.emit("agent_end", ctx)).resolves.toBeUndefined();
+
+      expect(await privateRefs(cwd)).toEqual([]);
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Undid the session turn, but files were not restored because the file snapshot after this turn failed.",
+      );
+
+      await pi.runCommand("redo", ctx);
+      expect(ctx.leaf).toBe("turn-1");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Redid the session turn, but files were not restored because the file snapshot after this turn failed.",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("C. snapshot cleanup failure cannot override successful capture", async () => {
+    const cwd = await makeRepository();
+    try {
+      const gitRunner = makeGitRunner(cwd, { env: await snapshotEnv(cwd) });
+      mockState.failRmForMockDirs = true;
+
+      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-cleanup-fail", defaultPool);
+      expect(beforeRes.status).toBe("git");
+      if (beforeRes.status !== "git") return;
+      expect(await privateRefs(cwd)).toHaveLength(1);
+
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+
+      const afterRes = await finishAfterTurn(
+        gitRunner,
+        beforeRes.checkpoint,
+        "leaf",
+        "turn-1",
+        defaultPool,
+      );
+      expect(afterRes.status).toBe("git");
+      if (afterRes.status !== "git") return;
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      let currentLeaf = "turn-1";
+      const nav = new SessionNavigation(
+        {
+          getLeafId: () => currentLeaf,
+          getBranch: () => [],
+          getEntry: () => undefined,
+          navigateTree: async (targetId) => {
+            currentLeaf = targetId;
+            return { cancelled: false };
+          },
+        },
+        gitRunner,
+      );
+      await nav.recordTurnEnd(afterRes.checkpoint);
+
+      const undoResult = await nav.undo();
+      expect(undoResult.status).toBe("moved");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+
+      const redoResult = await nav.redo();
+      expect(redoResult.status).toBe("moved");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("D. snapshot cleanup failure does not hide an operation failure", async () => {
+    const cwd = await makeRepository();
+    try {
+      const env = await snapshotEnv(cwd);
+      const gitRunner = makeGitRunner(cwd, { env });
+
+      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-op-and-cleanup-fail", defaultPool);
+      expect(beforeRes.status).toBe("git");
+      if (beforeRes.status !== "git") return;
+
+      const failingGitRunner = makeGitRunner(cwd, { failCommand: "write-tree", env });
+      mockState.failRmForMockDirs = true;
+
+      const afterRes = await finishAfterTurn(
+        failingGitRunner,
+        beforeRes.checkpoint,
+        "leaf",
+        "turn-1",
+        defaultPool,
+      );
+
+      expect(afterRes.status).toBe("session_only");
+      if (afterRes.status === "session_only") {
+        expect(afterRes.reason).toBe("after_snapshot_failed");
+      }
+
+      expect(await privateRefs(cwd)).toEqual([]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("E. patch allocation failure returns 'failed' without mutation", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "sess-patch-alloc-fail");
+
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = "turn-1";
+      await pi.emit("agent_end", ctx);
+
+      expect(await privateRefs(cwd)).toHaveLength(2);
+
+      const headTreeBefore = await rawGit(cwd, ["rev-parse", "HEAD^{tree}"]);
+      const fileContentBefore = await readFile(join(cwd, "tracked.txt"), "utf8");
+
+      mockState.failMkdtempPrefix = "omp-undo-redo-patch-";
+
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+
+      await pi.runCommand("undo", ctx);
+
+      expect(ctx.leaf).toBe("turn-1");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(fileContentBefore);
+      expect(await rawGit(cwd, ["rev-parse", "HEAD^{tree}"])).toBe(headTreeBefore);
+      expect(ctx.ui.notifications.at(-1)?.message).toBe("Could not restore the Git checkpoint.");
+
+      mockState.failMkdtempPrefix = null;
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("leaf");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("F. patch cleanup failure preserves the primary apply result", async () => {
+    const cwd = await makeRepository();
+    try {
+      const gitRunner = makeGitRunner(cwd, { env: await snapshotEnv(cwd) });
+
+      const beforeRes = await prepareBeforeTurn(gitRunner, "sess-patch-cleanup", defaultPool);
+      expect(beforeRes.status).toBe("git");
+      if (beforeRes.status !== "git") return;
+
+      await writeFile(join(cwd, "tracked.txt"), "modified\n");
+      const afterRes = await finishAfterTurn(
+        gitRunner,
+        beforeRes.checkpoint,
+        "leaf",
+        "t1",
+        defaultPool,
+      );
+      expect(afterRes.status).toBe("git");
+      if (afterRes.status !== "git") return;
+
+      mockState.failRmForMockDirs = true;
+
+      let currentLeaf = "t1";
+      const nav = new SessionNavigation(
+        {
+          getLeafId: () => currentLeaf,
+          getBranch: () => [],
+          getEntry: () => undefined,
+          navigateTree: async (targetId) => {
+            currentLeaf = targetId;
+            return { cancelled: false };
+          },
+        },
+        gitRunner,
+      );
+      await nav.recordTurnEnd(afterRes.checkpoint);
+
+      const undoRes = await nav.undo();
+      expect(undoRes.status).toBe("moved");
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+
+      await writeFile(join(cwd, "tracked.txt"), "conflicting content\n");
+      const redoRes = await nav.redo();
+      expect(redoRes.status).toBe("git_failed");
+      if (redoRes.status === "git_failed") {
+        expect(redoRes.failure).toBe("conflict");
+      }
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("conflicting content\n");
+
+      const emptyApplyRes = await applyCheckpoint(
+        gitRunner,
+        afterRes.checkpoint.afterHash,
+        afterRes.checkpoint.afterHash,
+      );
+      expect(emptyApplyRes).toEqual({
+        status: "applied",
+        nestedRepositories: [],
+        unreadableFiles: [],
+        restoredFiles: [],
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});

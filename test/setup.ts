@@ -13,28 +13,33 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...os, homedir, default: { ...os, homedir } };
 });
 
-// Every Git workspace gets a snapshot store under the store root, which
-// defaults to ~/.omp. Suites that do not pick their own root share a temp one.
-if (!process.env.OMP_UNDO_REDO_STORE_DIR) {
-  const storeRoot = join(tmpdir(), `omp-undo-redo-test-store-${process.pid}`);
-  process.env.OMP_UNDO_REDO_STORE_DIR = storeRoot;
-  // Detached sweeps may still hold it open on Windows; a leftover temp dir is harmless.
-  afterAll(() => rm(storeRoot, { recursive: true, force: true, maxRetries: 10 }).catch(() => {}));
-}
-
-// Runtime action state defaults to ~/.omp too: without this, every test
-// worker leaves a runtime/<pid>/ dir of fixture sessions in the user's home.
-if (!process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
-  const runtimeRoot = join(tmpdir(), `omp-undo-redo-test-runtime-${process.pid}`);
-  process.env.OMP_UNDO_REDO_RUNTIME_DIR = runtimeRoot;
-  afterAll(() => rm(runtimeRoot, { recursive: true, force: true, maxRetries: 10 }).catch(() => {}));
-}
+// Every Git workspace gets a snapshot store under the store root, and runtime
+// action state a dir under the runtime root; both default to ~/.omp. Always
+// overridden: the README has users set these globally, and honoring them here
+// would run tests (and housekeeping) against the real store.
+// BLOB_DIR is the legacy alias of STORE_DIR; RETENTION_DAYS and DEBUG would
+// change housekeeping and logging away from the defaults the suites assume.
+delete process.env.OMP_UNDO_REDO_BLOB_DIR;
+delete process.env.OMP_UNDO_REDO_RETENTION_DAYS;
+delete process.env.OMP_UNDO_REDO_DEBUG;
+const storeRoot = join(tmpdir(), `omp-undo-redo-test-store-${process.pid}`);
+const runtimeRoot = join(tmpdir(), `omp-undo-redo-test-runtime-${process.pid}`);
+process.env.OMP_UNDO_REDO_STORE_DIR = storeRoot;
+process.env.OMP_UNDO_REDO_RUNTIME_DIR = runtimeRoot;
+// Detached sweeps may still hold them open on Windows; a leftover temp dir is harmless.
+afterAll(() =>
+  Promise.all(
+    [storeRoot, runtimeRoot].map((dir) =>
+      rm(dir, { recursive: true, force: true, maxRetries: 10 }).catch(() => {}),
+    ),
+  ),
+);
 
 // Snapshot index leases live in %TEMP%/omp-undo-redo-index-* until
 // session_shutdown, which most suites never emit. Each test file runs in its
 // own worker process, so its leases are all released here. Imported late:
-// a static import would load checkpoints.js before a suite's vi.mock applies.
+// a static import would load index-leases.js before a suite's vi.mock applies.
 afterAll(async () => {
-  const { releaseAllPersistentSnapshotIndices } = await import("../src/core/checkpoints.js");
+  const { releaseAllPersistentSnapshotIndices } = await import("../src/snapshot/index-leases.js");
   await releaseAllPersistentSnapshotIndices();
 });
