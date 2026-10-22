@@ -126,23 +126,43 @@ async function leaseBaselineCurrent(git: GitRunner, lease: SnapshotIndexLease): 
   return lease.unborn ? tree === "" : tree === lease.baseTree;
 }
 
-/** Drops index entries that the current ignore rules exclude. With `baseTree`,
- *  entries the baseline tracks are kept: `read-tree HEAD` holds them in a fresh
- *  snapshot whatever the ignore rules say. Index-only: no worktree file is
- *  re-read, so the retained stat cache survives. */
+/** Drops index entries that the current ignore rules exclude. Entries a born
+ *  baseline tracks are kept (`read-tree HEAD` holds them in a fresh snapshot
+ *  whatever the ignore rules say), so only the entries it lacks are checked:
+ *  `ls-files --ignored` over the whole index lstat()s every entry once a
+ *  directory-only pattern exists, which in a large index costs several times
+ *  the `add -A` itself. An unborn baseline tracks nothing: every entry is
+ *  checked. Paths stay root relative throughout, whatever the cwd: `:(top)`
+ *  for `check-ignore`, which echoes them as given, and `--index-info`, which
+ *  (unlike `update-index --stdin`) takes no cwd prefix; mode 0 removes.
+ *  Index-only: no worktree file is re-read, so the retained stat cache
+ *  survives.
+ *  ponytail: cost still grows with the untracked entries; skip the check when
+ *  no ignore source changed if a huge untracked set ever matters. */
 async function pruneIgnoredEntries(
   git: GitRunner,
   env: Record<string, string>,
-  baseTree?: string,
+  lease: SnapshotIndexLease,
 ): Promise<boolean> {
-  const ignored = await invoke(
-    git,
-    ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
-    { env },
-  );
-  if (ignored.code !== 0) return false;
-  let paths = ignored.stdout;
-  if (paths && baseTree) {
+  let paths: string[];
+  if (lease.unborn) {
+    const ignored = await invoke(
+      git,
+      [
+        "ls-files",
+        "-z",
+        "--cached",
+        "--ignored",
+        "--exclude-standard",
+        "--full-name",
+        "--",
+        WORKTREE_PATHSPEC,
+      ],
+      { env },
+    );
+    if (ignored.code !== 0) return false;
+    paths = ignored.stdout.split("\0").filter(Boolean);
+  } else {
     const added = await invoke(
       git,
       [
@@ -152,23 +172,41 @@ async function pruneIgnoredEntries(
         "--diff-filter=A",
         "--name-only",
         "-z",
-        baseTree,
+        lease.baseTree,
         "--",
       ],
       { env },
     );
     if (added.code !== 0) return false;
-    const untracked = new Set(added.stdout.split("\0"));
-    paths = paths
-      .split("\0")
-      .filter((path) => path && untracked.has(path))
-      .map((path) => `${path}\0`)
-      .join("");
+    if (!added.stdout) return true;
+    // check-ignore refuses every pathspec magic but `top`, and an inherited
+    // GIT_*_PATHSPECS adds one to each path: it would fail every reused snapshot.
+    const ignored = await invoke(git, ["check-ignore", "--no-index", "-z", "--stdin"], {
+      env: {
+        ...env,
+        GIT_GLOB_PATHSPECS: "0",
+        GIT_NOGLOB_PATHSPECS: "0",
+        GIT_ICASE_PATHSPECS: "0",
+        GIT_LITERAL_PATHSPECS: "0",
+      },
+      stdin: added.stdout
+        .split("\0")
+        .filter(Boolean)
+        .map((path) => `${WORKTREE_PATHSPEC}${path}\0`)
+        .join(""),
+    });
+    // Exit 1: none ignored.
+    if (ignored.error || (ignored.code !== 0 && ignored.code !== 1)) return false;
+    paths = ignored.stdout.split("\0").filter(Boolean);
+    if (!paths.every((path) => path.startsWith(WORKTREE_PATHSPEC))) return false;
+    paths = paths.map((path) => path.slice(WORKTREE_PATHSPEC.length));
   }
-  if (!paths) return true;
-  const removed = await invoke(git, ["update-index", "--force-remove", "-z", "--stdin"], {
+  if (paths.length === 0) return true;
+  // Any object id of the repository's hash length; mode 0 ignores its value.
+  const removal = `0 ${"0".repeat(lease.baseTree.length)}\t`;
+  const removed = await invoke(git, ["update-index", "-z", "--index-info"], {
     env,
-    stdin: paths,
+    stdin: paths.map((path) => `${removal}${path}\0`).join(""),
   });
   return removed.code === 0;
 }
@@ -394,7 +432,7 @@ export async function createSnapshotCommitFromLease(
     // `add -A` cannot drop an entry that became ignored after it was staged, so
     // prune those explicitly; a fresh snapshot never holds one unless HEAD
     // tracks it (an unborn baseline tracks nothing).
-    if (!(await pruneIgnoredEntries(git, addEnv, lease.unborn ? undefined : lease.baseTree))) {
+    if (!(await pruneIgnoredEntries(git, addEnv, lease))) {
       return { reason: "snapshot_failed" };
     }
     const tree = await invoke(git, ["write-tree"], { env });

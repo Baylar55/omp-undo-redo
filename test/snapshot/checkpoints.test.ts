@@ -1081,6 +1081,83 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it.each<{ head: string; inherited: Record<string, string> }>([
+    { head: "born", inherited: {} },
+    { head: "unborn", inherited: {} },
+    // An inherited global pathspec magic must not fail the reused snapshot.
+    { head: "born", inherited: { GIT_GLOB_PATHSPECS: "1" } },
+  ])(
+    "drops reused-index entries that became ignored, as a fresh snapshot would ($head HEAD, $inherited)",
+    async ({ head, inherited }) => {
+      const { cwd, git, snap } = await makeRepo();
+      // A subdirectory session: candidate paths are root relative, the cwd is not.
+      const nested = join(cwd, "nested");
+      const nestedSnap = gitRunner(nested, { ...(await snapshotEnv(cwd)), ...inherited });
+      const sessionId = `became-ignored-${head}-${Object.keys(inherited).join()}`;
+      const freshId = `${sessionId}-fresh`;
+      try {
+        await mkdir(nested);
+        await writeFile(join(nested, "inside.txt"), "inside\n");
+        await writeFile(join(cwd, "tracked.log"), "tracked\n");
+        if (head === "born") {
+          await initializeBranch(git, cwd);
+        }
+        // A born HEAD tracks tracked.log, which keeps it; an unborn one tracks nothing.
+        const headTracked = head === "born" ? ["tracked.log"] : [];
+        const untrackedLog = head === "born" ? [] : ["tracked.log"];
+        await mkdir(join(cwd, "build", "sub"), { recursive: true });
+        await writeFile(join(cwd, "build", "sub", "out [1].bin"), "artifact\n");
+        await writeFile(join(cwd, "ünï cödé.tmp"), "scratch\n");
+        await writeFile(join(cwd, "untracked.log"), "log\n");
+        await writeFile(join(cwd, "keep.txt"), "keep\n");
+        const names = async (hash: string) =>
+          (await text(snap, ["ls-tree", "-r", "-z", "--name-only", hash])).split("\0");
+
+        const before1 = pendingCheckpoint(
+          await prepareBeforeTurn(nestedSnap, sessionId, defaultPool),
+        );
+        const after1 = completedCheckpoint(
+          await finishAfterTurn(nestedSnap, before1, null, null, defaultPool),
+        );
+        expect(await names(after1.afterHash)).toEqual(
+          expect.arrayContaining(["build/sub/out [1].bin", "ünï cödé.tmp", "untracked.log"]),
+        );
+
+        // Directory-only, basename and info/exclude rules.
+        await writeFile(join(cwd, ".gitignore"), "build/\n*.log\n");
+        await mkdir(join(cwd, ".git", "info"), { recursive: true });
+        await writeFile(join(cwd, ".git", "info", "exclude"), "*.tmp\n");
+        const before2 = pendingCheckpoint(
+          await prepareBeforeTurn(nestedSnap, sessionId, defaultPool),
+        );
+        expect(before2.snapshotIndexLease?.directory).toBe(before1.snapshotIndexLease?.directory);
+        const fresh = pendingCheckpoint(await prepareBeforeTurn(nestedSnap, freshId, defaultPool));
+        const kept = await names(before2.beforeHash);
+        expect(kept).toEqual(
+          expect.arrayContaining([".gitignore", "keep.txt", "nested/inside.txt", ...headTracked]),
+        );
+        for (const gone of [
+          "build/sub/out [1].bin",
+          "ünï cödé.tmp",
+          "untracked.log",
+          ...untrackedLog,
+        ]) {
+          expect(kept).not.toContain(gone);
+        }
+        expect(await text(snap, ["rev-parse", `${before2.beforeHash}^{tree}`])).toBe(
+          await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+        );
+
+        await releasePendingCheckpoint(snap, before2, defaultPool);
+        await releasePendingCheckpoint(snap, fresh, defaultPool);
+        await releaseCheckpoint(snap, after1);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await releasePersistentSnapshotIndices([sessionId, freshId]);
+      }
+    },
+  );
+
   it("pools the fallback after-snapshot's index when HEAD moves during a turn", async () => {
     const { cwd, git, snap } = await makeRepo();
     const sessionId = "head-moved-fallback";

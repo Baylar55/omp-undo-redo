@@ -32,6 +32,16 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 ### Fixed
 
+- **Sessions started in a subfolder kept files that became ignored, and every reused snapshot
+  paid a full ignore scan.** Reusing a session's snapshot index drops entries the current ignore
+  rules exclude, since `add -A` never removes them. The removal took its paths relative to the
+  session's folder, so in a subfolder session a file outside that folder that became ignored
+  (a new `build/` or `*.log` rule, or an `info/exclude` edit) stayed in every later snapshot,
+  where a fresh snapshot leaves it out. The paths are now root relative. The check also covered
+  every index entry, and with a directory pattern such as `node_modules/` it took about 1.3 s for
+  100k entries on Windows, twice per turn, several times the `add -A` itself. It now checks only
+  the entries HEAD does not track (HEAD's are kept whatever the rules say), so its cost grows
+  with the untracked files only.
 - **Store gc no longer holds the whole pin list in memory.** Before a Git-mode store's gc, the
   object list `rev-list` prints (one line per object the snapshots hold and HEAD does not reach)
   was buffered, split and joined, about three copies of it at once. It is now piped into
