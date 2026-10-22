@@ -64,9 +64,13 @@ export class IndexLeasePool {
     await Promise.all(leases.map((lease) => this.releaseSnapshotIndexLease(lease)));
   }
 
-  /** Releases every lease of this pool, idle or checked out. */
-  async releaseAll(): Promise<void> {
-    const leases = [...this.persistentSnapshotIndices.values(), ...this.leasesInUse.keys()];
+  /** Releases every lease of this pool, idle or checked out. `inUse: false`
+   *  keeps the checked-out ones, which a running git may still be writing. */
+  async releaseAll({ inUse = true }: { inUse?: boolean } = {}): Promise<void> {
+    const leases = [
+      ...this.persistentSnapshotIndices.values(),
+      ...(inUse ? this.leasesInUse.keys() : []),
+    ];
     await Promise.all(leases.map((lease) => this.releaseSnapshotIndexLease(lease)));
   }
 

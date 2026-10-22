@@ -180,8 +180,8 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       suspendDetached(navigation ? [navigation] : [], left ? [left] : []),
       // Its pooled index would otherwise sit in the temp dir until shutdown;
       // a resume reseeds one. Idle only: a checked-out lease (`left`'s, which
-      // suspendDetached releases) may still be under a running git. The id
-      // stays in `leaseSessionIds` so shutdown still finds any such lease.
+      // suspendDetached releases) may still be under a running git; shutdown's
+      // `releaseAll` still finds any such lease.
       services.leasePool.releasePersistentSnapshotIndices([sessionId], { inUse: false }),
     ]);
   }
@@ -263,9 +263,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
           // Local cleanup first: idle index leases (a checked-out one may sit
           // under a running git) and the runtime directory.
           await Promise.all([
-            services.leasePool.releasePersistentSnapshotIndices(services.leaseSessionIds, {
-              inUse: false,
-            }),
+            services.leasePool.releaseAll({ inUse: false }),
             services.runtimeStore.shutdown(),
           ]);
           await suspendDetached(detachedNavigations, detachedPending);
@@ -281,7 +279,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
             ]),
             SHUTDOWN_TURN_DRAIN_MS,
           );
-          await services.leasePool.releasePersistentSnapshotIndices(services.leaseSessionIds);
+          await services.leasePool.releaseAll();
           await drainState();
           await services.ownerRegistry.shutdown();
         } finally {
@@ -293,7 +291,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       // A git step that overran the budget must not cost the checked-out
       // leases: drop them now, filesystem only.
       if (await timedOutAfter(teardown, SHUTDOWN_BUDGET_MS)) {
-        await services.leasePool.releasePersistentSnapshotIndices(services.leaseSessionIds);
+        await services.leasePool.releaseAll();
       }
       void runShutdownHousekeeping(services, teardown);
     })();

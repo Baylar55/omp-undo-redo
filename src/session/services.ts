@@ -112,8 +112,6 @@ export type ExtensionServices = {
   /** Keyed `${sessionId}\0${reason}`: session ids are UUIDs, so the separator
    *  cannot collide. Never pruned: a re-resumed session is not notified again. */
   notifiedSessionReasons: Set<string>;
-  /** Sessions this copy captured for, i.e. whose index leases it owns. */
-  leaseSessionIds: Set<string>;
   flags: {
     closing: boolean;
     /** OMP binds a separate copy of this extension to every in-process
@@ -165,7 +163,6 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     expirationPromises: new Map(),
     explicitActiveHashes: new Set(),
     notifiedSessionReasons: new Set(),
-    leaseSessionIds: new Set(),
     flags: {
       closing: false,
       servesMainSession: false,

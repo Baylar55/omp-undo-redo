@@ -120,7 +120,6 @@ export async function beforeAgentStart(
   if (backend.kind === "session") {
     notifySessionOnly(services, typed, sessionId, backend.reason);
   }
-  if (backend.kind === "git") services.leaseSessionIds.add(sessionId);
   const gate = { complete: Promise.resolve(), late: false };
   const capture = beginCapture(services, sessionId, async () => {
     const prepared =
