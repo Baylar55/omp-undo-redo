@@ -61,12 +61,22 @@ async function seedFromUserIndex(
     return false;
   }
   if ((await invoke(git, ["read-tree", "--reset", tree], { env })).code !== 0) return false;
-  // Tags: "H" plain, "S" skip-worktree, lowercase assume-unchanged.
-  const entries = await invoke(git, ["ls-files", "-v", "-z"], { env });
-  return (
-    entries.code === 0 &&
-    entries.stdout.split("\0").every((entry) => !entry || entry.startsWith("H "))
-  );
+  // Tags: "H" plain, "S" skip-worktree, lowercase assume-unchanged. One
+  // entry per tracked path, so the listing is streamed, never held whole;
+  // a chunk may end mid-entry.
+  let flagged = false;
+  let partial = "";
+  const feed = (chunk: string) => {
+    if (flagged) return;
+    const records = (partial + chunk).split("\0");
+    partial = records.pop()!;
+    flagged = records.some((record) => record && !record.startsWith("H "));
+  };
+  const listed = await invoke(git, ["ls-files", "-v", "-z"], { env, onStdout: feed });
+  // A runner that ignores `onStdout` buffers instead; the NUL flushes the
+  // last entry.
+  feed(`${listed.stdout}\0`);
+  return listed.code === 0 && !flagged;
 }
 
 /** `gitDir`: the repository whose index may seed stat data (`seedFromUserIndex`).

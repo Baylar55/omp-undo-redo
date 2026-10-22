@@ -23,12 +23,14 @@ import { finishAfterTurn, prepareBeforeTurn } from "../../src/snapshot/capture.j
 import type {
   GitCheckpoint,
   GitRunner,
+  GitRunOptions,
   NavigationPort,
   PendingGitCheckpoint,
   SessionEntryLike,
   SessionReader,
   TurnCheckpoint,
 } from "../../src/types.js";
+import { createGitRunner } from "../../src/infra/git-runner.js";
 import { gitRepository, privateRefs, snapshotEnv } from "../helpers/index.js";
 import { checkpointNamespace } from "../../src/infra/paths.js";
 import { storeEnv } from "../../src/store/git-store.js";
@@ -1552,6 +1554,58 @@ describe("history-safe Git checkpoints", () => {
 
       await releasePendingCheckpoint(snap, first, defaultPool);
       await releasePendingCheckpoint(snap, second, defaultPool);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("seeds from the repository's index when its listing arrives in pieces", async () => {
+    const { cwd, git } = await makeRepo();
+    const real = createGitRunner(cwd, { env: await snapshotEnv(cwd) });
+    const commands: string[][] = [];
+    // Real streamed ls-files output, handed on in 7-character pieces.
+    const snap: GitRunner = Object.assign(
+      (args: string[], options?: GitRunOptions) => {
+        commands.push(args);
+        const onStdout = options?.onStdout;
+        if (!onStdout) return real(args, options);
+        return real(args, {
+          ...options,
+          onStdout: (chunk) => {
+            for (let at = 0; at < chunk.length; at += 7) onStdout(chunk.slice(at, at + 7));
+          },
+        });
+      },
+      { cwd, env: real.env },
+    );
+    const blob = (hash: string, path: string) => text(snap, ["cat-file", "-p", `${hash}:${path}`]);
+    const fellBack = () =>
+      commands.some(
+        (args) =>
+          args.includes("read-tree") && !args.includes("--reset") && !args.includes("--empty"),
+      );
+    try {
+      await initializeBranch(git, cwd);
+      for (const name of ["skip.txt", "assume.txt"]) await writeFile(join(cwd, name), "r1\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "seed"]);
+
+      const clean = pendingCheckpoint(await prepareBeforeTurn(snap, "seed-chunked", defaultPool));
+      expect(fellBack()).toBe(false);
+
+      await writeFile(join(cwd, "skip.txt"), "skip local\n");
+      await git(["update-index", "--skip-worktree", "skip.txt"]);
+      await writeFile(join(cwd, "assume.txt"), "assume local\n");
+      await git(["update-index", "--assume-unchanged", "assume.txt"]);
+      const flagged = pendingCheckpoint(
+        await prepareBeforeTurn(snap, "seed-chunked-flagged", defaultPool),
+      );
+      expect(fellBack()).toBe(true);
+      expect(await blob(flagged.beforeHash, "skip.txt")).toBe("skip local");
+      expect(await blob(flagged.beforeHash, "assume.txt")).toBe("assume local");
+
+      await releasePendingCheckpoint(snap, clean, defaultPool);
+      await releasePendingCheckpoint(snap, flagged, defaultPool);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
