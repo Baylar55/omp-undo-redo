@@ -2,7 +2,7 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
-## [Unreleased]
+## [1.8.0] - 2026-10-22
 
 ### Changed
 
@@ -29,6 +29,11 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
   which OMP added in 18.3.2: on 16.5.2 to 18.3.1 every subagent session was treated as a main
   session, writing snapshots and refs, and history that no one can `/undo`, waiting up to 25 s per
   tool call and rerunning the housekeeping sweeps. The peer dependency range now says so.
+- **Rolling back to 1.7.0.** Mostly safe, with one exception. A session where `/undo` or `/redo`
+  recorded a `checkpoint_removed` turn (see Fixed) has a history file that 1.7.0 refuses whole. 1.7.0
+  then reports that the session's undo/redo file history could not be loaded and loses its file
+  checkpoints. 1.8.0 or later loads that file again. Every other history and snapshot loads in
+  1.7.0 as before.
 
 ### Fixed
 

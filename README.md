@@ -23,11 +23,11 @@ Install through the agent; a plain `npm install` does not register the extension
 ```sh
 # OMP
 omp plugin install @baylarsadigov/omp-undo-redo
-omp plugin install @baylarsadigov/omp-undo-redo@1.7.0   # pin a release
+omp plugin install @baylarsadigov/omp-undo-redo@1.8.0   # pin a release
 
 # Pi
 pi install npm:@baylarsadigov/omp-undo-redo
-pi install npm:@baylarsadigov/omp-undo-redo@1.7.0       # pin a release
+pi install npm:@baylarsadigov/omp-undo-redo@1.8.0       # pin a release
 pi update --extensions                                  # update
 ```
 
