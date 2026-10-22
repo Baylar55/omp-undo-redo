@@ -872,7 +872,9 @@ describe("stale packed-refs.lock", () => {
     };
     await base(["init", "--bare", "-q", gitDir]);
     const tree = (await base(["mktree"], { stdin: "" })).stdout.trim();
-    const commit = (await base(["commit-tree", tree, "-m", "m"])).stdout.trim();
+    const commit = (
+      await base(["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-m", "m"])
+    ).stdout.trim();
     const refs = Array.from({ length: count }, (_, index) => ({
       ref: `refs/omp-undo-redo/r${index}`,
       expectedHash: commit,
