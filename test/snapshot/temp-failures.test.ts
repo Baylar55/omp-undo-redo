@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import type * as FsPromises from "node:fs/promises";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,7 @@ import {
   git as rawGit,
   makeRepository,
   privateRefs,
+  rmRetry,
   snapshotEnv,
 } from "../helpers/index.js";
 import { applyCheckpoint } from "../../src/snapshot/restore.js";
@@ -174,7 +175,7 @@ describe("temp-directory failure resilience", () => {
         "Redid the session turn, but files were not restored because the file snapshot before this turn failed or was still running when the turn started.",
       );
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -232,7 +233,7 @@ describe("temp-directory failure resilience", () => {
       // it does not check out.
       expect(await readFile(join(cwd, "other.txt"), "utf8")).toBe("turn-two\n");
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -276,7 +277,7 @@ describe("temp-directory failure resilience", () => {
         expect(ctx.ui.notifications.at(-1)?.message).toBe(`Redid the session turn, but ${reason}`);
         expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
       } finally {
-        await rm(cwd, { recursive: true, force: true });
+        await rmRetry(cwd);
       }
     },
   );
@@ -316,7 +317,7 @@ describe("temp-directory failure resilience", () => {
         },
       ]);
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -360,7 +361,7 @@ describe("temp-directory failure resilience", () => {
         "Redid the session turn, but files were not restored because the file snapshot after this turn failed.",
       );
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -411,7 +412,7 @@ describe("temp-directory failure resilience", () => {
       expect(redoResult.status).toBe("moved");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("changed\n");
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -443,7 +444,7 @@ describe("temp-directory failure resilience", () => {
 
       expect(await privateRefs(cwd)).toEqual([]);
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -484,7 +485,7 @@ describe("temp-directory failure resilience", () => {
       expect(ctx.leaf).toBe("leaf");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 
@@ -549,7 +550,7 @@ describe("temp-directory failure resilience", () => {
         restoredFiles: [],
       });
     } finally {
-      await rm(cwd, { recursive: true, force: true });
+      await rmRetry(cwd);
     }
   });
 });
