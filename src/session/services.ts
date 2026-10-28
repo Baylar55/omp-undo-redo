@@ -138,11 +138,14 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     }
     return gitRunnerFactory(repository.worktree, snapshotRunnerEnv(repository));
   }
+  // Shared and resolved on first use: on Windows and macOS it spawns a process.
+  let runtimeScope: Promise<string | null> | undefined;
+  const sharedRuntimeScope = () => (runtimeScope ??= resolveRuntimeScope());
   const ownerRegistry = new CheckpointOwnerRegistry({
     resolveHostIdentity: resolvePersistentHostId,
-    resolveRuntimeScope,
+    resolveRuntimeScope: sharedRuntimeScope,
   });
-  const runtimeStore = new RuntimeActionStateStore({ resolveRuntimeScope });
+  const runtimeStore = new RuntimeActionStateStore({ resolveRuntimeScope: sharedRuntimeScope });
   return {
     gitRunnerFactory,
     captureDeadlineMs,

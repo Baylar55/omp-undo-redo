@@ -83,7 +83,7 @@ A `runtime/<pid>/` directory without a `runtime.json` marker is never replaced o
 
 ## No runtime action state after an upgrade, a reboot or in a container
 
-A `runtime/<pid>/` whose `runtime.json` comes from another runtime scope (another container sharing `~/.omp`, a previous Linux boot) or from an earlier version that recorded none is not this process's to replace until its marker and its directory are both 24 h old. Until then, a process given that pid publishes no runtime action state (`runtime-dir-foreign` with `OMP_UNDO_REDO_DEBUG=1`), and undo and redo work as usual. A directory whose pid is not running in any container that shares the folder is safe to delete by hand. A directory from another hostname is never replaced or reaped.
+A `runtime/<pid>/` whose `runtime.json` comes from another runtime scope (another container sharing `~/.omp`, a previous boot) or from an earlier version that recorded none is not this process's to replace until its marker and its directory are both 24 h old. Until then, a process given that pid publishes no runtime action state (`runtime-dir-foreign` with `OMP_UNDO_REDO_DEBUG=1`), and undo and redo work as usual. A directory whose pid is not running in any container that shares the folder is safe to delete by hand. A directory from another hostname is never replaced or reaped. On Windows and macOS, the first start after upgrading past a version that did not record the boot treats every older directory this way.
 
 ## A snapshot store created with permissive file modes
 

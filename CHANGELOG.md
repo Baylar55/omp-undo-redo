@@ -2,6 +2,12 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **On Windows and macOS, a pid reused after a reboot kept a dead owner's refs and runtime directory.** The runtime scope there was one constant per platform, so a lease or `runtime/<pid>/` marker from an earlier boot was pid-probed against this boot's processes, and while an unrelated process held that pid, its pending checkpoint refs (and the snapshots they keep) and the directory were never reaped, and external clients saw its stale action state. The scope now includes the OS boot ID (`PrefetchParameters\BootId` in the registry on Windows, `kern.bootsessionuuid` on macOS), read once at startup, so an earlier boot's lease is handled as remote (reaped after 7 days without a refresh) and its runtime directory once it is 24 h old. The boot time computed from the clock and uptime was not used: a clock step would change it mid-boot and make a live owner look remote. If the boot ID cannot be read, the scope stays as before. After upgrading, leases and runtime directories written by the earlier version count as another scope, so one left by a process still running the earlier version is pid-probed no more; its leases stay while it refreshes them, and its `runtime/<pid>/` can be reaped once 24 h old.
+
 ## [1.8.0] - 2026-10-22
 
 ### Changed

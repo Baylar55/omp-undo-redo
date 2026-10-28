@@ -69,7 +69,7 @@ src/
 │   ├── git-store.ts             Git-mode store: ensureGitSnapshotStore, runner env (alternates)
 │   ├── private-store.ts         Private-Git store: config, excludes, refused workspaces
 │   ├── pinning.ts               copy/keep borrowed objects safe from gc
-│   ├── host-identity.ts         persistent host id, Linux runtime scope
+│   ├── host-identity.ts         persistent host id, runtime scope (boot + Linux PID namespace)
 │   ├── owners.ts                CheckpointOwnerRegistry: leases, liveness, stale-owner cleanup
 │   ├── backend.ts               resolveBackend: git / private / session-only
 │   └── maintenance/
@@ -231,7 +231,7 @@ use SHA-256 session namespaces; state holds action availability, selected leaf, 
 revision and the latest action result. Per-session writes larger than 64 KiB are skipped.
 Publication is observational and never adds file restoration to session-only mode. A
 `runtime/<pid>/` without a `runtime.json` marker is never replaced or deleted
-(`runtime-dir-foreign`). The marker records the writer's hostname and runtime scope (boot and PID
+(`runtime-dir-foreign`). The marker records the writer's hostname and runtime scope (boot, plus PID
 namespace on Linux, as owner leases do). Only a marker from this host and scope is pid-probed: such
 a `runtime/<pid>/` is replaced by the process now holding that pid, and reaped once the pid is
 gone. One from another scope (a container sharing `~/.omp`, a previous boot) or without a scope
@@ -356,7 +356,7 @@ owner's temporary v2 refs when its lease is valid and either:
 - has the same persistent host ID, hostname, and runtime scope, and its PID probe returns
   `ESRCH`; or
 - differs in host ID, hostname, or runtime scope (a remote owner: another machine, a regenerated
-  `host-id` file, or on Linux a reboot) and has gone 7 days without a refresh.
+  `host-id` file, or a reboot) and has gone 7 days without a refresh.
 
 The 7-day rule compares the scanning runtime's clock with the lease mtime the owner wrote, so an
 owner suspended, clock-skewed or unable to refresh for 7 days can be reaped while still alive. Only
@@ -370,8 +370,12 @@ Git failure decide whether a turn is kept.
 On Linux, the runtime scope binds cleanup to both the current kernel boot ID and PID namespace,
 preventing a container or WSL process outside that namespace from being mistaken for a dead local
 process. If that scope cannot be resolved, automatic cleanup is disabled while v2 checkpointing and
-graceful cleanup continue. Current, live, recently refreshed remote, malformed, future-version,
-unreadable, and otherwise uncertain owners are preserved. Existing ownerless refs and completed
+graceful cleanup continue. On Windows and macOS it binds cleanup to the OS boot ID (the registry's
+`PrefetchParameters\BootId`, `kern.bootsessionuuid`), so a pid an earlier boot recorded is not
+probed against this boot's processes; if that cannot be read, the scope is the same for every boot,
+as in earlier versions, and such a pid reused by a live process keeps its refs until that process
+exits. Current, live, recently refreshed remote, malformed, future-version, unreadable, and
+otherwise uncertain owners are preserved. Existing ownerless refs and completed
 history refs are never stale-runtime cleanup candidates. Automatic maintenance runs once per
 runtime and repository, in the background, with bounded Git operations; maintenance failure does
 not block checkpoint creation or commands.

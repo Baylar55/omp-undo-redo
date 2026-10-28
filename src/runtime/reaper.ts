@@ -31,8 +31,8 @@ export type RuntimeMarker = {
   runtimeId: string;
   pid: number;
   hostname: string;
-  /** `resolveRuntimeScope()` of the writer (boot + PID namespace on Linux), as
-   *  owner leases record it; null when it could not be read. */
+  /** `resolveRuntimeScope()` of the writer (boot, plus PID namespace on Linux),
+   *  as owner leases record it; null when it could not be read. */
   runtimeScope: string | null;
   startedAt: string;
 };

@@ -780,4 +780,32 @@ describe("owner liveness", () => {
     expect(otherNamespace).not.toBe(first);
     expect(unavailable).toBeNull();
   });
+
+  it("binds Windows and macOS cleanup to the OS boot ID", async () => {
+    const windowsBoot = (id: string) => async () =>
+      `\r\nHKEY_LOCAL_MACHINE\\...\\PrefetchParameters\r\n    BootId    REG_DWORD    ${id}\r\n\r\n`;
+    const macBoot = (id: string) => async () => `${id}\n`;
+    const failing = async (): Promise<string> => {
+      throw new Error("blocked");
+    };
+    const scope = (platform: NodeJS.Platform, runCommand: () => Promise<string>) =>
+      resolveRuntimeScope({ platform, env: {}, runCommand });
+
+    const windows = await scope("win32", windowsBoot("0x1d"));
+    expect(windows).toMatch(/^[0-9a-f]{64}$/);
+    expect(await scope("win32", windowsBoot("0x1d"))).toBe(windows);
+    expect(await scope("win32", windowsBoot("0x1e"))).not.toBe(windows);
+
+    const mac = await scope("darwin", macBoot("6F2D3C1A-0B4E-4C8D-9A7F-1E2D3C4B5A69"));
+    expect(await scope("darwin", macBoot("6f2d3c1a-0b4e-4c8d-9a7f-1e2d3c4b5a69"))).toBe(mac);
+    expect(await scope("darwin", macBoot("7F2D3C1A-0B4E-4C8D-9A7F-1E2D3C4B5A69"))).not.toBe(mac);
+
+    // An unreadable or unparsable boot ID keeps one boot-less scope per platform,
+    // never null: cleanup still works, as before boot IDs were read.
+    const windowsFallback = await scope("win32", failing);
+    expect(windowsFallback).toMatch(/^[0-9a-f]{64}$/);
+    expect(await scope("win32", async () => "ERROR: access denied")).toBe(windowsFallback);
+    expect(windowsFallback).not.toBe(windows);
+    expect(await scope("darwin", macBoot("garbage"))).toBe(await scope("darwin", failing));
+  });
 });
