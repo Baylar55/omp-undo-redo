@@ -155,12 +155,21 @@ export function borrowsObjects(repository: GitRepository): boolean {
  *  which no path inside it can name. Nested entries are harmless: every
  *  consumer takes their union.
  *  shortcut: a runtime root that is the worktree itself stays captured (its
- *  `<pid>/` dirs have no fixed name); exclude those by pattern if it is ever seen. */
-export function ownedPathsInWorktree(repository: GitRepository): string[] {
-  return [storeRootDirectory(), dirname(repository.storeDir), runtimeRootDirectory()]
-    .map((path) => pathInside(repository.worktree, path))
-    .filter((path) => path !== null);
+ *  `<pid>/` dirs have no fixed name); exclude those by pattern if it is ever seen.
+ *  Memoized per repository object: it costs several blocking `realpathSync`
+ *  calls, and capture and restore ask on every turn. */
+export function ownedPathsInWorktree(repository: GitRepository): readonly string[] {
+  let owned = ownedPathsCache.get(repository);
+  if (!owned) {
+    owned = [storeRootDirectory(), dirname(repository.storeDir), runtimeRootDirectory()]
+      .map((path) => pathInside(repository.worktree, path))
+      .filter((path) => path !== null);
+    ownedPathsCache.set(repository, owned);
+  }
+  return owned;
 }
+
+const ownedPathsCache = new WeakMap<GitRepository, readonly string[]>();
 
 function userObjects(repository: GitRepository): string {
   return join(repository.commonDir, "objects");

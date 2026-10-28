@@ -12,10 +12,18 @@ import type { GitRepository, GitRunner } from "../types.js";
 import type { ExtensionServices } from "./services.js";
 
 /** Counter key: realpath-canonical, so a store spelled in long form on a
- *  checkpoint and in 8.3 short form on its backend still count as one. */
+ *  checkpoint and in 8.3 short form on its backend still count as one.
+ *  Memoized per repository object: every turn asks, `realpathSync` blocks. */
 export function gcKey(repository: GitRepository): string {
-  return canonicalCwd(repository.storeDir);
+  let key = gcKeys.get(repository);
+  if (key === undefined) {
+    key = canonicalCwd(repository.storeDir);
+    gcKeys.set(repository, key);
+  }
+  return key;
 }
+
+const gcKeys = new WeakMap<GitRepository, string>();
 
 /** OMP binds a separate copy of this extension to every in-process subagent
  *  session (`ctx.agent.kind === "sub"`). Nobody can `/undo` a subagent, so
