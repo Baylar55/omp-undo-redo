@@ -2,7 +2,7 @@ import { lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GitRunner } from "../types.js";
-import { invoke } from "../infra/git-runner.js";
+import { invoke, outputLines } from "../infra/git-runner.js";
 import { autocrlfSetting, autocrlfOffConfig } from "./markers.js";
 import {
   pathsOutsideSnapshots,
@@ -256,7 +256,7 @@ async function applyPatch(
     let worktree = git.cwd;
     if (!worktree) {
       const top = await invoke(git, ["rev-parse", "--show-toplevel"]);
-      worktree = top.code === 0 && !top.error ? top.stdout.trim() : "";
+      worktree = top.code === 0 && !top.error ? outputLines(top.stdout)[0] : "";
       if (!worktree) return "failed";
     }
     const linked = await pathsBeyondLinks(worktree, restoredFiles);

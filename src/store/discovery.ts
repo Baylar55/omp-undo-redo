@@ -1,7 +1,7 @@
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { DiscoveredRepository, GitRunner } from "../types.js";
-import { invoke } from "../infra/git-runner.js";
+import { invoke, outputLines } from "../infra/git-runner.js";
 
 export async function canonicalPath(value: string, base: string): Promise<string> {
   const absolute = isAbsolute(value) ? value : resolve(base, value);
@@ -25,8 +25,8 @@ export async function resolveRepository(git: GitRunner): Promise<RepositoryResol
     { env: { LC_ALL: "C" } },
   );
   if (result.error === "unavailable") return { reason: "git_unavailable" };
-  const lines = result.code === 0 ? result.stdout.trim().split("\n") : [];
-  const [worktree = "", gitDir = "", commonDir = ""] = lines.map((line) => line.trim());
+  const lines = result.code === 0 ? outputLines(result.stdout) : [];
+  const [worktree = "", gitDir = "", commonDir = ""] = lines;
   if (!worktree) {
     const cwd = git.cwd;
     if (!cwd) return { reason: "not_repository" };

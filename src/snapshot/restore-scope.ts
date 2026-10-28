@@ -1,7 +1,7 @@
 import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { GitRunner } from "../types.js";
-import { invoke } from "../infra/git-runner.js";
+import { invoke, outputLines } from "../infra/git-runner.js";
 import {
   AUTOCRLF_OFF_LINE,
   NESTED_REPOSITORY_LINE,
@@ -112,7 +112,7 @@ export async function shieldIgnoredPaths(
   if (hiddenInSource.length > 0) {
     const top = await invoke(git, ["rev-parse", "--show-toplevel"]);
     if (top.code !== 0) return null;
-    const worktree = top.stdout.trim();
+    const worktree = outputLines(top.stdout)[0];
     for (const path of hiddenInSource) {
       // Absent on disk means nothing to collide with: let the patch create it.
       const onDisk = await lstat(join(worktree, path)).then(

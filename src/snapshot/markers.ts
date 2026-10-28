@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { GitRunner } from "../types.js";
-import { invoke } from "../infra/git-runner.js";
+import { invoke, outputLines } from "../infra/git-runner.js";
 
 /** Commit-message lines naming paths a snapshot left out: a nested repository
  *  with no commit, and a file git could not read (locked by another process,
@@ -58,10 +58,11 @@ export async function excludeRules(git: GitRunner, env?: Record<string, string>)
     invoke(git, ["config", "--path", "--default", fallback, "--get", "core.excludesFile"], { env }),
   ]);
   if (paths.error || paths.code !== 0 || global.error || global.code !== 0) return "";
-  const [top, exclude] = paths.stdout.split("\n").map((line) => line.trim());
+  const [top, exclude] = outputLines(paths.stdout);
+  const [excludesFile = ""] = outputLines(global.stdout);
   if (!top || !exclude) return "";
   // `--git-path` is relative to the cwd; git reads a relative excludesFile from the top.
-  const files = [resolve(top, global.stdout.trim()), resolve(git.cwd ?? process.cwd(), exclude)];
+  const files = [resolve(top, excludesFile), resolve(git.cwd ?? process.cwd(), exclude)];
   const contents = await Promise.all(files.map((file) => readFile(file, "latin1").catch(() => "")));
   // Latin-1 maps bytes 1:1, so any rule bytes survive the round trip.
   const rules = contents

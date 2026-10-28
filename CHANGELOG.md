@@ -13,6 +13,11 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
   each call, which blocks the event loop on a slow or stalled network home directory. The owned
   paths and the gc key are now computed once per repository and reused.
 
+- **On Linux and macOS, a worktree whose name ends in a space resolved to the trimmed path.**
+  `git rev-parse` output was `trim()`med, so `proj ` became `proj`: with a sibling `proj` folder,
+  snapshots, restores and exclude-rule reads ran against the wrong repository. Only the line
+  terminators are now stripped from `rev-parse` and `config --path` output.
+
 ## [1.8.0] - 2026-10-22
 
 ### Changed

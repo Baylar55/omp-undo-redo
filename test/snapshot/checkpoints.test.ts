@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  realpath,
   readlink,
   rm,
   stat,
@@ -234,6 +235,30 @@ describe("repository resolution", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps trailing spaces in worktree and git-dir names instead of resolving to siblings",
+    async () => {
+      const base = await realpath(await mkdtemp(join(tmpdir(), "omp-undo-redo-space-")));
+      try {
+        // The git dir lives outside the worktree, so --git-dir/--git-common-dir
+        // print its own name, trailing space included.
+        for (const suffix of ["", " "]) {
+          await mkdir(join(base, `proj${suffix}`, "sub"), { recursive: true });
+          const init = ["init", "-q", "--separate-git-dir", join(base, `store${suffix}`)];
+          expect((await gitRunner(join(base, `proj${suffix}`))(init)).code).toBe(0);
+        }
+        const resolved = await resolveRepository(gitRunner(join(base, "proj ", "sub")));
+        expect("repository" in resolved && resolved.repository).toEqual({
+          worktree: join(base, "proj "),
+          gitDir: join(base, "store "),
+          commonDir: join(base, "store "),
+        });
+      } finally {
+        await rm(base, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("history-safe Git checkpoints", () => {

@@ -342,3 +342,10 @@ export async function run(
 ): Promise<boolean> {
   return (await invoke(git, args, options)).code === 0;
 }
+
+/** Lines of a command that prints one raw path per line (`rev-parse`,
+ *  `config --path`). Only the line terminators are stripped: `trim()` would
+ *  also eat a POSIX path's trailing spaces and name a sibling folder. */
+export function outputLines(stdout: string): string[] {
+  return stdout.replace(/\r?\n$/, "").split(/\r?\n/);
+}
