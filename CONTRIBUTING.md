@@ -10,7 +10,7 @@ Thanks for helping improve OMP Undo/Redo. Contributions should preserve the narr
 
 ## Development
 
-Use Node.js 20 or newer. Install dependencies with `npm ci --ignore-scripts`, matching CI. The `@oh-my-pi/pi-coding-agent` dev dependency is used for types only, and its install scripts fetch native `onnxruntime-node` binaries the build and tests never load.
+Use Node.js 20 or newer. Install dependencies with `npm ci --ignore-scripts`, matching CI. The `@oh-my-pi/pi-coding-agent` dev dependency is used for types only, and its install scripts fetch native `onnxruntime-node` binaries the build and tests never load. Its exact `puppeteer-core` pin pulled in a vulnerable `zod` (GHSA-mrhx-c7xc-m3w5), so `overrides` in `package.json` lifts it to `^25.13.0`; remove that override once a pi-coding-agent release pins `puppeteer-core` 25.13.0 or newer.
 
 Use the existing scripts in `package.json`. Keep source changes under `src/` and tests under `test/`, which mirrors the source layout.
 
