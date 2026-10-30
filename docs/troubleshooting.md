@@ -87,7 +87,7 @@ A `runtime/<pid>/` whose `runtime.json` comes from another runtime scope (anothe
 
 ## A snapshot store created with permissive file modes
 
-Stores are created owner-only (`0700`, with `core.sharedRepository=0600`), but private repositories created by an earlier version keep their original object modes. If the store was ever created with a permissive umask, close every OMP and Pi process, then delete `<storeRoot>/repos`. That deletes all undo file history; the store is recreated owner-only on next use.
+`<storeRoot>/repos` is created owner-only (`0700`) and Private-Git stores set `core.sharedRepository=0600` (Git-mode snapshot objects take your repository's modes instead; see SECURITY.md), but private repositories created by an earlier version keep their original object modes. If the store was ever created with a permissive umask, close every OMP and Pi process, then delete `<storeRoot>/repos`. That deletes all undo file history; the store is recreated owner-only on next use.
 
 ## Collecting a debug trace
 

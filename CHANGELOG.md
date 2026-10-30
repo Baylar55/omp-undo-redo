@@ -24,6 +24,14 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
   guide. Restore errors that run no git command (a temp-directory failure, a throwing rollback) are
   now logged there too, so the log is not empty for them.
 
+### Documentation
+
+- **SECURITY.md no longer implies Git-mode snapshot objects are `0600`.** A Git-mode store sets
+  `core.sharedRepository=0600`, but capture runs in the user's repository, so loose objects take
+  that repository's setting and the umask (typically `0444`). Their privacy rests on `repos/`
+  being `0700`. The code is unchanged: passing `-c core.sharedRepository=0600` to capture would
+  also change the modes Git LFS gives new objects in the repository's own LFS storage.
+
 ## [1.8.0] - 2026-10-22
 
 ### Changed
