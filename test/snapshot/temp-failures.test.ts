@@ -467,6 +467,7 @@ describe("temp-directory failure resilience", () => {
       const fileContentBefore = await readFile(join(cwd, "tracked.txt"), "utf8");
 
       mockState.failMkdtempPrefix = "omp-undo-redo-patch-";
+      vi.stubEnv("OMP_UNDO_REDO_DEBUG", "1");
 
       ctx.navigateTree = async (targetId) => {
         ctx.leaf = targetId;
@@ -478,13 +479,19 @@ describe("temp-directory failure resilience", () => {
       expect(ctx.leaf).toBe("turn-1");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(fileContentBefore);
       expect(await rawGit(cwd, ["rev-parse", "HEAD^{tree}"])).toBe(headTreeBefore);
-      expect(ctx.ui.notifications.at(-1)?.message).toBe("Could not restore the Git checkpoint.");
+      expect(ctx.ui.notifications.at(-1)?.message).toBe(
+        "Could not restore the Git checkpoint. To log the cause, restart the agent with OMP_UNDO_REDO_DEBUG=1 and retry: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#collecting-a-debug-trace",
+      );
+      // The notice points here: a failure no git command records must still be logged.
+      const log = await readFile(join(process.env.OMP_UNDO_REDO_STORE_DIR!, "debug.log"), "utf8");
+      expect(log).toContain("Simulated mkdtemp failure");
 
       mockState.failMkdtempPrefix = null;
       await pi.runCommand("undo", ctx);
       expect(ctx.leaf).toBe("leaf");
       expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
     } finally {
+      vi.unstubAllEnvs();
       await rmRetry(cwd);
     }
   });

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GitRunner } from "../types.js";
 import { invoke, outputLines } from "../infra/git-runner.js";
+import { debugLog } from "../infra/debug-log.js";
 import { autocrlfSetting, autocrlfOffConfig } from "./markers.js";
 import {
   pathsOutsideSnapshots,
@@ -330,10 +331,11 @@ async function applyPatch(
     );
     if (applied.code === 0) return { restoredFiles };
     await rollbackPartialApply(git, sourceHash, effectiveTarget, tempDirectory, config).catch(
-      () => undefined,
+      (error: unknown) => debugLog({ event: "restore-rollback-failed", error: String(error) }),
     );
     return "failed";
-  } catch {
+  } catch (error) {
+    debugLog({ event: "restore-failed", error: String(error) });
     return "failed";
   } finally {
     if (tempDirectory !== null) {

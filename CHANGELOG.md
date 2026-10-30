@@ -18,6 +18,12 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
   snapshots, restores and exclude-rule reads ran against the wrong repository. Only the line
   terminators are now stripped from `rev-parse` and `config --path` output.
 
+- **A failed undo or redo gave no next step.** Timeouts, patch errors and rolled-back applies all
+  reported only "Could not restore the Git checkpoint." The notice now says to restart the agent
+  with `OMP_UNDO_REDO_DEBUG=1`, retry, and links to the debug-trace section of the troubleshooting
+  guide. Restore errors that run no git command (a temp-directory failure, a throwing rollback) are
+  now logged there too, so the log is not empty for them.
+
 ## [1.8.0] - 2026-10-22
 
 ### Changed
