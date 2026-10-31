@@ -9,6 +9,7 @@ import { createGitRunner } from "../../src/infra/git-runner.js";
 import type { GitRepository, GitRunner } from "../../src/types.js";
 import { historyPath, tombstonePath } from "../../src/history/layout.js";
 import { expireGitSessionHistories, readRetentionDays } from "../../src/history/retention.js";
+import { localRuntimeScope } from "../../src/store/host-identity.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -442,6 +443,74 @@ describe("expireGitSessionHistories", () => {
     // The sweep prunes the marker whose owner stopped beating.
     await expect(stat(markerPath)).rejects.toThrow();
   });
+
+  for (const owner of ["live", "dead"] as const) {
+    it(`${owner === "live" ? "keeps" : "expires"} a stale-marker session whose owner pid is ${owner}`, async (ctx) => {
+      const runtimeScope = await localRuntimeScope();
+      // No scope (e.g. Linux without /proc): markers carry no owner at all.
+      if (runtimeScope === null) ctx.skip();
+      const gitDir = await temporaryDirectory(`git-expire-owner-${owner}-`);
+      const repository: GitRepository = {
+        worktree: gitDir,
+        gitDir,
+        commonDir: gitDir,
+        storeDir: gitDir,
+      };
+      const sessionId = `owner-${owner}-session`;
+      const hash = sessionHash(sessionId);
+      const historyFile = historyPath(repository, sessionId);
+      const historyDir = join(gitDir, "omp-undo-redo", "history");
+      await mkdir(historyDir, { recursive: true });
+      const threeDaysAgo = Date.now() - 3 * 24 * 60 * 60 * 1000;
+      await writeFile(
+        historyFile,
+        JSON.stringify({
+          schemaVersion: 2,
+          sessionHash: hash,
+          repository,
+          checkpoints: [],
+          currentIndex: -1,
+          lastAccessedAt: new Date(threeDaysAgo).toISOString(),
+        }),
+      );
+      // A suspended (live) owner, or a pid above every OS's pid range.
+      const pid = owner === "live" ? process.pid : 2 ** 31 - 4;
+      const markerPath = join(historyDir, `.active.${hash}`);
+      await writeFile(markerPath, JSON.stringify({ pid, runtimeScope }));
+      await utimes(markerPath, threeDaysAgo / 1000, threeDaysAgo / 1000);
+
+      const deletedRefCommands: string[] = [];
+      const dummyGit: GitRunner = async (args, options) => {
+        if (args[0] === "for-each-ref") {
+          return {
+            stdout: `refs/omp-undo-redo/history/${hash}/chk1/before\0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0\0${Math.floor(threeDaysAgo / 1000)} +0000\n`,
+            stderr: "",
+            code: 0,
+          };
+        }
+        if (args[0] === "update-ref" && args[1] === "--stdin") {
+          deletedRefCommands.push(options?.stdin ?? "");
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      };
+
+      const removed = await expireGitSessionHistories(repository, dummyGit, 2, new Set());
+
+      if (owner === "live") {
+        expect(removed).toBe(0);
+        expect(deletedRefCommands).toEqual([]);
+        expect((await stat(historyFile)).isFile()).toBe(true);
+        await expect(stat(tombstonePath(repository, sessionId))).rejects.toThrow();
+        // pruneStaleHeartbeats keeps a live owner's marker too.
+        expect((await stat(markerPath)).isFile()).toBe(true);
+      } else {
+        expect(removed).toBe(1);
+        expect(deletedRefCommands).toHaveLength(1);
+        await expect(stat(historyFile)).rejects.toThrow();
+        await expect(stat(markerPath)).rejects.toThrow();
+      }
+    });
+  }
 
   it("keeps original git checkpoint coordinates on disk when refs are missing at resume", async () => {
     const gitDir = await temporaryDirectory("git-resume-nopersist-");

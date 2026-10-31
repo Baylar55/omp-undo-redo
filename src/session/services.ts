@@ -9,7 +9,7 @@ import { IndexLeasePool } from "../snapshot/index-leases.js";
 import { defaultGitRunnerFactory } from "../store/backend.js";
 import type { FileBackend, PrivateRepoEntry } from "../store/backend.js";
 import { snapshotRunnerEnv } from "../store/git-store.js";
-import { resolvePersistentHostId, resolveRuntimeScope } from "../store/host-identity.js";
+import { localRuntimeScope, resolvePersistentHostId } from "../store/host-identity.js";
 import { GcQueue } from "../store/maintenance/gc.js";
 import { CheckpointOwnerRegistry } from "../store/owners.js";
 import type {
@@ -138,14 +138,11 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     }
     return gitRunnerFactory(repository.worktree, snapshotRunnerEnv(repository));
   }
-  // Shared and resolved on first use: on Windows and macOS it spawns a process.
-  let runtimeScope: Promise<string | null> | undefined;
-  const sharedRuntimeScope = () => (runtimeScope ??= resolveRuntimeScope());
   const ownerRegistry = new CheckpointOwnerRegistry({
     resolveHostIdentity: resolvePersistentHostId,
-    resolveRuntimeScope: sharedRuntimeScope,
+    resolveRuntimeScope: localRuntimeScope,
   });
-  const runtimeStore = new RuntimeActionStateStore({ resolveRuntimeScope: sharedRuntimeScope });
+  const runtimeStore = new RuntimeActionStateStore({ resolveRuntimeScope: localRuntimeScope });
   return {
     gitRunnerFactory,
     captureDeadlineMs,

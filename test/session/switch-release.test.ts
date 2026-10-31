@@ -8,10 +8,13 @@ import ompUndoRedo from "../../src/index.js";
 import {
   context,
   FakeExtensionApi,
+  gitRepository,
   makeRepository,
   rmRetry,
   type TestEntry,
 } from "../helpers/index.js";
+import { historyDirectory } from "../../src/history/layout.js";
+import { activeHeartbeatPath } from "../../src/history/liveness.js";
 import { checkpointNamespace } from "../../src/infra/paths.js";
 
 const beats = vi.hoisted(() => [] as string[]);
@@ -91,6 +94,9 @@ describe("leaving a session", () => {
       ctx.entries = [prompt, response];
       await pi.emit("agent_end", ctx);
       expect(heartbeatTick()).toContain(hashA);
+      // The marker names this (live) process while it holds the session.
+      const markerA = activeHeartbeatPath(historyDirectory(await gitRepository(cwd)), hashA);
+      expect(JSON.parse(await readFile(markerA, "utf8")).pid).toBe(process.pid);
 
       // Same-id reload keeps the session live.
       await pi.emit("session_before_switch", ctx);
@@ -112,6 +118,8 @@ describe("leaving a session", () => {
       // Its pooled index is deleted now, not at shutdown.
       expect(pool["persistentSnapshotIndices"].size).toBe(0);
       expect(existsSync(idle[0]!.directory)).toBe(false);
+      // Its marker no longer claims this live pid: it ages by mtime alone.
+      expect(await readFile(markerA, "utf8")).toBe("");
 
       // Resume A: its turn survived the release and is undoable again.
       await pi.emit("session_before_switch", ctx);

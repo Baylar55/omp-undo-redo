@@ -278,8 +278,13 @@ session start (`store/maintenance/legacy.ts`).
 (`.active.<sessionHash>`, fresh for 24 hours) in the shared history directory, a background
 interval re-asserts it for all locally active sessions every 10 minutes, and retention sweeps skip
 any session with a fresh marker — including sweeps started by another process sharing the same
-repository or store. Expired `*.expired.json` tombstones are pruned after twice the retention
-period (default 4 days) so the history directory does not grow without bound.
+repository or store. The marker names its writer (pid and runtime scope: boot, plus PID namespace on
+Linux); a stale marker whose writer shares this process table and is not proven gone (ESRCH) counts
+as live, so an owner suspended or asleep on the same machine keeps its history, as does a marker
+hidden by any error other than a missing marker or history path (`ENOENT`, `ENOTDIR`). Another
+container's or machine's marker ages by mtime alone. A session left by a switch has that claim
+cleared and ages by mtime again. Expired `*.expired.json` tombstones are pruned after twice the
+retention period (default 4 days) so the history directory does not grow without bound.
 
 In Git workspaces, expiration removes the session's history refs under
 `refs/omp-undo-redo/history/<sessionHash>/` and its history file inside the repository's snapshot

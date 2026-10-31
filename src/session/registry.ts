@@ -1,7 +1,7 @@
 import { SHUTDOWN_BUDGET_MS, SHUTDOWN_TURN_DRAIN_MS } from "../host-contract.js";
 import type { AnyContext } from "../host-contract.js";
 import { historyDirectory } from "../history/layout.js";
-import { touchSessionHeartbeat } from "../history/liveness.js";
+import { releaseSessionHeartbeat, touchSessionHeartbeat } from "../history/liveness.js";
 import { timedOutAfter, track } from "../infra/async.js";
 import { checkpointNamespace } from "../infra/paths.js";
 import type { ActionId, PendingTurnCheckpoint } from "../types.js";
@@ -163,6 +163,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     // Resumed (or reloaded) again meanwhile: it is live.
     if (services.flags.closing || typed.sessionManager.getSessionId() === sessionId) return;
     const navigation = state.navigation;
+    const backend = state.backend;
     const left = state.pending;
     state.navigation = undefined;
     state.pending = undefined;
@@ -184,6 +185,14 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       // `releaseAll` still finds any such lease.
       services.leasePool.releasePersistentSnapshotIndices([sessionId], { inUse: false }),
     ]);
+    // Its marker named this live process, which would shield it from every
+    // sweep until exit; it now ages by mtime. Not if resumed meanwhile.
+    if (backend?.kind === "git" && typed.sessionManager.getSessionId() !== sessionId) {
+      await releaseSessionHeartbeat(
+        historyDirectory(backend.repository),
+        checkpointNamespace(sessionId),
+      );
+    }
   }
 
   async function sessionStart(typed: AnyContext): Promise<void> {

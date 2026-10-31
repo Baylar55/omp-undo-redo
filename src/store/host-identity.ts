@@ -150,3 +150,10 @@ export async function resolveRuntimeScope(
     return null;
   }
 }
+
+let localScope: Promise<string | null> | undefined;
+/** This process's runtime scope, resolved once per process (on Windows and
+ *  macOS it spawns a process): every reader compares against one value. */
+export function localRuntimeScope(): Promise<string | null> {
+  return (localScope ??= resolveRuntimeScope().catch(() => null));
+}
