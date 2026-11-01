@@ -63,6 +63,12 @@ export async function runNavigation(
         "warning",
       );
       break;
+    default: {
+      // Compile error when NavigationResult gains a status.
+      const _exhaustive: never = outcome;
+      ctx.ui.notify(verbs.unexpected, "error");
+      break;
+    }
   }
   return outcome;
 }

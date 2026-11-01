@@ -1,3 +1,6 @@
+import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
+import { context } from "../helpers/index.js";
+import { runNavigation } from "../../src/host/commands.js";
 import { SessionNavigation } from "../../src/session/navigation.js";
 import { describe, expect, it, vi } from "vitest";
 import type {
@@ -473,5 +476,28 @@ describe("recoverInterruptedRestore", () => {
     ).toEqual({
       outcome: "unknown",
     });
+  });
+});
+
+describe("runNavigation", () => {
+  it("notifies an unexpected outcome when an unknown status is returned", async () => {
+    const ctx = context("cwd", "s1");
+    const navigation = {
+      undo: async () => ({ status: "unexpected_status" }),
+    } as unknown as SessionNavigation;
+
+    const outcome = await runNavigation(
+      navigation,
+      ctx as unknown as ExtensionCommandContext,
+      "undo",
+    );
+    expect(outcome).toEqual({ status: "unexpected_status" });
+    expect(ctx.ui.notifications).toEqual([
+      {
+        message:
+          "Undo finished with an unexpected result; inspect the session and worktree manually.",
+        level: "error",
+      },
+    ]);
   });
 });

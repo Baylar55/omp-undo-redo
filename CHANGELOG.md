@@ -4,6 +4,10 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- **Navigation result exhaustiveness check.** Added a build-time exhaustiveness check for `NavigationResult` in `runNavigation` and enabled `@typescript-eslint/switch-exhaustiveness-check`; an unhandled status falls back to an error notice.
+
 ### Fixed
 
 - **Retention deleted the history of a session whose process was suspended for more than a day.** The only proof another process held a session was the mtime of its `.active.<hash>` marker, refreshed every 10 minutes and stale after 24 h. A process stopped (Ctrl+Z, `SIGSTOP`) or asleep longer than that and the retention window stopped beating, and the next OMP started on the same machine deleted its refs and history JSON and wrote a tombstone: every earlier turn came back as a removed checkpoint on resume. The marker now records its writer's pid and runtime scope (boot, plus PID namespace on Linux), written atomically; a stale marker whose writer shares this process table and is not proven gone by a pid probe keeps the session (and the marker itself), as does one hidden by any error other than a missing marker or history path. The hostname is not compared, as it can change while a laptop sleeps. A gone writer, an empty or older marker, or one from another scope ages by mtime as before, so a sweeper in another container or on another machine sharing the repository (including any sweeper outside a `docker pause`d container) still expires by the 24 h rule. A recycled pid, or another machine whose scope collides, only delays expiry. A session left by `/new`, `/resume`, fork or handoff drops its pid claim (after any beat already in flight; the marker is removed if it cannot be emptied), so it still expires while the process that left it keeps running.

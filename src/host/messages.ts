@@ -11,6 +11,7 @@ interface NavigationVerbs {
   rollbackFailed: string;
   conflict: string;
   linked: string;
+  unexpected: string;
 }
 
 export const VERBS: Record<ActionId, NavigationVerbs> = {
@@ -26,6 +27,8 @@ export const VERBS: Record<ActionId, NavigationVerbs> = {
     conflict: "Worktree changed; nothing was undone.",
     linked:
       "Files sit under a symlink or junction, which undo never writes through; nothing was undone.",
+    unexpected:
+      "Undo finished with an unexpected result; inspect the session and worktree manually.",
   },
   redo: {
     busy: "Cannot redo while the agent is busy.",
@@ -39,6 +42,8 @@ export const VERBS: Record<ActionId, NavigationVerbs> = {
     conflict: "Worktree changed; nothing was redone.",
     linked:
       "Files sit under a symlink or junction, which redo never writes through; nothing was redone.",
+    unexpected:
+      "Redo finished with an unexpected result; inspect the session and worktree manually.",
   },
 };
 

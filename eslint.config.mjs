@@ -59,6 +59,7 @@ export default [
       "@typescript-eslint/consistent-type-imports": "error",
       "@typescript-eslint/no-explicit-any": "error",
       "@typescript-eslint/no-floating-promises": "error",
+      "@typescript-eslint/switch-exhaustiveness-check": "error",
     },
   },
   layer(["src/types.ts", "src/host-contract.ts"], ALL),
