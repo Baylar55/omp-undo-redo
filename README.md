@@ -71,7 +71,7 @@ Refused whole: an undo or redo that would write, create or delete a file under a
 
 ## Configuration
 
-Optional environment variables, read once at startup and applied process-wide (e.g. `export OMP_UNDO_REDO_RETENTION_DAYS=7`, or `setx OMP_UNDO_REDO_RETENTION_DAYS 7` on Windows, then open a new terminal).
+Optional environment variables applied process-wide (e.g. `export OMP_UNDO_REDO_RETENTION_DAYS=7`, or `setx OMP_UNDO_REDO_RETENTION_DAYS 7` on Windows, then open a new terminal). `OMP_UNDO_REDO_RETENTION_DAYS` is read once at startup; paths and debug logging are read on use.
 
 | Variable                       | Default                        | Meaning                                                                                                                                                                                    |
 | ------------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
