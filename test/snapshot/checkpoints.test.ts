@@ -2538,6 +2538,69 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  describe("a hunk git apply would place at an offset", () => {
+    const block = (middle: string) => ["alpha", "beta", "gamma", middle, "delta", "eps", "zeta"];
+    const fill = (from: number) => Array.from({ length: 20 }, (_, index) => `fill ${from + index}`);
+    // Block 2 already holds what the turn writes into block 1.
+    const file = (first: string, extra: string[] = []) =>
+      `${[...extra, ...fill(0), ...block(first), ...fill(20), ...block("new")].join("\n")}\n`;
+    // C-quoted, with a tab after it, in the patch's "--- " header.
+    const name = "sub dir/naïve Ω.txt";
+
+    async function turn() {
+      const repo = await makeRepo();
+      await initializeBranch(repo.git, repo.cwd);
+      await mkdir(join(repo.cwd, "sub dir"));
+      await writeFile(join(repo.cwd, name), file("old"));
+      await repo.git(["add", "."]);
+      await repo.git(["commit", "-qm", "blocks"]);
+      const prepared = pendingCheckpoint(
+        await prepareBeforeTurn(repo.snap, "offset-session", defaultPool),
+      );
+      if (!prepared) throw new Error("no checkpoint");
+      await writeFile(join(repo.cwd, name), file("new"));
+      // Patched ahead of `name`, so the offset belongs to the second patch.
+      await writeFile(join(repo.cwd, "a.txt"), "added\n");
+      const finished = completedCheckpoint(
+        await finishAfterTurn(repo.snap, prepared, null, null, defaultPool),
+      );
+      if (!finished) throw new Error("no checkpoint");
+      return { ...repo, ...finished };
+    }
+
+    it("refuses instead of rewriting an identical block elsewhere", async () => {
+      const { cwd, snap, beforeHash, afterHash } = await turn();
+      try {
+        // The user edits the turn's line: only block 2 still matches the hunk.
+        const edited = file("user");
+        await writeFile(join(cwd, name), edited);
+        const conflict = { status: "conflict", conflictedFiles: [name] };
+        expect(await applyCheckpoint(snap, afterHash, beforeHash, true)).toEqual(conflict);
+        expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual(conflict);
+        expect(await readFile(join(cwd, name), "utf8")).toBe(edited);
+        expect(await readFile(join(cwd, "a.txt"), "utf8")).toBe("added\n");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it("still restores the turn's block when lines were only inserted above it", async () => {
+      const { cwd, snap, beforeHash, afterHash } = await turn();
+      try {
+        await writeFile(join(cwd, name), file("new", ["user 1", "user 2"]));
+        expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual({
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: ["a.txt", name],
+        });
+        expect(await readFile(join(cwd, name), "utf8")).toBe(file("old", ["user 1", "user 2"]));
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("blames the patch, not the worktree, when the worktree still matches the snapshot", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {

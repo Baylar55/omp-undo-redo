@@ -213,6 +213,15 @@ a tracked symlink is still restored as a link. A runner without `cwd` gets the w
 `git rev-parse --show-toplevel`. The scan reads the disk once: a link created between it and
 `git apply` is not caught (git's own check still covers real symlinks). Capture is unchanged.
 
+### Hunks applied at an offset
+
+`git apply` matches a hunk at the nearest place its lines appear, so after the user edits a
+turn's lines a repeated block elsewhere in the file can match instead. The check runs with `-v`
+and `misplacedHunkPaths` (`snapshot/restore-scope.ts`) diffs each file with an offset hunk
+against the source snapshot: the restore proceeds only when the user's changes leave every hunk's
+lines intact and shift them by exactly git's offset, otherwise it is a `conflict` naming the file.
+A hunk that matched at its own line is not re-checked.
+
 ### Subagents
 
 Subagent sessions (the `task` tool, eval `agent()`, `/tan` clones) run in the same process with

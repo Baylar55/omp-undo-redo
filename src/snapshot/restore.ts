@@ -12,6 +12,7 @@ import {
   pinnedTree,
   changedPaths,
   applyCheckPaths,
+  misplacedHunkPaths,
   pathsBeyondLinks,
 } from "./restore-scope.js";
 
@@ -21,7 +22,8 @@ import {
  *  created or deleted, relative to the worktree root. The snapshots cover the
  *  whole worktree, so this includes edits made during the turn by anyone
  *  else (an editor, another process), not only the agent's.
- *  `conflictedFiles`: the paths `git apply --check` refused, relative to the
+ *  `conflictedFiles`: the paths `git apply --check` refused or would have
+ *  patched in the wrong place (see `misplacedHunkPaths`), relative to the
  *  worktree root; empty when its output named none. `linkedFiles`: the paths
  *  the restore would reach through a symlink or junction in the worktree
  *  (see `pathsBeyondLinks`); nothing was written. */
@@ -263,15 +265,26 @@ async function applyPatch(
     const linked = await pathsBeyondLinks(worktree, restoredFiles);
     if (linked.length > 0) return { linkedFiles: linked };
 
-    const check = await invoke(
-      git,
-      [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace", "--check", patchPath],
-      {
-        ...restore,
-        env: { LC_ALL: "C" },
-      },
-    );
-    if (check.code !== 0) {
+    const checkArgs = [
+      ...config,
+      "apply",
+      "--whitespace=nowarn",
+      "--no-ignore-whitespace",
+      "--check",
+    ];
+    const checkOptions = { ...restore, env: { LC_ALL: "C" } };
+    // `-v` reports every hunk git matched away from its recorded line.
+    const verbose = await invoke(git, [...checkArgs, "-v", patchPath], checkOptions);
+    // The probe index: see `misplacedHunkPaths` and the drift probe below.
+    const probeEnv: Record<string, string> = {
+      GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
+    };
+    if (git.env?.GIT_DIR && git.cwd) probeEnv.GIT_WORK_TREE = git.cwd;
+    if (verbose.code !== 0) {
+      if (verbose.error) return "failed";
+      // A failed `-v` check also prints the file lines a hunk searched for,
+      // which `applyCheckPaths` would read as git's own messages.
+      const check = await invoke(git, [...checkArgs, patchPath], checkOptions);
       if (check.error) return "failed";
       // `apply --check` failing does not prove the worktree drifted: a patch
       // git cannot parse fails identically. When the worktree still matches
@@ -292,10 +305,6 @@ async function applyPatch(
       // warning per file. The extension's own directories are left out: their
       // files drift every turn, and an old snapshot holding them would always
       // read as a conflict.
-      const probeEnv: Record<string, string> = {
-        GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
-      };
-      if (git.env?.GIT_DIR && git.cwd) probeEnv.GIT_WORK_TREE = git.cwd;
       const seeded = await invoke(git, ["read-tree", sourceHash], { env: probeEnv });
       if (seeded.error || seeded.code !== 0) return "failed";
       const tracked = await invoke(
@@ -322,6 +331,16 @@ async function applyPatch(
       if (check.stderr.includes("already exists in working directory")) return conflict;
       return "failed";
     }
+    const misplaced = await misplacedHunkPaths(
+      git,
+      sourceHash,
+      patchPath,
+      verbose.stderr,
+      config,
+      probeEnv,
+    );
+    if (!misplaced) return "failed";
+    if (misplaced.length > 0) return { conflictedFiles: misplaced };
 
     if (checkOnly) return { restoredFiles };
     const applied = await invoke(
