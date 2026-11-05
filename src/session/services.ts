@@ -118,6 +118,15 @@ export type ExtensionServices = {
      *  subagent session (`ctx.agent.kind === "sub"`); see `isMainSession`. */
     servesMainSession: boolean;
     servesSubagent: boolean;
+    /** The host's agent loop is between `agent_start` and `agent_end`. One
+     *  loop per copy at a time, so not per session: a mid-run session switch
+     *  must not strand it. */
+    runOpen: boolean;
+    /** A `before_agent_start` since the last `agent_end` opened a turn. A
+     *  steering or follow-up message the host injects into a running loop
+     *  emits `before_agent_start` again, but the loop still ends with one
+     *  `agent_end`: with both flags set, that turn is already open. */
+    turnOpen: boolean;
     pendingNavigationSourceSessionId: string | null;
   };
   gitRunnerFor(repository: GitRepository): GitRunner;
@@ -167,6 +176,8 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
       closing: false,
       servesMainSession: false,
       servesSubagent: false,
+      runOpen: false,
+      turnOpen: false,
       pendingNavigationSourceSessionId: null,
     },
     gitRunnerFor,

@@ -39,6 +39,7 @@ export type SessionRegistry = {
   rememberNavigationSource(event: unknown, ctx: AnyContext): void;
   adoptSwitchedSession(typed: AnyContext): Promise<void>;
   beforeAgentStart(typed: AnyContext): Promise<void>;
+  agentStart(): void;
   toolCall(typed: AnyContext): Promise<void>;
   agentEnd(typed: AnyContext): Promise<void>;
   shutdown(): Promise<void>;
@@ -315,6 +316,9 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     rememberNavigationSource,
     adoptSwitchedSession,
     beforeAgentStart: (typed) => beforeAgentStart(services, typed),
+    agentStart: () => {
+      services.flags.runOpen = true;
+    },
     toolCall: (typed) => toolCall(services, typed),
     agentEnd: (typed) => agentEnd(services, typed),
     shutdown,

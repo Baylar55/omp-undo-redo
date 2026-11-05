@@ -240,6 +240,10 @@ async function finalizeTurn(
 }
 
 export async function agentEnd(services: ExtensionServices, typed: AnyContext): Promise<void> {
+  // Every agent_end, `willContinue` too: the turn is finalized below, so an
+  // automatic continuation's own prompt or steer opens a new one.
+  services.flags.runOpen = false;
+  services.flags.turnOpen = false;
   const sessionId = typed.sessionManager.getSessionId();
   // A lookup, not stateOf: a turn with no record (a subagent's) has nothing to
   // finalize and must not leave an empty record behind.

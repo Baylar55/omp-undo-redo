@@ -308,6 +308,51 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
+  it("keeps prompts steered into a run in that run's one checkpoint", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "steered-run");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      // Run 1: a steering message makes the host emit before_agent_start
+      // again inside the run; the run still ends with one agent_end.
+      ctx.leaf = "p1";
+      await pi.emit("before_agent_start", ctx);
+      await pi.emit("agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "run 1\n");
+      ctx.leaf = "s1";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "other.txt"), "steered\n");
+      ctx.leaf = "r1";
+      await pi.emit("agent_end", ctx, { type: "agent_end", willContinue: true });
+      // Run 2: an automatic continuation (agent_start with no prompt of its
+      // own) that is then steered: the steer opens its turn.
+      await pi.emit("agent_start", ctx);
+      ctx.leaf = "s2";
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "run 2\n");
+      ctx.leaf = "r2";
+      await pi.emit("agent_end", ctx);
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("s2");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("run 1\n");
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("p1");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+      await expect(readFile(join(cwd, "other.txt"), "utf8")).rejects.toThrow();
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("Nothing to undo");
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
   /** git-add waits `delayMs` BEFORE reading the worktree, so a write landing
    *  in that window leaks into the snapshot (the slow-cold-capture case).
    *  Real delays: the race is between real git children and the handlers'

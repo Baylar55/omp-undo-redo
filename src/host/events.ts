@@ -29,6 +29,8 @@ export function registerEvents(
     track(() => registry.beforeAgentStart(ctx), services.activeOperations),
   );
 
+  pi.on("agent_start", registry.agentStart);
+
   // Every tool (built-in, custom, MCP, subagent) passes through the host's
   // `tool_call` gate before executing. Returning undefined never blocks it.
   pi.on("tool_call", (_event, ctx) => registry.toolCall(ctx));

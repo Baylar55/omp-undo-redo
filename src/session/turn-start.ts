@@ -89,6 +89,10 @@ export async function beforeAgentStart(
 ): Promise<void> {
   if (services.flags.closing) return;
   if (!isMainSession(services, typed)) return;
+  // A message steered into the running loop: its edits belong to the turn
+  // already open, whose checkpoint must stay pending until agent_end.
+  if (services.flags.runOpen && services.flags.turnOpen) return;
+  services.flags.turnOpen = true;
   const sessionId = typed.sessionManager.getSessionId();
   const state = stateOf(services, sessionId);
   const oldPending = state.pending;
