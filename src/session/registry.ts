@@ -9,7 +9,7 @@ import { ensureNavigation, initializeNavigation, stateOf } from "./controller.js
 import { isMainSession, runShutdownHousekeeping } from "./housekeeping.js";
 import type { SessionNavigation } from "./navigation.js";
 import type { ExtensionServices } from "./services.js";
-import { agentEnd } from "./turn-end.js";
+import { agentEnd, settleContinuation } from "./turn-end.js";
 import { beforeAgentStart, releasePending, toolCall } from "./turn-start.js";
 
 /** Why `/undo` or `/redo` cannot run now, or the navigation to run it on. */
@@ -41,7 +41,8 @@ export type SessionRegistry = {
   beforeAgentStart(typed: AnyContext): Promise<void>;
   agentStart(): void;
   toolCall(typed: AnyContext): Promise<void>;
-  agentEnd(typed: AnyContext): Promise<void>;
+  agentEnd(typed: AnyContext, willContinue?: boolean): Promise<void>;
+  settleContinuation(typed: AnyContext): Promise<void>;
   shutdown(): Promise<void>;
 };
 
@@ -105,6 +106,9 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     // Commands run even mid-stream: the turn's finalize only registers at
     // agent_end, so the guards below must be read after the idle wait.
     await waitForIdle();
+    // Idle with a turn still held for a continuation: it was skipped, or
+    // waits on async work. Record it before navigating past it.
+    await settleContinuation(services, typed);
     const state = sessions.get(sessionId);
     // Every session's: a session left by /new or /resume may still be taking
     // its after-snapshot of the shared workspace, and a restore written under
@@ -315,12 +319,18 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     sessionTree,
     rememberNavigationSource,
     adoptSwitchedSession,
-    beforeAgentStart: (typed) => beforeAgentStart(services, typed),
+    // Before `agent_start`: a new prompt, not the scheduled continuation.
+    beforeAgentStart: async (typed) => {
+      await settleContinuation(services, typed);
+      await beforeAgentStart(services, typed);
+    },
     agentStart: () => {
       services.flags.runOpen = true;
+      services.flags.continuing = false;
     },
     toolCall: (typed) => toolCall(services, typed),
-    agentEnd: (typed) => agentEnd(services, typed),
+    agentEnd: (typed, willContinue) => agentEnd(services, typed, willContinue),
+    settleContinuation: (typed) => settleContinuation(services, typed),
     shutdown,
   };
 }

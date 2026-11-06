@@ -14,15 +14,23 @@ export function registerEvents(
     track(() => registry.sessionStart(ctx), services.activeOperations),
   );
 
+  // A turn held open for a continuation ends at the leaf being left.
+  const settle = (_event: unknown, ctx: AnyContext) =>
+    track(() => registry.settleContinuation(ctx), services.activeOperations);
+  pi.on("session_before_tree", settle);
   pi.on("session_tree", (event, ctx) =>
     track(() => registry.sessionTree(ctx, event), services.activeOperations),
   );
 
+  const leaveSession = (event: unknown, ctx: AnyContext) => {
+    registry.rememberNavigationSource(event, ctx);
+    return settle(event, ctx);
+  };
   const adoptSwitchedSession = (_event: unknown, ctx: AnyContext) =>
     track(() => registry.adoptSwitchedSession(ctx), services.activeOperations);
-  pi.on("session_before_switch", registry.rememberNavigationSource);
+  pi.on("session_before_switch", leaveSession);
   pi.on("session_switch", adoptSwitchedSession);
-  pi.on("session_before_branch", registry.rememberNavigationSource);
+  pi.on("session_before_branch", leaveSession);
   pi.on("session_branch", adoptSwitchedSession);
 
   pi.on("before_agent_start", (_event, ctx) =>
@@ -35,8 +43,10 @@ export function registerEvents(
   // `tool_call` gate before executing. Returning undefined never blocks it.
   pi.on("tool_call", (_event, ctx) => registry.toolCall(ctx));
 
-  pi.on("agent_end", (_event, ctx) =>
-    track(() => registry.agentEnd(ctx), services.activeOperations),
+  // `willContinue`: the host already scheduled a retry or continuation, which
+  // is not a settle; the turn stays open for its edits.
+  pi.on("agent_end", (event, ctx) =>
+    track(() => registry.agentEnd(ctx, event.willContinue === true), services.activeOperations),
   );
 
   pi.on("session_shutdown", () => registry.shutdown());

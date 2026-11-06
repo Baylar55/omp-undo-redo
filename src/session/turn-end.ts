@@ -239,10 +239,16 @@ async function finalizeTurn(
   await recordSessionOnly(services, typed, sessionId, completed);
 }
 
-export async function agentEnd(services: ExtensionServices, typed: AnyContext): Promise<void> {
-  // Every agent_end, `willContinue` too: the turn is finalized below, so an
-  // automatic continuation's own prompt or steer opens a new one.
+export async function agentEnd(
+  services: ExtensionServices,
+  typed: AnyContext,
+  willContinue = false,
+): Promise<void> {
   services.flags.runOpen = false;
+  // Not a settle: the continuation's edits belong to this turn, and its own
+  // agent_end (or settleContinuation, if it never starts) finalizes it.
+  services.flags.continuing = willContinue;
+  if (willContinue) return;
   services.flags.turnOpen = false;
   const sessionId = typed.sessionManager.getSessionId();
   // A lookup, not stateOf: a turn with no record (a subagent's) has nothing to
@@ -268,4 +274,11 @@ export async function agentEnd(services: ExtensionServices, typed: AnyContext): 
     typed.sessionManager.getLeafId(),
     turnStartLeaf,
   );
+}
+
+/** A scheduled continuation can be skipped (an aborted retry, an async wake
+ *  that never comes). A prompt, command or navigation reaching a turn still
+ *  held open for one ends that turn first, at the current leaf. */
+export function settleContinuation(services: ExtensionServices, typed: AnyContext): Promise<void> {
+  return services.flags.continuing ? agentEnd(services, typed) : Promise.resolve();
 }

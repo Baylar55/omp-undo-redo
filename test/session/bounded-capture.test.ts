@@ -330,8 +330,8 @@ describe("bounded capture lifecycle", () => {
       await writeFile(join(cwd, "other.txt"), "steered\n");
       ctx.leaf = "r1";
       await pi.emit("agent_end", ctx, { type: "agent_end", willContinue: true });
-      // Run 2: an automatic continuation (agent_start with no prompt of its
-      // own) that is then steered: the steer opens its turn.
+      // An automatic continuation (agent_start with no prompt of its own),
+      // then steered: both belong to run 1's turn.
       await pi.emit("agent_start", ctx);
       ctx.leaf = "s2";
       await pi.emit("before_agent_start", ctx);
@@ -339,14 +339,80 @@ describe("bounded capture lifecycle", () => {
       ctx.leaf = "r2";
       await pi.emit("agent_end", ctx);
       await pi.runCommand("undo", ctx);
-      expect(ctx.leaf).toBe("s2");
-      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("run 1\n");
-      await pi.runCommand("undo", ctx);
       expect(ctx.leaf).toBe("p1");
       await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
       await expect(readFile(join(cwd, "other.txt"), "utf8")).rejects.toThrow();
       await pi.runCommand("undo", ctx);
       expect(ctx.ui.notifications.at(-1)?.message).toContain("Nothing to undo");
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("keeps an automatic retry's edits in the turn it continues", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "retried-run");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      ctx.leaf = "p1";
+      await pi.emit("before_agent_start", ctx);
+      await pi.emit("agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "first\n");
+      ctx.leaf = "e1";
+      await pi.emit("agent_end", ctx, { type: "agent_end", willContinue: true });
+      await pi.emit("agent_start", ctx);
+      await writeFile(join(cwd, "other.txt"), "retried\n");
+      ctx.leaf = "r1";
+      await pi.emit("agent_end", ctx);
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("p1");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
+      await expect(readFile(join(cwd, "other.txt"), "utf8")).rejects.toThrow();
+      await pi.emit("session_shutdown", ctx);
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("ends a turn whose scheduled continuation never started", async () => {
+    const cwd = await makeRepository();
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = context(cwd, "skipped-continuation");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      await pi.emit("session_start", ctx);
+      ctx.leaf = "p1";
+      await pi.emit("before_agent_start", ctx);
+      await pi.emit("agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "turn 1\n");
+      ctx.leaf = "r1";
+      await pi.emit("agent_end", ctx, { type: "agent_end", willContinue: true });
+      // The retry was skipped; the user's next prompt is its own turn.
+      ctx.leaf = "p2";
+      await pi.emit("before_agent_start", ctx);
+      await pi.emit("agent_start", ctx);
+      await writeFile(join(cwd, "other.txt"), "turn 2\n");
+      ctx.leaf = "r2";
+      await pi.emit("agent_end", ctx, { type: "agent_end", willContinue: true });
+      // Its continuation is skipped too: /undo settles it first.
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("p2");
+      await expect(readFile(join(cwd, "other.txt"), "utf8")).rejects.toThrow();
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("turn 1\n");
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe("p1");
+      await expect(readFile(join(cwd, "tracked.txt"), "utf8")).resolves.toBe("base\n");
       await pi.emit("session_shutdown", ctx);
     } finally {
       await rmRetry(cwd);
