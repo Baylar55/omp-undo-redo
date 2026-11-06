@@ -24,7 +24,13 @@ import {
 import type { GitRunner } from "../../src/types.js";
 import { makeRepository } from "../helpers/index.js";
 import { canonicalCwd, storeRootDirectory } from "../../src/infra/paths.js";
-import { privateRepositoryPath } from "../../src/store/setup.js";
+import {
+  privateRepositoryPath,
+  STORE_HOST_KEY,
+  STORE_VOLUME_KEY,
+  volumeOf,
+} from "../../src/store/setup.js";
+import { localStoreHost } from "../../src/store/host-identity.js";
 import {
   ensureGitSnapshotStore,
   GIT_STORE_SOURCE_KEY,
@@ -143,6 +149,49 @@ describe("private per-workspace git repositories", () => {
       await rm(storeRoot, { recursive: true, force: true });
     }
   });
+
+  it.each(["private", "git"] as const)(
+    "stamps a %s store with this machine and its source's volume, older stores on relaunch",
+    async (kind) => {
+      const cwd =
+        kind === "git" ? await makeRepository() : await mkdtemp(join(tmpdir(), "omp-stamp-"));
+      const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+      try {
+        let source = await realpath(cwd);
+        const ensure = async (): Promise<string | null | undefined> => {
+          if (kind === "private") {
+            return (await ensurePrivateGitRepository(factory, cwd, storeRoot))?.gitDir;
+          }
+          const resolved = await resolveRepository(createGitRunner(cwd));
+          if (!("repository" in resolved)) throw new Error("not a repository");
+          source = resolved.repository.commonDir;
+          return ensureGitSnapshotStore(factory, resolved.repository, storeRoot);
+        };
+        const gitDir = await ensure();
+        if (!gitDir) throw new Error("store setup failed");
+        const stamps = async () => [
+          await storeConfig(gitDir, STORE_HOST_KEY),
+          await storeConfig(gitDir, STORE_VOLUME_KEY),
+        ];
+        const expected = [
+          { code: 0, value: await localStoreHost() },
+          { code: 0, value: await volumeOf(source) },
+        ];
+        expect(expected[0].value).toMatch(/^[0-9a-f]{64}$/);
+        expect(expected[1].value).toMatch(/^\d+:\d+$/);
+        expect(await stamps()).toEqual(expected);
+        // As an earlier version left it: no stamps.
+        for (const key of [STORE_HOST_KEY, STORE_VOLUME_KEY]) {
+          await gitInStore(cwd, gitDir, ["config", "--unset", key]);
+        }
+        expect(await ensure()).toBe(gitDir);
+        expect(await stamps()).toEqual(expected);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("sets up with a hooks-only init template and recreates a missing info/", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-template-"));

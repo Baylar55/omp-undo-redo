@@ -77,6 +77,20 @@ Replace the placeholders with the exact ref and object ID printed by the first c
 > **Warning**
 > On Windows and macOS, never copy or share the `omp-undo-redo/host-id` file (in `%LOCALAPPDATA%` or `~/Library/Application Support`) between machines: cloned virtual machines, synced dotfiles, shared network homes. Two machines with the same host ID and hostname working in the same repository look like one machine, so each treats the other's live sessions as dead and deletes their pending checkpoint refs. On Linux the boot ID marks the other machine as remote, so its pending refs are removed only after it goes 7 days without refreshing them (for example, while suspended mid-turn).
 
+## Snapshot stores of another machine
+
+Every store records the machine that last opened it as `omp-undo-redo.host` in its `config`, and a machine evicts only stores it stamped (or that no version stamped yet). A store of a retired machine, or one stamped before this machine's hostname or `omp-undo-redo/host-id` file changed, is therefore never evicted once its workspace is gone, until that workspace is opened again (which restamps it). To reclaim it, stop every OMP and Pi process on every machine that shares the store root, check that the store's source (`core.worktree` or `omp-undo-redo.commondir` in `<storeRoot>/repos/<hash>.git/config`) is gone on the machine that used it, then delete that `<hash>.git` directory. Deleting it removes its undo history for good.
+
+## Recovering a store set aside by eviction
+
+Eviction renames a store to `<storeRoot>/repos/<hash>.git.evicted-<ms>` (`<ms>` is when, in milliseconds since 1970) and deletes it 7 days after that. Until then it can be put back:
+
+1. Stop every OMP and Pi process on every machine that shares the store root.
+2. If `<hash>.git` exists again (the workspace was opened since and got a new store), move it out of `repos/`. Its history covers only the turns since; those sessions then resume without file undo.
+3. Rename `<hash>.git.evicted-<ms>` back to `<hash>.git`.
+
+This also recovers a store an earlier version set aside while its workspace was in use on another machine, or on a drive that was unplugged at the time.
+
 ## A `runtime/<pid>/` directory without `runtime.json`
 
 A `runtime/<pid>/` directory without a `runtime.json` marker is never replaced or deleted, so a process given that pid publishes no runtime action state (logged as `runtime-dir-foreign` with `OMP_UNDO_REDO_DEBUG=1`). Undo and redo work as usual. Version 1.7.0 and earlier could leave such a directory after a crash or a shutdown that could not delete every file; it holds only `sessions/` and `.tmp` files and is safe to delete by hand.

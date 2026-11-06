@@ -1,13 +1,20 @@
 import { realpath } from "node:fs";
 import { readdir, rename, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, parse } from "node:path";
 import { promisify } from "node:util";
 import { refusedPrivateWorkspace } from "../private-store.js";
 import type { CwdGitRunnerFactory } from "../../types.js";
 import { canonicalCwd, storeRootDirectory } from "../../infra/paths.js";
 import { RETRY_DELAY_MS, removeDirWithRetry } from "../../infra/fs.js";
-import { setupFinished, storeHasRefs } from "../setup.js";
+import {
+  STORE_HOST_KEY,
+  STORE_VOLUME_KEY,
+  readStoreConfig,
+  setupFinished,
+  storeHasRefs,
+} from "../setup.js";
 import { GIT_STORE_SOURCE_KEY } from "../git-store.js";
+import { localStoreHost } from "../host-identity.js";
 
 /** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */
 const nativeRealpath = promisify(realpath.native);
@@ -21,9 +28,11 @@ const EVICTION_IDLE_CUTOFF_MS = 24 * 60 * 60 * 1000;
  *  before any bytes are removed. */
 const EVICTION_TRASH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Newest mtime across `dir` and its direct children. Git writes land in
- *  descendants (logs, packs, COMMIT_EDITMSG), not necessarily the root, so
- *  the root mtime alone under-reports recent activity. Returns null when
+/** Newest mtime across `dir`, its direct children, and the owner leases and
+ *  session heartbeats under `omp-undo-redo/`. Git writes land in descendants
+ *  (logs, packs, COMMIT_EDITMSG), not necessarily the root, so the root mtime
+ *  alone under-reports recent activity; a live owner that takes no turns only
+ *  beats its lease (hourly) and heartbeat, two levels down. Returns null when
  *  freshness cannot be determined; callers must then not evict. */
 async function lastActivityMs(dir: string): Promise<number | null> {
   let newest: number | null = null;
@@ -35,22 +44,64 @@ async function lastActivityMs(dir: string): Promise<number | null> {
   } catch {
     return null;
   }
-  let children: string[];
-  try {
-    children = await readdir(dir);
-  } catch {
-    return newest;
-  }
+  let unknown = false;
+  const scan = async (parent: string): Promise<void> => {
+    let children: string[];
+    try {
+      children = await readdir(parent);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") unknown = true;
+      return;
+    }
+    await Promise.all(
+      children.map(async (name) => {
+        try {
+          consider((await stat(join(parent, name))).mtimeMs);
+        } catch (err) {
+          // Gone since the listing (a temp renamed into place) is no beat;
+          // anything else (EBUSY, EPERM, EIO) may hide a fresh one.
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT" && code !== "ENOTDIR") unknown = true;
+        }
+      }),
+    );
+  };
   await Promise.all(
-    children.map(async (name) => {
-      try {
-        consider((await stat(join(dir, name))).mtimeMs);
-      } catch {
-        // Ignore
-      }
-    }),
+    [dir, join(dir, "omp-undo-redo", "owners"), join(dir, "omp-undo-redo", "history")].map(scan),
   );
-  return newest;
+  return unknown ? null : newest;
+}
+
+/** Whether the volume `source` was on is present, so that its absence means
+ *  the source is gone: an unplugged drive, a disconnected mapped drive or an
+ *  unmounted mount point also reads ENOENT. `volume` is the store's
+ *  `STORE_VOLUME_KEY`: the mount root is that many levels above `source`, and
+ *  is mounted when it holds another device than its parent (an empty mount
+ *  point does not) or is a filesystem root that exists. */
+async function volumePresent(source: string, volume: string | undefined): Promise<boolean> {
+  const recorded = /^(\d+):(\d+)$/.exec(volume ?? "");
+  let root = source;
+  if (recorded) {
+    for (let levels = Number(recorded[2]); levels > 0; levels -= 1) root = dirname(root);
+  } else {
+    // Set up by an earlier version: only the filesystem root can be checked.
+    // A path of another platform (`C:\…` on POSIX, `/…` on Windows) is never
+    // gone here.
+    root = parse(source).root;
+    if (!isAbsolute(source) || (process.platform === "win32" && root.length < 3)) return false;
+  }
+  try {
+    const own = await stat(root);
+    // On Windows the device is the volume serial: another volume given the
+    // same drive letter is not this one. POSIX device numbers can change
+    // across reboots (btrfs, NFS, disk order), so only the mount check runs.
+    if (recorded && process.platform === "win32" && String(own.dev) !== recorded[1]) return false;
+    const parent = dirname(root);
+    return parent === root || own.dev !== (await stat(parent)).dev;
+  } catch {
+    return false;
+  }
 }
 
 /** Path whose disappearance means a store is abandoned: a private repo's
@@ -99,7 +150,10 @@ export async function storeSource(
  *  trash for EVICTION_TRASH_RETENTION_MS instead of being deleted outright.
  *  A store whose setup never finished names no source; it is evicted on
  *  idleness alone, and only while it holds no refs. A private store of a
- *  workspace `refusedPrivateWorkspace` rejects is evicted on idleness alone. */
+ *  workspace `refusedPrivateWorkspace` rejects is evicted on idleness alone.
+ *  A store stamped by another machine (`STORE_HOST_KEY`) is that machine's
+ *  to judge and is never evicted here; an unstamped one (set up by an earlier
+ *  version and not opened since) is judged as before. */
 export async function evictStalePrivateRepos(
   gitRunnerFactory: CwdGitRunnerFactory,
   busy: () => boolean,
@@ -120,6 +174,7 @@ export async function evictStalePrivateRepos(
   if (busy()) return;
 
   const now = Date.now();
+  const host = await localStoreHost();
   for (const entry of entries) {
     const path = join(reposDir, entry);
     const trashMatch = /\.evicted-(\d+)$/.exec(entry);
@@ -147,6 +202,14 @@ export async function evictStalePrivateRepos(
       } catch {
         // No pidfile.
       }
+      // Another machine's store: whether its source exists, and whether it
+      // is a refused workspace, only that machine can tell. An unreadable
+      // config hides the stamp, so the store is kept.
+      const config = await readStoreConfig(path);
+      if (config === null) continue;
+      const storeHost = config.get(STORE_HOST_KEY);
+      if (storeHost !== undefined && storeHost !== host) continue;
+      const volume = config.get(STORE_VOLUME_KEY);
       const found = await storeSource(reposDir, path, gitRunnerFactory);
       if (found) {
         const source = found.path;
@@ -158,8 +221,13 @@ export async function evictStalePrivateRepos(
             const code = (err as NodeJS.ErrnoException | undefined)?.code;
             // Anything else (EACCES, EBUSY, EIO, EMFILE...) means "cannot
             // tell", which must never be read as "gone".
-            return code === "ENOENT" || code === "ENOTDIR";
+            if (code !== "ENOENT" && code !== "ENOTDIR") return false;
           }
+          // Stamped by this version without a volume (unreadable at setup):
+          // an unplugged drive cannot be told from a deleted source, so it is
+          // kept until a launch records one. Unstamped: judged as before.
+          if (storeHost !== undefined && volume === undefined) return false;
+          return volumePresent(source, volume);
         };
         // A private store of a refused workspace (left by an earlier
         // version) is never used again, so it counts as abandoned. v1.5.0

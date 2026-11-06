@@ -9,7 +9,7 @@ import { IndexLeasePool } from "../snapshot/index-leases.js";
 import { defaultGitRunnerFactory } from "../store/backend.js";
 import type { FileBackend, PrivateRepoEntry } from "../store/backend.js";
 import { snapshotRunnerEnv } from "../store/git-store.js";
-import { localRuntimeScope, resolvePersistentHostId } from "../store/host-identity.js";
+import { localHostIdentity, localRuntimeScope } from "../store/host-identity.js";
 import { GcQueue } from "../store/maintenance/gc.js";
 import { CheckpointOwnerRegistry } from "../store/owners.js";
 import type {
@@ -148,7 +148,7 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     return gitRunnerFactory(repository.worktree, snapshotRunnerEnv(repository));
   }
   const ownerRegistry = new CheckpointOwnerRegistry({
-    resolveHostIdentity: resolvePersistentHostId,
+    resolveHostIdentity: localHostIdentity,
     resolveRuntimeScope: localRuntimeScope,
   });
   const runtimeStore = new RuntimeActionStateStore({ resolveRuntimeScope: localRuntimeScope });

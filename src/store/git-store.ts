@@ -16,7 +16,9 @@ import {
   setUpStore,
   applyConfig,
   ensureStoreHooksPath,
+  ensureStoreStamps,
   storeHooksConfig,
+  storeStampConfig,
   storeInitArgs,
   readStoreConfig,
   storeHasRefs,
@@ -120,18 +122,23 @@ export async function ensureGitSnapshotStore(
         });
         return init.code === 0;
       },
-      () =>
+      async () =>
         applyConfig(storeGit, [
           ["core.sharedRepository", "0600"],
           // Only the extension's own git reads these refs, so paths past
           // MAX_PATH cannot hide them from anyone's gc.
           ["core.longpaths", "true"],
           storeHooksConfig(storeDir),
+          ...(await storeStampConfig(repository.commonDir)),
           // Last: `setupFinished` reads it as proof the rest ran.
           [GIT_STORE_SOURCE_KEY, repository.commonDir],
         ]),
-      // Stores set up by earlier versions run hooks until this is set.
-      () => ensureStoreHooksPath(storeGit, storeDir),
+      // Stores set up by earlier versions run hooks and name no machine or
+      // volume until these are set.
+      async () => {
+        await ensureStoreHooksPath(storeGit, storeDir);
+        await ensureStoreStamps(storeGit, storeDir, repository.commonDir);
+      },
     );
     return ready ? storeDir : null;
   } catch {

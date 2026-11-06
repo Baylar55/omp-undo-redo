@@ -11,8 +11,9 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { hostname, tmpdir } from "node:os";
+import { basename, dirname, join, parse } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { createGitRunner } from "../../src/infra/git-runner.js";
 import { ensurePrivateGitRepository } from "../../src/store/private-store.js";
@@ -28,7 +29,14 @@ import {
   type TestContext,
 } from "../helpers/index.js";
 import { storeRootDirectory, checkpointNamespace } from "../../src/infra/paths.js";
-import { privateRepositoryPath } from "../../src/store/setup.js";
+import {
+  privateRepositoryPath,
+  STORE_HOST_KEY,
+  STORE_VOLUME_KEY,
+  volumeOf,
+} from "../../src/store/setup.js";
+import { evictStalePrivateRepos } from "../../src/store/maintenance/eviction.js";
+import { localHostIdentity, localStoreHost } from "../../src/store/host-identity.js";
 import {
   deleteRefsBatched,
   gcPendingPath,
@@ -62,14 +70,16 @@ async function withHermeticStore(run: (reposDir: string) => Promise<void>): Prom
   }
 }
 
-/** Backdates a repo past the 24h eviction idle cutoff, mirroring the
- *  lastActivityMs depth (repo root + direct children). */
+/** Backdates a whole repo past the 24h eviction idle cutoff: lastActivityMs
+ *  also reads the owner leases and heartbeats under `omp-undo-redo/`. A sweep
+ *  still running may rename the repo away meanwhile, which is not an error. */
 async function backdateRepo(gitDir: string): Promise<void> {
   const stale = new Date(Date.now() - 25 * 60 * 60 * 1000);
-  await utimes(gitDir, stale, stale);
-  for (const child of await readdir(gitDir)) {
-    await utimes(join(gitDir, child), stale, stale);
+  const children = await readdir(gitDir, { recursive: true }).catch(() => [] as string[]);
+  for (const child of children) {
+    await utimes(join(gitDir, child), stale, stale).catch(() => undefined);
   }
+  await utimes(gitDir, stale, stale).catch(() => undefined);
 }
 
 /** Polls until predicate holds or the window lapses (housekeeping runs
@@ -197,14 +207,15 @@ describe("private-repo housekeeping", () => {
         // runTurns' agent_end awaits finalize, so the private repo exists
         // deterministically the moment the turn completes.
         expect(await readdir(reposDir)).toHaveLength(1);
-        // The workspace disappears; the repo was captured seconds ago, so
-        // backdate its mtimes past the 24h idle cutoff to make abandonment
-        // decidable within the test.
+        // The workspace disappears. Shutdown beats the session's heartbeat
+        // and lease, so the 24h idle cutoff runs from there: backdate every
+        // mtime past it afterwards, then let a fresh boot sweep decide.
         await rmRetry(cwd);
         const [repoEntry] = await readdir(reposDir);
         const gitDir = join(reposDir, repoEntry);
-        await backdateRepo(gitDir);
         await pi.emit("session_shutdown", ctx);
+        await backdateRepo(gitDir);
+        ompUndoRedo(new FakeExtensionApi() as never, {});
         let trash = "";
         expect(
           await waitFor(async () => {
@@ -250,8 +261,9 @@ describe("private-repo housekeeping", () => {
         const ctx = context(cwd, "evict-abandoned-session");
         await runTurns(pi, ctx, 1, "tracked.txt");
         await rmRetry(cwd);
-        await backdateRepo(gitDir);
         await pi.emit("session_shutdown", ctx);
+        await backdateRepo(gitDir);
+        ompUndoRedo(new FakeExtensionApi() as never, {});
         expect(
           await waitFor(async () =>
             (await readdir(reposDir)).some((name) => /\.evicted-\d+$/.test(name)),
@@ -465,6 +477,192 @@ describe("private-repo housekeeping", () => {
       }
     });
   });
+
+  /** An idle store named `entry` whose config holds `entries`. Swept
+   *  directly: no session can race the assertion. */
+  async function idleStore(
+    reposDir: string,
+    entry: string,
+    entries: ReadonlyArray<readonly [string, string]>,
+  ): Promise<string> {
+    const gitDir = join(reposDir, entry);
+    await mkdir(gitDir, { recursive: true });
+    await writeFile(join(gitDir, "config"), "");
+    for (const [key, value] of entries) {
+      await createGitRunner(reposDir)(["config", "--file", join(gitDir, "config"), key, value]);
+    }
+    await backdateRepo(gitDir);
+    return gitDir;
+  }
+
+  /** Sweeps once; returns which of `entries` were evicted. */
+  async function sweep(reposDir: string, entries: string[]): Promise<Record<string, boolean>> {
+    await evictStalePrivateRepos(
+      (cwd, env) => createGitRunner(cwd, env ? { env } : undefined),
+      () => false,
+    );
+    const left = await readdir(reposDir);
+    return Object.fromEntries(
+      entries.map((entry) => [entry, left.some((name) => name.startsWith(`${entry}.evicted-`))]),
+    );
+  }
+
+  it("evicts an idle store only on the machine that stamped it, on every branch", async () => {
+    // A store root shared between machines (NFS/SMB home, WSL and Windows):
+    // a workspace missing here may be live on the machine that uses the store.
+    const local = await localStoreHost();
+    const { id } = await localHostIdentity();
+    expect(local).not.toBeNull();
+    // A shared home shares the host-id file: only the hostname differs.
+    const sharedHome = createHash("sha256").update(`${id}\0not-${hostname()}`).digest("hex");
+    const foreign = createHash("sha256").update(randomUUID()).digest("hex");
+    await withHermeticStore(async (reposDir) => {
+      const parent = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-host-"));
+      try {
+        const gone = join(parent, "gone");
+        // `gone` was one level below `parent`, on its volume.
+        const [dev, levels] = (await volumeOf(parent))!.split(":").map(Number);
+        const goneVolume = `${dev}:${levels + 1}`;
+        // A refused workspace (a filesystem root) and an unfinished setup
+        // are evicted on idleness alone, without a source check.
+        const root = parse(parent).root;
+        const stores: Record<string, Array<[string, string]>> = {};
+        for (const [name, host] of [
+          ["mine", local!],
+          ["foreign", foreign],
+          ["sharedHome", sharedHome],
+        ] as const) {
+          stores[`${name}-gone`] = [
+            [STORE_HOST_KEY, host],
+            [STORE_VOLUME_KEY, goneVolume],
+            ["core.worktree", gone],
+          ];
+          stores[`${name}-refused`] = [
+            [STORE_HOST_KEY, host],
+            ["core.worktree", root],
+          ];
+          stores[`${name}-unfinished`] = [[STORE_HOST_KEY, host]];
+        }
+        // Stamped by this version but its volume unreadable at setup: an
+        // unplugged drive cannot be told from a deleted source.
+        stores["mine-noVolume"] = [
+          [STORE_HOST_KEY, local!],
+          ["core.worktree", gone],
+        ];
+        const entries = Object.keys(stores).map((name) => `${name}.git`);
+        for (const [name, config] of Object.entries(stores)) {
+          await idleStore(reposDir, `${name}.git`, config);
+        }
+        const evicted = await sweep(reposDir, entries);
+        expect(evicted).toEqual(
+          Object.fromEntries(
+            entries.map((entry) => [
+              entry,
+              entry.startsWith("mine-") && entry !== "mine-noVolume.git",
+            ]),
+          ),
+        );
+      } finally {
+        await rm(parent, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+  });
+
+  it.each([
+    ["an owner lease", ["omp-undo-redo", "owners"], `${randomUUID()}.json`],
+    ["a session heartbeat", ["omp-undo-redo", "history"], ".active.abc"],
+  ])("keeps an idle store with %s that beat recently", async (_, dirs, file) => {
+    // Leases and heartbeats beat two levels down, under the store root's
+    // direct children, and are the only writes of an owner taking no turns.
+    await withHermeticStore(async (reposDir) => {
+      const parent = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-lease-"));
+      try {
+        const entry = `${"c".repeat(64)}.git`;
+        const gitDir = await idleStore(reposDir, entry, [["core.worktree", join(parent, "gone")]]);
+        const beat = join(gitDir, ...dirs, file);
+        await mkdir(dirname(beat), { recursive: true });
+        await writeFile(beat, "{}");
+        // Everything else, its directories included, stays a day old.
+        await backdateRepo(gitDir);
+        const now = new Date();
+        await utimes(beat, now, now);
+        expect(await sweep(reposDir, [entry])).toEqual({ [entry]: false });
+      } finally {
+        await rm(parent, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+  });
+
+  it("evicts an idle store whose source is gone from its volume, not one whose volume is away", async () => {
+    await withHermeticStore(async (reposDir) => {
+      const parent = await mkdtemp(join(tmpdir(), "omp-undo-redo-evict-volume-"));
+      try {
+        const deleted = join(parent, "deleted");
+        await mkdir(deleted);
+        const volume = await volumeOf(deleted);
+        expect(volume).toMatch(/^\d+:\d+$/);
+        await rm(deleted, { recursive: true });
+        const [dev, levels] = volume!.split(":").map(Number);
+        // An unmounted mount point: `mnt` is the recorded mount root, but it is
+        // now an empty directory on its parent's device.
+        await mkdir(join(parent, "mnt"));
+        const stores: Record<string, Array<[string, string]>> = {
+          deleted: [
+            ["core.worktree", deleted],
+            [STORE_VOLUME_KEY, volume!],
+          ],
+          unmounted: [
+            ["core.worktree", join(parent, "mnt", "proj")],
+            [STORE_VOLUME_KEY, `${dev}:1`],
+          ],
+          // Another volume under the recorded root: on Windows the device is
+          // the volume serial (a reused drive letter); POSIX does not compare.
+          otherVolume: [
+            ["core.worktree", join(parent, "other")],
+            [STORE_VOLUME_KEY, `${dev + 1}:${levels}`],
+          ],
+        };
+        for (const [name, config] of Object.entries(stores)) {
+          await idleStore(reposDir, `${name}.git`, config);
+        }
+        expect(await sweep(reposDir, ["deleted.git", "unmounted.git", "otherVolume.git"])).toEqual({
+          "deleted.git": true,
+          "unmounted.git": false,
+          "otherVolume.git": process.platform !== "win32",
+        });
+      } finally {
+        await rm(parent, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+  });
+
+  it.runIf(process.platform === "win32")(
+    "keeps an idle store set up before volumes were recorded on a missing drive or a POSIX path",
+    async () => {
+      // `stat("Q:\\proj")` reads ENOENT when Q: is unplugged, not just gone;
+      // `/home/u/proj` (a WSL store) resolves against the current drive.
+      let drive = "";
+      for (const letter of "ZYXWVUTSRQPONMLKJIHG") {
+        const missing = await stat(`${letter}:\\`).then(
+          () => false,
+          () => true,
+        );
+        if (missing) {
+          drive = letter;
+          break;
+        }
+      }
+      expect(drive).not.toBe("");
+      await withHermeticStore(async (reposDir) => {
+        await idleStore(reposDir, "drive.git", [["core.worktree", `${drive}:\\proj`]]);
+        await idleStore(reposDir, "posix.git", [["core.worktree", "/home/omp-gone/proj"]]);
+        expect(await sweep(reposDir, ["drive.git", "posix.git"])).toEqual({
+          "drive.git": false,
+          "posix.git": false,
+        });
+      });
+    },
+  );
 
   it("evicts an idle private store an earlier version made for the home directory", async () => {
     await withHermeticStore(async (reposDir) => {

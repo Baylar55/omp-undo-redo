@@ -338,9 +338,36 @@ the next launch.
 
 Stale stores whose workspace (Private-Git) or repository (Git mode) has disappeared are evicted
 conservatively: the source must read as missing on two checks moments apart, the store must be
-idle for at least 24 hours, and no capture, finalization, or `git gc` may be in flight. Eviction
-renames the store to `<hash>.git.evicted-<timestamp>` and removes its contents only after 7 days,
-so a transient mount, lock, or permission hiccup can never cost undo history.
+idle for at least 24 hours (owner leases and session heartbeats count as activity), and no
+capture, finalization, or `git gc` may be in flight. Eviction renames the store to
+`<hash>.git.evicted-<timestamp>` and removes its contents only after 7 days, so a transient mount,
+lock, or permission hiccup can never cost undo history.
+
+Each launch records two stamps in the store's `config`, which earlier stores receive the next time
+they are opened:
+
+- `omp-undo-redo.host`: the machine that last opened the store, a hash of its persistent host ID
+  and hostname. A sweep skips stores stamped by another machine, since on a store root shared
+  between machines (an NFS/SMB home, WSL and Windows) a path missing on one may be live on the
+  other. Two machines that share both the host-id file and the hostname (see the
+  [host-id warning](./troubleshooting.md#inspecting-and-deleting-checkpoint-refs-by-hand)) still
+  look like one.
+- `omp-undo-redo.volume`: the source's device and how many levels up its mount root is. A missing
+  source counts as gone only while that mount root is mounted (it holds another device than its
+  parent, or is an existing filesystem root), so an unplugged drive or unmounted mount point keeps
+  its store. On Windows the device is the volume serial, so another volume given the same drive
+  letter does not count; POSIX device numbers can change across reboots and are not compared.
+
+A store stamped with a host but no volume (unreadable at setup) is kept while its source is missing,
+until a launch records one. A store not yet stamped is judged as before: its source counts as gone
+when the path's filesystem root exists (a drive letter or UNC share on Windows; never a `/…` path
+there). A store whose `config` cannot be read is kept.
+
+A store stamped by another machine (or by this one before its hostname or host-id file changed) is
+never evicted here; see
+[Snapshot stores of another machine](./troubleshooting.md#snapshot-stores-of-another-machine). To
+put back a store already set aside, see
+[Recovering a store set aside by eviction](./troubleshooting.md#recovering-a-store-set-aside-by-eviction).
 
 ### Checkpoint refs and owner leases
 

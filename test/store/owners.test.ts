@@ -743,13 +743,16 @@ describe("owner liveness", () => {
 
   it("reuses a persistent host ID and does not overwrite malformed state", async () => {
     const home = await mkdtemp(join(tmpdir(), "omp-host-test-"));
+    // Empty env: test/setup.ts points XDG_STATE_HOME at a shared scratch dir.
     const first = await resolvePersistentHostId({
       platform: "linux",
+      env: {},
       homeDirectory: home,
       randomId: () => hostA,
     });
     const second = await resolvePersistentHostId({
       platform: "linux",
+      env: {},
       homeDirectory: home,
       randomId: () => ownerA,
     });

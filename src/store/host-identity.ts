@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, readFile, readlink, rm } from "node:fs/promises";
-import { homedir, platform } from "node:os";
+import { homedir, hostname, platform } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { writeExclusive } from "../infra/fs.js";
@@ -156,4 +156,26 @@ let localScope: Promise<string | null> | undefined;
  *  macOS it spawns a process): every reader compares against one value. */
 export function localRuntimeScope(): Promise<string | null> {
   return (localScope ??= resolveRuntimeScope().catch(() => null));
+}
+
+let localIdentity: Promise<HostIdentity> | undefined;
+/** This host's persistent identity, resolved once per process. */
+export function localHostIdentity(): Promise<HostIdentity> {
+  return (localIdentity ??= resolvePersistentHostId().catch(() => ({
+    id: null,
+    persistent: false,
+  })));
+}
+
+/** This machine as a snapshot store records it: its persistent host ID with
+ *  its hostname, hashed, as an owner lease tells hosts apart. The ID alone is
+ *  shared by machines sharing a home directory, where Linux and macOS keep it.
+ *  Null without a persistent ID. A hostname change only makes stores look
+ *  foreign until each is opened again (see `STORE_HOST_KEY`). `identity`
+ *  defaults to this process's; tests pass one kept out of the user's home. */
+export async function localStoreHost(identity?: HostIdentity): Promise<string | null> {
+  const { id, persistent } = identity ?? (await localHostIdentity());
+  return id && persistent
+    ? createHash("sha256").update(`${id}\0${hostname()}`).digest("hex")
+    : null;
 }

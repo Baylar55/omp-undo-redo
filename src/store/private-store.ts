@@ -13,7 +13,9 @@ import {
   setUpStore,
   applyConfig,
   ensureStoreHooksPath,
+  ensureStoreStamps,
   storeHooksConfig,
+  storeStampConfig,
   storeInitArgs,
 } from "./setup.js";
 
@@ -181,18 +183,21 @@ export async function ensurePrivateGitRepository(
       // does not create `info/`: `updateExclude` does that itself.
       async () => (await envGit(storeInitArgs(gitDir))).code === 0,
       // `core.worktree` goes last: `setupFinished` reads it as proof the rest ran.
-      () =>
+      async () =>
         applyConfig(envGit, [
           ...PRIVATE_REPO_CONFIG,
           storeHooksConfig(gitDir),
+          ...(await storeStampConfig(worktree)),
           ["core.worktree", worktree],
         ]),
       // Ensure repositories created by earlier versions write future objects
-      // owner-only and run no hooks. Not while "busy": the writes would contend
-      // for the config.lock a running setup needs.
+      // owner-only, run no hooks and name their machine and volume. Not while
+      // "busy": the writes would contend for the config.lock a running setup
+      // needs.
       async () => {
         await envGit(["config", "core.sharedRepository", "0600"]).catch(() => undefined);
         await ensureStoreHooksPath(envGit, gitDir);
+        await ensureStoreStamps(envGit, gitDir, worktree);
       },
     );
     if (!ready) return null;
