@@ -64,7 +64,8 @@ export type OmpUndoRedoDependencies = {
   gitRunnerFactory?: CwdGitRunnerFactory;
   /** How long the before_agent_start / agent_end / undo / redo handlers wait
    *  for an in-flight checkpoint capture before returning without it. The
-   *  capture keeps running and the turn is finalized when it settles. */
+   *  capture keeps running and the turn is finalized when it settles. Undo and
+   *  redo also wait this long for a started run's late `agent_end`. */
   captureDeadlineMs?: number;
   /** How long a `tool_call` waits for the turn's before-snapshot. Must stay
    *  under the host's 30 s `tool_call` cap, which blocks the tool on timeout. */
@@ -102,6 +103,11 @@ export type ExtensionServices = {
    *  turn starts also holds that turn's edits, which makes it unrestorable.
    *  Never reset, so a session start cannot make a stale value match again. */
   turnSequence: number;
+  /** Settles at the `agent_end` that closes the open run (`flags.runOpen`).
+   *  The host emits `agent_end` to extensions only after its own post-run
+   *  maintenance, so `/undo` can find the host idle with the run's turn not
+   *  yet claimed by a finalize; it waits on this. */
+  runEnd: PromiseWithResolvers<void>;
   /** Turn work (captures, finalizes, session events) shutdown waits on. */
   activeOperations: Set<Promise<void>>;
   /** Background store gcs and retention sweeps: shutdown never waits on them
@@ -172,6 +178,7 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     privateRetentionSweep: null,
     sessions: new Map(),
     turnSequence: 0,
+    runEnd: Promise.withResolvers<void>(),
     activeOperations: new Set(),
     housekeepingOperations: new Set(),
     expirationPromises: new Map(),

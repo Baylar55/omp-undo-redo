@@ -106,6 +106,17 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     // Commands run even mid-stream: the turn's finalize only registers at
     // agent_end, so the guards below must be read after the idle wait.
     await waitForIdle();
+    // The host emits `agent_end` to extensions only after its post-run
+    // maintenance (compaction, session_stop hooks) and behind other
+    // extensions' handlers, so its loop can be idle while this run's turn is
+    // still unclaimed. Navigating now would revert the turn before it, and
+    // the late finalize would then record this turn over the undone branch.
+    if (
+      services.flags.runOpen &&
+      (await timedOutAfter(services.runEnd.promise, services.captureDeadlineMs))
+    ) {
+      return { status: "finalizing" };
+    }
     // Idle with a turn still held for a continuation: it was skipped, or
     // waits on async work. Record it before navigating past it.
     await settleContinuation(services, typed);
@@ -325,6 +336,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       await beforeAgentStart(services, typed);
     },
     agentStart: () => {
+      if (!services.flags.runOpen) services.runEnd = Promise.withResolvers<void>();
       services.flags.runOpen = true;
       services.flags.continuing = false;
     },

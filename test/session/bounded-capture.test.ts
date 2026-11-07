@@ -929,6 +929,105 @@ describe("bounded capture lifecycle", () => {
     }
   });
 
+  it("refuses undo while the host is idle but the run's agent_end has not arrived", async () => {
+    // The host emits agent_end to extensions after its post-run maintenance,
+    // so its idle wait can resolve with turn 2 still unclaimed. Undoing then
+    // reverted turn 1, and turn 2's late finalize stranded it: redo found
+    // nothing and turn 1 could never be undone again.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-late-end-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { captureDeadlineMs: 200 });
+      const ctx = context(cwd, "late-end-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      const file = join(cwd, "tracked.txt");
+      const turn = async (leaf: string, content: string, end: boolean) => {
+        await pi.emit("before_agent_start", ctx);
+        await pi.emit("agent_start", ctx);
+        await pi.emit("tool_call", ctx);
+        await writeFile(file, content);
+        ctx.leaf = leaf;
+        if (end) await pi.emit("agent_end", ctx);
+      };
+      const undo = async (): Promise<string> => {
+        let message = "";
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+          await pi.runCommand("undo", ctx);
+          message = ctx.ui.notifications.at(-1)?.message ?? "";
+          if (!message.includes("still being")) break;
+          await sleep(50);
+        }
+        return message;
+      };
+      await pi.emit("session_start", ctx);
+      await writeFile(file, "base\n");
+      await turn("turn1", "one\n", true);
+      await turn("turn2", "two\n", false);
+
+      await pi.runCommand("undo", ctx);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("still being finalized");
+      expect(ctx.leaf).toBe("turn2");
+      await expect(readFile(file, "utf8")).resolves.toBe("two\n");
+
+      await pi.emit("agent_end", ctx);
+      expect(await undo()).toContain("file snapshot restored");
+      await expect(readFile(file, "utf8")).resolves.toBe("one\n");
+      expect(await undo()).toContain("file snapshot restored");
+      await expect(readFile(file, "utf8")).resolves.toBe("base\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("settles a turn a late willContinue agent_end holds before undoing past it", async () => {
+    // The run's late agent_end can schedule a continuation, which holds the
+    // turn open. Waiting for it must come before the continuation settle, or
+    // the settle sees nothing held and undo navigates past the open turn.
+    // Pins only that ordering, not what a continuation running afterwards does.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-late-continue-"));
+    try {
+      const pi = new FakeExtensionApi();
+      // Generous: every wait here ends on a real event, never on the deadline.
+      ompUndoRedo(pi as never, { captureDeadlineMs: 10_000 });
+      const ctx = context(cwd, "late-continue-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      const file = join(cwd, "tracked.txt");
+      const turn = async (leaf: string, content: string) => {
+        await pi.emit("before_agent_start", ctx);
+        await pi.emit("agent_start", ctx);
+        await pi.emit("tool_call", ctx);
+        await writeFile(file, content);
+        ctx.leaf = leaf;
+      };
+      await pi.emit("session_start", ctx);
+      await writeFile(file, "base\n");
+      await turn("turn1", "one\n");
+      await pi.emit("agent_end", ctx);
+      await turn("turn2", "two\n");
+
+      // The host loop is idle at once; the fake idle wait only signals that
+      // undo got past it, so agent_end lands while undo waits for it.
+      const idle = Promise.withResolvers<void>();
+      ctx.waitForIdle = async () => idle.resolve();
+      const undoRun = pi.runCommand("undo", ctx);
+      await idle.promise;
+      await sleep(20); // parked on the run's agent_end
+      await pi.emit("agent_end", ctx, { type: "agent_end", willContinue: true });
+      await undoRun;
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
+      expect(ctx.leaf).toBe("turn1");
+      await expect(readFile(file, "utf8")).resolves.toBe("one\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
   it("drops only the deferred turn whose after-snapshot raced the next turn", async () => {
     // Regression: a finalize waiting behind the previous turn's finalize left
     // its checkpoint in the pending slot, and the next before_agent_start

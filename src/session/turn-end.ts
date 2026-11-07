@@ -245,6 +245,7 @@ export async function agentEnd(
   willContinue = false,
 ): Promise<void> {
   services.flags.runOpen = false;
+  services.runEnd.resolve();
   // Not a settle: the continuation's edits belong to this turn, and its own
   // agent_end (or settleContinuation, if it never starts) finalizes it.
   services.flags.continuing = willContinue;
