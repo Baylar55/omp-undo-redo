@@ -1,4 +1,5 @@
 import { mkdir, readFile, rm, stat } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { writeJsonAtomic } from "../infra/fs.js";
 import { touchSessionHeartbeat } from "./liveness.js";
 import { readTombstone } from "./tombstones.js";
@@ -47,6 +48,11 @@ async function existingRefs(
 }
 
 export class SessionHistoryStore {
+  /** Set when a load failed for a reason that may be transient (a git or I/O
+   *  error, not corruption): the file on disk may still be good, so `save`
+   *  refuses to overwrite it with the rebuilt history until a load succeeds. */
+  private frozen = false;
+
   constructor(
     private readonly sessionId: string,
     private readonly repository: GitRepository,
@@ -54,6 +60,7 @@ export class SessionHistoryStore {
   ) {}
 
   async load(reader: SessionReader): Promise<HistoryLoadResult> {
+    this.frozen = false;
     const sessionHash = checkpointNamespace(this.sessionId);
     const dir = historyDirectory(this.repository);
     const tombstoneFile = tombstonePath(this.repository, this.sessionId);
@@ -63,8 +70,16 @@ export class SessionHistoryStore {
     }
 
     const path = historyPath(this.repository, this.sessionId);
-    const metadata = await stat(path).catch(() => null);
-    if (!metadata) return { status: "unavailable", reason: "missing" };
+    let metadata: Stats;
+    try {
+      metadata = await stat(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { status: "unavailable", reason: "missing" };
+      }
+      this.frozen = true;
+      return { status: "unavailable", reason: "unusable" };
+    }
     await touchSessionHeartbeat(dir, sessionHash);
     try {
       if (!metadata.isFile() || metadata.size > MAX_HISTORY_BYTES) {
@@ -75,7 +90,10 @@ export class SessionHistoryStore {
       if (!parsed) return { status: "unavailable", reason: "unusable" };
       const refPrefix = historyRefPrefix(parsed.sessionHash);
       const refs = await existingRefs(this.git, this.repository, refPrefix);
-      if (refs === null) return { status: "unavailable", reason: "unusable" };
+      if (refs === null) {
+        this.frozen = true;
+        return { status: "unavailable", reason: "unusable" };
+      }
       const checkpoints = parsed.checkpoints.map((checkpoint): TurnCheckpoint => {
         if (checkpoint.kind === "session") {
           const { reason } = checkpoint;
@@ -112,7 +130,12 @@ export class SessionHistoryStore {
       // would be lost. The mapping is re-derived on every load.
       await this.refreshStoredTimestamp(parsed).catch(() => undefined);
       return { status: "loaded", state };
-    } catch {
+    } catch (error) {
+      // A file deleted mid-load is missing, malformed JSON is corrupt; any
+      // other failure (EMFILE, EBUSY, ...) may pass, so keep the file intact.
+      if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.frozen = true;
+      }
       return { status: "unavailable", reason: "unusable" };
     }
   }
@@ -148,6 +171,7 @@ export class SessionHistoryStore {
   }
 
   async save(state: NavigationState): Promise<void> {
+    if (this.frozen) throw new Error("history load failed; refusing to overwrite stored history");
     const directory = historyDirectory(this.repository);
     const path = historyPath(this.repository, this.sessionId);
     if (state.checkpoints.length === 0) {

@@ -1091,4 +1091,75 @@ describe("SessionHistoryStore size bound and checkpoint shape", () => {
       });
     }
   });
+
+  it("keeps the stored file when a load fails transiently instead of overwriting it", async () => {
+    const sessionId = "transient-load-session";
+    const { repository, hash } = await setup("git-transient-", sessionId);
+    const refPrefix = `refs/omp-undo-redo/history/${hash}/`;
+    const beforeHash = "a".repeat(40);
+    const afterHash = "b".repeat(40);
+    const git: GitRunner = async (args) => ({
+      stdout:
+        args[0] === "for-each-ref"
+          ? `${refPrefix}c/before\0${beforeHash}\n${refPrefix}c/after\0${afterHash}\n`
+          : "",
+      stderr: "",
+      code: 0,
+    });
+    const failingGit: GitRunner = async () => ({ stdout: "", stderr: "timeout", code: 1 });
+    const checkpoint = {
+      kind: "git" as const,
+      repository,
+      beforeHash,
+      afterHash,
+      beforeRef: `${refPrefix}c/before`,
+      afterRef: `${refPrefix}c/after`,
+      parentLeafId: null,
+      leafId: "r",
+    };
+    await new SessionHistoryStore(sessionId, repository, git).save({
+      checkpoints: [checkpoint],
+      currentIndex: 0,
+    });
+
+    const failing = new SessionHistoryStore(sessionId, repository, failingGit);
+    expect(await failing.load(reader(["r", "n"]))).toEqual({
+      status: "unavailable",
+      reason: "unusable",
+    });
+    const rebuilt = {
+      kind: "session" as const,
+      reason: "resumed_checkpoint_unavailable" as const,
+      parentLeafId: "r",
+      leafId: "n",
+    };
+    await expect(failing.save({ checkpoints: [rebuilt], currentIndex: 0 })).rejects.toThrow();
+    await expect(failing.save({ checkpoints: [], currentIndex: -1 })).rejects.toThrow();
+
+    const loaded = await new SessionHistoryStore(sessionId, repository, git).load(reader(["r"]));
+    expect(loaded).toEqual({
+      status: "loaded",
+      state: { checkpoints: [checkpoint], currentIndex: 0 },
+    });
+  });
+
+  it("still lets a corrupt history be replaced", async () => {
+    const sessionId = "corrupt-load-session";
+    const { repository } = await setup("git-corrupt-", sessionId);
+    await mkdir(join(repository.storeDir, "omp-undo-redo", "history"), { recursive: true });
+    await writeFile(historyPath(repository, sessionId), "{corrupted");
+    const store = new SessionHistoryStore(sessionId, repository, noGit);
+    expect(await store.load(reader(["r"]))).toMatchObject({ reason: "unusable" });
+    const row = {
+      kind: "session" as const,
+      reason: "resumed_checkpoint_unavailable" as const,
+      parentLeafId: null,
+      leafId: "r",
+    };
+    await store.save({ checkpoints: [row], currentIndex: 0 });
+    expect(await store.load(reader(["r"]))).toEqual({
+      status: "loaded",
+      state: { checkpoints: [row], currentIndex: 0 },
+    });
+  });
 });
