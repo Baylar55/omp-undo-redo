@@ -148,24 +148,8 @@ async function rollbackPartialApply(
       written.set(path, targetSha!);
     }
   }
-  if (written.size > 0) {
-    const paths = [...written.keys()];
-    // C-quote every line: git unquotes a line starting with `"` and dies on
-    // the whole batch if that fails, and a raw newline would split a path.
-    const quoted = paths.map(
-      (path) => `"${path.replace(/[\\"\n]/g, (c) => (c === "\n" ? "\\n" : `\\${c}`))}"`,
-    );
-    const hashed = await invoke(git, [...config, "hash-object", "--stdin-paths"], {
-      stdin: `${quoted.join("\n")}\n`,
-      timeoutMs,
-    });
-    if (hashed.code === 0 && !hashed.error) {
-      const ids = hashed.stdout.split("\n");
-      paths.forEach((path, index) => {
-        if (ids[index] !== written.get(path)) return;
-        (added.has(path) ? remove : restore).push(path);
-      });
-    }
+  for (const path of (await pathsHoldingBlobs(git, written, config)) ?? []) {
+    (added.has(path) ? remove : restore).push(path);
   }
   for (const path of remove) {
     await rm(join(worktree, path), { force: true }).catch(() => undefined);
@@ -180,6 +164,67 @@ async function rollbackPartialApply(
     stdin: restore.map((path) => `${path}\0`).join(""),
     timeoutMs,
   });
+}
+
+/** Paths of `expected` whose worktree file, hashed under `config` and the
+ *  attributes on disk, is the blob `expected` maps it to; null when git
+ *  fails. */
+async function pathsHoldingBlobs(
+  git: GitRunner,
+  expected: ReadonlyMap<string, string>,
+  config: readonly string[],
+): Promise<string[] | null> {
+  const paths = [...expected.keys()];
+  if (paths.length === 0) return [];
+  // C-quote every line: git unquotes a line starting with `"` and dies on
+  // the whole batch if that fails, and a raw newline would split a path.
+  const quoted = paths.map(
+    (path) => `"${path.replace(/[\\"\n]/g, (c) => (c === "\n" ? "\\n" : `\\${c}`))}"`,
+  );
+  const hashed = await invoke(git, [...config, "hash-object", "--stdin-paths"], {
+    stdin: `${quoted.join("\n")}\n`,
+    timeoutMs: RESTORE_TIMEOUT_MS,
+  });
+  if (hashed.code !== 0 || hashed.error) return null;
+  const ids = hashed.stdout.split("\n");
+  return paths.filter((path, index) => ids[index] === expected.get(path));
+}
+
+/** A `.gitattributes` at any depth, in any case (the case-insensitive file
+ *  systems of Windows and macOS serve it to git under any). */
+const ATTRIBUTES_FILE = /(?:^|\/)\.gitattributes$/i;
+
+/** Regular files of `targetHash` that `git apply` writes as exactly their
+ *  `targetHash` blob: created ones (`apply --check` proved the path free) and
+ *  modified ones whose worktree file still hashes to the `sourceHash` blob.
+ *  A drifted file gets the hunks merged into the user's edits instead, which
+ *  a checkout of the target would destroy. Run before apply, so the hash
+ *  reads under the attributes on disk, as apply does. Null when git fails. */
+async function exactRestorePaths(
+  git: GitRunner,
+  sourceHash: string,
+  targetHash: string,
+  config: readonly string[],
+): Promise<string[] | null> {
+  const changes = await invoke(
+    git,
+    ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
+    { timeoutMs: RESTORE_TIMEOUT_MS },
+  );
+  if (changes.error || changes.code !== 0) return null;
+  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
+  const exact: string[] = [];
+  const modified = new Map<string, string>();
+  const fields = changes.stdout.split("\0");
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const [sourceMode, targetMode, sourceSha] = fields[index]!.slice(1).split(" ");
+    const path = fields[index + 1]!;
+    if (!targetMode!.startsWith("100") || sourceMode === "160000") continue;
+    if (sourceMode!.startsWith("100")) modified.set(path, sourceSha!);
+    else exact.push(path);
+  }
+  const unchanged = await pathsHoldingBlobs(git, modified, config);
+  return unchanged && [...exact, ...unchanged];
 }
 
 /** Every flag pins the plumbing contract against the user's own
@@ -343,12 +388,43 @@ async function applyPatch(
     if (misplaced.length > 0) return { conflictedFiles: misplaced };
 
     if (checkOnly) return { restoredFiles };
+    // `git apply` converts the files it writes under the attributes on disk
+    // before the patch, so a restore that changes a `.gitattributes` wrote
+    // them the source's way (CRLF where the target holds no `eol=crlf`), and
+    // the next restore read them as drift. The files apply writes as exactly
+    // the target's blob are checked out again from it, under the target's
+    // attributes, as `git checkout` would write them. The index is seeded
+    // before apply, so only the checkout can fail once the patch landed; an
+    // edit landing between the hash and the checkout is overwritten.
+    // ponytail: a drifted file keeps the source's conversion; re-convert the
+    // merged blob (`apply --cached` on a scratch index) if that ever matters.
+    const reconvert = restoredFiles.some((path) => ATTRIBUTES_FILE.test(path))
+      ? await exactRestorePaths(git, sourceHash, effectiveTarget, config)
+      : [];
+    if (!reconvert) return "failed";
+    const targetEnv: Record<string, string> = {
+      GIT_INDEX_FILE: join(tempDirectory, "target-index"),
+    };
+    if (git.env?.GIT_DIR) targetEnv.GIT_WORK_TREE = worktree;
+    if (reconvert.length > 0) {
+      const seeded = await invoke(git, ["read-tree", effectiveTarget], { env: targetEnv });
+      if (seeded.error || seeded.code !== 0) return "failed";
+    }
     const applied = await invoke(
       git,
       [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace", patchPath],
       restore,
     );
-    if (applied.code === 0) return { restoredFiles };
+    if (applied.code === 0) {
+      if (reconvert.length === 0) return { restoredFiles };
+      // Without stat data in the index every path is rewritten.
+      const checkout = await invoke(git, [...config, "checkout-index", "-f", "-z", "--stdin"], {
+        env: targetEnv,
+        stdin: reconvert.map((path) => `${path}\0`).join(""),
+        ...restore,
+      });
+      return !checkout.error && checkout.code === 0 ? { restoredFiles } : "failed";
+    }
     await rollbackPartialApply(git, sourceHash, effectiveTarget, tempDirectory, config).catch(
       (error: unknown) => debugLog({ event: "restore-rollback-failed", error: String(error) }),
     );

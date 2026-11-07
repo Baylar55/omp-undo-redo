@@ -427,6 +427,51 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("writes restored files under the attributes of the snapshot a .gitattributes change restores", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const bytes = (name: string) => readFile(join(cwd, name), "latin1");
+    const lines = (eol: string, first: string, last: string) =>
+      [first, "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", last].map((l) => l + eol).join("");
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "a.txt"), "one\ntwo\n");
+      await writeFile(join(cwd, "d.txt"), lines("\n", "l1", "l10"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "attributes", defaultPool));
+      await writeFile(join(cwd, ".gitattributes"), "*.txt text eol=crlf\n");
+      await writeFile(join(cwd, "a.txt"), "one\r\ntwo\r\nthree\r\n");
+      await writeFile(join(cwd, "d.txt"), lines("\r\n", "L1", "l10"));
+      const after = completedCheckpoint(
+        await finishAfterTurn(snap, before, null, null, defaultPool),
+      );
+
+      // git apply converted under the turn's attributes (CRLF), and redo then
+      // read the untouched files as drift.
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+        restoredFiles: [".gitattributes", "a.txt", "d.txt"],
+      });
+      expect(await bytes("a.txt")).toBe("one\ntwo\n");
+      expect(await bytes("d.txt")).toBe(lines("\n", "l1", "l10"));
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes(".gitattributes")).toBe("*.txt text eol=crlf\n");
+      expect(await bytes("a.txt")).toBe("one\r\ntwo\r\nthree\r\n");
+      expect(await bytes("d.txt")).toBe(lines("\r\n", "L1", "l10"));
+
+      // A file the user edited outside the hunks is merged by apply, never
+      // replaced by the snapshot's blob.
+      await writeFile(join(cwd, "d.txt"), lines("\r\n", "L1", "user"));
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes("a.txt")).toBe("one\ntwo\n");
+      expect((await bytes("d.txt")).replaceAll("\r\n", "\n")).toBe(lines("\n", "l1", "user"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("restores a checkpoint captured with line-ending conversion through that conversion", async () => {
     const { cwd, git, snap } = await makeRepo();
     const index = join(cwd, ".git", "legacy-index");
