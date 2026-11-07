@@ -19,7 +19,6 @@ import type { CheckpointApplyResult } from "../snapshot/restore.js";
 import { landsOnParent } from "../host-contract.js";
 
 type ExpectedTreeNavigation = {
-  oldLeafId: string | null;
   /** Every leaf the host may land on for this target. */
   landingLeafIds: ReadonlyArray<string | null>;
 };
@@ -111,7 +110,6 @@ export class SessionNavigation {
   private async navigateTo(targetId: string): Promise<TreeNavigationResult> {
     const target = this.port.getEntry(targetId);
     this.expectedTreeNavigation = {
-      oldLeafId: this.port.getLeafId(),
       landingLeafIds: landsOnParent(target) ? [targetId, target.parentId] : [targetId],
     };
     try {
@@ -130,17 +128,17 @@ export class SessionNavigation {
     // Must run before any queueing: the host awaits this handler inside its
     // navigateTree call, so an undo/redo's own navigation has to be recognized
     // synchronously or it would deadlock against itself on navigationTail.
+    // By landing leaf only: the host first appends pending `!cmd` output, so
+    // its oldLeafId may not be the leaf the navigation started from.
     const expected = this.expectedTreeNavigation;
-    if (
-      expected &&
-      expected.oldLeafId === oldLeafId &&
-      expected.landingLeafIds.includes(newLeafId)
-    ) {
+    if (expected?.landingLeafIds.includes(newLeafId)) {
       this.expectedTreeNavigation = null;
       return;
     }
     if (oldLeafId === newLeafId) return;
-    await this.serializeNavigation(() => this.performInvalidateRedo());
+    const invalidation = this.serializeNavigation(() => this.performInvalidateRedo());
+    // During our own navigation the chain is waiting on this handler.
+    if (!expected) await invalidation;
   }
 
   async invalidateRedo(): Promise<void> {

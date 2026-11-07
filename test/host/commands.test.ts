@@ -179,6 +179,57 @@ describe("session navigation", () => {
     expect((await navigation.redo()).status).toBe("empty");
   });
 
+  // Stands in for OMP's 30 s per-handler cap: a session_tree handler stuck on
+  // its own navigation chain is still pending at the next event-loop turn.
+  function settlesPromptly(handler: Promise<void>): Promise<boolean> {
+    const { promise: nextTurn, resolve } = Promise.withResolvers<boolean>();
+    setImmediate(resolve, false);
+    return Promise.race([handler.then(() => true), nextTurn]);
+  }
+
+  it("preserves redo when the host appends pending output before its own navigation", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    const settled: boolean[] = [];
+    navigation.setNavigateTree(async (targetId) => {
+      // OMP flushes `!cmd` output queued while streaming before reading oldLeafId.
+      session.leaf = `bash-after-${session.leaf}`;
+      const oldLeafId = session.leaf;
+      session.leaf = targetId;
+      settled.push(
+        await settlesPromptly(navigation.handleSessionTreeNavigation(oldLeafId, targetId)),
+      );
+      return { cancelled: false };
+    });
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
+
+    expect((await navigation.undo()).status).toBe("moved");
+    expect((await navigation.redo()).status).toBe("moved");
+    expect(session.leaf).toBe("a2");
+    expect(settled).toEqual([true, true]);
+  });
+
+  it("does not wait on its own navigation when the host lands elsewhere", async () => {
+    const session = port();
+    const navigation = makeNavigation(session);
+    const settled: boolean[] = [];
+    navigation.setNavigateTree(async () => {
+      const oldLeafId = session.leaf;
+      session.leaf = "other";
+      settled.push(
+        await settlesPromptly(navigation.handleSessionTreeNavigation(oldLeafId, "other")),
+      );
+      return { cancelled: false };
+    });
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    await navigation.recordTurnEnd(checkpoint("u2", "a2"));
+
+    expect((await navigation.undo()).status).toBe("moved");
+    expect(settled).toEqual([true]);
+    expect((await navigation.redo()).status).toBe("empty");
+  });
+
   it("invalidates only redo after unrelated tree navigation", async () => {
     const session = port();
     const navigation = makeNavigation(session);
