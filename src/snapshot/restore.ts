@@ -121,6 +121,10 @@ async function rollbackPartialApply(
   const remove: string[] = [];
   const written = new Map<string, string>();
   const added = new Set<string>();
+  // Deleted paths found on disk: on a case-insensitive file system possibly
+  // only through an added case twin (see `caseTwinCreations`) that the
+  // removal below takes away, leaving the source's file missing.
+  const deleted: string[] = [];
   const fields = changes.stdout.split("\0");
   for (let index = 0; index + 1 < fields.length; index += 2) {
     const [sourceMode, targetMode, , targetSha, status] = fields[index]!.slice(1).split(" ");
@@ -146,6 +150,8 @@ async function rollbackPartialApply(
       restore.push(path);
     } else if (status !== "D" && present.isFile()) {
       written.set(path, targetSha!);
+    } else if (status === "D") {
+      deleted.push(path);
     }
   }
   for (const path of (await pathsHoldingBlobs(git, written, config)) ?? []) {
@@ -153,6 +159,11 @@ async function rollbackPartialApply(
   }
   for (const path of remove) {
     await rm(join(worktree, path), { force: true }).catch(() => undefined);
+  }
+  if (remove.length > 0) {
+    for (const path of deleted) {
+      if (!(await lstat(join(worktree, path)).catch(() => null))) restore.push(path);
+    }
   }
   if (restore.length === 0) return;
 
@@ -227,6 +238,54 @@ async function exactRestorePaths(
   return unchanged && [...exact, ...unchanged];
 }
 
+/** Paths `targetHash` adds over `sourceHash` that, in `worktree`, are the
+ *  same file as another path the restore changes: on a case-insensitive file
+ *  system, the old name of a case-only rename. Comparing the files, not
+ *  `core.ignorecase`, leaves a case-sensitive one (or a file the user put
+ *  at the new name) to `git apply`'s own check. Null when git fails. */
+async function caseTwinCreations(
+  git: GitRunner,
+  worktree: string,
+  sourceHash: string,
+  targetHash: string,
+): Promise<string[] | null> {
+  const changes = await invoke(
+    git,
+    ["diff-tree", "-r", "-z", "--no-renames", "--name-status", sourceHash, targetHash],
+    { timeoutMs: RESTORE_TIMEOUT_MS },
+  );
+  if (changes.error || changes.code !== 0) return null;
+  const fields = changes.stdout.split("\0");
+  const byCase = new Map<string, string[]>();
+  const added: string[] = [];
+  for (let index = 0; index + 1 < fields.length; index += 2) {
+    const path = fields[index + 1]!;
+    if (fields[index] === "A") added.push(path);
+    const key = path.toLowerCase();
+    byCase.set(key, [...(byCase.get(key) ?? []), path]);
+  }
+  // An inode of 0 (some network file systems) identifies nothing.
+  const identity = (path: string) =>
+    lstat(join(worktree, path), { bigint: true }).then(
+      (stats) => (stats.ino === 0n ? null : `${stats.dev}:${stats.ino}`),
+      () => null,
+    );
+  const twins: string[] = [];
+  for (const path of added) {
+    const others = byCase.get(path.toLowerCase())!.filter((other) => other !== path);
+    if (others.length === 0) continue;
+    const file = await identity(path);
+    if (!file) continue;
+    for (const other of others) {
+      if ((await identity(other)) === file) {
+        twins.push(path);
+        break;
+      }
+    }
+  }
+  return twins;
+}
+
 /** Every flag pins the plumbing contract against the user's own
  *  configuration, each of which otherwise kills restoration outright on that
  *  machine: `diff.noprefix`/`diff.srcPrefix`/`diff.dstPrefix` produce a patch
@@ -266,27 +325,23 @@ async function applyPatch(
       tempDirectory,
     );
     if (!effectiveTarget) return "failed";
-    const diff = await invoke(
-      git,
-      [
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-relative",
-        "--ignore-submodules=none",
-        "--submodule=short",
-        "-U3",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        "--exit-code",
-        "--binary",
-        sourceHash,
-        effectiveTarget,
-        `--output=${patchPath}`,
-      ],
-      restore,
-    );
+    const diffArgs = [
+      "diff",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-relative",
+      "--ignore-submodules=none",
+      "--submodule=short",
+      "-U3",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      "--exit-code",
+      "--binary",
+      sourceHash,
+      effectiveTarget,
+    ];
+    const diff = await invoke(git, [...diffArgs, `--output=${patchPath}`], restore);
     // A killed or unspawnable child also exits 1, which is `--exit-code`'s
     // "there were differences": without this the truncated patch `--output`
     // already wrote would be applied and reported as a complete restore.
@@ -309,6 +364,30 @@ async function applyPatch(
     }
     const linked = await pathsBeyondLinks(worktree, restoredFiles);
     if (linked.length > 0) return { linkedFiles: linked };
+    // A case-insensitive file system serves a case-only rename's old file
+    // under the new name, so `git apply` (which checks every created path
+    // before deleting anything) reports it as "already exists". Those
+    // creations go to a second patch applied once the first has deleted the
+    // old file; checking only the first is complete: the created path is
+    // the old file, whose deletion it checks.
+    const deferred = await caseTwinCreations(git, worktree, sourceHash, effectiveTarget);
+    if (!deferred) return "failed";
+    let createPath: string | null = null;
+    if (deferred.length > 0) {
+      createPath = join(tempDirectory, "case-renames.patch");
+      for (const [output, magic] of [
+        [patchPath, "top,exclude,literal"],
+        [createPath, "top,literal"],
+      ] as const) {
+        const pathspecs = deferred.map((path) => `:(${magic})${path}`);
+        const split = await invoke(
+          git,
+          [...diffArgs, `--output=${output}`, "--", ...pathspecs],
+          restore,
+        );
+        if (split.error || split.code !== 1) return "failed";
+      }
+    }
 
     const checkArgs = [
       ...config,
@@ -410,11 +489,11 @@ async function applyPatch(
       const seeded = await invoke(git, ["read-tree", effectiveTarget], { env: targetEnv });
       if (seeded.error || seeded.code !== 0) return "failed";
     }
-    const applied = await invoke(
-      git,
-      [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace", patchPath],
-      restore,
-    );
+    const applyArgs = [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace"];
+    let applied = await invoke(git, [...applyArgs, patchPath], restore);
+    if (applied.code === 0 && createPath) {
+      applied = await invoke(git, [...applyArgs, createPath], restore);
+    }
     if (applied.code === 0) {
       if (reconvert.length === 0) return { restoredFiles };
       // Without stat data in the index every path is rewritten.

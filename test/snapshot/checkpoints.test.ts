@@ -601,6 +601,53 @@ describe("history-safe Git checkpoints", () => {
     },
   );
 
+  // `git apply` checks a created path against the worktree before it deletes
+  // anything, and a case-insensitive file system serves the deleted path to
+  // it under the new case: a case-only rename always read as a conflict.
+  it.runIf(process.platform === "win32" || process.platform === "darwin")(
+    "undoes and redoes a case-only rename",
+    async () => {
+      const { cwd, git, snap } = await makeRepo();
+      try {
+        await initializeBranch(git, cwd);
+        const contents = await readFile(join(cwd, "tracked.txt"), "utf8");
+        const before = pendingCheckpoint(await prepareBeforeTurn(snap, "case", defaultPool));
+        // Committed: a snapshot seeds from HEAD, whose entry otherwise keeps
+        // the old case under `core.ignorecase`.
+        await git(["mv", "tracked.txt", "Tracked.txt"]);
+        await git(["commit", "-qm", "rename"]);
+        await writeFile(join(cwd, "other.txt"), "other\n");
+        const after = completedCheckpoint(
+          await finishAfterTurn(snap, before, null, null, defaultPool),
+        );
+        const applied = {
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: ["Tracked.txt", "other.txt", "tracked.txt"],
+        };
+
+        expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash, true)).toEqual(
+          applied,
+        );
+        expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual(applied);
+        expect((await readdir(cwd)).filter((name) => name !== ".git")).toEqual(["tracked.txt"]);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(contents);
+        expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash, true)).toEqual(
+          applied,
+        );
+        expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual(applied);
+        expect((await readdir(cwd)).filter((name) => name !== ".git").sort()).toEqual([
+          "Tracked.txt",
+          "other.txt",
+        ]);
+        expect(await readFile(join(cwd, "Tracked.txt"), "utf8")).toBe(contents);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("navigates a completed turn with no file changes", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {
