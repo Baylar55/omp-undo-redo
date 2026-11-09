@@ -288,10 +288,16 @@ export function createGitRunner(cwd: string, dependencies: GitRunnerDependencies
   const { env } = dependencies;
   const runner: GitRunner = async (args, options) => {
     const merged = { ...env, ...options?.env };
+    // Bound to a store's objects, a command must not start the user's auto
+    // maintenance (a partial clone's lazy fetch does): it would run against
+    // the store's objects with the user's refs. `-c` reaches git's children.
+    const fullArgs = merged.GIT_OBJECT_DIRECTORY
+      ? ["-c", "maintenance.auto=false", "-c", "gc.auto=0", ...args]
+      : args;
     const started = Date.now();
     const result = await runGit(
       cwd,
-      args,
+      fullArgs,
       { ...options, env: merged },
       dependencies,
       // An injected spawn is a test double; give it the plain command.
@@ -301,7 +307,7 @@ export function createGitRunner(cwd: string, dependencies: GitRunnerDependencies
     // overrides this extension sets (paths, `LC_ALL`).
     debugLog({
       cwd,
-      args,
+      args: fullArgs,
       env: merged,
       code: result.code,
       error: result.error,

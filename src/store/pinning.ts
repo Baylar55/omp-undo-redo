@@ -77,9 +77,10 @@ export async function pinBorrowedObjects(
   );
   const unknown = [...candidates].filter((_, index) => !loose[index]);
   if (unknown.length === 0) return true;
-  // Without the alternates env only the store's own objects are visible.
+  // Only the store's own objects are visible: it is the repository, so a
+  // partial clone's promisor remote cannot lazily fetch the "missing" ones.
   const local = await invoke(git, ["cat-file", "--batch-check=%(objectname)"], {
-    env: { ...env, GIT_ALTERNATE_OBJECT_DIRECTORIES: "" },
+    env: { GIT_DIR: repository.storeDir, GIT_ALTERNATE_OBJECT_DIRECTORIES: "" },
     stdin: `${unknown.join("\n")}\n`,
   });
   if (local.code !== 0) return false;
