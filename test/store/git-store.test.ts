@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, delimiter, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createGitRunner } from "../../src/infra/git-runner.js";
 import { activeHeartbeatPath } from "../../src/history/liveness.js";
@@ -182,6 +182,35 @@ describe("snapshot storage", () => {
       await pi.emit("session_shutdown", ctx);
     } finally {
       if (remote) await rmRetry(remote);
+      await rmRetry(cwd);
+    }
+  });
+
+  it("snapshots and restores in a repository whose path holds the path-list separator", async () => {
+    // `GIT_ALTERNATE_OBJECT_DIRECTORIES` is a `;`/`:`-separated list: an
+    // unquoted path holding the separator split into two bogus alternates.
+    const cwd = await makeRepository(`omp-undo-redo-a${delimiter}b-`);
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never);
+      const ctx = resumedContext(cwd, "separator-session");
+      ctx.leaf = prompt.id;
+      ctx.branch = [prompt];
+      ctx.entries = [prompt];
+      await pi.emit("session_start", ctx);
+      await pi.emit("before_agent_start", ctx);
+      await writeFile(join(cwd, "tracked.txt"), "changed\n");
+      ctx.leaf = response.id;
+      ctx.branch = [prompt, response];
+      ctx.entries = [prompt, response];
+      await pi.emit("agent_end", ctx);
+
+      expect(await privateRefs(cwd)).toHaveLength(2);
+      await pi.runCommand("undo", ctx);
+      expect(ctx.leaf).toBe(prompt.id);
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("base\n");
+      await pi.emit("session_shutdown", ctx);
+    } finally {
       await rmRetry(cwd);
     }
   });

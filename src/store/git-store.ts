@@ -178,8 +178,12 @@ export function ownedPathsInWorktree(repository: GitRepository): readonly string
 
 const ownedPathsCache = new WeakMap<GitRepository, readonly string[]>();
 
+/** The user's objects as a `GIT_ALTERNATE_OBJECT_DIRECTORIES` entry. Git
+ *  splits that variable on `;` (Windows) or `:` (POSIX) unless the entry is a
+ *  C-style quoted string, so a path holding the separator must be quoted. */
 function userObjects(repository: GitRepository): string {
-  return join(repository.commonDir, "objects");
+  const path = join(repository.commonDir, "objects");
+  return `"${path.replace(/[\\"]/g, "\\$&").replace(/\n/g, "\\n")}"`;
 }
 
 /** Env binding a runner to `repository`'s snapshot store. Private-Git runs
