@@ -6,7 +6,8 @@ import type { ActionId, CommandNavigationResult, NavigationResult } from "../typ
 import {
   VERBS,
   commandBlockedMessage,
-  listed,
+  gitFailedMessage,
+  manualRestoreMessage,
   notRestoredMessage,
   restoredFilesMessage,
   unavailableMessage,
@@ -51,17 +52,10 @@ export async function runNavigation(
       ctx.ui.notify(verbs.cancelled, "warning");
       break;
     case "rollback_failed":
-      ctx.ui.notify(verbs.rollbackFailed, "error");
+      ctx.ui.notify(`${verbs.rollbackFailed}${manualRestoreMessage(direction, outcome)}`, "error");
       break;
     case "git_failed":
-      ctx.ui.notify(
-        outcome.failure === "conflict"
-          ? `${verbs.conflict}${outcome.conflictedFiles.length > 0 ? ` Conflicting files: ${listed(outcome.conflictedFiles)}.` : ""}`
-          : outcome.failure === "linked"
-            ? `${verbs.linked} Linked files: ${listed(outcome.linkedFiles)}. Replace the link with a real folder to restore them: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#undo-or-redo-refused-files-under-a-symlink-or-junction`
-            : "Could not restore the Git checkpoint. To log the cause, restart the agent with OMP_UNDO_REDO_DEBUG=1 and retry: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#collecting-a-debug-trace",
-        "warning",
-      );
+      ctx.ui.notify(gitFailedMessage(direction, outcome), "warning");
       break;
     default: {
       // Compile error when NavigationResult gains a status.

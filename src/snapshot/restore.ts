@@ -36,7 +36,9 @@ export type CheckpointApplyResult =
     }
   | { status: "conflict"; conflictedFiles: string[] }
   | { status: "linked"; linkedFiles: string[] }
-  | { status: "failed" };
+  /** `interrupted`: `git apply` wrote, and the worktree is not back where
+   *  `sourceHash` applies: files may sit between the snapshots. */
+  | { status: "failed"; interrupted?: true };
 
 /** Restores `targetHash`'s content over a worktree that currently matches
  *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
@@ -77,6 +79,7 @@ export async function applyCheckpoint(
     checkOnly,
   );
   if (applied === "failed") return { status: "failed" };
+  if (applied === "interrupted") return { status: "failed", interrupted: true };
   if ("conflictedFiles" in applied) return { status: "conflict", ...applied };
   if ("linkedFiles" in applied) return { status: "linked", ...applied };
   return { status: "applied", nestedRepositories, unreadableFiles, ...applied };
@@ -309,7 +312,11 @@ async function applyPatch(
   config: readonly string[],
   checkOnly: boolean,
 ): Promise<
-  { restoredFiles: string[] } | { conflictedFiles: string[] } | { linkedFiles: string[] } | "failed"
+  | { restoredFiles: string[] }
+  | { conflictedFiles: string[] }
+  | { linkedFiles: string[] }
+  | "failed"
+  | "interrupted"
 > {
   let tempDirectory: string | null = null;
   try {
@@ -491,6 +498,8 @@ async function applyPatch(
     }
     const applyArgs = [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace"];
     let applied = await invoke(git, [...applyArgs, patchPath], restore);
+    // Never spawned, so nothing was written: no rollback (see below).
+    if (applied.error === "unavailable") return "failed";
     if (applied.code === 0 && createPath) {
       applied = await invoke(git, [...applyArgs, createPath], restore);
     } else if (applied.code !== 0 && !applied.error && applied.stderr) {
@@ -518,14 +527,19 @@ async function applyPatch(
         stdin: reconvert.map((path) => `${path}\0`).join(""),
         ...restore,
       });
-      return !checkout.error && checkout.code === 0 ? { restoredFiles } : "failed";
+      return !checkout.error && checkout.code === 0 ? { restoredFiles } : "interrupted";
     }
     await rollbackPartialApply(git, sourceHash, effectiveTarget, tempDirectory, config).catch(
       (error: unknown) => debugLog({ event: "restore-rollback-failed", error: String(error) }),
     );
-    return "failed";
+    // Where the check above passed again: the worktree is back at the source
+    // (edits outside the hunks aside), so a retry is all the user needs.
+    const back = await invoke(git, [...checkArgs, patchPath], checkOptions);
+    return !back.error && back.code === 0 ? "failed" : "interrupted";
   } catch (error) {
     debugLog({ event: "restore-failed", error: String(error) });
+    // Nothing from `git apply` on can throw (`invoke` returns its errors, the
+    // rollback is caught), so an exception here means nothing was written.
     return "failed";
   } finally {
     if (tempDirectory !== null) {

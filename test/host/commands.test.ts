@@ -13,6 +13,8 @@ import type {
 } from "../../src/types.js";
 import { reconstructSessionHistory } from "../../src/history/reconstruct.js";
 import { recoverInterruptedRestore } from "../../src/session/recovery.js";
+import { recoveryPartialNotice } from "../../src/session/notices.js";
+import { manualRestoreMessage } from "../../src/host/messages.js";
 
 function mockGit(): GitRunner {
   return async () => ({ stdout: "", stderr: "", code: 0 });
@@ -550,5 +552,116 @@ describe("runNavigation", () => {
         level: "error",
       },
     ]);
+  });
+
+  it.each([
+    [
+      "undo",
+      "Undo",
+      "undone",
+      { storeDir: ".git", sourceHash: "after-a1", targetHash: "before-a1" },
+    ],
+    [
+      "redo",
+      "Redo",
+      "redone",
+      { storeDir: ".git", sourceHash: "before-a1", targetHash: "after-a1" },
+    ],
+  ] as const)(
+    "names the store and both snapshots when a %s may leave files between them",
+    async (direction, verb, done, restore) => {
+      const steps = `Restore them by hand from the snapshots in .git: ${restore.sourceHash} (before the /${direction}) and ${restore.targetHash} (its result). Steps: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#restoring-files-after-an-interrupted-undo-or-redo`;
+      const debugHint =
+        "To log the cause, restart the agent with OMP_UNDO_REDO_DEBUG=1 and retry: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#collecting-a-debug-trace";
+      type Stub = (
+        sourceHash: string,
+      ) => { status: "applied" } | { status: "failed"; interrupted?: true };
+      const run = async (cancelled: boolean, apply: Stub) => {
+        const session = port();
+        const intents: string[] = [];
+        let stub: Stub = () => ({ status: "applied" });
+        const navigation = new SessionNavigation(
+          session,
+          mockGit(),
+          undefined,
+          undefined,
+          async (_checkpoint, sourceHash) => {
+            const result = stub(sourceHash);
+            return result.status === "applied"
+              ? {
+                  status: "applied",
+                  nestedRepositories: [],
+                  unreadableFiles: [],
+                  restoredFiles: [],
+                }
+              : result;
+          },
+          {
+            save: async (intent) => void intents.push(`save ${intent.direction}`),
+            clear: async () => void intents.push("clear"),
+          },
+        );
+        await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+        if (direction === "redo") expect((await navigation.undo()).status).toBe("moved");
+        const cursor = navigation.snapshot().currentIndex;
+        intents.splice(0);
+        stub = apply;
+        navigation.setNavigateTree(async () => ({ cancelled }));
+        const ctx = context("cwd", "s1");
+        const outcome = await runNavigation(
+          navigation,
+          ctx as unknown as ExtensionCommandContext,
+          direction,
+        );
+        // The cursor stays where the steps say undo history points.
+        expect(navigation.snapshot().currentIndex).toBe(cursor);
+        expect(intents).toEqual([`save ${direction}`, "clear"]);
+        return { outcome, notifications: ctx.ui.notifications };
+      };
+
+      const midApply = await run(false, () => ({ status: "failed", interrupted: true }));
+      expect(midApply.outcome).toEqual({
+        status: "git_failed",
+        failure: "interrupted",
+        ...restore,
+      });
+      expect(midApply.notifications).toEqual([
+        {
+          message: `Could not restore the Git checkpoint: writing the files did not finish and the worktree is not back where it started, so some files may be left changed; undo history was left as it was. ${steps} ${debugHint}`,
+          level: "warning",
+        },
+      ]);
+
+      // Navigation cancelled; the compensating restore (target back to source) fails.
+      const compensation = await run(true, (sourceHash) =>
+        sourceHash === restore.sourceHash ? { status: "applied" } : { status: "failed" },
+      );
+      expect(compensation.outcome).toEqual({ status: "rollback_failed", ...restore });
+      expect(compensation.notifications).toEqual([
+        {
+          message: `${verb} navigation was cancelled, but putting the files back failed; they may be left partly ${done}, and undo history was left as it was. ${steps}`,
+          level: "error",
+        },
+      ]);
+
+      // Nothing left changed: no manual steps, just the debug hint.
+      const early = await run(false, () => ({ status: "failed" }));
+      expect(early.outcome).toEqual({ status: "git_failed", failure: "failed" });
+      expect(early.notifications).toEqual([
+        { message: `Could not restore the Git checkpoint. ${debugHint}`, level: "warning" },
+      ]);
+    },
+  );
+
+  it("gives the same manual steps as the interrupted-restore notice", () => {
+    // Two copies because host/ may not import session/notices.ts.
+    const restore = { storeDir: "/store", sourceHash: "a".repeat(40), targetHash: "b".repeat(40) };
+    const notice = recoveryPartialNotice(
+      "/redo",
+      restore.storeDir,
+      restore.sourceHash,
+      restore.targetHash,
+    );
+    expect(notice.endsWith(manualRestoreMessage("redo", restore))).toBe(true);
   });
 });

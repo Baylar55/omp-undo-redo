@@ -2995,7 +2995,7 @@ describe("history-safe Git checkpoints", () => {
             beforeHash,
             afterHash,
           ),
-        ).toEqual({ status: "failed" });
+        ).toEqual(kept ? { status: "failed", interrupted: true } : { status: "failed" });
         expect(await read("tracked.txt")).toBe("base\n");
         expect(await read("second.txt")).toBe(lines("l1"));
         if (kept) expect(await read("created.txt")).toBe(content);
@@ -3024,6 +3024,19 @@ describe("history-safe Git checkpoints", () => {
       expect(await read("tracked.txt")).toBe("turn\n");
       expect(await read("created.txt")).toBe("created\n");
       expect(await read("second.txt")).toBe(lines("L1", "mine"));
+
+      // Git never spawned: nothing was written, so a file the user deleted
+      // since `apply --check` stays deleted instead of being rolled back.
+      const unspawned: GitRunner = Object.assign(
+        async (args: string[], options?: Parameters<GitRunner>[1]) => {
+          if (!args.includes("apply") || args.includes("--check")) return snap(args, options);
+          await rm(join(cwd, "tracked.txt"));
+          return { stdout: "", stderr: "spawn git ENOENT", code: 1, error: "unavailable" as const };
+        },
+        { cwd: snap.cwd, env: snap.env },
+      );
+      expect(await applyCheckpoint(unspawned, afterHash, beforeHash)).toEqual({ status: "failed" });
+      await expect(lstat(join(cwd, "tracked.txt"))).rejects.toThrow();
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

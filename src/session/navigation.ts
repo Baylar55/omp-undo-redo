@@ -3,6 +3,7 @@ import type {
   GitRepository,
   GitRunner,
   GitRunnerFactory,
+  ManualRestore,
   NavigationPort,
   NavigationResult,
   NavigationState,
@@ -232,13 +233,19 @@ export class SessionNavigation {
 
   private async applyFileCheckpoint(
     checkpoint: GitCheckpoint,
-    source: "before" | "after",
+    target: "before" | "after",
   ): Promise<CheckpointApplyResult> {
-    return this.applyGit(
-      checkpoint,
-      source === "before" ? checkpoint.afterHash : checkpoint.beforeHash,
-      source === "before" ? checkpoint.beforeHash : checkpoint.afterHash,
-    );
+    const { sourceHash, targetHash } = this.manualRestore(checkpoint, target);
+    return this.applyGit(checkpoint, sourceHash, targetHash);
+  }
+
+  /** Restoring the `target` snapshot: the snapshots a user restores from by
+   *  hand when the files were left between them. */
+  private manualRestore(checkpoint: GitCheckpoint, target: "before" | "after"): ManualRestore {
+    const { storeDir } = checkpoint.repository;
+    return target === "before"
+      ? { storeDir, sourceHash: checkpoint.afterHash, targetHash: checkpoint.beforeHash }
+      : { storeDir, sourceHash: checkpoint.beforeHash, targetHash: checkpoint.afterHash };
   }
 
   private async saveIntent(direction: "undo" | "redo", checkpoint: GitCheckpoint): Promise<void> {
@@ -265,6 +272,7 @@ export class SessionNavigation {
 
   private restoreFailedResult(
     applied: Exclude<CheckpointApplyResult, { status: "applied" }>,
+    restore: ManualRestore,
   ): NavigationResult {
     if (applied.status === "conflict") {
       return {
@@ -276,6 +284,7 @@ export class SessionNavigation {
     if (applied.status === "linked") {
       return { status: "git_failed", failure: "linked", linkedFiles: applied.linkedFiles };
     }
+    if (applied.interrupted) return { status: "git_failed", failure: "interrupted", ...restore };
     return { status: "git_failed", failure: "failed" };
   }
 
@@ -297,12 +306,17 @@ export class SessionNavigation {
     const applied = await this.applyFileCheckpoint(checkpoint, "before");
     if (applied.status !== "applied") {
       await this.clearIntent();
-      return this.restoreFailedResult(applied);
+      return this.restoreFailedResult(applied, this.manualRestore(checkpoint, "before"));
     }
     if (!(await this.navigateSession(checkpoint.parentLeafId))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "after");
+      // Cleared even when this fails: the next load could find the files at
+      // the target and move the cursor, completing the navigation just
+      // cancelled, or misjudge files the user has since fixed by hand. The
+      // result names the snapshots to restore from instead.
       await this.clearIntent();
-      if (compensated.status !== "applied") return { status: "rollback_failed" };
+      if (compensated.status !== "applied")
+        return { status: "rollback_failed", ...this.manualRestore(checkpoint, "before") };
       return { status: "cancelled" };
     }
     this.currentIndex--;
@@ -329,12 +343,14 @@ export class SessionNavigation {
     const applied = await this.applyFileCheckpoint(checkpoint, "after");
     if (applied.status !== "applied") {
       await this.clearIntent();
-      return this.restoreFailedResult(applied);
+      return this.restoreFailedResult(applied, this.manualRestore(checkpoint, "after"));
     }
     if (!(await this.navigateSession(checkpoint.leafId))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "before");
+      // Cleared even when this fails: see performUndo.
       await this.clearIntent();
-      if (compensated.status !== "applied") return { status: "rollback_failed" };
+      if (compensated.status !== "applied")
+        return { status: "rollback_failed", ...this.manualRestore(checkpoint, "after") };
       return { status: "cancelled" };
     }
     this.currentIndex++;

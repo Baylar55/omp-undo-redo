@@ -1,5 +1,10 @@
 import type { CommandNavigation } from "../session/registry.js";
-import type { FileCheckpointUnavailableReason, ActionId } from "../types.js";
+import type {
+  ActionId,
+  FileCheckpointUnavailableReason,
+  ManualRestore,
+  NavigationResult,
+} from "../types.js";
 
 interface NavigationVerbs {
   busy: string;
@@ -23,7 +28,7 @@ export const VERBS: Record<ActionId, NavigationVerbs> = {
     empty: "Nothing to undo in this session.",
     cancelled: "Undo was cancelled; the session and files were left unchanged.",
     rollbackFailed:
-      "Undo navigation was cancelled, but file rollback failed; inspect the session and worktree manually.",
+      "Undo navigation was cancelled, but putting the files back failed; they may be left partly undone, and undo history was left as it was.",
     conflict: "Worktree changed; nothing was undone.",
     linked:
       "Files sit under a symlink or junction, which undo never writes through; nothing was undone.",
@@ -38,7 +43,7 @@ export const VERBS: Record<ActionId, NavigationVerbs> = {
     empty: "Nothing to redo in this session.",
     cancelled: "Redo was cancelled; the session and files were left unchanged.",
     rollbackFailed:
-      "Redo navigation was cancelled, but file rollback failed; inspect the session and worktree manually.",
+      "Redo navigation was cancelled, but putting the files back failed; they may be left partly redone, and undo history was left as it was.",
     conflict: "Worktree changed; nothing was redone.",
     linked:
       "Files sit under a symlink or junction, which redo never writes through; nothing was redone.",
@@ -110,6 +115,32 @@ export function notRestoredMessage(
  *  than the agent (an editor, another process). */
 export function restoredFilesMessage(paths: readonly string[]): string {
   return paths.length > 0 ? ` Restored files: ${listed(paths)}.` : " No files changed.";
+}
+
+/** Same steps as `recoveryPartialNotice` (src/session/notices.ts): the
+ *  layers keep host/ from importing it. */
+export function manualRestoreMessage(id: ActionId, restore: ManualRestore): string {
+  return ` Restore them by hand from the snapshots in ${restore.storeDir}: ${restore.sourceHash} (before the /${id}) and ${restore.targetHash} (its result). Steps: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#restoring-files-after-an-interrupted-undo-or-redo`;
+}
+
+const DEBUG_TRACE_HINT =
+  "To log the cause, restart the agent with OMP_UNDO_REDO_DEBUG=1 and retry: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#collecting-a-debug-trace";
+
+export function gitFailedMessage(
+  id: ActionId,
+  outcome: Extract<NavigationResult, { status: "git_failed" }>,
+): string {
+  const verbs = VERBS[id];
+  switch (outcome.failure) {
+    case "conflict":
+      return `${verbs.conflict}${outcome.conflictedFiles.length > 0 ? ` Conflicting files: ${listed(outcome.conflictedFiles)}.` : ""}`;
+    case "linked":
+      return `${verbs.linked} Linked files: ${listed(outcome.linkedFiles)}. Replace the link with a real folder to restore them: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#undo-or-redo-refused-files-under-a-symlink-or-junction`;
+    case "interrupted":
+      return `Could not restore the Git checkpoint: writing the files did not finish and the worktree is not back where it started, so some files may be left changed; undo history was left as it was.${manualRestoreMessage(id, outcome)} ${DEBUG_TRACE_HINT}`;
+    case "failed":
+      return `Could not restore the Git checkpoint. ${DEBUG_TRACE_HINT}`;
+  }
 }
 
 export function commandBlockedMessage(

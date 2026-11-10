@@ -65,7 +65,14 @@ export type NavigationResult =
    *  junction, which a restore never writes through; nothing was written. */
   | { status: "git_failed"; failure: "linked"; linkedFiles: string[] }
   | { status: "git_failed"; failure: "failed" }
-  | { status: "rollback_failed" };
+  /** Writing the files failed partway: they may sit between the snapshots. */
+  | ({ status: "git_failed"; failure: "interrupted" } & ManualRestore)
+  /** Navigation was cancelled and putting the files back failed. */
+  | ({ status: "rollback_failed" } & ManualRestore);
+
+/** The snapshots to restore files from by hand: undo history still points
+ *  at `sourceHash`, `targetHash` is the command's result. */
+export type ManualRestore = { storeDir: string; sourceHash: string; targetHash: string };
 
 export type ActionId = "undo" | "redo";
 
