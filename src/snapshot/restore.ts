@@ -493,6 +493,22 @@ async function applyPatch(
     let applied = await invoke(git, [...applyArgs, patchPath], restore);
     if (applied.code === 0 && createPath) {
       applied = await invoke(git, [...applyArgs, createPath], restore);
+    } else if (applied.code !== 0 && !applied.error && applied.stderr) {
+      // Apply checks the whole patch before writing any of it, so when
+      // `--check` repeats its failure word for word, apply stopped at that
+      // check and wrote nothing: the user changed a path since the check
+      // above. No rollback, which would read a file they deleted or emptied
+      // as one apply removed and restore it. A failed write leaves other
+      // messages (git's write error vs. the paths it removed), and a killed
+      // or timed-out apply may have written: both still roll back, as does
+      // a failed case-rename patch (the first one already wrote). The
+      // comparison runs in apply's own locale; the paths are read under
+      // `LC_ALL=C`, as `applyCheckPaths` expects.
+      const recheck = await invoke(git, [...applyArgs, "--check", patchPath], restore);
+      if (!recheck.error && recheck.code !== 0 && recheck.stderr === applied.stderr) {
+        const check = await invoke(git, [...checkArgs, patchPath], checkOptions);
+        return { conflictedFiles: check.error ? [] : applyCheckPaths(check.stderr) };
+      }
     }
     if (applied.code === 0) {
       if (reconvert.length === 0) return { restoredFiles };

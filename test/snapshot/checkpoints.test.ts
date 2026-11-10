@@ -3029,6 +3029,49 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("rolls nothing back when git apply stopped at its own check, and reports a conflict", async () => {
+    // Regression: the user deleting or truncating a patched file between
+    // `apply --check` and apply fails apply before it writes anything, and
+    // the rollback then read those edits as apply's and reverted them. The
+    // restore reports them as a conflict instead.
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "b.txt"), "b\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "b"]);
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "apply-check", defaultPool));
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      await writeFile(join(cwd, "b.txt"), "turn b\n");
+      await writeFile(join(cwd, "new.txt"), "new\n");
+      const after = completedCheckpoint(
+        await finishAfterTurn(snap, before, null, null, defaultPool),
+      );
+
+      const editAfterCheck: GitRunner = Object.assign(
+        async (args: string[], options?: Parameters<GitRunner>[1]) => {
+          const result = await snap(args, options);
+          if (args.includes("--check") && args.includes("-v")) {
+            await rm(join(cwd, "b.txt"));
+            await rm(join(cwd, "new.txt"));
+            await writeFile(join(cwd, "tracked.txt"), "");
+          }
+          return result;
+        },
+        { cwd: snap.cwd, env: snap.env },
+      );
+      expect(await applyCheckpoint(editAfterCheck, after.afterHash, after.beforeHash)).toEqual({
+        status: "conflict",
+        conflictedFiles: ["b.txt", "new.txt", "tracked.txt"],
+      });
+      await expect(lstat(join(cwd, "b.txt"))).rejects.toThrow();
+      await expect(lstat(join(cwd, "new.txt"))).rejects.toThrow();
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
     "rolls back paths that start with a quote or hold a newline",
     async () => {
