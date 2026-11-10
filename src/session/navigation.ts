@@ -202,6 +202,17 @@ export class SessionNavigation {
     return !result.cancelled;
   }
 
+  /** Where undo navigates to: the leaf the turn started from. A turn that
+   *  started on an empty session has none; the root of its branch stands in
+   *  (`getBranch(leafId)[0]`, the turn's first entry). A root has no parent,
+   *  so when it is a user message the host lands on that parent: the empty
+   *  session. */
+  private undoTarget(checkpoint: TurnCheckpoint): string | null {
+    if (checkpoint.parentLeafId !== null) return checkpoint.parentLeafId;
+    if (checkpoint.leafId === null) return null;
+    return this.port.getBranch(checkpoint.leafId)[0]?.id ?? null;
+  }
+
   private sessionOnlyResult(checkpoint: SessionOnlyCheckpoint): NavigationResult {
     return { status: "moved", files: "unavailable", reason: checkpoint.reason };
   }
@@ -295,8 +306,10 @@ export class SessionNavigation {
   private async performUndo(): Promise<NavigationResult> {
     if (this.currentIndex < 0) return { status: "empty" };
     const checkpoint = await this.holeIfRemoved(this.currentIndex);
+    // Resolved before any file is written: a host read that throws leaves nothing half done.
+    const target = this.undoTarget(checkpoint);
     if (checkpoint.kind === "session") {
-      if (!(await this.navigateSession(checkpoint.parentLeafId))) return { status: "cancelled" };
+      if (!(await this.navigateSession(target))) return { status: "cancelled" };
       this.currentIndex--;
       await this.persistState();
       return this.sessionOnlyResult(checkpoint);
@@ -308,7 +321,7 @@ export class SessionNavigation {
       await this.clearIntent();
       return this.restoreFailedResult(applied, this.manualRestore(checkpoint, "before"));
     }
-    if (!(await this.navigateSession(checkpoint.parentLeafId))) {
+    if (!(await this.navigateSession(target))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "after");
       // Cleared even when this fails: the next load could find the files at
       // the target and move the cursor, completing the navigation just

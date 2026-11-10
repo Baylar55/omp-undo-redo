@@ -119,6 +119,30 @@ describe("session navigation", () => {
     expect((await navigation.redo()).status).toBe("empty");
   });
 
+  it("undoes a turn that started on an empty session back to the empty session", async () => {
+    for (const make of [checkpoint, sessionCheckpoint]) {
+      const session = port();
+      session.leaf = "a1";
+      const navigation = makeNavigation(session);
+      // OMP/Pi rule: a user-message target leaves the leaf on its parent.
+      navigation.setNavigateTree(async (targetId) => {
+        const oldLeafId = session.leaf;
+        session.navigateCalls.push(targetId);
+        const target = session.getEntry(targetId)!;
+        session.leaf = (target.message?.role === "user" ? target.parentId : targetId) as string;
+        await navigation.handleSessionTreeNavigation(oldLeafId, session.leaf);
+        return { cancelled: false };
+      });
+      await navigation.recordTurnEnd(make(null, "a1"));
+
+      expect((await navigation.undo()).status).toBe("moved");
+      expect(session.navigateCalls).toEqual(["u1"]);
+      expect(session.leaf).toBeNull();
+      expect((await navigation.redo()).status).toBe("moved");
+      expect(session.leaf).toBe("a1");
+    }
+  });
+
   it("serializes overlapping undo and redo operations", async () => {
     const session = port();
     const navigation = makeNavigation(session);
