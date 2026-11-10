@@ -70,7 +70,7 @@ export async function runNavigation(
 export function registerCommands(pi: ExtensionAPI, registry: SessionRegistry): void {
   const makeHandler = (id: ActionId) => async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
-    const prepared = await registry.commandNavigation(ctx, () => ctx.waitForIdle());
+    const prepared = await registry.commandNavigation(ctx);
     if (prepared.status !== "ready") {
       ctx.ui.notify(commandBlockedMessage(id, prepared.status), "warning");
       return;

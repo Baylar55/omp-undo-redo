@@ -1,5 +1,6 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import { SHUTDOWN_BUDGET_MS, SHUTDOWN_TURN_DRAIN_MS } from "../host-contract.js";
-import type { AnyContext } from "../host-contract.js";
+import type { AnyContext, CommandHost } from "../host-contract.js";
 import { historyDirectory } from "../history/layout.js";
 import { releaseSessionHeartbeat, touchSessionHeartbeat } from "../history/liveness.js";
 import { timedOutAfter, track } from "../infra/async.js";
@@ -27,10 +28,7 @@ export type SessionRegistry = {
     token: string,
     applied: boolean,
   ): Promise<void>;
-  commandNavigation(
-    typed: AnyContext,
-    waitForIdle: () => Promise<void>,
-  ): Promise<CommandNavigation>;
+  commandNavigation(typed: AnyContext & CommandHost): Promise<CommandNavigation>;
   sessionStart(typed: AnyContext): Promise<void>;
   sessionTree(
     typed: AnyContext,
@@ -97,15 +95,12 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
 
   /** `/undo` and `/redo`: the session's navigation once the last turn's
    *  capture and every session's finalize settled. */
-  async function commandNavigation(
-    typed: AnyContext,
-    waitForIdle: () => Promise<void>,
-  ): Promise<CommandNavigation> {
+  async function commandNavigation(typed: AnyContext & CommandHost): Promise<CommandNavigation> {
     if (!isMainSession(services, typed)) return { status: "subagent" };
     const sessionId = typed.sessionManager.getSessionId();
     // Commands run even mid-stream: the turn's finalize only registers at
     // agent_end, so the guards below must be read after the idle wait.
-    await waitForIdle();
+    await typed.waitForIdle();
     // The host emits `agent_end` to extensions only after its post-run
     // maintenance (compaction, session_stop hooks) and behind other
     // extensions' handlers, so its loop can be idle while this run's turn is
@@ -117,6 +112,13 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     ) {
       return { status: "finalizing" };
     }
+    // A different gap: the host delivers `agent_end` (detached) before it
+    // stops counting the prompt in flight, and `isIdle()` stays false until
+    // then, so `runNavigation`'s busy check could refuse a command typed
+    // mid-stream. Before the continuation settle: a continuation the host
+    // schedules meanwhile still gets to open (`agent_start`).
+    const idleBy = Date.now() + services.captureDeadlineMs;
+    while (!typed.isIdle() && !services.flags.closing && Date.now() < idleBy) await sleep(50);
     // Idle with a turn still held for a continuation: it was skipped, or
     // waits on async work. Record it before navigating past it.
     await settleContinuation(services, typed);

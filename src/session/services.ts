@@ -65,7 +65,8 @@ export type OmpUndoRedoDependencies = {
   /** How long the before_agent_start / agent_end / undo / redo handlers wait
    *  for an in-flight checkpoint capture before returning without it. The
    *  capture keeps running and the turn is finalized when it settles. Undo and
-   *  redo also wait this long for a started run's late `agent_end`. */
+   *  redo also wait this long for a started run's late `agent_end`, and then
+   *  for the host to report idle. */
   captureDeadlineMs?: number;
   /** How long a `tool_call` waits for the turn's before-snapshot. Must stay
    *  under the host's 30 s `tool_call` cap, which blocks the tool on timeout. */

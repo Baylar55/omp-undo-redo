@@ -967,8 +967,16 @@ describe("bounded capture lifecycle", () => {
       await turn("turn1", "one\n", true);
       await turn("turn2", "two\n", false);
 
+      // Refused on the late agent_end alone: the idle poll would only add its
+      // own deadline on top.
+      let idleChecks = 0;
+      ctx.isIdle = () => {
+        idleChecks += 1;
+        return true;
+      };
       await pi.runCommand("undo", ctx);
       expect(ctx.ui.notifications.at(-1)?.message).toContain("still being finalized");
+      expect(idleChecks).toBe(0);
       expect(ctx.leaf).toBe("turn2");
       await expect(readFile(file, "utf8")).resolves.toBe("two\n");
 
@@ -976,6 +984,44 @@ describe("bounded capture lifecycle", () => {
       expect(await undo()).toContain("file snapshot restored");
       await expect(readFile(file, "utf8")).resolves.toBe("one\n");
       expect(await undo()).toContain("file snapshot restored");
+      await expect(readFile(file, "utf8")).resolves.toBe("base\n");
+    } finally {
+      await rmRetry(cwd);
+    }
+  });
+
+  it("waits for the host to report idle after its loop ends before undoing", async () => {
+    // The command's idle wait ends with the host's agent loop; `isIdle()`
+    // stays false through the post-run maintenance after it.
+    const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-idle-lag-"));
+    try {
+      const pi = new FakeExtensionApi();
+      ompUndoRedo(pi as never, { captureDeadlineMs: 10_000 });
+      const ctx = context(cwd, "idle-lag-session");
+      ctx.navigateTree = async (targetId) => {
+        ctx.leaf = targetId;
+        return { cancelled: false };
+      };
+      const file = join(cwd, "tracked.txt");
+      await pi.emit("session_start", ctx);
+      await writeFile(file, "base\n");
+      await pi.emit("before_agent_start", ctx);
+      await pi.emit("agent_start", ctx);
+      await pi.emit("tool_call", ctx);
+      await writeFile(file, "one\n");
+      ctx.leaf = "turn1";
+      await pi.emit("agent_end", ctx);
+
+      // Busy for 200 ms from the first check, so slower work ahead of the
+      // poll cannot use up the window and hide a missing poll.
+      let firstCheck: number | undefined;
+      ctx.isIdle = () => {
+        firstCheck ??= Date.now();
+        return Date.now() - firstCheck >= 200;
+      };
+      await pi.runCommand("undo", ctx);
+      expect(Date.now() - (firstCheck ?? Date.now())).toBeGreaterThanOrEqual(200);
+      expect(ctx.ui.notifications.at(-1)?.message).toContain("file snapshot restored");
       await expect(readFile(file, "utf8")).resolves.toBe("base\n");
     } finally {
       await rmRetry(cwd);

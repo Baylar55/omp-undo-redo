@@ -15,6 +15,10 @@ export type AnyContext = {
   agent?: { kind: "main" | "sub" };
 };
 
+/** A command context's two idle signals. `waitForIdle` ends with the agent
+ *  loop; `isIdle` stays false until the host's post-run work is done too. */
+export type CommandHost = { waitForIdle(): Promise<void>; isIdle(): boolean };
+
 export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
 
 export const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
