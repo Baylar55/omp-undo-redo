@@ -19,26 +19,36 @@ import {
   storeInitArgs,
 } from "./setup.js";
 
+/** Directory-only, so a file of the same name (a `build` script) is still
+ *  snapshotted. A junction counts as a directory (Git for Windows walks it);
+ *  a symlink of one of these names is snapshotted as the link itself. */
 export const DEFAULT_EXCLUDES = [
-  ".git",
-  ".hg",
-  ".svn",
-  "node_modules",
-  ".history",
-  "dist",
-  "coverage",
-  ".omp",
-  ".next",
-  "build",
-  "out",
-  "target",
+  ".git/",
+  ".hg/",
+  ".svn/",
+  "node_modules/",
+  ".history/",
+  "dist/",
+  "coverage/",
+  ".omp/",
+  ".next/",
+  "build/",
+  "out/",
+  "target/",
   // IDE and tool state: Visual Studio holds `.vs` databases open exclusively.
-  ".vs",
-  ".idea",
-  "__pycache__",
-  ".venv",
-  ".gradle",
+  ".vs/",
+  ".idea/",
+  "__pycache__/",
+  ".venv/",
+  ".gradle/",
 ] as const;
+
+/** The same names as earlier versions seeded them, without the trailing
+ *  slash: `updateExclude` rewrites such a line in place (keeping its position,
+ *  which a negation can make significant). */
+const LEGACY_EXCLUDES = new Set<string>(
+  DEFAULT_EXCLUDES.filter((entry) => entry.endsWith("/")).map((entry) => entry.slice(0, -1)),
+);
 
 /** Per-workspace private repositories: a non-git workspace is snapshotted
  *  through a private git repo stored under the omp state root, keyed by the
@@ -94,7 +104,7 @@ export function refusedPrivateWorkspace(canonical: string): boolean {
 /** Appends `<relative-storeRoot>/` to the private repo's info/exclude so a
  *  snapshot never captures the omp state root (which contains the private
  *  repo itself), plus the built-in default ignore list
- *  (`node_modules`, `dist`, `.omp`, …) so private-git snapshots do not grow
+ *  (`node_modules/`, `dist/`, `.omp/`, …) so private-git snapshots do not grow
  *  unbounded on churning dependency/build/state directories. The store-root
  *  entry is skipped when it is not inside the worktree; the built-in ignores
  *  are always seeded. Launches started together race to replace the file, and
@@ -122,28 +132,31 @@ async function updateExclude(gitDir: string, worktree: string, storeRoot: string
     // would drop the user's own entries.
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const managed: string[] = [];
+  const managed = new Set<string>();
   const rel = pathInside(worktree, storeRoot);
-  if (rel) managed.push(`${rel}/`);
-  managed.push(...DEFAULT_EXCLUDES);
+  if (rel) managed.add(`${rel}/`);
+  for (const entry of DEFAULT_EXCLUDES) managed.add(entry);
 
-  const lines = content.split(/\r?\n/);
+  const original = content.split(/\r?\n/);
+  const lines = original.map((line) =>
+    LEGACY_EXCLUDES.has(line.trim()) ? `${line.trim()}/` : line,
+  );
+  const migrated = lines.some((line, index) => line !== original[index]);
   // Earlier versions re-appended every managed entry on each launch. Drop the
   // repeats, keeping the first occurrence. Skipped when a negation exists:
   // last-match-wins makes line order significant there.
   const dedupe = !lines.some((line) => line.trim().startsWith("!"));
-  const managedSet = new Set<string>(managed);
   const seen = new Set<string>();
   const kept = lines.filter((line) => {
     const entry = line.trim();
-    if (!dedupe || !managedSet.has(entry)) return true;
+    if (!dedupe || !managed.has(entry)) return true;
     if (seen.has(entry)) return false;
     seen.add(entry);
     return true;
   });
   const present = new Set(kept.map((line) => line.trim()));
-  const missing = managed.filter((entry) => !present.has(entry));
-  if (missing.length === 0 && kept.length === lines.length) return;
+  const missing = [...managed].filter((entry) => !present.has(entry));
+  if (missing.length === 0 && kept.length === lines.length && !migrated) return;
 
   while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
   const updated = `${[...kept, ...missing].join("\n")}\n`;
