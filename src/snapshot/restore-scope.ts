@@ -3,9 +3,11 @@ import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { GitRunner } from "../types.js";
 import { invoke, outputLines } from "../infra/git-runner.js";
+import { debugLog } from "../infra/debug-log.js";
 import {
   AUTOCRLF_OFF_LINE,
   NESTED_REPOSITORY_LINE,
+  UNREADABLE_DIRECTORY_LINE,
   UNREADABLE_FILE_LINE,
   recordedExcludeRules,
 } from "./markers.js";
@@ -151,12 +153,13 @@ interface SnapshotsOutside extends OutsideSnapshot {
   /** `--index-info -z` entries pinning every unreadable file to its source
    *  entry (a removal when the source has none). */
   unreadablePins: string[];
-  /** `--index-info -z` entries pinning every path under the extension's own
-   *  directories that the two commits disagree on to its source entry (a
-   *  removal when the source has none). Only snapshots taken before those
-   *  were left out hold such paths; restoring them would delete the store's
-   *  objects. */
-  ownedPins: string[];
+  /** `--index-info -z` entries pinning every path the two commits disagree
+   *  on to its source entry (a removal when the source has none) under the
+   *  extension's own directories and under unreadable directories. Only
+   *  snapshots taken before the former were left out hold such paths;
+   *  restoring them would delete the store's objects. An unreadable
+   *  directory's entries in the snapshot that could not open it are missing. */
+  keptPins: string[];
   /** Both commits carry `AUTOCRLF_OFF_LINE`. */
   autocrlfOff: boolean;
 }
@@ -164,15 +167,19 @@ interface SnapshotsOutside extends OutsideSnapshot {
 /** Paths neither commit holds the contents of. Nested repositories: gitlinks
  *  (a submodule or committed nested repository is recorded as its HEAD commit
  *  only, and `git apply` without an index skips gitlink hunks) plus the ones a
- *  snapshot left out for having no commit. Unreadable files: a snapshot's
- *  entry for one is stale or missing, so the restore must leave the file on
- *  disk alone. `ownedPaths`: the extension's directories inside the worktree
- *  (`ownedPathsInWorktree`), whose paths get `ownedPins`. Null when a commit
- *  is unreadable. Also reads how both commits
- *  were captured (`autocrlfOff`). The listings are streamed,
+ *  snapshot left out for having no commit. Unreadable files and directories: a
+ *  snapshot's entries for one are stale or missing, so the restore must leave
+ *  it on disk alone. `ownedPaths`: the extension's directories inside the
+ *  worktree (`ownedPathsInWorktree`). Both get `keptPins`. Null when a commit
+ *  is unreadable, or when a path to pin is not UTF-8: it is read as text with
+ *  U+FFFD in place of the bad bytes, so a pin written from it would name
+ *  another path and leave the real one to the patch. Also reads how both
+ *  commits were captured (`autocrlfOff`). The listings are streamed,
  *  so memory stays bounded by what is kept, not by the tree's size.
  *  ponytail: lists every tree entry per restore; record gitlinks at capture
- *  time if undo in million-file trees gets slow. */
+ *  time if undo in million-file trees gets slow. ponytail: a path really
+ *  named with U+FFFD under a pinned folder fails the restore too; pin from
+ *  raw bytes if that ever matters. */
 export async function pathsOutsideSnapshots(
   git: GitRunner,
   sourceHash: string,
@@ -181,6 +188,7 @@ export async function pathsOutsideSnapshots(
 ): Promise<SnapshotsOutside | null> {
   const nested = new Set<string>();
   const unreadable = new Set<string>();
+  const unreadableDirectories = new Set<string>();
   let autocrlfOff = true;
   for (const commit of [sourceHash, targetHash]) {
     const object = await invoke(git, ["cat-file", "commit", commit]);
@@ -193,13 +201,25 @@ export async function pathsOutsideSnapshots(
         nested.add(line.slice(NESTED_REPOSITORY_LINE.length));
       } else if (line.startsWith(UNREADABLE_FILE_LINE)) {
         unreadable.add(line.slice(UNREADABLE_FILE_LINE.length));
+      } else if (line.startsWith(UNREADABLE_DIRECTORY_LINE)) {
+        unreadableDirectories.add(line.slice(UNREADABLE_DIRECTORY_LINE.length));
       }
     }
   }
   const sourceEntries = new Map<string, string>();
-  // Entries under the owned paths: [source, target].
-  const ownedEntries = [new Map<string, string>(), new Map<string, string>()] as const;
-  const ownedPrefixes = ownedPaths.map((path) => `${path}/`);
+  // The first path to pin that is not UTF-8 (see the doc comment).
+  let undecodable = [...unreadable, ...unreadableDirectories].find((path) =>
+    path.includes("\uFFFD"),
+  );
+  // Entries kept at their source state: [source, target].
+  const keptEntries = [new Map<string, string>(), new Map<string, string>()] as const;
+  // The roots themselves too: one snapshot may hold a file or symlink where
+  // the other could not open a folder.
+  const keptRoots = [
+    ...ownedPaths,
+    ...[...unreadableDirectories].map((directory) => directory.slice(0, -1)),
+  ];
+  const keptPrefixes = keptRoots.map((path) => `${path}/`);
   for (const [side, commit] of [sourceHash, targetHash].entries()) {
     // Entries: "<mode> <type> <object>\t<path>", a format `--index-info` reads.
     let partial = "";
@@ -210,8 +230,9 @@ export async function pathsOutsideSnapshots(
         const path = entry.slice(entry.indexOf("\t") + 1);
         if (entry.startsWith("160000 ")) nested.add(path);
         if (commit === sourceHash && unreadable.has(path)) sourceEntries.set(path, entry);
-        if (ownedPaths.includes(path) || ownedPrefixes.some((prefix) => path.startsWith(prefix))) {
-          ownedEntries[side]!.set(path, entry);
+        if (keptRoots.includes(path) || keptPrefixes.some((prefix) => path.startsWith(prefix))) {
+          if (path.includes("\uFFFD")) undecodable ??= path;
+          keptEntries[side]!.set(path, entry);
         }
       }
     };
@@ -223,24 +244,29 @@ export async function pathsOutsideSnapshots(
     // A runner that ignores `onStdout` buffers instead; scanning twice is harmless.
     feed(`${tree.stdout}\0`);
   }
+  if (undecodable !== undefined) {
+    debugLog({ event: "restore-pin-not-utf8", path: undecodable });
+    return null;
+  }
   // Mode 0 with an all-zero id of the repository's hash length removes a path.
   const removal = `0 ${"0".repeat(sourceHash.length)}`;
-  const [sourceOwned, targetOwned] = ownedEntries;
-  const ownedPins: string[] = [];
+  const [sourceKept, targetKept] = keptEntries;
+  const keptPins: string[] = [];
   // Removals first: a source file may sit where the target has a directory.
-  for (const path of targetOwned.keys()) {
-    if (!sourceOwned.has(path)) ownedPins.push(`${removal}\t${path}\0`);
+  for (const path of targetKept.keys()) {
+    if (!sourceKept.has(path)) keptPins.push(`${removal}\t${path}\0`);
   }
-  for (const [path, entry] of sourceOwned) {
-    if (targetOwned.get(path) !== entry) ownedPins.push(`${entry}\0`);
+  for (const [path, entry] of sourceKept) {
+    if (targetKept.get(path) !== entry) keptPins.push(`${entry}\0`);
   }
   return {
     nestedRepositories: [...nested].sort(),
     unreadableFiles: [...unreadable].sort(),
+    unreadableDirectories: [...unreadableDirectories].sort(),
     unreadablePins: [...unreadable].map(
       (path) => `${sourceEntries.get(path) ?? `${removal}\t${path}`}\0`,
     ),
-    ownedPins,
+    keptPins,
     autocrlfOff,
   };
 }

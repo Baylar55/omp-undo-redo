@@ -63,7 +63,7 @@ Left as they are by `/undo` and `/redo`:
 
 - **Ignored files:** matched by `.gitignore` or the built-in list.
 - **Nested Git repositories and submodules:** contents and `HEAD` untouched; the result names them.
-- **Files Git could not read** at snapshot time (locked, e.g. Visual Studio's `.vs` databases, or no read permission); the result names them.
+- **Files and folders Git could not read** at snapshot time (locked, e.g. Visual Studio's `.vs` databases, no read permission, or a folder path past 260 characters with `core.longpaths` off); the result names them. For long paths, `git config core.longpaths true` in the repository lets later snapshots capture and restore them.
 - **Pruned Git LFS files:** snapshotting runs clean filters like `git add`, writing LFS objects to `.git/lfs/objects` (or the store's `lfs/` for non-Git folders). If `git lfs prune` removed one and LFS cannot download it again, the restore is rolled back; if the file's current version was pruned too, it is left empty.
 - **Rewritten history:** in Git mode, content reachable from `HEAD` is shared with your repository until the next store gc. Rewriting and pruning it before then (`git filter-repo`, BFG) makes those checkpoints unrestorable; undo/redo reports the failure rather than restoring part of them. Normal `git gc --prune=now` is safe.
 

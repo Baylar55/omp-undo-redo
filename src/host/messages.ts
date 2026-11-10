@@ -104,7 +104,7 @@ export function notRestoredMessage(
   }
   if (unreadable.length > 0) {
     parts.push(
-      `files Git could not read when the snapshot was taken (locked by another process or no read permission) were left as they are: ${listed(unreadable)}`,
+      `files and folders Git could not read when the snapshot was taken (locked by another process, no read permission, or a path too long) were left as they are: ${listed(unreadable)}`,
     );
   }
   return `${parts.join("; ")}.`;

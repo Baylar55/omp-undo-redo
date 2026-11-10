@@ -42,8 +42,8 @@ export type NavigationResult =
    *  created or deleted, whoever last edited it. */
   | { status: "moved"; files: "restored"; restoredFiles: string[] }
   /** Restored everything the snapshot holds; `nestedRepositories` and
-   *  `unreadableFiles` (worktree root relative) are outside it and were not
-   *  restored. */
+   *  `unreadableFiles` (worktree root relative; a folder git could not open
+   *  ends in "/") are outside it and were not restored. */
   | {
       status: "moved";
       files: "partial";

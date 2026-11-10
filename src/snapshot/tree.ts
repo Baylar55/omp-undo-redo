@@ -17,6 +17,14 @@ const NO_COMMIT_ERROR = /^error: '(.+?)\/?' does not have a commit checked out$/
 
 const UNABLE_TO_INDEX_ERROR = /^error: unable to index file '(.+?)\/?'$/;
 
+/** `add -A` warns and exits 0 on a directory it cannot open (no permission,
+ *  a path past MAX_PATH under `core.longpaths=false`): its untracked files
+ *  are skipped and its index entries dropped or left stale. Errno text has no
+ *  quote, so the last `': ` ends the path. */
+const UNOPENED_DIRECTORY_PREFIX = "warning: could not open directory '";
+
+const UNOPENED_DIRECTORY_WARNING = /^warning: could not open directory '(.*)': [^']*$/;
+
 const GITIGNORE_PATH = /(?:^|\/)\.gitignore$/;
 
 export type SnapshotResult =
@@ -311,9 +319,12 @@ async function pruneIgnoredEntries(
  *  by a running app on Windows; it would disable capture for as long as the
  *  lock is held). The index keeps whatever entry an unreadable file had, so
  *  its tree entry is stale or missing: restores pin it (`applyPatch`) instead
- *  of treating it as deleted. Any other error still fails the snapshot, as
- *  does an error line not naming the file the following "unable to index"
- *  line reports. `LC_ALL=C` pins the messages being matched.
+ *  of treating it as deleted. A folder git cannot open is left out the same
+ *  way, though `add -A` exits 0: its entries are missing or stale, so
+ *  restores keep every path under it as it is. Any other error still fails
+ *  the snapshot, as does an error line not naming the file the following
+ *  "unable to index" line reports. `LC_ALL=C` pins the messages being
+ *  matched.
  *  `core.autocrlf=false`: `core.autocrlf` would store an LF blob for a CRLF
  *  file, so restoring an LF file wrote CRLF and a turn that only changed
  *  line endings recorded nothing. Text/eol attributes still apply: the
@@ -362,7 +373,28 @@ async function addWorktree(
     ],
     { env: { ...env, LC_ALL: "C" } },
   );
-  const outside: OutsideSnapshot = { nestedRepositories: [], unreadableFiles: [] };
+  const outside: OutsideSnapshot = {
+    nestedRepositories: [],
+    unreadableFiles: [],
+    unreadableDirectories: [],
+  };
+  for (const line of added.stderr.split(/\r?\n/)) {
+    if (!line.startsWith(UNOPENED_DIRECTORY_PREFIX)) continue;
+    const directory = UNOPENED_DIRECTORY_WARNING.exec(line)?.[1];
+    // git prints the path unquoted (tabs kept): a newline in it splits the
+    // line, and other control characters print as "?". A split line that
+    // still parses captures a prefix of the real path, so the trailing "/" is
+    // what makes it an ancestor folder (fenced off whole) rather than another
+    // path; the root (".") has none either. Bytes that are not UTF-8 decode to
+    // U+FFFD, and restore pins written from that text name another path even
+    // though tree listings decode the same way. Any of these fails the
+    // snapshot. ponytail: a POSIX folder really named with "?" or U+FFFD
+    // fails it too.
+    if (!directory?.endsWith("/") || /[?\uFFFD]/.test(directory)) return null;
+    if (!outside.unreadableDirectories.includes(directory)) {
+      outside.unreadableDirectories.push(directory);
+    }
+  }
   if (added.code === 0) return outside;
   if (added.error || added.code !== 1) return null;
   // Error lines git printed for the file the next "unable to index" names.

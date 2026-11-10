@@ -62,7 +62,9 @@ export async function applyCheckpoint(
   // Read first: failing after the patch landed would misreport a restore.
   const outside = await pathsOutsideSnapshots(git, sourceHash, targetHash, ownedPaths);
   if (!outside) return { status: "failed" };
-  const { nestedRepositories, unreadableFiles, unreadablePins, ownedPins } = outside;
+  const { nestedRepositories, unreadablePins, keptPins } = outside;
+  // A folder keeps its trailing "/", so the report tells it from a file.
+  const unreadableFiles = [...outside.unreadableFiles, ...outside.unreadableDirectories].sort();
   let config: string[] = [];
   if (outside.autocrlfOff) {
     const setting = await autocrlfSetting(git);
@@ -73,7 +75,7 @@ export async function applyCheckpoint(
     git,
     sourceHash,
     targetHash,
-    [...unreadablePins, ...ownedPins],
+    [...unreadablePins, ...keptPins],
     ownedPaths,
     config,
     checkOnly,

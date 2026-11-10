@@ -16,7 +16,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep, toNamespacedPath } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { SessionNavigation } from "../../src/session/navigation.js";
@@ -43,7 +43,11 @@ import {
   releasePendingCheckpoint,
   retainCheckpointForResume,
 } from "../../src/snapshot/checkpoint-refs.js";
-import { applyCheckPaths, pathsBeyondLinks } from "../../src/snapshot/restore-scope.js";
+import {
+  applyCheckPaths,
+  pathsBeyondLinks,
+  pathsOutsideSnapshots,
+} from "../../src/snapshot/restore-scope.js";
 import { applyCheckpoint } from "../../src/snapshot/restore.js";
 import { historyDirectory } from "../../src/history/layout.js";
 
@@ -1145,6 +1149,151 @@ describe("history-safe Git checkpoints", () => {
       },
     );
   }
+
+  // `add -A` warns and exits 0 on a folder it cannot open, dropping its
+  // entries: undo would delete the folder's files and report full success.
+  // Windows: a path past MAX_PATH under `core.longpaths=false`; elsewhere mode
+  // 000, which root ignores. Unopenable during the before-snapshot only.
+  // Replaced: the turn puts a file where git could not open the folder.
+  for (const replaced of [false, true]) {
+    it.skipIf(process.getuid?.() === 0)(
+      `snapshots around a folder git cannot open and leaves it alone on restore${replaced ? " when a file replaces it" : ""}`,
+      async () => {
+        const { cwd, git, snap } = await makeRepo();
+        const sessionId = `unopened-folder-${replaced}`;
+        const windows = process.platform === "win32";
+        const folder = windows
+          ? Array.from({ length: 6 }, (_, index) => `${"d".repeat(50)}${index}`).join("/")
+          : "locked";
+        const onDisk = (path: string) => toNamespacedPath(join(cwd, path));
+        try {
+          await mkdir(onDisk(folder), { recursive: true });
+          await writeFile(onDisk(`${folder}/kept.txt`), "v0\n");
+          await git(["config", "core.longpaths", "true"]);
+          await initializeBranch(git, cwd);
+          const lock = async (locked: boolean) => {
+            if (windows) await git(["config", "core.longpaths", String(!locked)]);
+            else await chmod(join(cwd, folder), locked ? 0o000 : 0o755);
+          };
+          await writeFile(onDisk(`${folder}/kept.txt`), "v1\n");
+          await lock(true);
+          let before: PendingGitCheckpoint;
+          try {
+            before = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId, defaultPool));
+          } finally {
+            await lock(false);
+          }
+          const message = await text(snap, ["log", "-1", "--format=%B", before.beforeHash]);
+          const unopened = /^Unreadable directory outside snapshot: (.+)$/m.exec(message)?.[1];
+          expect(unopened).toBeDefined();
+          expect(unopened!.endsWith("/")).toBe(true);
+          expect(`${folder}/`.startsWith(unopened!)).toBe(true);
+          // Each path the turn leaves on disk, which no restore may touch.
+          const left: Record<string, string> = replaced
+            ? { [unopened!.slice(0, -1)]: "turn\n" }
+            : { [`${folder}/kept.txt`]: "v1\n", [`${folder}/added.txt`]: "turn\n" };
+          if (replaced) await rm(onDisk(unopened!), { recursive: true });
+          await writeFile(join(cwd, "tracked.txt"), "turn\n");
+          for (const [path, content] of Object.entries(left)) {
+            await writeFile(onDisk(path), content);
+          }
+          const after = completedCheckpoint(
+            await finishAfterTurn(snap, before, null, null, defaultPool),
+          );
+
+          const notRestored = {
+            nestedRepositories: [],
+            unreadableFiles: [unopened],
+            restoredFiles: ["tracked.txt"],
+          };
+          for (const [source, target, tracked] of [
+            [after.afterHash, after.beforeHash, "base\n"],
+            [after.beforeHash, after.afterHash, "turn\n"],
+          ] as const) {
+            expect(await applyCheckpoint(snap, source, target)).toEqual({
+              status: "applied",
+              ...notRestored,
+            });
+            expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(tracked);
+            for (const [path, content] of Object.entries(left)) {
+              expect(await readFile(onDisk(path), "utf8")).toBe(content);
+            }
+          }
+          await releaseCheckpoint(snap, after);
+        } finally {
+          await rm(toNamespacedPath(cwd), { recursive: true, force: true });
+          await releasePersistentSnapshotIndices([sessionId]);
+        }
+      },
+    );
+  }
+
+  // git prints the folder unquoted, so a newline splits its warning and any
+  // other control character prints as "?": the snapshot must fail rather than
+  // leave the folder unfenced. POSIX only: Windows names cannot hold either.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0).each(["a\nb", "a\u0001b"])(
+    "fails the snapshot when an unopenable folder's name is %j",
+    async (name) => {
+      const { cwd, git, snap } = await makeRepo();
+      const sessionId = `unopened-folder-${name.charCodeAt(1)}`;
+      const folder = join(cwd, name);
+      try {
+        await initializeBranch(git, cwd);
+        await mkdir(folder);
+        await writeFile(join(folder, "kept.txt"), "v1\n");
+        await chmod(folder, 0o000);
+        try {
+          expect(await prepareBeforeTurn(snap, sessionId, defaultPool)).toEqual({
+            status: "session_only",
+            reason: "before_snapshot_failed",
+          });
+        } finally {
+          await chmod(folder, 0o755);
+        }
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await releasePersistentSnapshotIndices([sessionId]);
+      }
+    },
+  );
+
+  // Tree paths are read as text, so a pin for a name that is not UTF-8 would
+  // land on its U+FFFD spelling: undo would delete the real file and create
+  // that one. The restore must refuse and write nothing. Linux only: Windows
+  // and APFS names are always Unicode; root reads mode-000 folders.
+  it.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
+    "refuses a restore that would pin a non-UTF-8 path under an unopened folder",
+    async () => {
+      const { cwd, git, snap } = await makeRepo();
+      const sessionId = "unopened-folder-non-utf8";
+      const folder = join(cwd, "locked");
+      const file = Buffer.concat([Buffer.from(`${folder}/a`), Buffer.from([0xff, 0x62])]);
+      try {
+        await initializeBranch(git, cwd);
+        await mkdir(folder);
+        await chmod(folder, 0o000);
+        let before: PendingGitCheckpoint;
+        try {
+          before = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId, defaultPool));
+        } finally {
+          await chmod(folder, 0o755);
+        }
+        await writeFile(file, "turn\n");
+        const after = completedCheckpoint(
+          await finishAfterTurn(snap, before, null, null, defaultPool),
+        );
+        expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
+          status: "failed",
+        });
+        expect(await readFile(file, "utf8")).toBe("turn\n");
+        expect(await readdir(folder)).toHaveLength(1);
+        await releaseCheckpoint(snap, after);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await releasePersistentSnapshotIndices([sessionId]);
+      }
+    },
+  );
 
   it("reuses the persisted alternate index across consecutive turns to avoid a full re-hash", async () => {
     const { cwd, git, snap } = await makeRepo();
@@ -3261,6 +3410,35 @@ describe("applyCheckPaths", () => {
       "link",
       "run.sh",
     ]);
+  });
+});
+
+describe("pathsOutsideSnapshots", () => {
+  // Git's answers as the runner hands them over: decoded text, a byte that
+  // is not UTF-8 already turned into U+FFFD.
+  const objectId = "a".repeat(40);
+  const fakeGit = (trees: Record<string, string[]>): GitRunner =>
+    (async (args: string[]) => {
+      if (args[0] === "cat-file") {
+        const marker = args[2] === "T" ? "Unreadable directory outside snapshot: locked/" : "";
+        return { stdout: `tree x\n\nsnapshot\n\n${marker}`, stderr: "", code: 0 };
+      }
+      if (args[0] === "ls-tree") {
+        const entries = trees[args.at(-1)!]!.map((path) => `100644 blob ${objectId}\t${path}\0`);
+        return { stdout: entries.join(""), stderr: "", code: 0 };
+      }
+      throw new Error(`unexpected git ${args.join(" ")}`);
+    }) as GitRunner;
+
+  it("pins an unopened folder and its own path, and refuses only a pin that is not UTF-8", async () => {
+    const pins = async (source: string[]) =>
+      (await pathsOutsideSnapshots(fakeGit({ S: source, T: [] }), "S", "T"))?.keptPins ?? null;
+    expect(await pins(["locked/a", "elsewhere"])).toEqual([`100644 blob ${objectId}\tlocked/a\0`]);
+    expect(await pins(["locked"])).toEqual([`100644 blob ${objectId}\tlocked\0`]);
+    // A pin would land on the U+FFFD spelling and leave the real file to the patch.
+    expect(await pins(["locked/a\uFFFDb"])).toBeNull();
+    // Outside the pinned folders the patch carries raw bytes: no reason to refuse.
+    expect(await pins(["other/a\uFFFDb"])).toEqual([]);
   });
 });
 

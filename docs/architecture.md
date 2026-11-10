@@ -267,6 +267,11 @@ literal `:(exclude)` pathspecs, and index entries for them (a `HEAD` that tracks
 Restores pin every path under them to its state in the source snapshot, so snapshots taken before
 this exclusion existed cannot rewrite the store either.
 
+A folder `git add -A` cannot open (no permission, a path past `MAX_PATH` under `core.longpaths=false`)
+only draws a warning and exit 0, and its index entries are dropped or left stale. The snapshot
+records it as an unreadable directory marker, and restores pin the folder and every path under it
+the same way, in both directions, and report it as not restored.
+
 Each capture copies into the store every snapshot object the user's `HEAD` does not reach (content
 of a reset or amended commit, a staged-then-dropped file, an old version a file was reverted to),
 and before every store gc the extension packs every snapshot object `HEAD` then does not reach into
