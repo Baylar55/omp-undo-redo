@@ -2243,6 +2243,132 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("checks only entries added since the last reused unborn snapshot until an ignore source changes", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const excludesFile = join(cwd, "..", `${cwd.slice(cwd.lastIndexOf(sep) + 1)}-excludes`);
+    const sessionId = "unborn-incremental-prune";
+    const freshIds: string[] = [];
+    const commands: string[][] = [];
+    const gitWrapper = Object.assign(
+      async (args: string[], options?: Parameters<GitRunner>[1]) => {
+        commands.push(args);
+        return snap(args, options);
+      },
+      { cwd, env: snap.env },
+    ) satisfies GitRunner;
+    const checkpoints: GitCheckpoint[] = [];
+    // Which ignore check the counted snapshots ran; "none" fails both
+    // assertions, so a reworded command cannot pass silently.
+    const checked = () =>
+      commands.some((args) => args.includes("--cached") && args.includes("--ignored"))
+        ? "whole"
+        : commands.some((args) => args.includes("--name-status"))
+          ? "incremental"
+          : "none";
+    // One turn on the reused lease (both snapshots counted); its after tree
+    // must match a fresh snapshot.
+    const turn = async () => {
+      commands.length = 0;
+      const before = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId, defaultPool));
+      const after = completedCheckpoint(
+        await finishAfterTurn(gitWrapper, before, null, null, defaultPool),
+      );
+      checkpoints.push(after);
+      const freshId = `${sessionId}-fresh-${freshIds.length}`;
+      freshIds.push(freshId);
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, freshId, defaultPool));
+      expect(await text(snap, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+      );
+      await releasePendingCheckpoint(snap, fresh, defaultPool);
+      return (await text(snap, ["ls-tree", "-r", "-z", "--name-only", after.afterHash])).split(
+        "\0",
+      );
+    };
+    try {
+      await mkdir(join(cwd, "dir"));
+      await mkdir(join(cwd, "sub"));
+      for (const path of ["keep.txt", "dir/a.txt", "x.tmp", "y.bak", "sub/c.txt", "sub/d.txt"]) {
+        await writeFile(join(cwd, path), `${path}\n`);
+      }
+      // Seeds the lease; the first reused snapshot checks the whole index.
+      await turn();
+      expect(checked()).toBe("whole");
+      expect(await turn()).toContain("dir/a.txt");
+      expect(checked()).toBe("incremental");
+
+      // A tracked .gitignore changes: the whole index is checked once.
+      await writeFile(join(cwd, ".gitignore"), "dir/\n");
+      expect(await turn()).not.toContain("dir/a.txt");
+      expect(checked()).toBe("whole");
+      // The seed's dir/a.txt is restored by normalization each time and is
+      // pruned again as an added entry.
+      await writeFile(join(cwd, "added.txt"), "added\n");
+      const names = await turn();
+      expect(names).toContain("added.txt");
+      expect(names).not.toContain("dir/a.txt");
+      expect(checked()).toBe("incremental");
+
+      await mkdir(join(cwd, ".git", "info"), { recursive: true });
+      await writeFile(join(cwd, ".git", "info", "exclude"), "*.tmp\n");
+      expect(await turn()).not.toContain("x.tmp");
+      expect(checked()).toBe("whole");
+
+      await writeFile(excludesFile, "*.bak\n");
+      await git(["config", "core.excludesFile", excludesFile.replaceAll("\\", "/")]);
+      expect(await turn()).not.toContain("y.bak");
+      expect(checked()).toBe("whole");
+
+      // A .gitignore that ignores itself never enters the index: a diff cannot
+      // see it change, so it forces the whole check while it applies.
+      await writeFile(join(cwd, "sub", ".gitignore"), ".gitignore\nc.txt\n");
+      expect(await turn()).not.toContain("sub/c.txt");
+      expect(checked()).toBe("whole");
+      await writeFile(join(cwd, "sub", ".gitignore"), ".gitignore\nc.txt\nd.txt\n");
+      const ignoredItself = await turn();
+      expect(ignoredItself).not.toContain("sub/d.txt");
+      expect(ignoredItself).not.toContain("sub/.gitignore");
+      expect(checked()).toBe("whole");
+
+      // Once it is gone, the next turn still checks the whole index (it may
+      // have held negations), and the one after is incremental again.
+      await rm(join(cwd, "sub", ".gitignore"));
+      expect(await turn()).toContain("sub/d.txt");
+      expect(checked()).toBe("whole");
+      await turn();
+      expect(checked()).toBe("incremental");
+
+      // The same at the root, where the rules cover the whole tree.
+      await writeFile(join(cwd, ".gitignore"), "dir/\n.gitignore\nkeep.txt\n");
+      const rootIgnored = await turn();
+      expect(rootIgnored).not.toContain(".gitignore");
+      expect(rootIgnored).not.toContain("keep.txt");
+      expect(checked()).toBe("whole");
+      await writeFile(join(cwd, ".gitignore"), "dir/\n");
+      expect(await turn()).toContain("keep.txt");
+      expect(checked()).toBe("whole");
+
+      // A pruned tree gone from the store falls back to the whole check
+      // instead of failing the reused snapshot (a fresh one runs `read-tree`).
+      const before = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId, defaultPool));
+      const lease = before.snapshotIndexLease!;
+      lease.prunedTree = "f".repeat(lease.baseTree.length);
+      commands.length = 0;
+      checkpoints.push(
+        completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null, defaultPool)),
+      );
+      expect(checked()).toBe("whole");
+      expect(commands.some((args) => args.includes("read-tree"))).toBe(false);
+      await turn();
+      expect(checked()).toBe("incremental");
+    } finally {
+      for (const checkpoint of checkpoints) await releaseCheckpoint(snap, checkpoint);
+      await rm(cwd, { recursive: true, force: true });
+      await rm(excludesFile, { force: true });
+      await releasePersistentSnapshotIndices([sessionId, ...freshIds]);
+    }
+  });
+
   it("creates valid empty snapshots in an unborn repository", async () => {
     const { cwd, snap } = await makeRepo();
     try {

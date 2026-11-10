@@ -145,6 +145,14 @@ export interface SnapshotIndexLease {
   baseTree: string;
   /** Seeded against an unborn HEAD; the lease goes stale once HEAD is born. */
   unborn?: true;
+  /** Unborn only: the tree a reused snapshot last wrote, holding no entry the
+   *  ignore rules excluded when `prunedRules` (`excludeRules` output) applied,
+   *  so the next pass checks only entries added since. `prunedRules` is unset
+   *  before the first reused snapshot, and after one pruned under an ignored
+   *  `.gitignore` that no diff can see change: either way the next pass checks
+   *  the whole index. */
+  prunedTree?: string;
+  prunedRules?: string;
 }
 
 export interface GitCheckpoint {

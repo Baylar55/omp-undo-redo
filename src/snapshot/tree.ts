@@ -17,6 +17,8 @@ const NO_COMMIT_ERROR = /^error: '(.+?)\/?' does not have a commit checked out$/
 
 const UNABLE_TO_INDEX_ERROR = /^error: unable to index file '(.+?)\/?'$/;
 
+const GITIGNORE_PATH = /(?:^|\/)\.gitignore$/;
+
 export type SnapshotResult =
   | { hash: string; tree: string; snapshotIndexLease?: SnapshotIndexLease }
   | { reason: "invalid_head" | "snapshot_failed" };
@@ -136,42 +138,143 @@ async function leaseBaselineCurrent(git: GitRunner, lease: SnapshotIndexLease): 
   return lease.unborn ? tree === "" : tree === lease.baseTree;
 }
 
+/** Root-relative `paths` the current ignore rules exclude; null on failure.
+ *  check-ignore refuses every pathspec magic but `top`, and an inherited
+ *  GIT_*_PATHSPECS adds one to each path: it would fail every reused snapshot. */
+async function ignoredAmong(
+  git: GitRunner,
+  env: Record<string, string>,
+  paths: string[],
+): Promise<string[] | null> {
+  if (paths.length === 0) return [];
+  const ignored = await invoke(git, ["check-ignore", "--no-index", "-z", "--stdin"], {
+    env: {
+      ...env,
+      GIT_GLOB_PATHSPECS: "0",
+      GIT_NOGLOB_PATHSPECS: "0",
+      GIT_ICASE_PATHSPECS: "0",
+      GIT_LITERAL_PATHSPECS: "0",
+    },
+    stdin: paths.map((path) => `${WORKTREE_PATHSPEC}${path}\0`).join(""),
+  });
+  // Exit 1: none ignored.
+  if (ignored.error || (ignored.code !== 0 && ignored.code !== 1)) return null;
+  const echoed = ignored.stdout.split("\0").filter(Boolean);
+  if (!echoed.every((path) => path.startsWith(WORKTREE_PATHSPEC))) return null;
+  return echoed.map((path) => path.slice(WORKTREE_PATHSPEC.length));
+}
+
+/** Paths of `diff-index --name-status -z` output that are not modified or
+ *  deleted (added, typechanged: a file that became a gitlink can match a
+ *  directory-only pattern); null when a `.gitignore` is among them. */
+function addedPaths(raw: string): string[] | null {
+  const fields = raw.split("\0");
+  const paths: string[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const status = fields[i]!;
+    const path = fields[i + 1]!;
+    if (GITIGNORE_PATH.test(path)) return null;
+    if (status !== "M" && status !== "D") paths.push(path);
+  }
+  return paths;
+}
+
+/** Whether `ls-files --others --ignored --directory -z` output names a
+ *  `.gitignore` outside every directory it lists whole: an ignored one that
+ *  git still reads, next to index entries (git lists a directory whole only
+ *  when the index has none in it). Diffing the index cannot see it change. */
+function appliedIgnoredGitignore(raw: string): boolean {
+  const entries = raw.split("\0");
+  const directories = new Set(entries.filter((entry) => entry.endsWith("/")));
+  return entries.some((entry) => {
+    if (!GITIGNORE_PATH.test(entry)) return false;
+    for (let end = entry.lastIndexOf("/"); end > 0; end = entry.lastIndexOf("/", end - 1)) {
+      if (directories.has(entry.slice(0, end + 1))) return false;
+    }
+    return true;
+  });
+}
+
 /** Drops index entries that the current ignore rules exclude. Entries a born
  *  baseline tracks are kept (`read-tree HEAD` holds them in a fresh snapshot
- *  whatever the ignore rules say), so only the entries it lacks are checked:
- *  `ls-files --ignored` over the whole index lstat()s every entry once a
- *  directory-only pattern exists, which in a large index costs several times
- *  the `add -A` itself. An unborn baseline tracks nothing: every entry is
- *  checked. Paths stay root relative throughout, whatever the cwd: `:(top)`
- *  for `check-ignore`, which echoes them as given, and `--index-info`, which
- *  (unlike `update-index --stdin`) takes no cwd prefix; mode 0 removes.
- *  Index-only: no worktree file is re-read, so the retained stat cache
- *  survives.
- *  ponytail: cost still grows with the untracked entries; skip the check when
- *  no ignore source changed if a huge untracked set ever matters. */
+ *  whatever the ignore rules say, typechanged ones included), so only the
+ *  entries it lacks are checked: `ls-files --ignored` over the whole index
+ *  lstat()s every entry once a directory-only pattern exists, which in a large
+ *  index costs several times the `add -A` itself. An unborn baseline tracks
+ *  nothing (a private store never gets a HEAD): only entries added or
+ *  typechanged since `lease.prunedTree` are checked while no ignore source
+ *  changed (`rules`, a `.gitignore` in the index, or an ignored `.gitignore`
+ *  next to index entries, which forces the whole check every time it exists);
+ *  else every entry. Paths stay root relative throughout, whatever the cwd:
+ *  `:(top)` for `check-ignore`, which echoes them as given, and
+ *  `--index-info`, which (unlike `update-index --stdin`) takes no cwd prefix;
+ *  mode 0 removes. Index-only: no worktree file is re-read, so the retained
+ *  stat cache survives.
+ *  Null on failure; else, for an unborn lease, the `rules` the pruned index is
+ *  clean under (`prunedRules`), undefined when an ignored `.gitignore` applies.
+ *  ponytail: a born lease's cost still grows with the untracked entries; give
+ *  it the same `prunedTree` pass if a huge untracked set ever matters. */
 async function pruneIgnoredEntries(
   git: GitRunner,
   env: Record<string, string>,
   lease: SnapshotIndexLease,
-): Promise<boolean> {
-  let paths: string[];
+  rules: string,
+  ownedPaths: readonly string[],
+): Promise<{ cleanUnder?: string } | null> {
+  let paths: string[] | null;
+  let cleanUnder: string | undefined;
   if (lease.unborn) {
-    const ignored = await invoke(
-      git,
-      [
-        "ls-files",
-        "-z",
-        "--cached",
-        "--ignored",
-        "--exclude-standard",
-        "--full-name",
-        "--",
-        WORKTREE_PATHSPEC,
-      ],
-      { env },
-    );
-    if (ignored.code !== 0) return false;
-    paths = ignored.stdout.split("\0").filter(Boolean);
+    const since = lease.prunedRules === rules ? lease.prunedTree : undefined;
+    const [changes, others] = await Promise.all([
+      since === undefined
+        ? null
+        : invoke(
+            git,
+            ["diff-index", "--cached", "--no-renames", "--name-status", "-z", since, "--"],
+            { env },
+          ),
+      invoke(
+        git,
+        [
+          "ls-files",
+          "-z",
+          "--others",
+          "--ignored",
+          "--exclude-standard",
+          "--directory",
+          "--full-name",
+          "--",
+          WORKTREE_PATHSPEC,
+          ...ownedPaths.map((path) => `:(top,exclude,literal)${path}`),
+        ],
+        { env },
+      ),
+    ]);
+    if (others.code !== 0) return null;
+    if (!appliedIgnoredGitignore(others.stdout)) cleanUnder = rules;
+    // A failed diff (`prunedTree` gone from the store) falls back to the whole check.
+    const added =
+      cleanUnder !== undefined && changes?.code === 0 ? addedPaths(changes.stdout) : null;
+    if (added) {
+      paths = await ignoredAmong(git, env, added);
+    } else {
+      const ignored = await invoke(
+        git,
+        [
+          "ls-files",
+          "-z",
+          "--cached",
+          "--ignored",
+          "--exclude-standard",
+          "--full-name",
+          "--",
+          WORKTREE_PATHSPEC,
+        ],
+        { env },
+      );
+      if (ignored.code !== 0) return null;
+      paths = ignored.stdout.split("\0").filter(Boolean);
+    }
   } else {
     const added = await invoke(
       git,
@@ -187,38 +290,18 @@ async function pruneIgnoredEntries(
       ],
       { env },
     );
-    if (added.code !== 0) return false;
-    if (!added.stdout) return true;
-    // check-ignore refuses every pathspec magic but `top`, and an inherited
-    // GIT_*_PATHSPECS adds one to each path: it would fail every reused snapshot.
-    const ignored = await invoke(git, ["check-ignore", "--no-index", "-z", "--stdin"], {
-      env: {
-        ...env,
-        GIT_GLOB_PATHSPECS: "0",
-        GIT_NOGLOB_PATHSPECS: "0",
-        GIT_ICASE_PATHSPECS: "0",
-        GIT_LITERAL_PATHSPECS: "0",
-      },
-      stdin: added.stdout
-        .split("\0")
-        .filter(Boolean)
-        .map((path) => `${WORKTREE_PATHSPEC}${path}\0`)
-        .join(""),
-    });
-    // Exit 1: none ignored.
-    if (ignored.error || (ignored.code !== 0 && ignored.code !== 1)) return false;
-    paths = ignored.stdout.split("\0").filter(Boolean);
-    if (!paths.every((path) => path.startsWith(WORKTREE_PATHSPEC))) return false;
-    paths = paths.map((path) => path.slice(WORKTREE_PATHSPEC.length));
+    if (added.code !== 0) return null;
+    paths = await ignoredAmong(git, env, added.stdout.split("\0").filter(Boolean));
   }
-  if (paths.length === 0) return true;
+  if (!paths) return null;
+  if (paths.length === 0) return { cleanUnder };
   // Any object id of the repository's hash length; mode 0 ignores its value.
   const removal = `0 ${"0".repeat(lease.baseTree.length)}\t`;
   const removed = await invoke(git, ["update-index", "-z", "--index-info"], {
     env,
     stdin: paths.map((path) => `${removal}${path}\0`).join(""),
   });
-  return removed.code === 0;
+  return removed.code === 0 ? { cleanUnder } : null;
 }
 
 /** `git add -A` of the whole worktree. Two failures leave a path out instead
@@ -442,12 +525,15 @@ export async function createSnapshotCommitFromLease(
     // `add -A` cannot drop an entry that became ignored after it was staged, so
     // prune those explicitly; a fresh snapshot never holds one unless HEAD
     // tracks it (an unborn baseline tracks nothing).
-    if (!(await pruneIgnoredEntries(git, addEnv, lease))) {
-      return { reason: "snapshot_failed" };
-    }
+    const pruned = await pruneIgnoredEntries(git, addEnv, lease, rules, ownedPaths);
+    if (!pruned) return { reason: "snapshot_failed" };
     const tree = await invoke(git, ["write-tree"], { env });
     const treeHash = tree.stdout.trim();
     if (tree.code !== 0 || !treeHash) return { reason: "snapshot_failed" };
+    if (lease.unborn) {
+      lease.prunedTree = treeHash;
+      lease.prunedRules = pruned.cleanUnder;
+    }
 
     if (!(await leaseBaselineCurrent(git, lease))) return { reason: "snapshot_failed" };
     return createCommitForTree(git, treeHash, snapshotMessage(message, outside, rules));
