@@ -41,7 +41,8 @@ export type SessionRegistry = {
   toolCall(typed: AnyContext): Promise<void>;
   agentEnd(typed: AnyContext, willContinue?: boolean): Promise<void>;
   settleContinuation(typed: AnyContext): Promise<void>;
-  shutdown(): Promise<void>;
+  /** `leftSession`: a committed `/new`, `/resume` or fork (Pi), which clears redo. */
+  shutdown(leftSession?: boolean): Promise<void>;
 };
 
 /** Every session of this extension copy: session lifecycle events, switching
@@ -268,8 +269,16 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     await ensureNavigation(services, typed);
   }
 
-  function shutdown(): Promise<void> {
+  function shutdown(leftSession = false): Promise<void> {
     if (shutdownPromise) return shutdownPromise;
+    // Captured before the detach below. Pi replaces this copy on `/new`,
+    // `/resume` and fork; like OMP's `adoptSwitchedSession`, the session left
+    // loses its redo. Pi's copy serves one session, so this is that session's.
+    // ponytail: a `/new` while the session's history is still loading finds
+    // no navigation (it is published only after the load, and `closing` stops
+    // that), so the stored redo survives; clearing it would mean awaiting
+    // `initialization` here before the detach.
+    const leftNavigations = leftSession ? navigations() : [];
     services.flags.closing = true;
     services.flags.pendingNavigationSourceSessionId = null;
     const detachedNavigations = navigations();
@@ -287,7 +296,14 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       // and is lost only if the process exits first.
       const teardown = (async () => {
         try {
-          // Local cleanup first: idle index leases (a checked-out one may sit
+          // First, and never cut short: `suspend` below empties a navigation
+          // outside its queue. An invalidation saving after it would persist
+          // that empty state, and saving an empty history deletes the file:
+          // the session's whole undo history, not just its redo.
+          await Promise.allSettled(
+            leftNavigations.map((navigation) => navigation.invalidateRedo()),
+          );
+          // Then local cleanup: idle index leases (a checked-out one may sit
           // under a running git) and the runtime directory.
           await Promise.all([
             services.leasePool.releaseAll({ inUse: false }),

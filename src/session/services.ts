@@ -134,11 +134,16 @@ export type ExtensionServices = {
      *  emits `before_agent_start` again, but the loop still ends with one
      *  `agent_end`: with both flags set, that turn is already open. */
     turnOpen: boolean;
-    /** The last `agent_end` had `willContinue`: the host scheduled a
+    /** The last `agent_end` held the turn open (`willContinue`, or any one
+     *  under Pi, `runsEndAtSettle`): the host may run a
      *  continuation (retry, compaction resume, todo reminder) with no prompt
      *  of its own, so the turn stays open for it. Its `agent_start` clears
      *  this; anything else first settles the turn (`settleContinuation`). */
     continuing: boolean;
+    /** This copy runs under Pi (`isPiSessionStart`): every `agent_end` holds
+     *  the turn open, and `agent_settled` (or the next prompt, command or
+     *  navigation) ends it. */
+    runsEndAtSettle: boolean;
     pendingNavigationSourceSessionId: string | null;
   };
   gitRunnerFor(repository: GitRepository): GitRunner;
@@ -192,6 +197,7 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
       runOpen: false,
       turnOpen: false,
       continuing: false,
+      runsEndAtSettle: false,
       pendingNavigationSourceSessionId: null,
     },
     gitRunnerFor,

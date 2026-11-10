@@ -19,6 +19,34 @@ export type AnyContext = {
  *  loop; `isIdle` stays false until the host's post-run work is done too. */
 export type CommandHost = { waitForIdle(): Promise<void>; isIdle(): boolean };
 
+/** Pi (0.65+) tags every `session_start` with a `reason`; OMP's carries none.
+ *  Pi differs from OMP in three ways the host layer handles:
+ *  - its `agent_end` has no `willContinue`: retries and compaction resumes run
+ *    as more `agent_start`/`agent_end` loops of one run, and (0.80.4+) one
+ *    `agent_settled` ends the run, so every `agent_end` holds the turn open;
+ *  - `/new`, `/resume` and fork shut this copy down (`session_shutdown` with
+ *    that `reason`) and start a new one (`session_start`), with no
+ *    `session_switch`;
+ *  - the pre-fork event is `session_before_fork`, not `session_before_branch`. */
+// ponytail: any string `reason` counts, not Pi's current five: a new Pi reason
+// must not silently bring back finalizing at `agent_end`. Bet: OMP's
+// `session_start` never gains a `reason`; if it does, OMP turns stay open until
+// the next prompt or command (undo still correct) and one held at quit is lost.
+export function isPiSessionStart(event: unknown): boolean {
+  return typeof event === "object" && event !== null && "reason" in event
+    ? typeof event.reason === "string"
+    : false;
+}
+
+/** Pi's `session_shutdown` for `/new`, `/resume` or fork: a session navigation
+ *  committed (its cancellable pre-event passed), which clears redo. `quit` and
+ *  `reload` keep it, as a restart does; OMP's reasonless shutdown and any
+ *  reason Pi adds later keep it too, the safe default. */
+export function leavesSessionOnShutdown(event: unknown): boolean {
+  if (typeof event !== "object" || event === null || !("reason" in event)) return false;
+  return event.reason === "new" || event.reason === "resume" || event.reason === "fork";
+}
+
 export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;
 
 export const DEFAULT_TOOL_CALL_DEADLINE_MS = 25_000;
