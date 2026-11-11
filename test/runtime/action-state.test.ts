@@ -32,6 +32,8 @@ const rmGate = vi.hoisted(() => ({
 const statGate = vi.hoisted(() => ({ fail: new Set<string>() }));
 /** `writeFile` of a runtime marker rejects while set, as a full disk would. */
 const markerGate = vi.hoisted(() => ({ fail: false }));
+const debugLog = vi.hoisted(() => vi.fn());
+vi.mock("../../src/infra/debug-log.js", () => ({ debugLog }));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof Fs>();
   return {
@@ -341,6 +343,49 @@ describe("runtime action-state store", () => {
     await expect(access(live.sessionPath("session"))).rejects.toThrow();
     expect((await readState(stale, "session")).runtimeId).toBe("new");
     await stale.shutdown();
+  });
+
+  it("keeps a live directory fresh for another runtime scope's sweep", async () => {
+    // Same hostname, other PID namespace (WSL, `--network host`): only age decides.
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const root = await makeRoot();
+      const ancient = new Date(Date.now() - 48 * 60 * 60 * 1_000);
+      const store = new RuntimeActionStateStore({
+        rootDirectory: root,
+        pid: 132,
+        clock: () => ancient,
+        resolveRuntimeScope,
+      });
+      await store.publishNavigation("session", state(0), "turn");
+      await utimes(store.runtimeDirectory, ancient, ancient);
+
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1_000);
+      await vi.waitFor(async () =>
+        expect((await stat(store.runtimeDirectory)).mtimeMs).toBeGreaterThan(ancient.getTime()),
+      );
+      await reapStaleRuntimes(root, 999, otherScope);
+
+      expect((await readState(store, "session")).activeSessionLeaf).toBe("turn");
+
+      // Reaped and reinstalled by another owner: its directory is left to age.
+      const markerPath = join(store.runtimeDirectory, "runtime.json");
+      const marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+      await writeFile(markerPath, JSON.stringify({ ...marker, runtimeId: "other-owner" }));
+      await utimes(store.runtimeDirectory, ancient, ancient);
+      debugLog.mockClear();
+      await vi.advanceTimersByTimeAsync(60 * 60 * 1_000);
+      await vi.waitFor(() =>
+        expect(debugLog).toHaveBeenCalledWith(
+          expect.objectContaining({ event: "runtime-dir-heartbeat-failed" }),
+        ),
+      );
+      expect((await stat(store.runtimeDirectory)).mtimeMs).toBeLessThan(ancient.getTime() + 1_000);
+      await store.shutdown();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("publishes over leftovers of an install a killed process left", async () => {

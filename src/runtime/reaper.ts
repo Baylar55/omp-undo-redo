@@ -95,10 +95,9 @@ export async function reapStaleRuntimes(
       if (typeof marker.pid === "number" && sharesProcessTable(marker, runtimeScope)) {
         try {
           process.kill(marker.pid, 0);
-          // Alive and ours: never age it out. A live owner does not refresh
-          // its directory, so after 24 h the age check would delete the
-          // state it is still publishing. A recycled pid's directory is
-          // reaped once that process exits (ESRCH) instead.
+          // Alive and ours: never age it out, even with its hourly mtime
+          // heartbeat lapsed (a stopped or suspended process). A recycled
+          // pid's directory is reaped once that process exits (ESRCH) instead.
           continue;
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code;
@@ -112,7 +111,8 @@ export async function reapStaleRuntimes(
       }
       // PID-recycling guard: an unprobeable pid (or a marker without one, or
       // another runtime scope's) only loses its directory once the marker and
-      // the directory are both ancient.
+      // the directory are both ancient. A live owner touches its directory
+      // hourly, so its mtime never gets there.
       if (!dead && !(await isAncient(dir, marker.startedAt))) continue;
       // A recycled pid may have installed a fresh `runtime/<pid>` since the
       // marker was read. Claim atomically by renaming aside, then delete only

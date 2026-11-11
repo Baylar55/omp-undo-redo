@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, stat, utimes } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { renameWithRetry, writeFileAtomic } from "../infra/fs.js";
@@ -18,6 +18,11 @@ import type { RuntimeMarker } from "./reaper.js";
 const ACTION_STATE_SCHEMA = 2;
 const ACTION_STATE_PROTOCOL = "omp-undo-redo/action-state";
 const MAX_STATE_BYTES = 64 * 1024;
+/** Directory mtime refresh, well inside `STALE_RUNTIME_MS`: a runtime scope
+ *  that cannot probe this pid (another PID namespace sharing the hostname
+ *  and root) judges the directory by age alone. Session writes land in
+ *  `sessions/` and do not bump it. */
+const RUNTIME_HEARTBEAT_MS = 60 * 60 * 1_000;
 type StoredActionState = RuntimeActionState & {
   schemaVersion: typeof ACTION_STATE_SCHEMA;
   protocol: typeof ACTION_STATE_PROTOCOL;
@@ -65,16 +70,35 @@ function navigationRevision(state: NavigationState, activeSessionLeaf: string | 
  *  directory. Held on `globalThis` because module state can be per copy.
  *  `foreign`: this process did not install the directory (it existed without
  *  this extension's marker, or installing failed), so it is left alone and
- *  nothing is published (copies that predate the field never set it). */
+ *  nothing is published (copies that predate the field never set it).
+ *  `heartbeat`: the installed directory's mtime refresher; it stops itself
+ *  once no copy uses the directory (a last-out copy may predate the field). */
 type SharedRuntimeDirectory = {
   users: number;
   runtimeId: string;
   tail: Promise<void>;
   foreign?: boolean;
+  heartbeat?: NodeJS.Timeout;
 };
 const sharedRuntimeDirectories = ((globalThis as Record<symbol, unknown>)[
   Symbol.for("omp-undo-redo/runtime-directories/v1")
 ] ??= new Map<string, SharedRuntimeDirectory>()) as Map<string, SharedRuntimeDirectory>;
+
+/** Refreshes `directory`'s mtime only while it still carries `runtimeId`'s
+ *  marker: once reaped (owner suspended past the stale window) and reinstalled
+ *  by another process, touching it would keep that owner's leftover alive. */
+async function touchOwnRuntimeDirectory(directory: string, runtimeId: string): Promise<void> {
+  try {
+    const marker = JSON.parse(
+      await readFile(join(directory, "runtime.json"), "utf8"),
+    ) as Partial<RuntimeMarker> | null;
+    if (marker?.runtimeId !== runtimeId) throw new Error("runtime marker replaced");
+    const now = new Date();
+    await utimes(directory, now, now);
+  } catch (error) {
+    debugLog({ event: "runtime-dir-heartbeat-failed", dir: directory, error: String(error) });
+  }
+}
 
 export class RuntimeActionStateStore {
   private runtimeId: string;
@@ -180,6 +204,7 @@ export class RuntimeActionStateStore {
       await this.discardRuntimeDirectory();
       await renameWithRetry(staging, this.runtimeDirectory);
       staging = null;
+      this.startHeartbeat(shared);
     } catch (error) {
       // Runtime state is observational. Keep extension operations independent;
       // a directory this process did not install is not its to write or remove.
@@ -197,6 +222,22 @@ export class RuntimeActionStateStore {
    *  paths of one replacement must differ. */
   private temporaryRuntimePath(): string {
     return `${this.runtimeDirectory}.${randomUUID()}.tmp`;
+  }
+
+  private startHeartbeat(shared: SharedRuntimeDirectory): void {
+    clearInterval(shared.heartbeat);
+    const { runtimeDirectory } = this;
+    const { runtimeId } = shared;
+    const heartbeat = setInterval(() => {
+      if (shared.users > 0 && !shared.foreign && shared.heartbeat === heartbeat) {
+        void touchOwnRuntimeDirectory(runtimeDirectory, runtimeId);
+        return;
+      }
+      clearInterval(heartbeat);
+      if (shared.heartbeat === heartbeat) shared.heartbeat = undefined;
+    }, RUNTIME_HEARTBEAT_MS);
+    heartbeat.unref?.();
+    shared.heartbeat = heartbeat;
   }
 
   /** Removes `runtime/<pid>/` without ever leaving it there unmarked: it is
@@ -380,6 +421,8 @@ export class RuntimeActionStateStore {
         );
         return;
       }
+      clearInterval(shared.heartbeat);
+      shared.heartbeat = undefined;
       shared.tail = shared.tail.then(() =>
         shared.foreign ? undefined : this.discardRuntimeDirectory().catch(() => undefined),
       );
