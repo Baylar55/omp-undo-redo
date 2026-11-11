@@ -147,8 +147,7 @@ async function leaseBaselineCurrent(git: GitRunner, lease: SnapshotIndexLease): 
 }
 
 /** Root-relative `paths` the current ignore rules exclude; null on failure.
- *  check-ignore refuses every pathspec magic but `top`, and an inherited
- *  GIT_*_PATHSPECS adds one to each path: it would fail every reused snapshot. */
+ *  check-ignore refuses every pathspec magic but `top`. */
 async function ignoredAmong(
   git: GitRunner,
   env: Record<string, string>,
@@ -156,13 +155,7 @@ async function ignoredAmong(
 ): Promise<string[] | null> {
   if (paths.length === 0) return [];
   const ignored = await invoke(git, ["check-ignore", "--no-index", "-z", "--stdin"], {
-    env: {
-      ...env,
-      GIT_GLOB_PATHSPECS: "0",
-      GIT_NOGLOB_PATHSPECS: "0",
-      GIT_ICASE_PATHSPECS: "0",
-      GIT_LITERAL_PATHSPECS: "0",
-    },
+    env,
     stdin: paths.map((path) => `${WORKTREE_PATHSPEC}${path}\0`).join(""),
   });
   // Exit 1: none ignored.

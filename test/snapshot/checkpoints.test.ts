@@ -18,7 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve, sep, toNamespacedPath } from "node:path";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SessionNavigation } from "../../src/session/navigation.js";
 import { finishAfterTurn, prepareBeforeTurn } from "../../src/snapshot/capture.js";
 import type {
@@ -1352,18 +1352,23 @@ describe("history-safe Git checkpoints", () => {
   it.each<{ head: string; inherited: Record<string, string> }>([
     { head: "born", inherited: {} },
     { head: "unborn", inherited: {} },
-    // An inherited global pathspec magic must not fail the reused snapshot.
+    // Inherited global pathspec settings must not fail the reused snapshot.
     { head: "born", inherited: { GIT_GLOB_PATHSPECS: "1" } },
+    { head: "unborn", inherited: { GIT_LITERAL_PATHSPECS: "1" } },
+    { head: "born", inherited: { GIT_ICASE_PATHSPECS: "1" } },
+    { head: "born", inherited: { GIT_NOGLOB_PATHSPECS: "1" } },
   ])(
     "drops reused-index entries that became ignored, as a fresh snapshot would ($head HEAD, $inherited)",
     async ({ head, inherited }) => {
       const { cwd, git, snap } = await makeRepo();
       // A subdirectory session: candidate paths are root relative, the cwd is not.
+      // The production runner: it owns what an inherited environment reaches git.
       const nested = join(cwd, "nested");
-      const nestedSnap = gitRunner(nested, { ...(await snapshotEnv(cwd)), ...inherited });
+      const nestedSnap = createGitRunner(nested, { env: await snapshotEnv(cwd) });
       const sessionId = `became-ignored-${head}-${Object.keys(inherited).join()}`;
       const freshId = `${sessionId}-fresh`;
       try {
+        for (const [name, value] of Object.entries(inherited)) vi.stubEnv(name, value);
         await mkdir(nested);
         await writeFile(join(nested, "inside.txt"), "inside\n");
         await writeFile(join(cwd, "tracked.log"), "tracked\n");
@@ -1420,6 +1425,7 @@ describe("history-safe Git checkpoints", () => {
         await releasePendingCheckpoint(snap, fresh, defaultPool);
         await releaseCheckpoint(snap, after1);
       } finally {
+        vi.unstubAllEnvs();
         await rm(cwd, { recursive: true, force: true });
         await releasePersistentSnapshotIndices([sessionId, freshId]);
       }

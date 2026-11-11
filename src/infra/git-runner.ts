@@ -47,7 +47,7 @@ type ChildResult = {
 };
 
 export interface GitRunnerDependencies {
-  /** Fixed env merged after `process.env` (minus `REPOSITORY_ENV`) and before per-invocation
+  /** Fixed env merged after `process.env` (minus `STRIPPED_ENV`) and before per-invocation
    *  `options.env`, so it overrides the process environment. Used for private
    *  per-workspace repositories where GIT_DIR must be present on every command;
    *  the runner re-exposes it as `runner.env` so callers can detect it. */
@@ -66,15 +66,19 @@ const LAUNCHER_ENV = ["PATH", "HOME", "MSYSTEM", "PLINK_PROTOCOL", "MSYS"];
 
 let directGit: Promise<DirectGit | null> | undefined;
 
-/** `git rev-parse --local-env-vars` minus the `-c` config pair: the set git
+/** Inherited variables dropped before every git command.
+ *  `git rev-parse --local-env-vars` minus the `-c` config pair: the set git
  *  itself clears before running a command in another repository
  *  (run-command.c `sanitize_repo_env`). Inherited from a hook or a dotfiles
  *  setup they would point every command at a foreign repository and
  *  worktree; this runner picks its repository itself, through cwd or its
  *  fixed `env`. `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` are kept on purpose
  *  (env-supplied `safe.directory` in containers): whoever can set them could
- *  still pass `core.worktree`, but can already set any env of this process. */
-const REPOSITORY_ENV: Record<string, true> = {
+ *  still pass `core.worktree`, but can already set any env of this process.
+ *  Plus the global pathspec settings: every pathspec this runner passes spells
+ *  its own magic (`:(top)`, `--literal-pathspecs`), which they would rewrite
+ *  or reject. */
+const STRIPPED_ENV: Record<string, true> = {
   GIT_ALTERNATE_OBJECT_DIRECTORIES: true,
   GIT_CONFIG: true,
   GIT_OBJECT_DIRECTORY: true,
@@ -88,6 +92,10 @@ const REPOSITORY_ENV: Record<string, true> = {
   GIT_PREFIX: true,
   GIT_SHALLOW_FILE: true,
   GIT_COMMON_DIR: true,
+  GIT_GLOB_PATHSPECS: true,
+  GIT_NOGLOB_PATHSPECS: true,
+  GIT_ICASE_PATHSPECS: true,
+  GIT_LITERAL_PATHSPECS: true,
 };
 
 /** On Windows `git` on PATH is usually a launcher that starts the real
@@ -160,7 +168,7 @@ async function runGit(
   // Windows env names are case-insensitive.
   const inherited = Object.entries(process.env).filter(
     ([key]) =>
-      !Object.hasOwn(REPOSITORY_ENV, process.platform === "win32" ? key.toUpperCase() : key),
+      !Object.hasOwn(STRIPPED_ENV, process.platform === "win32" ? key.toUpperCase() : key),
   );
   const env: NodeJS.ProcessEnv = {
     ...Object.fromEntries(inherited),
