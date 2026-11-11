@@ -106,14 +106,16 @@ async function seedSnapshotIndex(
     const seeded = await invoke(git, ["read-tree", hash], { env });
     return seeded.code === 0 ? { status: "seeded", headTree: hash } : { status: "failed" };
   }
-  if (headTree.error === "unavailable") return { status: "failed" };
+  if (headTree.error) return { status: "failed" };
 
   const symbolicHead = await invoke(git, ["symbolic-ref", "-q", "HEAD"]);
+  if (symbolicHead.error) return { status: "failed" };
   if (symbolicHead.code !== 0 || !symbolicHead.stdout.trim()) return { status: "invalid_head" };
   const branchRef = symbolicHead.stdout.trim();
   const branch = await invoke(git, ["show-ref", "--verify", "--quiet", branchRef]);
-  if (branch.code === 0) return { status: "invalid_head" };
-  if (branch.error === "unavailable") return { status: "failed" };
+  if (branch.error) return { status: "failed" };
+  // 1: no such ref (unborn). 0: the ref resolves; 128: it names a missing object.
+  if (branch.code !== 1) return { status: "invalid_head" };
 
   const empty = await invoke(git, ["read-tree", "--empty"], { env });
   return empty.code === 0 ? { status: "empty" } : { status: "failed" };

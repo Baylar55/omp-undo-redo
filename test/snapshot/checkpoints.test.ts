@@ -2567,6 +2567,41 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("classifies a branch naming a missing commit instead of treating it as unborn", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      // Same length as a real OID, so a SHA-256 repository reads it as missing, not malformed.
+      const missing = "1".repeat((await text(git, ["rev-parse", "HEAD"])).length);
+      await writeFile(join(cwd, ".git", "refs", "heads", "A"), `${missing}\n`);
+      expect(await prepareBeforeTurn(snap, "missing-head-object", defaultPool)).toEqual({
+        status: "session_only",
+        reason: "invalid_head",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails a snapshot whose branch probe times out instead of treating HEAD as unborn", async () => {
+    const { cwd, snap } = await makeRepo();
+    // A killed git exits 1, the same code as a ref that does not exist.
+    const timedOut: GitRunner = async (args, options) =>
+      args.includes("show-ref")
+        ? { stdout: "", stderr: "", code: 1, error: "timeout" }
+        : snap(args, options);
+    timedOut.cwd = snap.cwd;
+    if (snap.env) timedOut.env = snap.env;
+    try {
+      expect(await prepareBeforeTurn(timedOut, "unborn-probe-timeout", defaultPool)).toEqual({
+        status: "session_only",
+        reason: "before_snapshot_failed",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("distinguishes missing from unusable history in SessionHistoryStore.load", async () => {
     const { cwd, git } = await makeRepo();
     const repository = await gitRepository(cwd);
