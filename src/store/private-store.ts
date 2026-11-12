@@ -17,6 +17,7 @@ import {
   storeHooksConfig,
   storeStampConfig,
   storeInitArgs,
+  STORE_INIT_ENV,
 } from "./setup.js";
 
 /** Directory-only, so a file of the same name (a `build` script) is still
@@ -194,7 +195,7 @@ export async function ensurePrivateGitRepository(
       // No user template may seed hooks into the private repo, where the
       // extension's own git commands would run them (see `storeInitArgs`). It
       // does not create `info/`: `updateExclude` does that itself.
-      async () => (await envGit(storeInitArgs(gitDir))).code === 0,
+      async () => (await envGit(storeInitArgs(gitDir), { env: STORE_INIT_ENV })).code === 0,
       // `core.worktree` goes last: `setupFinished` reads it as proof the rest ran.
       async () =>
         applyConfig(envGit, [

@@ -167,8 +167,7 @@ async function runGit(
   const { promise, resolve } = Promise.withResolvers<ChildResult>();
   // Windows env names are case-insensitive.
   const inherited = Object.entries(process.env).filter(
-    ([key]) =>
-      !Object.hasOwn(STRIPPED_ENV, process.platform === "win32" ? key.toUpperCase() : key),
+    ([key]) => !Object.hasOwn(STRIPPED_ENV, process.platform === "win32" ? key.toUpperCase() : key),
   );
   const env: NodeJS.ProcessEnv = {
     ...Object.fromEntries(inherited),

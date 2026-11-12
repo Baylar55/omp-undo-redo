@@ -45,6 +45,9 @@ process.env.OMP_UNDO_REDO_RUNTIME_DIR = runtimeRoot;
 // location on Windows and Linux, for any direct `resolvePersistentHostId()`.
 process.env.LOCALAPPDATA = stateRoot;
 process.env.XDG_STATE_HOME = stateRoot;
+// Fixtures write loose ref files and packed-refs locks, files-backend concepts;
+// a machine whose git default is reftable would break them.
+process.env.GIT_DEFAULT_REF_FORMAT = "files";
 // Detached sweeps may still hold them open on Windows; a leftover temp dir is harmless.
 afterAll(() =>
   Promise.all(

@@ -20,6 +20,7 @@ import {
   storeHooksConfig,
   storeStampConfig,
   storeInitArgs,
+  STORE_INIT_ENV,
   readStoreConfig,
   storeHasRefs,
 } from "./setup.js";
@@ -118,7 +119,7 @@ export async function ensureGitSnapshotStore(
         const objectFormat = await repositoryFormat();
         if (!objectFormat) return false;
         const init = await storeGit(storeInitArgs(storeDir, "--bare"), {
-          env: { GIT_DEFAULT_HASH: objectFormat },
+          env: { ...STORE_INIT_ENV, GIT_DEFAULT_HASH: objectFormat },
         });
         return init.code === 0;
       },

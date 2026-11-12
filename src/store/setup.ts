@@ -208,6 +208,12 @@ export function storeInitArgs(gitDir: string, ...flags: string[]): string[] {
   return ["-c", `${key}=${value}`, "init", "-q", "--template=", ...flags];
 }
 
+/** Env for a store's `git init`: the files ref backend over a user's
+ *  `init.defaultRefFormat`/`GIT_DEFAULT_REF_FORMAT`, since `storeHasRefs` and
+ *  `releaseLooseRef` read refs as files. git before 2.45 ignores it and only
+ *  knows files; `--ref-format` would make that git fail the init. */
+export const STORE_INIT_ENV = { GIT_DEFAULT_REF_FORMAT: "files" } as const;
+
 /** Sets `core.hooksPath` on a finished store that was set up before it was
  *  part of setup. Read without a git process, so a store that has it costs
  *  nothing; an unreadable config is left alone. */

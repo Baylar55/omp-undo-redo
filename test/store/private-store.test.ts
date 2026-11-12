@@ -28,6 +28,7 @@ import {
   privateRepositoryPath,
   STORE_HOST_KEY,
   STORE_VOLUME_KEY,
+  storeHasRefs,
   volumeOf,
 } from "../../src/store/setup.js";
 import { localStoreHost } from "../../src/store/host-identity.js";
@@ -580,6 +581,36 @@ describe("private per-workspace git repositories", () => {
       await rm(storeRoot, { recursive: true, force: true });
     }
   });
+
+  it.each(["Git snapshot", "Private-Git"])(
+    "gives a %s store loose refs under a reftable default",
+    async (kind) => {
+      // A reftable store keeps a `refs/heads` stub file, so `storeHasRefs` saw
+      // refs forever and gc/eviction never emptied it.
+      const cwd = await makeRepository();
+      const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+      try {
+        vi.stubEnv("GIT_CONFIG_COUNT", "1");
+        vi.stubEnv("GIT_CONFIG_KEY_0", "init.defaultRefFormat");
+        vi.stubEnv("GIT_CONFIG_VALUE_0", "reftable");
+        vi.stubEnv("GIT_DEFAULT_REF_FORMAT", "reftable");
+        let storeDir: string | null;
+        if (kind === "Private-Git") {
+          storeDir = (await ensurePrivateGitRepository(factory, cwd, storeRoot))?.gitDir ?? null;
+        } else {
+          const resolved = await resolveRepository(createGitRunner(cwd));
+          if (!("repository" in resolved)) throw new Error("not a repository");
+          storeDir = await ensureGitSnapshotStore(factory, resolved.repository, storeRoot);
+        }
+        expect(storeDir).not.toBeNull();
+        expect(await storeHasRefs(storeDir!)).toBe(false);
+        await expect(stat(join(storeDir!, "reftable"))).rejects.toThrow();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each([
     ["no refs", null],
