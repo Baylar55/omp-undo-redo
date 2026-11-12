@@ -30,7 +30,7 @@ export async function pinBorrowedObjects(
   const env = snapshotRunnerEnv(repository);
   const changed = await invoke(
     git,
-    ["diff-tree", "-r", "-t", "-z", "--no-renames", "--no-relative", "HEAD", tree, "--"],
+    ["diff-tree", "-r", "-t", "-z", "--no-renames", "HEAD", tree, "--"],
     { env },
   );
   const candidates = new Set<string>();

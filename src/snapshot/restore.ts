@@ -334,12 +334,15 @@ async function applyPatch(
       tempDirectory,
     );
     if (!effectiveTarget) return "failed";
+    // `-c` rather than `--no-relative`, which git before 2.28 rejects; older
+    // git has no `diff.relative` and ignores the unknown key.
     const diffArgs = [
+      "-c",
+      "diff.relative=false",
       "diff",
       "--no-color",
       "--no-ext-diff",
       "--no-textconv",
-      "--no-relative",
       "--ignore-submodules=none",
       "--submodule=short",
       "-U3",
@@ -448,6 +451,9 @@ async function applyPatch(
           "core.safecrlf=false",
           "-c",
           "diff.autoRefreshIndex=true",
+          // Not `--no-relative`: git before 2.28 rejects it (see `diffArgs`).
+          "-c",
+          "diff.relative=false",
           "diff",
           "--no-ext-diff",
           "--no-textconv",

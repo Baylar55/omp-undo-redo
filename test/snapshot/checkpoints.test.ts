@@ -3093,7 +3093,7 @@ describe("history-safe Git checkpoints", () => {
 
       const timedOutDiff: GitRunner = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) => {
-          if (args[0] === "diff") {
+          if (args.includes("diff")) {
             // What runGit returns for a child it had to terminate, after
             // `--output` already wrote a valid patch prefix.
             await snap(args, options);
