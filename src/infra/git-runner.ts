@@ -77,7 +77,9 @@ let directGit: Promise<DirectGit | null> | undefined;
  *  still pass `core.worktree`, but can already set any env of this process.
  *  Plus the global pathspec settings: every pathspec this runner passes spells
  *  its own magic (`:(top)`, `--literal-pathspecs`), which they would rewrite
- *  or reject. */
+ *  or reject. Plus the commit identity and dates: they would override the
+ *  `-c user.*` identity snapshot commits pass (`tree.ts` `GIT_AUTHOR`), and an
+ *  empty name or invalid date fails `commit-tree`. */
 const STRIPPED_ENV: Record<string, true> = {
   GIT_ALTERNATE_OBJECT_DIRECTORIES: true,
   GIT_CONFIG: true,
@@ -96,6 +98,12 @@ const STRIPPED_ENV: Record<string, true> = {
   GIT_NOGLOB_PATHSPECS: true,
   GIT_ICASE_PATHSPECS: true,
   GIT_LITERAL_PATHSPECS: true,
+  GIT_AUTHOR_NAME: true,
+  GIT_AUTHOR_EMAIL: true,
+  GIT_AUTHOR_DATE: true,
+  GIT_COMMITTER_NAME: true,
+  GIT_COMMITTER_EMAIL: true,
+  GIT_COMMITTER_DATE: true,
 };
 
 /** On Windows `git` on PATH is usually a launcher that starts the real

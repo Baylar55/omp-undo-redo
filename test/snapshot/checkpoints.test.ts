@@ -1357,6 +1357,11 @@ describe("history-safe Git checkpoints", () => {
     { head: "unborn", inherited: { GIT_LITERAL_PATHSPECS: "1" } },
     { head: "born", inherited: { GIT_ICASE_PATHSPECS: "1" } },
     { head: "born", inherited: { GIT_NOGLOB_PATHSPECS: "1" } },
+    // Inherited commit identity and dates must not fail `commit-tree`. Unborn:
+    // the test's own `git commit` for a born HEAD would read them.
+    { head: "unborn", inherited: { GIT_AUTHOR_DATE: "garbage" } },
+    { head: "unborn", inherited: { GIT_COMMITTER_DATE: "garbage" } },
+    { head: "unborn", inherited: { GIT_AUTHOR_NAME: "" } },
   ])(
     "drops reused-index entries that became ignored, as a fresh snapshot would ($head HEAD, $inherited)",
     async ({ head, inherited }) => {
