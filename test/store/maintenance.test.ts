@@ -66,7 +66,11 @@ async function withHermeticStore(run: (reposDir: string) => Promise<void>): Prom
   } finally {
     if (previousStore === undefined) delete process.env.OMP_UNDO_REDO_STORE_DIR;
     else process.env.OMP_UNDO_REDO_STORE_DIR = previousStore;
-    await rm(store, { recursive: true, force: true }).catch(() => undefined);
+    // Detached shutdown housekeeping can still hold the store open on Windows.
+    // shortcut: a shutdown gc that outlives this rm recreates a commit-graph-only
+    // store dir (a few KB leaked). registry.ts discards the runShutdownHousekeeping
+    // promise; expose it via a dependency hook and await it here if %TEMP% must stay clean.
+    await rmRetry(store, 10);
   }
 }
 

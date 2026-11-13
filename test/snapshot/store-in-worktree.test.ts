@@ -8,18 +8,24 @@ import { defaultPool } from "../../src/snapshot/index-leases.js";
 import { applyCheckpoint } from "../../src/snapshot/restore.js";
 import { createSnapshotCommit } from "../../src/snapshot/tree.js";
 import { ownedPathsInWorktree, snapshotRunnerEnv } from "../../src/store/git-store.js";
-import { git, gitRepository } from "../helpers/index.js";
+import { git, gitRepository, rmRetry } from "../helpers/index.js";
 
 // A home directory that is a Git repository puts the store root inside the
 // worktree. The glob characters check the pathspecs are literal.
 const STORE = "st[1]";
 
-afterEach(() => vi.unstubAllEnvs());
+const repositories: string[] = [];
+
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  for (const cwd of repositories.splice(0)) await rmRetry(cwd);
+});
 
 /** A repository whose store lands inside it: `layout` points the store/runtime
  *  env vars at `cwd`. */
 async function storeInsideRepository(layout: (cwd: string) => void) {
   const cwd = await mkdtemp(join(tmpdir(), "omp-undo-redo-store-in-repo-"));
+  repositories.push(cwd);
   await git(cwd, ["init", "-q"]);
   await git(cwd, ["config", "user.name", "test"]);
   await git(cwd, ["config", "user.email", "test@example.com"]);

@@ -1,8 +1,8 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type * as Capture from "../../src/snapshot/capture.js";
 import { createGitRunner } from "../../src/infra/git-runner.js";
 import type { GitRunner } from "../../src/types.js";
@@ -26,13 +26,6 @@ vi.mock("../../src/snapshot/capture.js", async (importOriginal) => {
         ? Promise.reject(new Error("capture failed"))
         : actual.prepareBeforeTurn(...args),
   };
-});
-
-const testStoreRoot = join(tmpdir(), `omp-undo-redo-test-store-${process.pid}`);
-process.env.OMP_UNDO_REDO_STORE_DIR = testStoreRoot;
-
-afterAll(async () => {
-  await rm(testStoreRoot, { recursive: true, force: true });
 });
 
 /** A runner factory whose git-add invocations take `delayMs` to complete.
