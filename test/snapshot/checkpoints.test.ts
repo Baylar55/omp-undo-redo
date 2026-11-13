@@ -2951,6 +2951,44 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it.each([false, true])(
+    "reports a conflict instead of moving a renamed file the user edited (attributes changed: %s)",
+    async (changeAttributes) => {
+      // Regression: the restore patch detected renames, so undo moved the
+      // user's edit to the old name (or, with a `.gitattributes` change, wrote
+      // the old name from the snapshot and dropped the edit) without a conflict.
+      const { cwd, git, snap } = await makeRepo();
+      try {
+        await initializeBranch(git, cwd);
+        const content = "one\ntwo\nthree\nfour\nfive\n";
+        await writeFile(join(cwd, "x.txt"), content);
+        await writeFile(join(cwd, ".gitattributes"), "*.bin binary\n");
+        await git(["add", "."]);
+        await git(["commit", "-qm", "rename fixture"]);
+        const prepared = await prepareBeforeTurn(snap, "rename-edit-session", defaultPool);
+        expect(prepared.status).toBe("git");
+        if (prepared.status !== "git") return;
+        await rm(join(cwd, "x.txt"));
+        await writeFile(join(cwd, "y.txt"), content);
+        if (changeAttributes) await writeFile(join(cwd, ".gitattributes"), "*.dat binary\n");
+        const finished = await finishAfterTurn(snap, prepared.checkpoint, null, null, defaultPool);
+        expect(finished.status).toBe("git");
+        if (finished.status !== "git") return;
+        const { beforeHash, afterHash } = finished.checkpoint;
+
+        const edited = `${content}user line\n`;
+        await writeFile(join(cwd, "y.txt"), edited);
+        const conflict = { status: "conflict", conflictedFiles: ["y.txt"] };
+        expect(await applyCheckpoint(snap, afterHash, beforeHash, true)).toEqual(conflict);
+        expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual(conflict);
+        expect(await readFile(join(cwd, "y.txt"), "utf8")).toBe(edited);
+        await expect(readFile(join(cwd, "x.txt"))).rejects.toThrow();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
   describe("a hunk git apply would place at an offset", () => {
     const block = (middle: string) => ["alpha", "beta", "gamma", middle, "delta", "eps", "zeta"];
     const fill = (from: number) => Array.from({ length: 20 }, (_, index) => `fill ${from + index}`);

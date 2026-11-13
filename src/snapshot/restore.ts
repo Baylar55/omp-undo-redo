@@ -344,6 +344,9 @@ async function applyPatch(
       "--no-ext-diff",
       "--no-textconv",
       "--ignore-submodules=none",
+      // Per-path, as every other restore step: a rename section moves the
+      // user's edit to the old name instead of `apply --check` refusing it.
+      "--no-renames",
       "--submodule=short",
       "-U3",
       "--src-prefix=a/",

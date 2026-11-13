@@ -40,7 +40,7 @@ In Pi, confirm with `pi list` and restart the TUI; `/undo` and `/redo` then appe
 
 Neither command takes arguments or starts a model turn. Both wait for the agent to become idle (no time limit), then up to 3 s each for an in-flight snapshot and for the last turn's finalize; if either is still running, nothing changes and you get a warning.
 
-Snapshots are taken when a turn starts and when it ends, so anything that changes a file mid-turn (a formatter on save, another OMP process in the same repository) is reverted with the agent's edits. Check the restored-file list ("Restored files: notes.md, src/app.ts.") for files the agent did not touch. Edits made after the turn are safe: if they overlap the turn's changes, `/undo` refuses and names the conflicting files; otherwise they stay in place.
+Snapshots are taken when a turn starts and when it ends, so anything that changes a file mid-turn (a formatter on save, another OMP process in the same repository) is reverted with the agent's edits. Check the restored-file list ("Restored files: notes.md, src/app.ts.") for files the agent did not touch. Edits made after the turn are safe: if they overlap the turn's changes, `/undo` refuses and names the conflicting files (an edit anywhere in a file the turn renamed counts, since the rename changes the whole file); otherwise they stay in place.
 
 - **Restarts:** history survives resuming the session in the same worktree until retention expires. If file history is missing, undo moves only the conversation, with a warning.
 - **Subagents** (`task`, eval `agent()`, `/tan`) have no undo of their own; their edits belong to the parent turn.
