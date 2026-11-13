@@ -386,6 +386,9 @@ async function addWorktree(
     // snapshot. ponytail: a POSIX folder really named with "?" or U+FFFD
     // fails it too.
     if (!directory?.endsWith("/") || /[?\uFFFD]/.test(directory)) return null;
+    // Git 2.25 still walks excluded folders and warns about store ref folders
+    // it cannot open (2.56 does not); owned paths are never captured anyway.
+    if (ownedPaths.some((path) => directory.startsWith(`${path}/`))) continue;
     if (!outside.unreadableDirectories.includes(directory)) {
       outside.unreadableDirectories.push(directory);
     }
