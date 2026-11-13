@@ -42,9 +42,9 @@ export class SessionNavigation {
   private expectedTreeNavigation: ExpectedTreeNavigation | null = null;
   private readonly gitForRepository: GitRunnerFactory;
   private navigationTail: Promise<void> = Promise.resolve();
-  private readonly stateChanged: (state: NavigationState) => Promise<void>;
+  private stateChanged: (state: NavigationState) => Promise<void>;
   private readonly applyGit: ApplyCheckpoint;
-  private readonly intents: RestoreIntentPort;
+  private intents: RestoreIntentPort;
 
   constructor(
     private readonly port: Omit<NavigationPort, "navigateTree"> & {
@@ -194,6 +194,25 @@ export class SessionNavigation {
           checkpoint.kind === "git" && !checkpoint.beforeRef.startsWith(HISTORY_REF_ROOT),
       ),
     );
+  }
+
+  /** Moves this navigation to the session id its session continues under:
+   *  `adopt` renames the checkpoints into that session's namespace, and this
+   *  state and every later save and intent go to `ports`. Serialized, so no
+   *  undo, redo or recorded turn straddles the move. */
+  async rekey(
+    adopt: (checkpoints: readonly TurnCheckpoint[]) => Promise<TurnCheckpoint[]>,
+    ports: { stateChanged: (state: NavigationState) => Promise<void>; intents: RestoreIntentPort },
+  ): Promise<void> {
+    await this.serializeNavigation(async () => {
+      this.stateChanged = ports.stateChanged;
+      this.intents = ports.intents;
+      // Empty (nothing recorded, or suspended meanwhile): saving it would
+      // delete the new session's history file instead.
+      if (this.checkpoints.length === 0) return;
+      this.checkpoints = await adopt(this.checkpoints);
+      await this.persistState();
+    });
   }
 
   private async navigateSession(targetId: string | null): Promise<boolean> {

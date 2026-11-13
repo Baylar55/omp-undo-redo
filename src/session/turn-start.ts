@@ -5,7 +5,7 @@ import { prepareBeforeTurn } from "../snapshot/capture.js";
 import { releasePendingCheckpoint } from "../snapshot/checkpoint-refs.js";
 import { runCaptureGc } from "../store/maintenance/gc.js";
 import type { PendingTurnCheckpoint } from "../types.js";
-import { notifySessionOnly, stateOf, turnBackend } from "./controller.js";
+import { liveSessionId, notifySessionOnly, stateOf, turnBackend } from "./controller.js";
 import { gcKey, isMainSession } from "./housekeeping.js";
 import type { ExtensionServices, PendingCapture } from "./services.js";
 
@@ -93,7 +93,7 @@ export async function beforeAgentStart(
   // already open, whose checkpoint must stay pending until agent_end.
   if (services.flags.runOpen && services.flags.turnOpen) return;
   services.flags.turnOpen = true;
-  const sessionId = typed.sessionManager.getSessionId();
+  const sessionId = liveSessionId(services, typed);
   const state = stateOf(services, sessionId);
   const oldPending = state.pending;
   state.pending = undefined;
@@ -163,7 +163,7 @@ export async function beforeAgentStart(
 }
 
 export async function toolCall(services: ExtensionServices, typed: AnyContext): Promise<void> {
-  const gate = services.sessions.get(typed.sessionManager.getSessionId())?.beforeSnapshotGate;
+  const gate = services.sessions.get(liveSessionId(services, typed))?.beforeSnapshotGate;
   if (!gate || gate.late || services.flags.closing) return;
   if (await timedOutAfter(gate.complete, services.toolCallDeadlineMs)) gate.late = true;
 }

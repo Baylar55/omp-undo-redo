@@ -195,6 +195,19 @@ are reconstructed from the active session branch as session-only checkpoints, wi
 outgrows it keeps the checkpoint at the cursor and drops the oldest turns first; their snapshots
 stay until retention removes the session.
 
+OMP 18.20+ moves a session it cannot keep writing (another live process holds its file, or the
+file changed on disk) to a new session id with no event; the new header's `continuationOf` names
+the old id, and `/resume` of the old session opens the copy. Every handler reads the id through
+`liveSessionId` (`session/controller.ts`): a record still filed under the old id moves to the new
+one, with its turn in flight, and `SessionNavigation.rekey` copies its history refs into the new
+namespace and saves under the new id from then on. A copy resumed without history of its own
+adopts the old id's file (`SessionHistoryStore.load`), up to its cursor and only while its turns
+are on the copy's branch, since the old session's process may have gone on. Refs are copied, never
+moved: the old session keeps its history. The move is noticed at the next event or command; an
+idle process keeps beating the old id's liveness marker until then (or until it exits), which only
+delays that history's expiry. Until its first write the host has not moved a resumed session, so
+an `/undo` there still saves to the old id's file, which another process may also own.
+
 Before restoring files, `/undo` and `/redo` save a restore intent next to the history. On the next
 load `session/recovery.ts` checks whether the restore patch still applies from either snapshot:
 from the source means nothing changed, from the target moves the cursor, from neither leaves the

@@ -1,4 +1,7 @@
+import { continuationOf } from "../host-contract.js";
 import type { AnyContext } from "../host-contract.js";
+import { historyDirectory } from "../history/layout.js";
+import { releaseSessionHeartbeat } from "../history/liveness.js";
 import { appendUnrecordedTurns, reconstructSessionHistory } from "../history/reconstruct.js";
 import { SessionHistoryStore } from "../history/store.js";
 import { track } from "../infra/async.js";
@@ -19,6 +22,7 @@ import {
   sweepPrivateRepoRetention,
 } from "./housekeeping.js";
 import { SessionNavigation } from "./navigation.js";
+import type { RestoreIntentPort } from "./navigation.js";
 import {
   HISTORY_EXPIRED_NOTICE,
   HISTORY_UNLOADABLE_NOTICE,
@@ -34,6 +38,32 @@ export function stateOf(services: ExtensionServices, sessionId: string): Session
   return state;
 }
 
+/** Where a navigation of `sessionId` saves its state and restore intents. */
+function navigationPorts(
+  ctx: AnyContext,
+  sessionId: string,
+  store: SessionHistoryStore | undefined,
+  runtimeStore: RuntimeActionStateStore,
+): { stateChanged: (state: NavigationState) => Promise<void>; intents: RestoreIntentPort } {
+  return {
+    stateChanged: async (state) => {
+      const activeSessionLeaf = ctx.sessionManager.getLeafId();
+      const [saved] = await Promise.allSettled([
+        store?.save(state),
+        runtimeStore.publishNavigation(sessionId, state, activeSessionLeaf),
+      ]);
+      // Rejecting keeps an in-flight restore's intent: the cursor is not durable.
+      if (saved.status === "rejected") throw saved.reason;
+    },
+    intents: store
+      ? {
+          save: (intent) => store.saveRestoreIntent(intent),
+          clear: () => store.clearRestoreIntent(),
+        }
+      : { save: async () => undefined, clear: async () => undefined },
+  };
+}
+
 export function createNavigation(
   ctx: AnyContext,
   sessionId: string,
@@ -44,6 +74,7 @@ export function createNavigation(
   gitRunnerFactory: CwdGitRunnerFactory = defaultGitRunnerFactory,
 ): SessionNavigation {
   const manager = ctx.sessionManager;
+  const { stateChanged, intents } = navigationPorts(ctx, sessionId, store, runtimeStore);
   return new SessionNavigation(
     {
       getLeafId: () => manager.getLeafId(),
@@ -52,21 +83,78 @@ export function createNavigation(
     },
     backend?.kind === "git" ? backend.git : gitRunnerFactory(ctx.cwd),
     gitForRepository ?? ((repository) => gitRunnerFactory(repository.worktree)),
-    async (state) => {
-      const activeSessionLeaf = manager.getLeafId();
-      const [saved] = await Promise.allSettled([
-        store?.save(state),
-        runtimeStore.publishNavigation(sessionId, state, activeSessionLeaf),
-      ]);
-      // Rejecting keeps an in-flight restore's intent: the cursor is not durable.
-      if (saved.status === "rejected") throw saved.reason;
-    },
+    stateChanged,
     undefined,
-    store && {
-      save: (intent) => store.saveRestoreIntent(intent),
-      clear: () => store.clearRestoreIntent(),
-    },
+    intents,
   );
+}
+
+/** The live session id. When the host moved the session to a new id
+ *  (`continuationOf`), the old id's record is filed under the new one first,
+ *  so a turn that started before the move still ends, and its navigation and
+ *  history (file and refs) move to the new id. Every handler reads the
+ *  session id through this. */
+export function liveSessionId(services: ExtensionServices, ctx: AnyContext): string {
+  const sessionId = ctx.sessionManager.getSessionId();
+  if (services.sessions.has(sessionId)) return sessionId;
+  const from = continuationOf(ctx);
+  const state = from === undefined ? undefined : services.sessions.get(from);
+  if (from === undefined || !state) return sessionId;
+  services.sessions.delete(from);
+  services.sessions.set(sessionId, state);
+  services.explicitActiveHashes.delete(checkpointNamespace(from));
+  services.explicitActiveHashes.add(checkpointNamespace(sessionId));
+
+  // Built after any in-flight initialization: that is what sets `backend`.
+  const move = async (navigation: SessionNavigation): Promise<void> => {
+    const backend = state.backend;
+    const store =
+      backend?.kind === "git"
+        ? new SessionHistoryStore(sessionId, backend.repository, backend.git)
+        : undefined;
+    await navigation.rekey(
+      async (checkpoints) => (store ? store.adoptCheckpoints(checkpoints, from) : [...checkpoints]),
+      navigationPorts(ctx, sessionId, store, services.runtimeStore),
+    );
+  };
+  let moved: Promise<unknown> = Promise.resolve();
+  if (state.navigation) {
+    moved = move(state.navigation);
+  } else if (state.initialization) {
+    // Callers waiting on the initialization get the navigation once moved.
+    const initialization = state.initialization.then(async (navigation) => {
+      await move(navigation);
+      return navigation;
+    });
+    state.initialization = initialization;
+    moved = initialization.finally(() => {
+      if (state.initialization === initialization) state.initialization = undefined;
+    });
+  }
+  void track(async () => {
+    await moved.catch(() => undefined);
+    // As `releaseLeftSession` does for a session left by a switch.
+    const backend = state.backend;
+    await Promise.all([
+      services.runtimeStore.releaseSession(from),
+      services.leasePool.releasePersistentSnapshotIndices([from], { inUse: false }),
+      backend?.kind === "git"
+        ? releaseSessionHeartbeat(historyDirectory(backend.repository), checkpointNamespace(from))
+        : undefined,
+    ]);
+  }, services.activeOperations);
+  return sessionId;
+}
+
+/** The id `state` is filed under now: `liveSessionId` re-keys a record a
+ *  deferred finalize still holds. `fallback` once the record was released. */
+export function recordSessionId(
+  services: ExtensionServices,
+  state: SessionState,
+  fallback: string,
+): string {
+  for (const [sessionId, record] of services.sessions) if (record === state) return sessionId;
+  return fallback;
 }
 
 export function notifySessionOnly(
@@ -91,7 +179,7 @@ export async function initializeNavigation(
   replaceExisting: boolean,
   historyLeafId?: string | null,
 ): Promise<SessionNavigation> {
-  const sessionId = ctx.sessionManager.getSessionId();
+  const sessionId = liveSessionId(services, ctx);
   const sessionHash = checkpointNamespace(sessionId);
   services.explicitActiveHashes.add(sessionHash);
   const state = stateOf(services, sessionId);
@@ -145,7 +233,7 @@ export async function initializeNavigation(
       backend,
       services.gitRunnerFor,
     );
-    const loadResult = store ? await store.load(ctx.sessionManager) : null;
+    const loadResult = store ? await store.load(ctx.sessionManager, continuationOf(ctx)) : null;
     let restored: NavigationState | null = null;
     if (loadResult?.status === "loaded") {
       restored = loadResult.state;

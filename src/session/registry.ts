@@ -6,7 +6,7 @@ import { releaseSessionHeartbeat, touchSessionHeartbeat } from "../history/liven
 import { timedOutAfter, track } from "../infra/async.js";
 import { checkpointNamespace } from "../infra/paths.js";
 import type { ActionId, PendingTurnCheckpoint } from "../types.js";
-import { ensureNavigation, initializeNavigation, stateOf } from "./controller.js";
+import { ensureNavigation, initializeNavigation, liveSessionId, stateOf } from "./controller.js";
 import { isMainSession, runShutdownHousekeeping } from "./housekeeping.js";
 import type { SessionNavigation } from "./navigation.js";
 import type { ExtensionServices } from "./services.js";
@@ -21,7 +21,6 @@ export type CommandNavigation =
 /** The one entry point `host/` uses into `session/`. */
 export type SessionRegistry = {
   publishActionResult(
-    sessionId: string,
     navigation: SessionNavigation,
     ctx: AnyContext,
     id: ActionId,
@@ -79,13 +78,14 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     [...sessions.values()].flatMap((s) => (s.navigation === undefined ? [] : [s.navigation]));
 
   async function publishActionResult(
-    sessionId: string,
     navigation: SessionNavigation,
     ctx: AnyContext,
     id: ActionId,
     token: string,
     applied: boolean,
   ): Promise<void> {
+    // The command's own session move can be what made the host change the id.
+    const sessionId = liveSessionId(services, ctx);
     await services.runtimeStore.publishActionResult(
       sessionId,
       navigation.snapshot(),
@@ -98,7 +98,6 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
    *  capture and every session's finalize settled. */
   async function commandNavigation(typed: AnyContext & CommandHost): Promise<CommandNavigation> {
     if (!isMainSession(services, typed)) return { status: "subagent" };
-    const sessionId = typed.sessionManager.getSessionId();
     // Commands run even mid-stream: the turn's finalize only registers at
     // agent_end, so the guards below must be read after the idle wait.
     await typed.waitForIdle();
@@ -123,7 +122,9 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     // Idle with a turn still held for a continuation: it was skipped, or
     // waits on async work. Record it before navigating past it.
     await settleContinuation(services, typed);
-    const state = sessions.get(sessionId);
+    // Read after the waits: the turn they waited on can be what moved the
+    // session to a new id.
+    const state = sessions.get(liveSessionId(services, typed));
     // Every session's: a session left by /new or /resume may still be taking
     // its after-snapshot of the shared workspace, and a restore written under
     // it would land in that session's checkpoint. Finalizes never reject.
@@ -217,7 +218,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
   async function sessionStart(typed: AnyContext): Promise<void> {
     if (services.flags.closing) return;
     if (!isMainSession(services, typed)) return;
-    const sessionId = typed.sessionManager.getSessionId();
+    const sessionId = liveSessionId(services, typed);
     const state = stateOf(services, sessionId);
     const previousPending = state.pending;
     state.pending = undefined;
@@ -236,7 +237,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     event: { oldLeafId: string | null; newLeafId: string | null },
   ): Promise<void> {
     if (services.flags.closing) return;
-    const navigation = sessions.get(typed.sessionManager.getSessionId())?.navigation;
+    const navigation = sessions.get(liveSessionId(services, typed))?.navigation;
     if (!navigation) return;
     await navigation.handleSessionTreeNavigation(event.oldLeafId, event.newLeafId);
   }
@@ -246,7 +247,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
   // which is a safe superset, and releases no session (unknown source).
   const rememberNavigationSource = (_event: unknown, ctx: AnyContext): void => {
     if (services.flags.closing) return;
-    services.flags.pendingNavigationSourceSessionId = ctx.sessionManager.getSessionId();
+    services.flags.pendingNavigationSourceSessionId = liveSessionId(services, ctx);
   };
 
   // The host emits no `session_start` for the session it switched to, so its

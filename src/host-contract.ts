@@ -7,6 +7,8 @@ export type AnyContext = {
     getLeafId(): string | null;
     getBranch(fromId?: string): SessionEntryLike[];
     getEntry(id: string): SessionEntryLike | undefined;
+    /** Absent in test doubles; see `continuationOf`. */
+    getHeader?(): unknown;
   };
   ui?: {
     notify(message: string, level: "info" | "warning" | "error"): void;
@@ -45,6 +47,18 @@ export function isPiSessionStart(event: unknown): boolean {
 export function leavesSessionOnShutdown(event: unknown): boolean {
   if (typeof event !== "object" || event === null || !("reason" in event)) return false;
   return event.reason === "new" || event.reason === "resume" || event.reason === "fork";
+}
+
+/** OMP 18.20+ moves a session it cannot keep writing (another live process
+ *  holds its file, or the file changed on disk) to a new session id, with no
+ *  event: `getSessionId()` just changes. The new header's `continuationOf`
+ *  names the id it continues; `/resume` of the old session opens that copy. */
+export function continuationOf(ctx: AnyContext): string | undefined {
+  const header = ctx.sessionManager.getHeader?.();
+  if (typeof header !== "object" || header === null || !("continuationOf" in header)) {
+    return undefined;
+  }
+  return typeof header.continuationOf === "string" ? header.continuationOf : undefined;
 }
 
 export const DEFAULT_CAPTURE_DEADLINE_MS = 3_000;

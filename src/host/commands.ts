@@ -78,14 +78,7 @@ export function registerCommands(pi: ExtensionAPI, registry: SessionRegistry): v
     const nav = prepared.navigation;
     nav.setNavigateTree(ctx.navigateTree);
     const outcome = await runNavigation(nav, ctx, id);
-    await registry.publishActionResult(
-      ctx.sessionManager.getSessionId(),
-      nav,
-      ctx,
-      id,
-      token,
-      outcome.status === "moved",
-    );
+    await registry.publishActionResult(nav, ctx, id, token, outcome.status === "moved");
   };
 
   pi.registerCommand("undo", {
