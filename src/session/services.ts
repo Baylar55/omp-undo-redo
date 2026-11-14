@@ -116,6 +116,10 @@ export type ExtensionServices = {
   housekeepingOperations: Set<Promise<void>>;
   expirationPromises: Map<string, Promise<void>>;
   explicitActiveHashes: Set<string>;
+  /** Sessions left by a switch whose release has not ended, each to its
+   *  release's token: `liveSessionId` never refiles their records. Entries
+   *  leave with their release, so the map holds at most the in-flight ones. */
+  leavingSessions: Map<string, object>;
   /** Keyed `${sessionId}\0${reason}`: session ids are UUIDs, so the separator
    *  cannot collide. Never pruned: a re-resumed session is not notified again. */
   notifiedSessionReasons: Set<string>;
@@ -189,6 +193,7 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     housekeepingOperations: new Set(),
     expirationPromises: new Map(),
     explicitActiveHashes: new Set(),
+    leavingSessions: new Map(),
     notifiedSessionReasons: new Set(),
     flags: {
       closing: false,

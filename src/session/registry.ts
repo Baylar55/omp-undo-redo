@@ -6,7 +6,13 @@ import { releaseSessionHeartbeat, touchSessionHeartbeat } from "../history/liven
 import { timedOutAfter, track } from "../infra/async.js";
 import { checkpointNamespace } from "../infra/paths.js";
 import type { ActionId, PendingTurnCheckpoint } from "../types.js";
-import { ensureNavigation, initializeNavigation, liveSessionId, stateOf } from "./controller.js";
+import {
+  ensureNavigation,
+  initializeNavigation,
+  liveSessionId,
+  recordSessionId,
+  stateOf,
+} from "./controller.js";
 import { isMainSession, runShutdownHousekeeping } from "./housekeeping.js";
 import type { SessionNavigation } from "./navigation.js";
 import type { ExtensionServices } from "./services.js";
@@ -176,15 +182,32 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
    *  for the process's lifetime; a later resume reloads it from its persisted
    *  history, as after a restart. Its in-flight work settles first so the
    *  last turn still lands in that history. */
-  async function releaseLeftSession(typed: AnyContext, sessionId: string): Promise<void> {
+  async function releaseLeftSession(
+    typed: AnyContext,
+    sessionId: string,
+    token: object,
+  ): Promise<void> {
+    try {
+      await drainLeftSession(typed, sessionId);
+    } finally {
+      // Even on a throw: left behind, the id would never follow a move again.
+      if (services.leavingSessions.get(sessionId) === token) {
+        services.leavingSessions.delete(sessionId);
+      }
+    }
+  }
+
+  async function drainLeftSession(typed: AnyContext, sessionId: string): Promise<void> {
     const state = stateOf(services, sessionId);
     for (;;) {
       const busy = state.finalize ?? state.initialization ?? state.capture?.complete;
       if (!busy) break;
       await Promise.allSettled([busy]);
     }
-    // Resumed (or reloaded) again meanwhile: it is live.
-    if (services.flags.closing || typed.sessionManager.getSessionId() === sessionId) return;
+    // Resumed (or reloaded) again meanwhile: it is live. If the host has moved
+    // it since, the record is the new id's (`liveSessionId` files it there).
+    if (services.flags.closing || liveSessionId(services, typed) === sessionId) return;
+    if (recordSessionId(services, state, sessionId) !== sessionId) return;
     const navigation = state.navigation;
     const backend = state.backend;
     const left = state.pending;
@@ -260,11 +283,26 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     if (services.flags.closing) return;
     if (!isMainSession(services, typed)) return;
     const sourceSessionId = services.flags.pendingNavigationSourceSessionId;
+    const token = {};
+    if (sourceSessionId) services.leavingSessions.set(sourceSessionId, token);
+    // Files the copy's record before anything awaits: from then on
+    // `liveSessionId` finds it and never refiles the source's (see there).
+    const sessionId = liveSessionId(services, typed);
+    stateOf(services, sessionId);
     services.flags.pendingNavigationSourceSessionId = null;
+    // Live again (a same-id reload, or a resume of a session still being left).
+    services.leavingSessions.delete(sessionId);
     if (sourceSessionId) {
-      await sessions.get(sourceSessionId)?.navigation?.invalidateRedo();
-      // Detached: the switch must not wait out the source's deferred finalize.
-      void track(() => releaseLeftSession(typed, sourceSessionId), services.activeOperations);
+      try {
+        await sessions.get(sourceSessionId)?.navigation?.invalidateRedo();
+      } finally {
+        // Detached: the switch must not wait out the source's deferred
+        // finalize. Even if the invalidation failed: it ends `token` too.
+        void track(
+          () => releaseLeftSession(typed, sourceSessionId, token),
+          services.activeOperations,
+        );
+      }
     } else {
       await invalidateAllRedo();
     }
@@ -354,6 +392,11 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     adoptSwitchedSession,
     // Before `agent_start`: a new prompt, not the scheduled continuation.
     beforeAgentStart: async (typed) => {
+      // A source still set is from a cancelled or rolled-back switch (OMP
+      // starts no turn mid-switch), and would stop `liveSessionId` following a
+      // move. ponytail: a move after a cancel within the same turn still loses
+      // that turn; no event marks the cancel any sooner.
+      if (isMainSession(services, typed)) services.flags.pendingNavigationSourceSessionId = null;
       await settleContinuation(services, typed);
       await beforeAgentStart(services, typed);
     },

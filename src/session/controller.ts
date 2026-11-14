@@ -5,6 +5,7 @@ import { releaseSessionHeartbeat } from "../history/liveness.js";
 import { appendUnrecordedTurns, reconstructSessionHistory } from "../history/reconstruct.js";
 import { SessionHistoryStore } from "../history/store.js";
 import { track } from "../infra/async.js";
+import { debugLog } from "../infra/debug-log.js";
 import { checkpointNamespace } from "../infra/paths.js";
 import type { RuntimeActionStateStore } from "../runtime/action-state.js";
 import { defaultGitRunnerFactory, resolveBackend } from "../store/backend.js";
@@ -98,6 +99,17 @@ export function liveSessionId(services: ExtensionServices, ctx: AnyContext): str
   const sessionId = ctx.sessionManager.getSessionId();
   if (services.sessions.has(sessionId)) return sessionId;
   const from = continuationOf(ctx);
+  // A switch (`/resume`) into a copy of a session it leaves (or left, with the
+  // release still running) is no move: that session's record is being
+  // released, and refiled here it would bring its whole history, turns off the
+  // copy's branch included, and then that release along.
+  if (
+    from !== undefined &&
+    (from === services.flags.pendingNavigationSourceSessionId || services.leavingSessions.has(from))
+  ) {
+    debugLog({ event: "continuation not adopted: session being left", from, sessionId });
+    return sessionId;
+  }
   const state = from === undefined ? undefined : services.sessions.get(from);
   if (from === undefined || !state) return sessionId;
   services.sessions.delete(from);

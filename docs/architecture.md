@@ -200,7 +200,15 @@ file changed on disk) to a new session id with no event; the new header's `conti
 the old id, and `/resume` of the old session opens the copy. Every handler reads the id through
 `liveSessionId` (`session/controller.ts`): a record still filed under the old id moves to the new
 one, with its turn in flight, and `SessionNavigation.rekey` copies its history refs into the new
-namespace and saves under the new id from then on. A copy resumed without history of its own
+namespace and saves under the new id from then on. A switch (`/resume`) into a copy of a session
+being left is not a move: `liveSessionId` never refiles the record of the switch's source (from
+`session_before_switch`) or of any session whose release (`releaseLeftSession`) is still waiting
+out its last turn (`leavingSessions`); the copy loads its stored history instead, without a turn
+still finalizing. Resuming a session drops it from `leavingSessions`, so a move of it is followed
+again, and a release that finds its record moved leaves it to the new id. A cancelled switch
+announces nothing, so its source is dropped at the next turn start; until then a move is not
+followed, and a move inside the turn the switch was cancelled in loses that turn's file
+checkpoint. A copy resumed without history of its own
 adopts the old id's file (`SessionHistoryStore.load`), up to its cursor and only while its turns
 are on the copy's branch, since the old session's process may have gone on. Refs are copied, never
 moved: the old session keeps its history. The move is noticed at the next event or command; an
