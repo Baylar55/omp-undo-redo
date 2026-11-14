@@ -39,7 +39,8 @@ async function ignoredUnder(
   await mkdir(rules);
   const env = { GIT_INDEX_FILE: join(directory, `${label}-index`), GIT_WORK_TREE: rules };
   if ((await invoke(git, ["read-tree", commit], { env })).code !== 0) return null;
-  const files = await invoke(git, ["ls-files", "-z", "--", ":(glob)**/.gitignore"], { env });
+  // `icase`: case-insensitive file systems serve `.GITIGNORE` to git as `.gitignore`.
+  const files = await invoke(git, ["ls-files", "-z", "--", ":(glob,icase)**/.gitignore"], { env });
   if (files.code !== 0) return null;
   if (files.stdout) {
     const written = await invoke(git, ["checkout-index", "-z", "--stdin"], {

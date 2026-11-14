@@ -754,53 +754,60 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
-  it("keeps a pre-existing ignored file across undo/redo of a turn that un-ignores it", async () => {
-    const { cwd, git, snap } = await makeRepo();
-    const envPath = join(cwd, ".env");
-    try {
-      await initializeBranch(git, cwd);
-      await writeFile(join(cwd, ".gitignore"), ".env\n");
-      await git(["add", ".gitignore"]);
-      await git(["commit", "-qm", "ignore fixture"]);
-      await writeFile(envPath, "SECRET=1\n");
+  // Case-insensitive file systems serve `.GITIGNORE` to git as `.gitignore`.
+  it.each([
+    ".gitignore",
+    ...(process.platform === "win32" || process.platform === "darwin" ? [".GITIGNORE"] : []),
+  ])(
+    "keeps a pre-existing ignored file across undo/redo of a turn that un-ignores it (%s)",
+    async (rulesFile) => {
+      const { cwd, git, snap } = await makeRepo();
+      const envPath = join(cwd, ".env");
+      try {
+        await initializeBranch(git, cwd);
+        await writeFile(join(cwd, rulesFile), ".env\n");
+        await git(["add", rulesFile]);
+        await git(["commit", "-qm", "ignore fixture"]);
+        await writeFile(envPath, "SECRET=1\n");
 
-      const pending = pendingCheckpoint(
-        await prepareBeforeTurn(snap, "unignore-turn", defaultPool),
-      );
-      await writeFile(join(cwd, ".gitignore"), "# cleaned\n");
-      const checkpoint = completedCheckpoint(
-        await finishAfterTurn(snap, pending, null, null, defaultPool),
-      );
+        const pending = pendingCheckpoint(
+          await prepareBeforeTurn(snap, "unignore-turn", defaultPool),
+        );
+        await writeFile(join(cwd, rulesFile), "# cleaned\n");
+        const checkpoint = completedCheckpoint(
+          await finishAfterTurn(snap, pending, null, null, defaultPool),
+        );
 
-      // `.env` is pinned to its on-disk state, so only `.gitignore` is restored.
-      await expect(
-        applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
-      ).resolves.toEqual({
-        status: "applied",
-        nestedRepositories: [],
-        unreadableFiles: [],
-        restoredFiles: [".gitignore"],
-      });
-      expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe(".env\n");
-      expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+        // `.env` is pinned to its on-disk state, so only the rules file is restored.
+        await expect(
+          applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
+        ).resolves.toEqual({
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: [rulesFile],
+        });
+        expect(await readFile(join(cwd, rulesFile), "utf8")).toBe(".env\n");
+        expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
-      await expect(
-        applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
-      ).resolves.toEqual({
-        status: "applied",
-        nestedRepositories: [],
-        unreadableFiles: [],
-        restoredFiles: [".gitignore"],
-      });
-      expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe("# cleaned\n");
-      expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+        await expect(
+          applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
+        ).resolves.toEqual({
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: [rulesFile],
+        });
+        expect(await readFile(join(cwd, rulesFile), "utf8")).toBe("# cleaned\n");
+        expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
-      await releaseCheckpoint(snap, checkpoint);
-      await releasePersistentSnapshotIndices(["unignore-turn"]);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
+        await releaseCheckpoint(snap, checkpoint);
+        await releasePersistentSnapshotIndices(["unignore-turn"]);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("keeps a pre-existing ignored file across undo/redo of a turn that force-adds it", async () => {
     const { cwd, git, snap } = await makeRepo();

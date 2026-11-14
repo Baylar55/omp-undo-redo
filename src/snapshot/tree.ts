@@ -25,7 +25,8 @@ const UNOPENED_DIRECTORY_PREFIX = "warning: could not open directory '";
 
 const UNOPENED_DIRECTORY_WARNING = /^warning: could not open directory '(.*)': [^']*$/;
 
-const GITIGNORE_PATH = /(?:^|\/)\.gitignore$/;
+/** Any case: case-insensitive file systems serve `.GITIGNORE` to git as `.gitignore`. */
+const GITIGNORE_PATH = /(?:^|\/)\.gitignore$/i;
 
 export type SnapshotResult =
   | { hash: string; tree: string; snapshotIndexLease?: SnapshotIndexLease }
