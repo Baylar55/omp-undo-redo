@@ -45,6 +45,7 @@ export class SessionNavigation {
   private stateChanged: (state: NavigationState) => Promise<void>;
   private readonly applyGit: ApplyCheckpoint;
   private intents: RestoreIntentPort;
+  private isSuspended = false;
 
   constructor(
     private readonly port: Omit<NavigationPort, "navigateTree"> & {
@@ -84,8 +85,10 @@ export class SessionNavigation {
     return { checkpoints: [...this.checkpoints], currentIndex: this.currentIndex };
   }
 
-  /** False when the state could not be saved. */
+  /** False when the state could not be saved. Never saves once suspended:
+   *  work still queued would persist the emptied state, deleting the file. */
   private async persistState(): Promise<boolean> {
+    if (this.isSuspended) return false;
     return this.stateChanged({
       checkpoints: [...this.checkpoints],
       currentIndex: this.currentIndex,
@@ -172,6 +175,8 @@ export class SessionNavigation {
   }
 
   private async performRecordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
+    // No save will ever reference it: release its refs instead of orphaning them.
+    if (this.isSuspended) return this.releaseFileCheckpoints([checkpoint]);
     const discarded = this.checkpoints.splice(
       this.currentIndex + 1,
       this.checkpoints.length - this.currentIndex - 1,
@@ -182,8 +187,15 @@ export class SessionNavigation {
     await this.releaseFileCheckpoints(discarded);
   }
 
-  /** Teardown-only: runs outside the navigation chain (suspend/resume path). */
+  /** True once `suspend` ran: its state is gone and nothing it does is saved. */
+  get suspended(): boolean {
+    return this.isSuspended;
+  }
+
+  /** Teardown-only: runs outside the navigation chain (suspend/resume path).
+   *  Work already queued still runs; `isSuspended` keeps it from saving. */
   async suspend(): Promise<void> {
+    this.isSuspended = true;
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
     this.currentIndex = -1;

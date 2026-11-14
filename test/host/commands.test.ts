@@ -70,7 +70,8 @@ function checkpoint(parentLeafId: string | null, leafId: string): GitCheckpoint 
     worktree: ".",
     gitDir: ".git",
     commonDir: ".git",
-    storeDir: ".git",
+    // Missing on purpose: ref releases mark gc-pending in the store, never this repo's .git.
+    storeDir: "missing-store",
   };
   return {
     kind: "git",
@@ -502,6 +503,48 @@ describe("session navigation", () => {
     expect((await unsaved.undo()).status).toBe("moved");
     expect(intents).toEqual(["save undo"]);
   });
+
+  it("never saves state after suspend, even from work already queued", async () => {
+    const applyGate = Promise.withResolvers<void>();
+    let applyCalls = 0;
+    const saves: number[] = [];
+    const intents: string[] = [];
+    const refUpdates: string[] = [];
+    const navigation = new SessionNavigation(
+      port(),
+      async (_args, options) => {
+        if (options?.stdin) refUpdates.push(options.stdin);
+        return { stdout: "", stderr: "", code: 0 };
+      },
+      undefined,
+      async (state) => void saves.push(state.checkpoints.length),
+      async () => {
+        applyCalls++;
+        await applyGate.promise;
+        return { status: "applied", nestedRepositories: [], unreadableFiles: [], restoredFiles: [] };
+      },
+      {
+        save: async (intent) => void intents.push(`save ${intent.direction}`),
+        clear: async () => void intents.push("clear"),
+      },
+    );
+    await navigation.recordTurnEnd(checkpoint("u1", "a1"));
+    saves.length = 0;
+
+    const pendingUndo = navigation.undo();
+    await vi.waitFor(() => expect(applyCalls).toBe(1));
+    await navigation.suspend();
+    applyGate.resolve();
+    await pendingUndo;
+    await navigation.recordTurnEnd(checkpoint("a1", "a2"));
+
+    // An empty save deletes the history file; a one-entry save truncates it.
+    expect(saves).toEqual([]);
+    // The intent survives so the next load can settle the cursor.
+    expect(intents).toEqual(["save undo"]);
+    // The unsaved turn's refs are released, not orphaned.
+    expect(refUpdates.join("")).toContain("delete refs/omp-undo-redo/history/test/a2/before");
+  });
 });
 
 describe("recoverInterruptedRestore", () => {
@@ -583,18 +626,18 @@ describe("runNavigation", () => {
       "undo",
       "Undo",
       "undone",
-      { storeDir: ".git", sourceHash: "after-a1", targetHash: "before-a1" },
+      { storeDir: "missing-store", sourceHash: "after-a1", targetHash: "before-a1" },
     ],
     [
       "redo",
       "Redo",
       "redone",
-      { storeDir: ".git", sourceHash: "before-a1", targetHash: "after-a1" },
+      { storeDir: "missing-store", sourceHash: "before-a1", targetHash: "after-a1" },
     ],
   ] as const)(
     "names the store and both snapshots when a %s may leave files between them",
     async (direction, verb, done, restore) => {
-      const steps = `Restore them by hand from the snapshots in .git: ${restore.sourceHash} (before the /${direction}) and ${restore.targetHash} (its result). Steps: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#restoring-files-after-an-interrupted-undo-or-redo`;
+      const steps = `Restore them by hand from the snapshots in ${restore.storeDir}: ${restore.sourceHash} (before the /${direction}) and ${restore.targetHash} (its result). Steps: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#restoring-files-after-an-interrupted-undo-or-redo`;
       const debugHint =
         "To log the cause, restart the agent with OMP_UNDO_REDO_DEBUG=1 and retry: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#collecting-a-debug-trace";
       type Stub = (

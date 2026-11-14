@@ -84,6 +84,9 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     token: string,
     applied: boolean,
   ): Promise<void> {
+    // Detached by a session switch: its emptied state would re-create the
+    // left session's state file (or overwrite a resumed one's).
+    if (navigation.suspended) return;
     // The command's own session move can be what made the host change the id.
     const sessionId = liveSessionId(services, ctx);
     await services.runtimeStore.publishActionResult(
@@ -298,9 +301,9 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       const teardown = (async () => {
         try {
           // First, and never cut short: `suspend` below empties a navigation
-          // outside its queue. An invalidation saving after it would persist
-          // that empty state, and saving an empty history deletes the file:
-          // the session's whole undo history, not just its redo.
+          // outside its queue, and a suspended navigation never saves. An
+          // invalidation landing after it would be dropped, keeping the
+          // stored redo the user just left behind.
           await Promise.allSettled(
             leftNavigations.map((navigation) => navigation.invalidateRedo()),
           );
