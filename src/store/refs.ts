@@ -30,18 +30,33 @@ export async function markGcPending(storeDir: string): Promise<void> {
  *  single unexpected hash cannot block the rest. `onSingleFailure` receives
  *  refs that still fail alone — that is how a caller reaches a loose-ref
  *  unlink when git itself is unusable, so a throw falls through to halving
- *  rather than aborting. A timeout aborts the walk instead: the repository is
- *  busy and splitting only multiplies the wait. A held `packed-refs.lock`
- *  fails every deletion alike (each spawn waiting out git's lock timeout),
- *  so it skips the halving and hands every ref to `onSingleFailure` at once. */
-export async function deleteRefsBatched(
+ *  rather than aborting. A deletion timeout aborts the walk instead: the
+ *  repository is busy and splitting only multiplies the wait. A held
+ *  `packed-refs.lock` fails every deletion alike (each spawn waiting out
+ *  git's lock timeout), so it skips the halving and hands every ref to
+ *  `onSingleFailure` at once.
+ *  In a batch of two or more, refs under `REF_ROOT` that a successful listing
+ *  shows are gone count as deleted; a lone missing ref still goes to
+ *  `onSingleFailure`. */
+export function deleteRefsBatched(
   git: GitRunner,
   refs: readonly RefSpec[],
-  options: {
-    env?: Record<string, string>;
-    timeoutMs?: number;
-    onSingleFailure?: (ref: RefSpec) => Promise<boolean>;
-  } = {},
+  options: DeleteRefsOptions = {},
+): Promise<"ok" | "failed" | "timeout"> {
+  return deleteBatch(git, refs, options, false);
+}
+
+interface DeleteRefsOptions {
+  env?: Record<string, string>;
+  timeoutMs?: number;
+  onSingleFailure?: (ref: RefSpec) => Promise<boolean>;
+}
+
+async function deleteBatch(
+  git: GitRunner,
+  refs: readonly RefSpec[],
+  options: DeleteRefsOptions,
+  listed: boolean,
 ): Promise<"ok" | "failed" | "timeout"> {
   if (refs.length === 0) return "ok";
   const input = refs.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n");
@@ -67,10 +82,34 @@ export async function deleteRefsBatched(
     for (const ref of refs) if (!(await fallback(ref))) released = false;
     return released ? "ok" : "failed";
   }
+  if (!listed) {
+    // A ref another process already deleted fails every batch holding it, so
+    // halving would cost ~2n spawns: list once and drop the missing ones.
+    let listing;
+    try {
+      listing = await git(["for-each-ref", "--format=%(refname)", `${REF_ROOT}/`], {
+        env: options.env,
+        timeoutMs: options.timeoutMs,
+      });
+    } catch {
+      // Unusable git: halve as before, down to `onSingleFailure`.
+    }
+    // A failed or timed-out listing (it spans the whole namespace) proves
+    // nothing about these refs, so halving proceeds as before.
+    if (listing && listing.code === 0 && !listing.error) {
+      const existing = new Set(listing.stdout.split(/\r?\n/));
+      // Only the listed namespace can be proven missing.
+      const present = refs.filter(
+        ({ ref }) => !ref.startsWith(`${REF_ROOT}/`) || existing.has(ref),
+      );
+      if (present.length === 0) return "ok";
+      if (present.length < refs.length) return deleteBatch(git, present, options, true);
+    }
+  }
   const midpoint = Math.ceil(refs.length / 2);
-  const left = await deleteRefsBatched(git, refs.slice(0, midpoint), options);
+  const left = await deleteBatch(git, refs.slice(0, midpoint), options, true);
   if (left === "timeout") return "timeout";
-  const right = await deleteRefsBatched(git, refs.slice(midpoint), options);
+  const right = await deleteBatch(git, refs.slice(midpoint), options, true);
   if (right === "timeout") return "timeout";
   return left === "ok" && right === "ok" ? "ok" : "failed";
 }

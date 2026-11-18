@@ -1135,6 +1135,28 @@ describe("stale packed-refs.lock", () => {
     }
   }, 30000);
 
+  it("drops refs another process already deleted instead of halving to singles", async () => {
+    // Two processes cleaning the same refs: the slower one's batch failed on
+    // every missing ref and halved down to ~2N spawns.
+    const { gitDir, git, refs, counter, remaining } = await seedRefs(8);
+    try {
+      const gone = refs.slice(0, 6);
+      await git(["update-ref", "--stdin"], {
+        stdin: `${gone.map(({ ref, expectedHash }) => `delete ${ref} ${expectedHash}`).join("\n")}\n`,
+      });
+      counter.spawns = 0;
+      expect(await deleteRefsBatched(git, refs)).toBe("ok");
+      // The failed batch, then one batch of the two survivors.
+      expect(counter.spawns).toBe(2);
+      expect(await remaining()).toEqual([]);
+      counter.spawns = 0;
+      expect(await deleteRefsBatched(git, refs)).toBe("ok");
+      expect(counter.spawns).toBe(1);
+    } finally {
+      await rmRetry(gitDir);
+    }
+  }, 30000);
+
   it("hands every ref to the loose-ref fallback when the lock is held", async () => {
     // releaseRefs' fallback unlinks loose refs; packed ones need git and wait.
     const { gitDir, git, refs, counter, remaining } = await seedRefs(6, 2);
