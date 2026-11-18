@@ -799,6 +799,33 @@ describe("expireGitSessionHistories", () => {
     await expect(stat(tombFile)).rejects.toThrow();
   });
 
+  it("removes temp files left by a killed write once older than 24 h, even with retention off", async () => {
+    const gitDir = await temporaryDirectory("git-prune-tmp-");
+    const repository: GitRepository = {
+      worktree: gitDir,
+      gitDir,
+      commonDir: gitDir,
+      storeDir: gitDir,
+    };
+    const historyDir = join(gitDir, "omp-undo-redo", "history");
+    await mkdir(historyDir, { recursive: true });
+    const hash = sessionHash("killed-write");
+    const stale = join(historyDir, `.${hash}.json.dead.tmp`);
+    const staleBeat = join(historyDir, `.active.${hash}.dead.tmp`);
+    const fresh = join(historyDir, `.${hash}.json.inflight.tmp`);
+    for (const path of [stale, staleBeat, fresh]) await writeFile(path, "{");
+    const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+    await utimes(stale, twoDaysAgo, twoDaysAgo);
+    await utimes(staleBeat, twoDaysAgo, twoDaysAgo);
+
+    const dummyGit: GitRunner = async () => ({ stdout: "", stderr: "", code: 0 });
+    await expireGitSessionHistories(repository, dummyGit, 0, () => new Set());
+
+    await expect(stat(stale)).rejects.toThrow();
+    await expect(stat(staleBeat)).rejects.toThrow();
+    await expect(stat(fresh)).resolves.toBeTruthy();
+  });
+
   describe("refs with no history JSON", () => {
     const OLD = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
     const day = 24 * 60 * 60;

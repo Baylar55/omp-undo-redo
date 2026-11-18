@@ -102,8 +102,8 @@ function serialized(path: string, work: () => Promise<void>): Promise<void> {
 /** Best-effort liveness beat: rewrites the marker naming this process, which
  *  also refreshes its mtime, creating it on first touch. Atomic (temp +
  *  rename): a writer stopped mid-write never leaves an empty marker, and
- *  readers never see a partial one; the temp starts with `.active.`, so one
- *  leaked by a crash is pruned like a stale marker. Failures never block the
+ *  readers never see a partial one; a temp leaked by a crash is pruned by
+ *  age like any other history temp. Failures never block the
  *  caller; the remaining sweep guards (local active set, fail-closed ref
  *  deletion) still apply. */
 export function touchSessionHeartbeat(historyDir: string, sessionHash: string): Promise<void> {
@@ -159,8 +159,9 @@ export async function sessionHeartbeatIsFresh(
   return ownerIsAlive(path);
 }
 
-/** Removes markers whose owners are gone (stale and not alive) so the history
- *  directory does not accumulate one file per historical session forever. */
+/** Removes markers whose owners are gone (stale and not alive), and temp
+ *  files (`.<name>.<uuid>.tmp`) left by writers killed mid-write, so the
+ *  history directory does not accumulate files forever. */
 export async function pruneStaleHeartbeats(historyDir: string): Promise<void> {
   let names: string[];
   try {
@@ -169,12 +170,15 @@ export async function pruneStaleHeartbeats(historyDir: string): Promise<void> {
     return;
   }
   for (const name of names) {
-    if (!name.startsWith(".active.")) continue;
+    const temporary = name.startsWith(".") && name.endsWith(".tmp");
+    if (!temporary && !name.startsWith(".active.")) continue;
     const path = join(historyDir, name);
     try {
       const metadata = await stat(path);
       if (!metadata.isFile()) continue;
-      if (Date.now() - metadata.mtimeMs >= ACTIVE_HEARTBEAT_TTL_MS && !(await ownerIsAlive(path))) {
+      if (Date.now() - metadata.mtimeMs < ACTIVE_HEARTBEAT_TTL_MS) continue;
+      // No reader ever opens a temp, so age alone proves its writer died mid-write.
+      if (temporary || !(await ownerIsAlive(path))) {
         await rm(path, { force: true }).catch(() => undefined);
       }
     } catch {
