@@ -49,7 +49,7 @@ export function defaultStoreRoot(): string {
 }
 
 export function storeRootDirectory(): string {
-  const explicit = process.env.OMP_UNDO_REDO_STORE_DIR ?? process.env.OMP_UNDO_REDO_BLOB_DIR;
+  const explicit = process.env.OMP_UNDO_REDO_STORE_DIR || process.env.OMP_UNDO_REDO_BLOB_DIR;
   if (explicit) return canonicalCwd(explicit);
   if (process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
     const runtime = resolve(process.env.OMP_UNDO_REDO_RUNTIME_DIR);
