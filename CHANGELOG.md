@@ -10,6 +10,8 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 ### Fixed
 
+- **Running an older version next to this one lost its recent undo history.** Each start moves history files an older version left in `.git/omp-undo-redo/` into the snapshot store, but a file the store already held was kept and the legacy copy deleted unread. After one migration, an older version still running kept saving that session to `.git`, and the next start deleted those saves, so turns taken after the first migration were missing from `/undo`. The legacy copy now replaces the store's file when its modification time is newer.
+
 - **Windows/macOS: undo/redo deleted a file an upper-case `.GITIGNORE` ignored.** Git on a case-insensitive file system reads `.GITIGNORE` as `.gitignore`, but restore collected only lower-case `.gitignore` files to decide which paths a snapshot left out because they were ignored. A `.GITIGNORE` listing `.env`, a turn that removed that line, then `/undo`: `.env` was deleted from disk (a lower-case `.gitignore` kept it). Ignore files are now matched in any case, at restore and when a snapshot checks for a changed ignore file.
 
 - **Undo/redo of a rename overwrote or moved the user's later edit without a conflict.** The restore patch was the one restore step that let `git diff` detect renames. A turn that renamed `x.txt` to `y.txt`, followed by a user edit to `y.txt`, then `/undo`: the rename section moved the edit back into `x.txt`, and when the turn also changed a `.gitattributes`, `x.txt` was rewritten from the snapshot and the edit was lost, both reported as applied. The patch now uses `--no-renames` like every other step, so the edited file is a deletion `git apply --check` refuses, reported as a conflict on `y.txt`.

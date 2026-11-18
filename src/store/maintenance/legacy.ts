@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rm, rmdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { GitRepository, GitRunner } from "../../types.js";
+import { renameWithRetry } from "../../infra/fs.js";
 import { DEFAULT_TIMEOUT_MS, invoke } from "../../infra/git-runner.js";
 import { parseRefLines } from "../../infra/git-parse.js";
 import { snapshotRunnerEnv, storeEnv } from "../git-store.js";
@@ -102,10 +103,16 @@ export async function migrateLegacySnapshots(
   await rmdir(legacyRoot).catch(() => undefined);
 }
 
-/** Moves every file of `from` into `to`; a file already in `to` was written
- *  by this version and supersedes the legacy copy. Copy + rename, not a bare
- *  rename: the two directories may sit on different volumes, and readers must
- *  never see a partial file. */
+/** Moves every file of `from` into `to`. A file already in `to` is kept
+ *  unless the legacy copy is newer: an older version still running keeps
+ *  rewriting the legacy file after an earlier migration, and history files are
+ *  whole-state rewrites, so the newer copy wins (as in liveness: last writer
+ *  wins). Copy + rename, not a bare rename: the two directories may sit on
+ *  different volumes, and readers must never see a partial file.
+ *  shortcut: mtime is the only signal an older version writes, and a load
+ *  here refreshes the store file's mtime, so a load between an old version's
+ *  save and the next start keeps the stale store copy; upgrade if the history
+ *  format gains a save counter both versions write. */
 async function moveFiles(from: string, to: string): Promise<void> {
   const names = await readdir(from).catch(() => null);
   if (!names) return;
@@ -113,21 +120,32 @@ async function moveFiles(from: string, to: string): Promise<void> {
   for (const name of names) {
     const source = join(from, name);
     const target = join(to, name);
-    const present = await stat(target).then(
-      () => true,
-      () => false,
+    // An unreadable source is left for the next run, never deleted uncopied.
+    const sourceTime = await stat(source).then(
+      (s) => s.mtimeMs,
+      () => null,
     );
-    if (!present) {
+    if (sourceTime === null) continue;
+    const targetTime = await stat(target).then(
+      (s) => s.mtimeMs,
+      () => -Infinity,
+    );
+    if (sourceTime > targetTime) {
       const temporary = join(to, `.${name}.${randomUUID()}.tmp`);
       try {
         await copyFile(source, temporary);
-        await rename(temporary, target);
+        await renameWithRetry(temporary, target);
       } catch {
         await rm(temporary, { force: true }).catch(() => undefined);
         continue;
       }
     }
-    await rm(source, { force: true }).catch(() => undefined);
+    // A save landing mid-copy changes the mtime: leave it for the next run.
+    const unchanged = await stat(source).then(
+      (s) => s.mtimeMs === sourceTime,
+      () => false,
+    );
+    if (unchanged) await rm(source, { force: true }).catch(() => undefined);
   }
   await rmdir(from).catch(() => undefined);
 }

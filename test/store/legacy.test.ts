@@ -1,4 +1,4 @@
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -128,5 +128,50 @@ describe("migrateLegacySnapshots", () => {
     expect(await git(cwd, ["rev-parse", LEGACY_REF])).toBe(commit);
     expect((await storeGit(["for-each-ref", "refs/omp-undo-redo/"])).stdout).toBe("");
     expect((await readdir(packDir)).sort()).toEqual(before);
+  });
+
+  it("replaces a migrated history file only with a newer legacy copy", async () => {
+    const legacy = join(repository.commonDir, "omp-undo-redo", "history");
+    const store = join(repository.storeDir, "omp-undo-redo", "history");
+    await mkdir(legacy, { recursive: true });
+    await mkdir(store, { recursive: true });
+    // An older version saved `newer.json` after a past migration copied it.
+    await writeFile(join(store, "newer.json"), "migrated");
+    await writeFile(join(legacy, "newer.json"), "saved later");
+    await utimes(join(store, "newer.json"), 1000, 1000);
+    await utimes(join(legacy, "newer.json"), 2000, 2000);
+    // This version saved `older.json` after the legacy copy was written.
+    await writeFile(join(store, "older.json"), "current");
+    await writeFile(join(legacy, "older.json"), "stale");
+    await utimes(join(store, "older.json"), 2000, 2000);
+    await utimes(join(legacy, "older.json"), 1000, 1000);
+    // `copyFile` keeps the mtime (Windows): a copy whose source delete failed.
+    await writeFile(join(store, "same.json"), "copied");
+    await writeFile(join(legacy, "same.json"), "copied earlier");
+    await utimes(join(store, "same.json"), 1500, 1500);
+    await utimes(join(legacy, "same.json"), 1500, 1500);
+
+    await migrateLegacySnapshots(userGit, repository);
+
+    expect(await readFile(join(store, "newer.json"), "utf8")).toBe("saved later");
+    expect(await readFile(join(store, "older.json"), "utf8")).toBe("current");
+    expect(await readFile(join(store, "same.json"), "utf8")).toBe("copied");
+    await expect(readdir(legacy)).rejects.toThrow();
+  });
+
+  it("keeps a newer legacy file whose copy into the store fails", async () => {
+    const legacy = join(repository.commonDir, "omp-undo-redo", "history");
+    const store = join(repository.storeDir, "omp-undo-redo", "history");
+    await mkdir(legacy, { recursive: true });
+    // A directory at the target makes the rename fail.
+    await mkdir(join(store, "blocked.json"), { recursive: true });
+    await writeFile(join(legacy, "blocked.json"), "only copy");
+    await utimes(join(store, "blocked.json"), 1000, 1000);
+    await utimes(join(legacy, "blocked.json"), 2000, 2000);
+
+    await migrateLegacySnapshots(userGit, repository);
+
+    expect(await readFile(join(legacy, "blocked.json"), "utf8")).toBe("only copy");
+    expect(await readdir(store)).toEqual(["blocked.json"]);
   });
 });
