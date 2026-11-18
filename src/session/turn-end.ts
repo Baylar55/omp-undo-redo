@@ -126,15 +126,7 @@ async function resolveNavigation(
   if (typed.sessionManager.getSessionId() !== sessionId) return null;
   const nav =
     (await ensureNavigation(services, typed, turnStartLeaf)) ??
-    createNavigation(
-      typed,
-      sessionId,
-      undefined,
-      services.runtimeStore,
-      undefined,
-      services.gitRunnerFor,
-      services.gitRunnerFactory,
-    );
+    createNavigation(typed, sessionId, undefined, services.runtimeStore, services.gitRunnerFor);
   state.navigation = nav;
   return nav;
 }

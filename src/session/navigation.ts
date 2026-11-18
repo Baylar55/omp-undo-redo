@@ -35,6 +35,10 @@ export type RestoreIntentPort = {
   clear(): Promise<void>;
 };
 
+type SessionPort = Omit<NavigationPort, "navigateTree"> & {
+  navigateTree?: NavigationPort["navigateTree"];
+};
+
 export class SessionNavigation {
   private checkpoints: TurnCheckpoint[] = [];
   private currentIndex = -1;
@@ -48,16 +52,31 @@ export class SessionNavigation {
   private isSuspended = false;
 
   constructor(
-    private readonly port: Omit<NavigationPort, "navigateTree"> & {
-      navigateTree?: NavigationPort["navigateTree"];
-    },
+    port: SessionPort,
     git: GitRunner,
+    gitFactory?: undefined,
+    stateChanged?: (state: NavigationState) => Promise<void>,
+    applyGit?: ApplyCheckpoint,
+    intents?: RestoreIntentPort,
+  );
+  constructor(
+    port: SessionPort,
+    git: undefined,
+    gitFactory: GitRunnerFactory,
+    stateChanged?: (state: NavigationState) => Promise<void>,
+    applyGit?: ApplyCheckpoint,
+    intents?: RestoreIntentPort,
+  );
+  constructor(
+    private readonly port: SessionPort,
+    git: GitRunner | undefined,
     gitFactory?: GitRunnerFactory,
     stateChanged?: (state: NavigationState) => Promise<void>,
     applyGit?: ApplyCheckpoint,
     intents?: RestoreIntentPort,
   ) {
-    this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git);
+    // The overloads guarantee one of `git` / `gitFactory`.
+    this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git!);
     this.stateChanged = stateChanged ?? (async () => undefined);
     this.applyGit =
       applyGit ??

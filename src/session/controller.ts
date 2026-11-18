@@ -8,13 +8,11 @@ import { track } from "../infra/async.js";
 import { debugLog } from "../infra/debug-log.js";
 import { checkpointNamespace } from "../infra/paths.js";
 import type { RuntimeActionStateStore } from "../runtime/action-state.js";
-import { defaultGitRunnerFactory, resolveBackend } from "../store/backend.js";
+import { resolveBackend } from "../store/backend.js";
 import type { FileBackend } from "../store/backend.js";
 import type {
-  CwdGitRunnerFactory,
   FileCheckpointUnavailableReason,
-  GitRepository,
-  GitRunner,
+  GitRunnerFactory,
   NavigationState,
 } from "../types.js";
 import {
@@ -70,9 +68,7 @@ export function createNavigation(
   sessionId: string,
   store: SessionHistoryStore | undefined,
   runtimeStore: RuntimeActionStateStore,
-  backend?: FileBackend,
-  gitForRepository?: (repository: GitRepository) => GitRunner,
-  gitRunnerFactory: CwdGitRunnerFactory = defaultGitRunnerFactory,
+  gitForRepository: GitRunnerFactory,
 ): SessionNavigation {
   const manager = ctx.sessionManager;
   const { stateChanged, intents } = navigationPorts(ctx, sessionId, store, runtimeStore);
@@ -82,8 +78,8 @@ export function createNavigation(
       getBranch: (fromId) => manager.getBranch(fromId),
       getEntry: (id) => manager.getEntry(id),
     },
-    backend?.kind === "git" ? backend.git : gitRunnerFactory(ctx.cwd),
-    gitForRepository ?? ((repository) => gitRunnerFactory(repository.worktree)),
+    undefined, // no single runner: the factory resolves one per checkpoint repository
+    gitForRepository,
     stateChanged,
     undefined,
     intents,
@@ -242,7 +238,6 @@ export async function initializeNavigation(
       sessionId,
       store,
       services.runtimeStore,
-      backend,
       services.gitRunnerFor,
     );
     const loadResult = store ? await store.load(ctx.sessionManager, continuationOf(ctx)) : null;
