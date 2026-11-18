@@ -470,14 +470,23 @@ function headerPath(field: string): string | null {
   return name.startsWith("a/") ? name.slice(2) : null;
 }
 
-/** Paths `git apply` touches going from `sourceHash` to `targetHash`. Gitlinks
- *  are skipped: apply leaves them alone and `pathsOutsideSnapshots` reports
- *  them. Null when git fails. */
-export async function changedPaths(
+/** One `diff-tree -r --no-renames` record. */
+export interface TreeChange {
+  sourceMode: string;
+  targetMode: string;
+  sourceSha: string;
+  targetSha: string;
+  status: string;
+  path: string;
+}
+
+/** Every path that differs between `sourceHash` and `targetHash`, gitlinks
+ *  included. Null when git fails. */
+export async function treeChanges(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
-): Promise<string[] | null> {
+): Promise<TreeChange[] | null> {
   const changes = await invoke(
     git,
     ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
@@ -486,13 +495,26 @@ export async function changedPaths(
   if (changes.error || changes.code !== 0) return null;
   // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
   const fields = changes.stdout.split("\0");
-  const paths: string[] = [];
+  const records: TreeChange[] = [];
   for (let index = 0; index + 1 < fields.length; index += 2) {
-    const [sourceMode, targetMode] = fields[index]!.slice(1).split(" ");
-    if (sourceMode !== "160000" && targetMode !== "160000") paths.push(fields[index + 1]!);
+    const [sourceMode, targetMode, sourceSha, targetSha, status] =
+      fields[index]!.slice(1).split(" ");
+    records.push({
+      sourceMode: sourceMode!,
+      targetMode: targetMode!,
+      sourceSha: sourceSha!,
+      targetSha: targetSha!,
+      status: status!,
+      path: fields[index + 1]!,
+    });
   }
-  return paths;
+  return records;
 }
+
+/** A record git apply touches: it leaves gitlinks alone and
+ *  `pathsOutsideSnapshots` reports them. */
+export const isApplied = (change: TreeChange) =>
+  change.sourceMode !== "160000" && change.targetMode !== "160000";
 
 /** Paths of `paths` (worktree root relative, `/`-separated) with a symlink or
  *  junction above them in `worktree`. Git for Windows takes a junction for a

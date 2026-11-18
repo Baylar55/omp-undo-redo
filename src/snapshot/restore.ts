@@ -10,11 +10,13 @@ import {
   RESTORE_TIMEOUT_MS,
   shieldIgnoredPaths,
   pinnedTree,
-  changedPaths,
+  treeChanges,
+  isApplied,
   applyCheckPaths,
   misplacedHunkPaths,
   pathsBeyondLinks,
 } from "./restore-scope.js";
+import type { TreeChange } from "./restore-scope.js";
 
 /** `nestedRepositories` and `unreadableFiles`: paths whose contents the
  *  restore could not touch, relative to the worktree root (see
@@ -107,21 +109,13 @@ export async function applyCheckpoint(
 async function rollbackPartialApply(
   git: GitRunner,
   sourceHash: string,
-  targetHash: string,
+  changes: readonly TreeChange[],
   directory: string,
   config: readonly string[],
 ): Promise<void> {
   const worktree = git.cwd;
   if (!worktree) return;
   const timeoutMs = RESTORE_TIMEOUT_MS;
-  const changes = await invoke(
-    git,
-    ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
-    { timeoutMs },
-  );
-  if (changes.error || changes.code !== 0) return;
-
-  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
   const restore: string[] = [];
   const remove: string[] = [];
   const written = new Map<string, string>();
@@ -130,11 +124,7 @@ async function rollbackPartialApply(
   // only through an added case twin (see `caseTwinCreations`) that the
   // removal below takes away, leaving the source's file missing.
   const deleted: string[] = [];
-  const fields = changes.stdout.split("\0");
-  for (let index = 0; index + 1 < fields.length; index += 2) {
-    const [sourceMode, targetMode, , targetSha, status] = fields[index]!.slice(1).split(" ");
-    const path = fields[index + 1]!;
-    if (sourceMode === "160000" || targetMode === "160000") continue;
+  for (const { path, targetSha, status } of changes.filter(isApplied)) {
     const present = await lstat(join(worktree, path)).catch(() => null);
     if (status === "A") {
       // Apply writes nothing when an added path already exists, so a file
@@ -142,7 +132,7 @@ async function rollbackPartialApply(
       // even an empty file (a failed smudge, as below, or a user's lock or
       // marker file), may have been created after `apply --check`: kept.
       if (present?.isFile()) {
-        written.set(path, targetSha!);
+        written.set(path, targetSha);
         added.add(path);
       }
     } else if (!present) {
@@ -154,7 +144,7 @@ async function rollbackPartialApply(
       // is apply's write or an empty source: restoring the source is safe.
       restore.push(path);
     } else if (status !== "D" && present.isFile()) {
-      written.set(path, targetSha!);
+      written.set(path, targetSha);
     } else if (status === "D") {
       deleted.push(path);
     }
@@ -218,25 +208,14 @@ const ATTRIBUTES_FILE = /(?:^|\/)\.gitattributes$/i;
  *  reads under the attributes on disk, as apply does. Null when git fails. */
 async function exactRestorePaths(
   git: GitRunner,
-  sourceHash: string,
-  targetHash: string,
+  changes: readonly TreeChange[],
   config: readonly string[],
 ): Promise<string[] | null> {
-  const changes = await invoke(
-    git,
-    ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
-    { timeoutMs: RESTORE_TIMEOUT_MS },
-  );
-  if (changes.error || changes.code !== 0) return null;
-  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
   const exact: string[] = [];
   const modified = new Map<string, string>();
-  const fields = changes.stdout.split("\0");
-  for (let index = 0; index + 1 < fields.length; index += 2) {
-    const [sourceMode, targetMode, sourceSha] = fields[index]!.slice(1).split(" ");
-    const path = fields[index + 1]!;
-    if (!targetMode!.startsWith("100") || sourceMode === "160000") continue;
-    if (sourceMode!.startsWith("100")) modified.set(path, sourceSha!);
+  for (const { sourceMode, targetMode, sourceSha, path } of changes) {
+    if (!targetMode.startsWith("100") || sourceMode === "160000") continue;
+    if (sourceMode.startsWith("100")) modified.set(path, sourceSha);
     else exact.push(path);
   }
   const unchanged = await pathsHoldingBlobs(git, modified, config);
@@ -247,25 +226,15 @@ async function exactRestorePaths(
  *  same file as another path the restore changes: on a case-insensitive file
  *  system, the old name of a case-only rename. Comparing the files, not
  *  `core.ignorecase`, leaves a case-sensitive one (or a file the user put
- *  at the new name) to `git apply`'s own check. Null when git fails. */
+ *  at the new name) to `git apply`'s own check. */
 async function caseTwinCreations(
-  git: GitRunner,
   worktree: string,
-  sourceHash: string,
-  targetHash: string,
-): Promise<string[] | null> {
-  const changes = await invoke(
-    git,
-    ["diff-tree", "-r", "-z", "--no-renames", "--name-status", sourceHash, targetHash],
-    { timeoutMs: RESTORE_TIMEOUT_MS },
-  );
-  if (changes.error || changes.code !== 0) return null;
-  const fields = changes.stdout.split("\0");
+  changes: readonly TreeChange[],
+): Promise<string[]> {
   const byCase = new Map<string, string[]>();
   const added: string[] = [];
-  for (let index = 0; index + 1 < fields.length; index += 2) {
-    const path = fields[index + 1]!;
-    if (fields[index] === "A") added.push(path);
+  for (const { path, status } of changes) {
+    if (status === "A") added.push(path);
     const key = path.toLowerCase();
     byCase.set(key, [...(byCase.get(key) ?? []), path]);
   }
@@ -364,8 +333,9 @@ async function applyPatch(
     if (diff.code === 0) return { restoredFiles: [] };
     if (diff.code !== 1) return "failed";
     // Listed before applying: failing after the patch landed would misreport.
-    const restoredFiles = await changedPaths(git, sourceHash, effectiveTarget);
-    if (!restoredFiles) return "failed";
+    const changes = await treeChanges(git, sourceHash, effectiveTarget);
+    if (!changes) return "failed";
+    const restoredFiles = changes.filter(isApplied).map((change) => change.path);
     // Before `--check` too: recovery's check-only probe must not call such a
     // restore applicable. A runner from a host's `gitRunnerFactory` may carry
     // no cwd: git then names the worktree. A scan of the disk as it is now: a
@@ -385,8 +355,7 @@ async function applyPatch(
     // creations go to a second patch applied once the first has deleted the
     // old file; checking only the first is complete: the created path is
     // the old file, whose deletion it checks.
-    const deferred = await caseTwinCreations(git, worktree, sourceHash, effectiveTarget);
-    if (!deferred) return "failed";
+    const deferred = await caseTwinCreations(worktree, changes);
     let createPath: string | null = null;
     if (deferred.length > 0) {
       createPath = join(tempDirectory, "case-renames.patch");
@@ -496,7 +465,7 @@ async function applyPatch(
     // ponytail: a drifted file keeps the source's conversion; re-convert the
     // merged blob (`apply --cached` on a scratch index) if that ever matters.
     const reconvert = restoredFiles.some((path) => ATTRIBUTES_FILE.test(path))
-      ? await exactRestorePaths(git, sourceHash, effectiveTarget, config)
+      ? await exactRestorePaths(git, changes, config)
       : [];
     if (!reconvert) return "failed";
     const targetEnv: Record<string, string> = {
@@ -540,7 +509,7 @@ async function applyPatch(
       });
       return !checkout.error && checkout.code === 0 ? { restoredFiles } : "interrupted";
     }
-    await rollbackPartialApply(git, sourceHash, effectiveTarget, tempDirectory, config).catch(
+    await rollbackPartialApply(git, sourceHash, changes, tempDirectory, config).catch(
       (error: unknown) => debugLog({ event: "restore-rollback-failed", error: String(error) }),
     );
     // Where the check above passed again: the worktree is back at the source

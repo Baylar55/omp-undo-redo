@@ -8,6 +8,8 @@ All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
 - **Navigation result exhaustiveness check.** Added a build-time exhaustiveness check for `NavigationResult` in `runNavigation` and enabled `@typescript-eslint/switch-exhaustiveness-check`; an unhandled status falls back to an error notice.
 
+- **Restore diffs the two snapshots once.** Restore ran the same `git diff-tree` up to four times (changed paths, case-rename check, `.gitattributes` re-conversion, rollback), each with its own parser. It now runs once and every step reads the same records.
+
 ### Fixed
 
 - **An empty `OMP_UNDO_REDO_RUNTIME_DIR` put runtime state in the working directory and dropped it from file history.** The store root treated an empty value as unset, but the runtime root resolved `""` to the current directory. Each process then created a `<pid>/` folder in the workspace, which snapshots captured, and the working directory counted as one of the extension's own folders: launched from a subdirectory of a repository, that subdirectory was left out of every snapshot and left untouched by every undo and redo. An empty value now falls back to `~/.omp/omp-undo-redo/runtime`, matching the store root. `<pid>/` folders already created in a repository are not removed; delete them by hand.
