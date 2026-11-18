@@ -65,7 +65,7 @@ export function defaultRuntimeRoot(): string {
 export function runtimeRootDirectory(
   rootDirectory = process.env.OMP_UNDO_REDO_RUNTIME_DIR,
 ): string {
-  return rootDirectory === undefined ? defaultRuntimeRoot() : resolve(rootDirectory);
+  return rootDirectory ? resolve(rootDirectory) : defaultRuntimeRoot();
 }
 
 export function checkpointNamespace(sessionId: string): string {
