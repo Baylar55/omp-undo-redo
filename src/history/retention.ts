@@ -205,12 +205,8 @@ export async function expireGitSessionHistories(
     }
   }
 
-  await pruneExpiredTombstones(
-    dir,
-    retentionDays,
-    getActive,
-    (v) => HASH.test(v),
-    (hash) => sessionHeartbeatIsFresh(dir, hash),
+  await pruneExpiredTombstones(dir, retentionDays, getActive, (hash) =>
+    sessionHeartbeatIsFresh(dir, hash),
   );
   return refsRemoved;
 }
