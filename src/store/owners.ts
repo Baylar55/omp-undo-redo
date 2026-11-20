@@ -373,13 +373,11 @@ export class CheckpointOwnerRegistry {
     hostId: string,
     runtimeScope: string,
   ): Promise<void> {
-    let entries;
-    try {
-      entries = await readdir(leaseDirectory(repository), { withFileTypes: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
-      return;
-    }
+    // Missing or unreadable lease directory: nothing to scan.
+    const entries = await readdir(leaseDirectory(repository), { withFileTypes: true }).catch(
+      () => null,
+    );
+    if (!entries) return;
     const candidates: Array<{ ownerId: string }> = [];
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
