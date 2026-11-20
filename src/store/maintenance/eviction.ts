@@ -1,5 +1,6 @@
 import { readdir, realpath, rename, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { refusedPrivateWorkspace } from "../private-store.js";
 import type { CwdGitRunnerFactory } from "../../types.js";
 import { canonicalCwd, storeRootDirectory } from "../../infra/paths.js";
@@ -235,7 +236,7 @@ export async function evictStalePrivateRepos(
           refusedPrivateWorkspace(await realpath(source).catch(() => source));
         if (!refused) {
           if (!(await vanished())) continue;
-          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+          await sleep(RETRY_DELAY_MS);
           if (!(await vanished())) continue;
         }
       } else if ((await setupFinished(path)) !== false || (await storeHasRefs(path))) {
@@ -256,7 +257,7 @@ export async function evictStalePrivateRepos(
           break;
         } catch {
           if (attempt === 4) break; // Stranded until a later sweep.
-          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+          await sleep(RETRY_DELAY_MS);
         }
       }
     } catch {

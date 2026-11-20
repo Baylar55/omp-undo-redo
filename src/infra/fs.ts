@@ -1,5 +1,6 @@
 import "./compat.js";
 import { rename, rm, writeFile, mkdir, open } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 
@@ -57,9 +58,7 @@ export async function removeDirWithRetry(path: string): Promise<boolean> {
       return true;
     } catch {
       if (attempt === 4) return false;
-      const { promise, resolve } = Promise.withResolvers<void>();
-      setTimeout(resolve, RETRY_DELAY_MS);
-      await promise;
+      await sleep(RETRY_DELAY_MS);
     }
   }
   return false;
@@ -77,9 +76,7 @@ export async function renameWithRetry(from: string, to: string): Promise<void> {
       if (attempt === 4 || !(code === "EPERM" || code === "EACCES" || code === "EBUSY")) {
         throw error;
       }
-      const { promise, resolve } = Promise.withResolvers<void>();
-      setTimeout(resolve, RETRY_DELAY_MS);
-      await promise;
+      await sleep(RETRY_DELAY_MS);
     }
   }
 }

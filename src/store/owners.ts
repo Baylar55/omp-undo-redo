@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat, utimes } from "node:fs/promises";
 import { hostname as systemHostname } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { GitRepository, GitRunner, GitCommandResult, OwnershipMode } from "../types.js";
 import { parseRefLines } from "../infra/git-parse.js";
 import type { RefSpec } from "../infra/git-parse.js";
@@ -420,7 +421,7 @@ export class CheckpointOwnerRegistry {
     this.heartbeat = undefined;
     const scans = [...this.scans];
     if (scans.length > 0) {
-      await Promise.race([Promise.allSettled(scans), delay(this.shutdownWaitMs)]);
+      await Promise.race([Promise.allSettled(scans), sleep(this.shutdownWaitMs)]);
     }
     for (const { repository, git } of this.initialized.values()) {
       const refs = await enumerateOwnerRefs(git, repository, this.ownerId, CLEANUP_TIMEOUT_MS);
@@ -429,10 +430,4 @@ export class CheckpointOwnerRegistry {
     }
     this.initialized.clear();
   }
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
 }
