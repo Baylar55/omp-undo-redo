@@ -1,7 +1,5 @@
-import { realpath } from "node:fs";
-import { readdir, rename, stat } from "node:fs/promises";
+import { readdir, realpath, rename, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse } from "node:path";
-import { promisify } from "node:util";
 import { refusedPrivateWorkspace } from "../private-store.js";
 import type { CwdGitRunnerFactory } from "../../types.js";
 import { canonicalCwd, storeRootDirectory } from "../../infra/paths.js";
@@ -15,9 +13,6 @@ import {
 } from "../setup.js";
 import { GIT_STORE_SOURCE_KEY } from "../git-store.js";
 import { localStoreHost } from "../host-identity.js";
-
-/** `fs/promises` has no `realpath.native`; only native expands 8.3 short names. */
-const nativeRealpath = promisify(realpath.native);
 
 /** How long a snapshot repo must sit untouched before its workspace's
  *  disappearance counts as abandonment rather than a transient mount or
@@ -237,7 +232,7 @@ export async function evictStalePrivateRepos(
         // thread, as `vanished` would, never the event loop.
         const refused =
           !found.gitStore &&
-          refusedPrivateWorkspace(await nativeRealpath(source).catch(() => source));
+          refusedPrivateWorkspace(await realpath(source).catch(() => source));
         if (!refused) {
           if (!(await vanished())) continue;
           await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
