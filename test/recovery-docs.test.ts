@@ -19,8 +19,8 @@ const execFileAsync = promisify(execFile);
 
 // The commands under docs/troubleshooting.md's "Restoring files after an
 // interrupted undo or redo" heading, exactly as users copy them. The heading's
-// anchor is linked from recoveryPartialNotice (src/session/notices.ts): rename
-// both together.
+// anchor is linked from recoveryPartialNotice (src/session/notices.ts) and
+// manualRestoreMessage (src/host/messages.ts): rename all three together.
 const section =
   readFileSync(new URL("../docs/troubleshooting.md", import.meta.url), "utf8")
     .replace(/\r\n/g, "\n")

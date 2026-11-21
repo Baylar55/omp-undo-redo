@@ -1,9 +1,10 @@
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createGitRunner } from "../../src/infra/git-runner.js";
-import { storeEnv } from "../../src/store/git-store.js";
+import { snapshotRunnerEnv, storeEnv } from "../../src/store/git-store.js";
 import { pinBorrowedObjects, pinStoreObjects } from "../../src/store/pinning.js";
 import type { GitCommandResult, GitRepository, GitRunner, GitRunOptions } from "../../src/types.js";
 import { git, gitRepository, makeRepository, rmRetry } from "../helpers/index.js";
@@ -196,4 +197,41 @@ describe("pinBorrowedObjects", () => {
       expect(check.stdout.trim().split("\n").sort()).toEqual([...staged, tree].sort());
     },
   );
+
+  it("never lazily fetches or starts maintenance in a partial clone", async () => {
+    await git(cwd, ["config", "uploadpack.allowFilter", "true"]);
+    const root = await mkdtemp(join(tmpdir(), "omp-undo-redo-partial-"));
+    try {
+      const clone = join(root, "clone");
+      await git(root, ["clone", "-q", "--filter=blob:none", pathToFileURL(cwd).href, clone]);
+      const partial = await gitRepository(clone);
+      await writeFile(join(clone, "tracked.txt"), "staged only\n");
+      await git(clone, ["add", "tracked.txt"]);
+      // Written to the user's objects, so the store only borrows it.
+      const tree = await git(clone, ["write-tree"]);
+      const blob = await git(clone, ["rev-parse", ":tracked.txt"]);
+      const trace = join(root, "trace2.json");
+      const snapshotGit = createGitRunner(clone, {
+        env: { ...snapshotRunnerEnv(partial), GIT_TRACE2_EVENT: trace },
+      });
+
+      expect(await pinBorrowedObjects(snapshotGit, partial, tree)).toBe(true);
+
+      const children = (await readFile(trace, "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { event: string; argv?: string[] })
+        .filter((event) => event.event === "child_start")
+        .map((event) => event.argv ?? []);
+      expect(children.filter((argv) => argv.includes("fetch"))).toEqual([]);
+      expect(children.filter((argv) => argv.includes("maintenance"))).toEqual([]);
+      const storeOnly = createGitRunner(tmpdir(), { env: { GIT_DIR: partial.storeDir } });
+      const check = await storeOnly(["cat-file", "--batch-check=%(objectname)"], {
+        stdin: `${blob}\n${tree}\n`,
+      });
+      expect(check.stdout.trim().split("\n")).toEqual([blob, tree]);
+    } finally {
+      await rmRetry(root);
+    }
+  });
 });

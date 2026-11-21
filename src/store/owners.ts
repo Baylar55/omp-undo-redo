@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat, utimes } from "node:fs/promises";
 import { hostname as systemHostname } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { GitRepository, GitRunner, GitCommandResult, OwnershipMode } from "../types.js";
 import { parseRefLines } from "../infra/git-parse.js";
 import type { RefSpec } from "../infra/git-parse.js";
@@ -18,7 +19,7 @@ const MAX_CONCURRENT_OWNERS = 4;
 const DEFAULT_SHUTDOWN_WAIT_MS = 1_000;
 /** Live owners touch their lease this often; a "remote" lease (unprobeable:
  *  other host ID, hostname, or runtime scope, e.g. a regenerated host-id file
- *  or a Linux reboot) untouched for the TTL is treated as stale. */
+ *  or a reboot) untouched for the TTL is treated as stale. */
 const LEASE_HEARTBEAT_MS = 60 * 60 * 1_000;
 const REMOTE_LEASE_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -263,7 +264,8 @@ export class CheckpointOwnerRegistry {
   private readonly now: () => Date;
   private readonly probePid: (pid: number) => void;
   private readonly hostIdentityPromise: Promise<HostIdentity>;
-  private readonly runtimeScopePromise: Promise<string | null>;
+  private readonly resolveRuntimeScope: () => Promise<string | null>;
+  private runtimeScopePromise: Promise<string | null> | undefined;
   private readonly initializations = new Map<string, Promise<OwnershipMode>>();
   private readonly initialized = new Map<
     string,
@@ -284,11 +286,8 @@ export class CheckpointOwnerRegistry {
         ? options.resolveHostIdentity()
         : Promise.resolve(options.hostIdentity ?? { id: null, persistent: false })
     ).catch(() => ({ id: null, persistent: false }));
-    this.runtimeScopePromise = (
-      options.resolveRuntimeScope
-        ? options.resolveRuntimeScope()
-        : Promise.resolve(options.runtimeScope ?? null)
-    ).catch(() => null);
+    this.resolveRuntimeScope =
+      options.resolveRuntimeScope ?? (() => Promise.resolve(options.runtimeScope ?? null));
   }
 
   async ensureInitialized(repository: GitRepository, git: GitRunner): Promise<OwnershipMode> {
@@ -306,6 +305,11 @@ export class CheckpointOwnerRegistry {
   }
 
   private async initialize(repository: GitRepository, git: GitRunner): Promise<OwnershipMode> {
+    // Resolved on first use: on Windows and macOS it spawns a process, and a
+    // copy that never checkpoints (a subagent's) never needs it.
+    this.runtimeScopePromise ??= Promise.resolve()
+      .then(this.resolveRuntimeScope)
+      .catch(() => null);
     const [host, resolvedRuntimeScope] = await Promise.all([
       this.hostIdentityPromise,
       this.runtimeScopePromise,
@@ -369,13 +373,11 @@ export class CheckpointOwnerRegistry {
     hostId: string,
     runtimeScope: string,
   ): Promise<void> {
-    let entries;
-    try {
-      entries = await readdir(leaseDirectory(repository), { withFileTypes: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
-      return;
-    }
+    // Missing or unreadable lease directory: nothing to scan.
+    const entries = await readdir(leaseDirectory(repository), { withFileTypes: true }).catch(
+      () => null,
+    );
+    if (!entries) return;
     const candidates: Array<{ ownerId: string }> = [];
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
@@ -417,7 +419,7 @@ export class CheckpointOwnerRegistry {
     this.heartbeat = undefined;
     const scans = [...this.scans];
     if (scans.length > 0) {
-      await Promise.race([Promise.allSettled(scans), delay(this.shutdownWaitMs)]);
+      await Promise.race([Promise.allSettled(scans), sleep(this.shutdownWaitMs)]);
     }
     for (const { repository, git } of this.initialized.values()) {
       const refs = await enumerateOwnerRefs(git, repository, this.ownerId, CLEANUP_TIMEOUT_MS);
@@ -426,10 +428,4 @@ export class CheckpointOwnerRegistry {
     }
     this.initialized.clear();
   }
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, milliseconds);
-  });
 }

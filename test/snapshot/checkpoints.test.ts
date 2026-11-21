@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  realpath,
   readlink,
   rm,
   stat,
@@ -15,9 +16,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep, toNamespacedPath } from "node:path";
 import { promisify } from "node:util";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SessionNavigation } from "../../src/session/navigation.js";
 import { finishAfterTurn, prepareBeforeTurn } from "../../src/snapshot/capture.js";
 import type {
@@ -42,7 +43,11 @@ import {
   releasePendingCheckpoint,
   retainCheckpointForResume,
 } from "../../src/snapshot/checkpoint-refs.js";
-import { applyCheckPaths, pathsBeyondLinks } from "../../src/snapshot/restore-scope.js";
+import {
+  applyCheckPaths,
+  pathsBeyondLinks,
+  pathsOutsideSnapshots,
+} from "../../src/snapshot/restore-scope.js";
 import { applyCheckpoint } from "../../src/snapshot/restore.js";
 import { historyDirectory } from "../../src/history/layout.js";
 
@@ -234,6 +239,30 @@ describe("repository resolution", () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(process.platform === "win32")(
+    "keeps trailing spaces in worktree and git-dir names instead of resolving to siblings",
+    async () => {
+      const base = await realpath(await mkdtemp(join(tmpdir(), "omp-undo-redo-space-")));
+      try {
+        // The git dir lives outside the worktree, so --git-dir/--git-common-dir
+        // print its own name, trailing space included.
+        for (const suffix of ["", " "]) {
+          await mkdir(join(base, `proj${suffix}`, "sub"), { recursive: true });
+          const init = ["init", "-q", "--separate-git-dir", join(base, `store${suffix}`)];
+          expect((await gitRunner(join(base, `proj${suffix}`))(init)).code).toBe(0);
+        }
+        const resolved = await resolveRepository(gitRunner(join(base, "proj ", "sub")));
+        expect("repository" in resolved && resolved.repository).toEqual({
+          worktree: join(base, "proj "),
+          gitDir: join(base, "store "),
+          commonDir: join(base, "store "),
+        });
+      } finally {
+        await rm(base, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("history-safe Git checkpoints", () => {
@@ -402,6 +431,51 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("writes restored files under the attributes of the snapshot a .gitattributes change restores", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const bytes = (name: string) => readFile(join(cwd, name), "latin1");
+    const lines = (eol: string, first: string, last: string) =>
+      [first, "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", last].map((l) => l + eol).join("");
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "a.txt"), "one\ntwo\n");
+      await writeFile(join(cwd, "d.txt"), lines("\n", "l1", "l10"));
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "attributes", defaultPool));
+      await writeFile(join(cwd, ".gitattributes"), "*.txt text eol=crlf\n");
+      await writeFile(join(cwd, "a.txt"), "one\r\ntwo\r\nthree\r\n");
+      await writeFile(join(cwd, "d.txt"), lines("\r\n", "L1", "l10"));
+      const after = completedCheckpoint(
+        await finishAfterTurn(snap, before, null, null, defaultPool),
+      );
+
+      // git apply converted under the turn's attributes (CRLF), and redo then
+      // read the untouched files as drift.
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+        restoredFiles: [".gitattributes", "a.txt", "d.txt"],
+      });
+      expect(await bytes("a.txt")).toBe("one\ntwo\n");
+      expect(await bytes("d.txt")).toBe(lines("\n", "l1", "l10"));
+      expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes(".gitattributes")).toBe("*.txt text eol=crlf\n");
+      expect(await bytes("a.txt")).toBe("one\r\ntwo\r\nthree\r\n");
+      expect(await bytes("d.txt")).toBe(lines("\r\n", "L1", "l10"));
+
+      // A file the user edited outside the hunks is merged by apply, never
+      // replaced by the snapshot's blob.
+      await writeFile(join(cwd, "d.txt"), lines("\r\n", "L1", "user"));
+      expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toMatchObject({
+        status: "applied",
+      });
+      expect(await bytes("a.txt")).toBe("one\ntwo\n");
+      expect((await bytes("d.txt")).replaceAll("\r\n", "\n")).toBe(lines("\n", "l1", "user"));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("restores a checkpoint captured with line-ending conversion through that conversion", async () => {
     const { cwd, git, snap } = await makeRepo();
     const index = join(cwd, ".git", "legacy-index");
@@ -531,6 +605,53 @@ describe("history-safe Git checkpoints", () => {
     },
   );
 
+  // `git apply` checks a created path against the worktree before it deletes
+  // anything, and a case-insensitive file system serves the deleted path to
+  // it under the new case: a case-only rename always read as a conflict.
+  it.runIf(process.platform === "win32" || process.platform === "darwin")(
+    "undoes and redoes a case-only rename",
+    async () => {
+      const { cwd, git, snap } = await makeRepo();
+      try {
+        await initializeBranch(git, cwd);
+        const contents = await readFile(join(cwd, "tracked.txt"), "utf8");
+        const before = pendingCheckpoint(await prepareBeforeTurn(snap, "case", defaultPool));
+        // Committed: a snapshot seeds from HEAD, whose entry otherwise keeps
+        // the old case under `core.ignorecase`.
+        await git(["mv", "tracked.txt", "Tracked.txt"]);
+        await git(["commit", "-qm", "rename"]);
+        await writeFile(join(cwd, "other.txt"), "other\n");
+        const after = completedCheckpoint(
+          await finishAfterTurn(snap, before, null, null, defaultPool),
+        );
+        const applied = {
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: ["Tracked.txt", "other.txt", "tracked.txt"],
+        };
+
+        expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash, true)).toEqual(
+          applied,
+        );
+        expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual(applied);
+        expect((await readdir(cwd)).filter((name) => name !== ".git")).toEqual(["tracked.txt"]);
+        expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(contents);
+        expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash, true)).toEqual(
+          applied,
+        );
+        expect(await applyCheckpoint(snap, after.beforeHash, after.afterHash)).toEqual(applied);
+        expect((await readdir(cwd)).filter((name) => name !== ".git").sort()).toEqual([
+          "Tracked.txt",
+          "other.txt",
+        ]);
+        expect(await readFile(join(cwd, "Tracked.txt"), "utf8")).toBe(contents);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("navigates a completed turn with no file changes", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {
@@ -633,53 +754,60 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
-  it("keeps a pre-existing ignored file across undo/redo of a turn that un-ignores it", async () => {
-    const { cwd, git, snap } = await makeRepo();
-    const envPath = join(cwd, ".env");
-    try {
-      await initializeBranch(git, cwd);
-      await writeFile(join(cwd, ".gitignore"), ".env\n");
-      await git(["add", ".gitignore"]);
-      await git(["commit", "-qm", "ignore fixture"]);
-      await writeFile(envPath, "SECRET=1\n");
+  // Case-insensitive file systems serve `.GITIGNORE` to git as `.gitignore`.
+  it.each([
+    ".gitignore",
+    ...(process.platform === "win32" || process.platform === "darwin" ? [".GITIGNORE"] : []),
+  ])(
+    "keeps a pre-existing ignored file across undo/redo of a turn that un-ignores it (%s)",
+    async (rulesFile) => {
+      const { cwd, git, snap } = await makeRepo();
+      const envPath = join(cwd, ".env");
+      try {
+        await initializeBranch(git, cwd);
+        await writeFile(join(cwd, rulesFile), ".env\n");
+        await git(["add", rulesFile]);
+        await git(["commit", "-qm", "ignore fixture"]);
+        await writeFile(envPath, "SECRET=1\n");
 
-      const pending = pendingCheckpoint(
-        await prepareBeforeTurn(snap, "unignore-turn", defaultPool),
-      );
-      await writeFile(join(cwd, ".gitignore"), "# cleaned\n");
-      const checkpoint = completedCheckpoint(
-        await finishAfterTurn(snap, pending, null, null, defaultPool),
-      );
+        const pending = pendingCheckpoint(
+          await prepareBeforeTurn(snap, "unignore-turn", defaultPool),
+        );
+        await writeFile(join(cwd, rulesFile), "# cleaned\n");
+        const checkpoint = completedCheckpoint(
+          await finishAfterTurn(snap, pending, null, null, defaultPool),
+        );
 
-      // `.env` is pinned to its on-disk state, so only `.gitignore` is restored.
-      await expect(
-        applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
-      ).resolves.toEqual({
-        status: "applied",
-        nestedRepositories: [],
-        unreadableFiles: [],
-        restoredFiles: [".gitignore"],
-      });
-      expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe(".env\n");
-      expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+        // `.env` is pinned to its on-disk state, so only the rules file is restored.
+        await expect(
+          applyCheckpoint(snap, checkpoint.afterHash, checkpoint.beforeHash),
+        ).resolves.toEqual({
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: [rulesFile],
+        });
+        expect(await readFile(join(cwd, rulesFile), "utf8")).toBe(".env\n");
+        expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
-      await expect(
-        applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
-      ).resolves.toEqual({
-        status: "applied",
-        nestedRepositories: [],
-        unreadableFiles: [],
-        restoredFiles: [".gitignore"],
-      });
-      expect(await readFile(join(cwd, ".gitignore"), "utf8")).toBe("# cleaned\n");
-      expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
+        await expect(
+          applyCheckpoint(snap, checkpoint.beforeHash, checkpoint.afterHash),
+        ).resolves.toEqual({
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: [rulesFile],
+        });
+        expect(await readFile(join(cwd, rulesFile), "utf8")).toBe("# cleaned\n");
+        expect(await readFile(envPath, "utf8")).toBe("SECRET=1\n");
 
-      await releaseCheckpoint(snap, checkpoint);
-      await releasePersistentSnapshotIndices(["unignore-turn"]);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
+        await releaseCheckpoint(snap, checkpoint);
+        await releasePersistentSnapshotIndices(["unignore-turn"]);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("keeps a pre-existing ignored file across undo/redo of a turn that force-adds it", async () => {
     const { cwd, git, snap } = await makeRepo();
@@ -1029,6 +1157,151 @@ describe("history-safe Git checkpoints", () => {
     );
   }
 
+  // `add -A` warns and exits 0 on a folder it cannot open, dropping its
+  // entries: undo would delete the folder's files and report full success.
+  // Windows: a path past MAX_PATH under `core.longpaths=false`; elsewhere mode
+  // 000, which root ignores. Unopenable during the before-snapshot only.
+  // Replaced: the turn puts a file where git could not open the folder.
+  for (const replaced of [false, true]) {
+    it.skipIf(process.getuid?.() === 0)(
+      `snapshots around a folder git cannot open and leaves it alone on restore${replaced ? " when a file replaces it" : ""}`,
+      async () => {
+        const { cwd, git, snap } = await makeRepo();
+        const sessionId = `unopened-folder-${replaced}`;
+        const windows = process.platform === "win32";
+        const folder = windows
+          ? Array.from({ length: 6 }, (_, index) => `${"d".repeat(50)}${index}`).join("/")
+          : "locked";
+        const onDisk = (path: string) => toNamespacedPath(join(cwd, path));
+        try {
+          await mkdir(onDisk(folder), { recursive: true });
+          await writeFile(onDisk(`${folder}/kept.txt`), "v0\n");
+          await git(["config", "core.longpaths", "true"]);
+          await initializeBranch(git, cwd);
+          const lock = async (locked: boolean) => {
+            if (windows) await git(["config", "core.longpaths", String(!locked)]);
+            else await chmod(join(cwd, folder), locked ? 0o000 : 0o755);
+          };
+          await writeFile(onDisk(`${folder}/kept.txt`), "v1\n");
+          await lock(true);
+          let before: PendingGitCheckpoint;
+          try {
+            before = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId, defaultPool));
+          } finally {
+            await lock(false);
+          }
+          const message = await text(snap, ["log", "-1", "--format=%B", before.beforeHash]);
+          const unopened = /^Unreadable directory outside snapshot: (.+)$/m.exec(message)?.[1];
+          expect(unopened).toBeDefined();
+          expect(unopened!.endsWith("/")).toBe(true);
+          expect(`${folder}/`.startsWith(unopened!)).toBe(true);
+          // Each path the turn leaves on disk, which no restore may touch.
+          const left: Record<string, string> = replaced
+            ? { [unopened!.slice(0, -1)]: "turn\n" }
+            : { [`${folder}/kept.txt`]: "v1\n", [`${folder}/added.txt`]: "turn\n" };
+          if (replaced) await rm(onDisk(unopened!), { recursive: true });
+          await writeFile(join(cwd, "tracked.txt"), "turn\n");
+          for (const [path, content] of Object.entries(left)) {
+            await writeFile(onDisk(path), content);
+          }
+          const after = completedCheckpoint(
+            await finishAfterTurn(snap, before, null, null, defaultPool),
+          );
+
+          const notRestored = {
+            nestedRepositories: [],
+            unreadableFiles: [unopened],
+            restoredFiles: ["tracked.txt"],
+          };
+          for (const [source, target, tracked] of [
+            [after.afterHash, after.beforeHash, "base\n"],
+            [after.beforeHash, after.afterHash, "turn\n"],
+          ] as const) {
+            expect(await applyCheckpoint(snap, source, target)).toEqual({
+              status: "applied",
+              ...notRestored,
+            });
+            expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe(tracked);
+            for (const [path, content] of Object.entries(left)) {
+              expect(await readFile(onDisk(path), "utf8")).toBe(content);
+            }
+          }
+          await releaseCheckpoint(snap, after);
+        } finally {
+          await rm(toNamespacedPath(cwd), { recursive: true, force: true });
+          await releasePersistentSnapshotIndices([sessionId]);
+        }
+      },
+    );
+  }
+
+  // git prints the folder unquoted, so a newline splits its warning and any
+  // other control character prints as "?": the snapshot must fail rather than
+  // leave the folder unfenced. POSIX only: Windows names cannot hold either.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0).each(["a\nb", "a\u0001b"])(
+    "fails the snapshot when an unopenable folder's name is %j",
+    async (name) => {
+      const { cwd, git, snap } = await makeRepo();
+      const sessionId = `unopened-folder-${name.charCodeAt(1)}`;
+      const folder = join(cwd, name);
+      try {
+        await initializeBranch(git, cwd);
+        await mkdir(folder);
+        await writeFile(join(folder, "kept.txt"), "v1\n");
+        await chmod(folder, 0o000);
+        try {
+          expect(await prepareBeforeTurn(snap, sessionId, defaultPool)).toEqual({
+            status: "session_only",
+            reason: "before_snapshot_failed",
+          });
+        } finally {
+          await chmod(folder, 0o755);
+        }
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await releasePersistentSnapshotIndices([sessionId]);
+      }
+    },
+  );
+
+  // Tree paths are read as text, so a pin for a name that is not UTF-8 would
+  // land on its U+FFFD spelling: undo would delete the real file and create
+  // that one. The restore must refuse and write nothing. Linux only: Windows
+  // and APFS names are always Unicode; root reads mode-000 folders.
+  it.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
+    "refuses a restore that would pin a non-UTF-8 path under an unopened folder",
+    async () => {
+      const { cwd, git, snap } = await makeRepo();
+      const sessionId = "unopened-folder-non-utf8";
+      const folder = join(cwd, "locked");
+      const file = Buffer.concat([Buffer.from(`${folder}/a`), Buffer.from([0xff, 0x62])]);
+      try {
+        await initializeBranch(git, cwd);
+        await mkdir(folder);
+        await chmod(folder, 0o000);
+        let before: PendingGitCheckpoint;
+        try {
+          before = pendingCheckpoint(await prepareBeforeTurn(snap, sessionId, defaultPool));
+        } finally {
+          await chmod(folder, 0o755);
+        }
+        await writeFile(file, "turn\n");
+        const after = completedCheckpoint(
+          await finishAfterTurn(snap, before, null, null, defaultPool),
+        );
+        expect(await applyCheckpoint(snap, after.afterHash, after.beforeHash)).toEqual({
+          status: "failed",
+        });
+        expect(await readFile(file, "utf8")).toBe("turn\n");
+        expect(await readdir(folder)).toHaveLength(1);
+        await releaseCheckpoint(snap, after);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await releasePersistentSnapshotIndices([sessionId]);
+      }
+    },
+  );
+
   it("reuses the persisted alternate index across consecutive turns to avoid a full re-hash", async () => {
     const { cwd, git, snap } = await makeRepo();
     const sessionId = "cross-turn-reuse";
@@ -1086,18 +1359,28 @@ describe("history-safe Git checkpoints", () => {
   it.each<{ head: string; inherited: Record<string, string> }>([
     { head: "born", inherited: {} },
     { head: "unborn", inherited: {} },
-    // An inherited global pathspec magic must not fail the reused snapshot.
+    // Inherited global pathspec settings must not fail the reused snapshot.
     { head: "born", inherited: { GIT_GLOB_PATHSPECS: "1" } },
+    { head: "unborn", inherited: { GIT_LITERAL_PATHSPECS: "1" } },
+    { head: "born", inherited: { GIT_ICASE_PATHSPECS: "1" } },
+    { head: "born", inherited: { GIT_NOGLOB_PATHSPECS: "1" } },
+    // Inherited commit identity and dates must not fail `commit-tree`. Unborn:
+    // the test's own `git commit` for a born HEAD would read them.
+    { head: "unborn", inherited: { GIT_AUTHOR_DATE: "garbage" } },
+    { head: "unborn", inherited: { GIT_COMMITTER_DATE: "garbage" } },
+    { head: "unborn", inherited: { GIT_AUTHOR_NAME: "" } },
   ])(
     "drops reused-index entries that became ignored, as a fresh snapshot would ($head HEAD, $inherited)",
     async ({ head, inherited }) => {
       const { cwd, git, snap } = await makeRepo();
       // A subdirectory session: candidate paths are root relative, the cwd is not.
+      // The production runner: it owns what an inherited environment reaches git.
       const nested = join(cwd, "nested");
-      const nestedSnap = gitRunner(nested, { ...(await snapshotEnv(cwd)), ...inherited });
+      const nestedSnap = createGitRunner(nested, { env: await snapshotEnv(cwd) });
       const sessionId = `became-ignored-${head}-${Object.keys(inherited).join()}`;
       const freshId = `${sessionId}-fresh`;
       try {
+        for (const [name, value] of Object.entries(inherited)) vi.stubEnv(name, value);
         await mkdir(nested);
         await writeFile(join(nested, "inside.txt"), "inside\n");
         await writeFile(join(cwd, "tracked.log"), "tracked\n");
@@ -1154,6 +1437,7 @@ describe("history-safe Git checkpoints", () => {
         await releasePendingCheckpoint(snap, fresh, defaultPool);
         await releaseCheckpoint(snap, after1);
       } finally {
+        vi.unstubAllEnvs();
         await rm(cwd, { recursive: true, force: true });
         await releasePersistentSnapshotIndices([sessionId, freshId]);
       }
@@ -2126,6 +2410,132 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it("checks only entries added since the last reused unborn snapshot until an ignore source changes", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    const excludesFile = join(cwd, "..", `${cwd.slice(cwd.lastIndexOf(sep) + 1)}-excludes`);
+    const sessionId = "unborn-incremental-prune";
+    const freshIds: string[] = [];
+    const commands: string[][] = [];
+    const gitWrapper = Object.assign(
+      async (args: string[], options?: Parameters<GitRunner>[1]) => {
+        commands.push(args);
+        return snap(args, options);
+      },
+      { cwd, env: snap.env },
+    ) satisfies GitRunner;
+    const checkpoints: GitCheckpoint[] = [];
+    // Which ignore check the counted snapshots ran; "none" fails both
+    // assertions, so a reworded command cannot pass silently.
+    const checked = () =>
+      commands.some((args) => args.includes("--cached") && args.includes("--ignored"))
+        ? "whole"
+        : commands.some((args) => args.includes("--name-status"))
+          ? "incremental"
+          : "none";
+    // One turn on the reused lease (both snapshots counted); its after tree
+    // must match a fresh snapshot.
+    const turn = async () => {
+      commands.length = 0;
+      const before = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId, defaultPool));
+      const after = completedCheckpoint(
+        await finishAfterTurn(gitWrapper, before, null, null, defaultPool),
+      );
+      checkpoints.push(after);
+      const freshId = `${sessionId}-fresh-${freshIds.length}`;
+      freshIds.push(freshId);
+      const fresh = pendingCheckpoint(await prepareBeforeTurn(snap, freshId, defaultPool));
+      expect(await text(snap, ["rev-parse", `${after.afterHash}^{tree}`])).toBe(
+        await text(snap, ["rev-parse", `${fresh.beforeHash}^{tree}`]),
+      );
+      await releasePendingCheckpoint(snap, fresh, defaultPool);
+      return (await text(snap, ["ls-tree", "-r", "-z", "--name-only", after.afterHash])).split(
+        "\0",
+      );
+    };
+    try {
+      await mkdir(join(cwd, "dir"));
+      await mkdir(join(cwd, "sub"));
+      for (const path of ["keep.txt", "dir/a.txt", "x.tmp", "y.bak", "sub/c.txt", "sub/d.txt"]) {
+        await writeFile(join(cwd, path), `${path}\n`);
+      }
+      // Seeds the lease; the first reused snapshot checks the whole index.
+      await turn();
+      expect(checked()).toBe("whole");
+      expect(await turn()).toContain("dir/a.txt");
+      expect(checked()).toBe("incremental");
+
+      // A tracked .gitignore changes: the whole index is checked once.
+      await writeFile(join(cwd, ".gitignore"), "dir/\n");
+      expect(await turn()).not.toContain("dir/a.txt");
+      expect(checked()).toBe("whole");
+      // The seed's dir/a.txt is restored by normalization each time and is
+      // pruned again as an added entry.
+      await writeFile(join(cwd, "added.txt"), "added\n");
+      const names = await turn();
+      expect(names).toContain("added.txt");
+      expect(names).not.toContain("dir/a.txt");
+      expect(checked()).toBe("incremental");
+
+      await mkdir(join(cwd, ".git", "info"), { recursive: true });
+      await writeFile(join(cwd, ".git", "info", "exclude"), "*.tmp\n");
+      expect(await turn()).not.toContain("x.tmp");
+      expect(checked()).toBe("whole");
+
+      await writeFile(excludesFile, "*.bak\n");
+      await git(["config", "core.excludesFile", excludesFile.replaceAll("\\", "/")]);
+      expect(await turn()).not.toContain("y.bak");
+      expect(checked()).toBe("whole");
+
+      // A .gitignore that ignores itself never enters the index: a diff cannot
+      // see it change, so it forces the whole check while it applies.
+      await writeFile(join(cwd, "sub", ".gitignore"), ".gitignore\nc.txt\n");
+      expect(await turn()).not.toContain("sub/c.txt");
+      expect(checked()).toBe("whole");
+      await writeFile(join(cwd, "sub", ".gitignore"), ".gitignore\nc.txt\nd.txt\n");
+      const ignoredItself = await turn();
+      expect(ignoredItself).not.toContain("sub/d.txt");
+      expect(ignoredItself).not.toContain("sub/.gitignore");
+      expect(checked()).toBe("whole");
+
+      // Once it is gone, the next turn still checks the whole index (it may
+      // have held negations), and the one after is incremental again.
+      await rm(join(cwd, "sub", ".gitignore"));
+      expect(await turn()).toContain("sub/d.txt");
+      expect(checked()).toBe("whole");
+      await turn();
+      expect(checked()).toBe("incremental");
+
+      // The same at the root, where the rules cover the whole tree.
+      await writeFile(join(cwd, ".gitignore"), "dir/\n.gitignore\nkeep.txt\n");
+      const rootIgnored = await turn();
+      expect(rootIgnored).not.toContain(".gitignore");
+      expect(rootIgnored).not.toContain("keep.txt");
+      expect(checked()).toBe("whole");
+      await writeFile(join(cwd, ".gitignore"), "dir/\n");
+      expect(await turn()).toContain("keep.txt");
+      expect(checked()).toBe("whole");
+
+      // A pruned tree gone from the store falls back to the whole check
+      // instead of failing the reused snapshot (a fresh one runs `read-tree`).
+      const before = pendingCheckpoint(await prepareBeforeTurn(gitWrapper, sessionId, defaultPool));
+      const lease = before.snapshotIndexLease!;
+      lease.prunedTree = "f".repeat(lease.baseTree.length);
+      commands.length = 0;
+      checkpoints.push(
+        completedCheckpoint(await finishAfterTurn(gitWrapper, before, null, null, defaultPool)),
+      );
+      expect(checked()).toBe("whole");
+      expect(commands.some((args) => args.includes("read-tree"))).toBe(false);
+      await turn();
+      expect(checked()).toBe("incremental");
+    } finally {
+      for (const checkpoint of checkpoints) await releaseCheckpoint(snap, checkpoint);
+      await rm(cwd, { recursive: true, force: true });
+      await rm(excludesFile, { force: true });
+      await releasePersistentSnapshotIndices([sessionId, ...freshIds]);
+    }
+  }, 120_000);
+
   it("creates valid empty snapshots in an unborn repository", async () => {
     const { cwd, snap } = await makeRepo();
     try {
@@ -2163,6 +2573,41 @@ describe("history-safe Git checkpoints", () => {
       expect(await prepareBeforeTurn(snap, "invalid-head", defaultPool)).toEqual({
         status: "session_only",
         reason: "invalid_head",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies a branch naming a missing commit instead of treating it as unborn", async () => {
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      // Same length as a real OID, so a SHA-256 repository reads it as missing, not malformed.
+      const missing = "1".repeat((await text(git, ["rev-parse", "HEAD"])).length);
+      await writeFile(join(cwd, ".git", "refs", "heads", "A"), `${missing}\n`);
+      expect(await prepareBeforeTurn(snap, "missing-head-object", defaultPool)).toEqual({
+        status: "session_only",
+        reason: "invalid_head",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails a snapshot whose branch probe times out instead of treating HEAD as unborn", async () => {
+    const { cwd, snap } = await makeRepo();
+    // A killed git exits 1, the same code as a ref that does not exist.
+    const timedOut: GitRunner = async (args, options) =>
+      args.includes("show-ref")
+        ? { stdout: "", stderr: "", code: 1, error: "timeout" }
+        : snap(args, options);
+    timedOut.cwd = snap.cwd;
+    if (snap.env) timedOut.env = snap.env;
+    try {
+      expect(await prepareBeforeTurn(timedOut, "unborn-probe-timeout", defaultPool)).toEqual({
+        status: "session_only",
+        reason: "before_snapshot_failed",
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -2513,6 +2958,107 @@ describe("history-safe Git checkpoints", () => {
     }
   });
 
+  it.each([false, true])(
+    "reports a conflict instead of moving a renamed file the user edited (attributes changed: %s)",
+    async (changeAttributes) => {
+      // Regression: the restore patch detected renames, so undo moved the
+      // user's edit to the old name (or, with a `.gitattributes` change, wrote
+      // the old name from the snapshot and dropped the edit) without a conflict.
+      const { cwd, git, snap } = await makeRepo();
+      try {
+        await initializeBranch(git, cwd);
+        const content = "one\ntwo\nthree\nfour\nfive\n";
+        await writeFile(join(cwd, "x.txt"), content);
+        await writeFile(join(cwd, ".gitattributes"), "*.bin binary\n");
+        await git(["add", "."]);
+        await git(["commit", "-qm", "rename fixture"]);
+        const prepared = await prepareBeforeTurn(snap, "rename-edit-session", defaultPool);
+        expect(prepared.status).toBe("git");
+        if (prepared.status !== "git") return;
+        await rm(join(cwd, "x.txt"));
+        await writeFile(join(cwd, "y.txt"), content);
+        if (changeAttributes) await writeFile(join(cwd, ".gitattributes"), "*.dat binary\n");
+        const finished = await finishAfterTurn(snap, prepared.checkpoint, null, null, defaultPool);
+        expect(finished.status).toBe("git");
+        if (finished.status !== "git") return;
+        const { beforeHash, afterHash } = finished.checkpoint;
+
+        const edited = `${content}user line\n`;
+        await writeFile(join(cwd, "y.txt"), edited);
+        const conflict = { status: "conflict", conflictedFiles: ["y.txt"] };
+        expect(await applyCheckpoint(snap, afterHash, beforeHash, true)).toEqual(conflict);
+        expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual(conflict);
+        expect(await readFile(join(cwd, "y.txt"), "utf8")).toBe(edited);
+        await expect(readFile(join(cwd, "x.txt"))).rejects.toThrow();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    },
+  );
+
+  describe("a hunk git apply would place at an offset", () => {
+    const block = (middle: string) => ["alpha", "beta", "gamma", middle, "delta", "eps", "zeta"];
+    const fill = (from: number) => Array.from({ length: 20 }, (_, index) => `fill ${from + index}`);
+    // Block 2 already holds what the turn writes into block 1.
+    const file = (first: string, extra: string[] = []) =>
+      `${[...extra, ...fill(0), ...block(first), ...fill(20), ...block("new")].join("\n")}\n`;
+    // C-quoted, with a tab after it, in the patch's "--- " header.
+    const name = "sub dir/naïve Ω.txt";
+
+    async function turn() {
+      const repo = await makeRepo();
+      await initializeBranch(repo.git, repo.cwd);
+      await mkdir(join(repo.cwd, "sub dir"));
+      await writeFile(join(repo.cwd, name), file("old"));
+      await repo.git(["add", "."]);
+      await repo.git(["commit", "-qm", "blocks"]);
+      const prepared = pendingCheckpoint(
+        await prepareBeforeTurn(repo.snap, "offset-session", defaultPool),
+      );
+      if (!prepared) throw new Error("no checkpoint");
+      await writeFile(join(repo.cwd, name), file("new"));
+      // Patched ahead of `name`, so the offset belongs to the second patch.
+      await writeFile(join(repo.cwd, "a.txt"), "added\n");
+      const finished = completedCheckpoint(
+        await finishAfterTurn(repo.snap, prepared, null, null, defaultPool),
+      );
+      if (!finished) throw new Error("no checkpoint");
+      return { ...repo, ...finished };
+    }
+
+    it("refuses instead of rewriting an identical block elsewhere", async () => {
+      const { cwd, snap, beforeHash, afterHash } = await turn();
+      try {
+        // The user edits the turn's line: only block 2 still matches the hunk.
+        const edited = file("user");
+        await writeFile(join(cwd, name), edited);
+        const conflict = { status: "conflict", conflictedFiles: [name] };
+        expect(await applyCheckpoint(snap, afterHash, beforeHash, true)).toEqual(conflict);
+        expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual(conflict);
+        expect(await readFile(join(cwd, name), "utf8")).toBe(edited);
+        expect(await readFile(join(cwd, "a.txt"), "utf8")).toBe("added\n");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it("still restores the turn's block when lines were only inserted above it", async () => {
+      const { cwd, snap, beforeHash, afterHash } = await turn();
+      try {
+        await writeFile(join(cwd, name), file("new", ["user 1", "user 2"]));
+        expect(await applyCheckpoint(snap, afterHash, beforeHash)).toEqual({
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: ["a.txt", name],
+        });
+        expect(await readFile(join(cwd, name), "utf8")).toBe(file("old", ["user 1", "user 2"]));
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
   it("blames the patch, not the worktree, when the worktree still matches the snapshot", async () => {
     const { cwd, git, snap } = await makeRepo();
     try {
@@ -2597,7 +3143,7 @@ describe("history-safe Git checkpoints", () => {
 
       const timedOutDiff: GitRunner = Object.assign(
         async (args: string[], options?: Parameters<GitRunner>[1]) => {
-          if (args[0] === "diff") {
+          if (args.includes("diff")) {
             // What runGit returns for a child it had to terminate, after
             // `--output` already wrote a valid patch prefix.
             await snap(args, options);
@@ -2689,7 +3235,7 @@ describe("history-safe Git checkpoints", () => {
             beforeHash,
             afterHash,
           ),
-        ).toEqual({ status: "failed" });
+        ).toEqual(kept ? { status: "failed", interrupted: true } : { status: "failed" });
         expect(await read("tracked.txt")).toBe("base\n");
         expect(await read("second.txt")).toBe(lines("l1"));
         if (kept) expect(await read("created.txt")).toBe(content);
@@ -2718,6 +3264,62 @@ describe("history-safe Git checkpoints", () => {
       expect(await read("tracked.txt")).toBe("turn\n");
       expect(await read("created.txt")).toBe("created\n");
       expect(await read("second.txt")).toBe(lines("L1", "mine"));
+
+      // Git never spawned: nothing was written, so a file the user deleted
+      // since `apply --check` stays deleted instead of being rolled back.
+      const unspawned: GitRunner = Object.assign(
+        async (args: string[], options?: Parameters<GitRunner>[1]) => {
+          if (!args.includes("apply") || args.includes("--check")) return snap(args, options);
+          await rm(join(cwd, "tracked.txt"));
+          return { stdout: "", stderr: "spawn git ENOENT", code: 1, error: "unavailable" as const };
+        },
+        { cwd: snap.cwd, env: snap.env },
+      );
+      expect(await applyCheckpoint(unspawned, afterHash, beforeHash)).toEqual({ status: "failed" });
+      await expect(lstat(join(cwd, "tracked.txt"))).rejects.toThrow();
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls nothing back when git apply stopped at its own check, and reports a conflict", async () => {
+    // Regression: the user deleting or truncating a patched file between
+    // `apply --check` and apply fails apply before it writes anything, and
+    // the rollback then read those edits as apply's and reverted them. The
+    // restore reports them as a conflict instead.
+    const { cwd, git, snap } = await makeRepo();
+    try {
+      await initializeBranch(git, cwd);
+      await writeFile(join(cwd, "b.txt"), "b\n");
+      await git(["add", "."]);
+      await git(["commit", "-qm", "b"]);
+      const before = pendingCheckpoint(await prepareBeforeTurn(snap, "apply-check", defaultPool));
+      await writeFile(join(cwd, "tracked.txt"), "turn\n");
+      await writeFile(join(cwd, "b.txt"), "turn b\n");
+      await writeFile(join(cwd, "new.txt"), "new\n");
+      const after = completedCheckpoint(
+        await finishAfterTurn(snap, before, null, null, defaultPool),
+      );
+
+      const editAfterCheck: GitRunner = Object.assign(
+        async (args: string[], options?: Parameters<GitRunner>[1]) => {
+          const result = await snap(args, options);
+          if (args.includes("--check") && args.includes("-v")) {
+            await rm(join(cwd, "b.txt"));
+            await rm(join(cwd, "new.txt"));
+            await writeFile(join(cwd, "tracked.txt"), "");
+          }
+          return result;
+        },
+        { cwd: snap.cwd, env: snap.env },
+      );
+      expect(await applyCheckpoint(editAfterCheck, after.afterHash, after.beforeHash)).toEqual({
+        status: "conflict",
+        conflictedFiles: ["b.txt", "new.txt", "tracked.txt"],
+      });
+      await expect(lstat(join(cwd, "b.txt"))).rejects.toThrow();
+      await expect(lstat(join(cwd, "new.txt"))).rejects.toThrow();
+      expect(await readFile(join(cwd, "tracked.txt"), "utf8")).toBe("");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -2899,6 +3501,35 @@ describe("applyCheckPaths", () => {
       "link",
       "run.sh",
     ]);
+  });
+});
+
+describe("pathsOutsideSnapshots", () => {
+  // Git's answers as the runner hands them over: decoded text, a byte that
+  // is not UTF-8 already turned into U+FFFD.
+  const objectId = "a".repeat(40);
+  const fakeGit = (trees: Record<string, string[]>): GitRunner =>
+    (async (args: string[]) => {
+      if (args[0] === "cat-file") {
+        const marker = args[2] === "T" ? "Unreadable directory outside snapshot: locked/" : "";
+        return { stdout: `tree x\n\nsnapshot\n\n${marker}`, stderr: "", code: 0 };
+      }
+      if (args[0] === "ls-tree") {
+        const entries = trees[args.at(-1)!]!.map((path) => `100644 blob ${objectId}\t${path}\0`);
+        return { stdout: entries.join(""), stderr: "", code: 0 };
+      }
+      throw new Error(`unexpected git ${args.join(" ")}`);
+    }) as GitRunner;
+
+  it("pins an unopened folder and its own path, and refuses only a pin that is not UTF-8", async () => {
+    const pins = async (source: string[]) =>
+      (await pathsOutsideSnapshots(fakeGit({ S: source, T: [] }), "S", "T"))?.keptPins ?? null;
+    expect(await pins(["locked/a", "elsewhere"])).toEqual([`100644 blob ${objectId}\tlocked/a\0`]);
+    expect(await pins(["locked"])).toEqual([`100644 blob ${objectId}\tlocked\0`]);
+    // A pin would land on the U+FFFD spelling and leave the real file to the patch.
+    expect(await pins(["locked/a\uFFFDb"])).toBeNull();
+    // Outside the pinned folders the patch carries raw bytes: no reason to refuse.
+    expect(await pins(["other/a\uFFFDb"])).toEqual([]);
   });
 });
 

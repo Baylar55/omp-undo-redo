@@ -1,10 +1,13 @@
+import { createReadStream } from "node:fs";
 import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { GitRunner } from "../types.js";
-import { invoke } from "../infra/git-runner.js";
+import { invoke, outputLines } from "../infra/git-runner.js";
+import { debugLog } from "../infra/debug-log.js";
 import {
   AUTOCRLF_OFF_LINE,
   NESTED_REPOSITORY_LINE,
+  UNREADABLE_DIRECTORY_LINE,
   UNREADABLE_FILE_LINE,
   recordedExcludeRules,
 } from "./markers.js";
@@ -36,7 +39,8 @@ async function ignoredUnder(
   await mkdir(rules);
   const env = { GIT_INDEX_FILE: join(directory, `${label}-index`), GIT_WORK_TREE: rules };
   if ((await invoke(git, ["read-tree", commit], { env })).code !== 0) return null;
-  const files = await invoke(git, ["ls-files", "-z", "--", ":(glob)**/.gitignore"], { env });
+  // `icase`: case-insensitive file systems serve `.GITIGNORE` to git as `.gitignore`.
+  const files = await invoke(git, ["ls-files", "-z", "--", ":(glob,icase)**/.gitignore"], { env });
   if (files.code !== 0) return null;
   if (files.stdout) {
     const written = await invoke(git, ["checkout-index", "-z", "--stdin"], {
@@ -112,7 +116,7 @@ export async function shieldIgnoredPaths(
   if (hiddenInSource.length > 0) {
     const top = await invoke(git, ["rev-parse", "--show-toplevel"]);
     if (top.code !== 0) return null;
-    const worktree = top.stdout.trim();
+    const worktree = outputLines(top.stdout)[0];
     for (const path of hiddenInSource) {
       // Absent on disk means nothing to collide with: let the patch create it.
       const onDisk = await lstat(join(worktree, path)).then(
@@ -150,12 +154,13 @@ interface SnapshotsOutside extends OutsideSnapshot {
   /** `--index-info -z` entries pinning every unreadable file to its source
    *  entry (a removal when the source has none). */
   unreadablePins: string[];
-  /** `--index-info -z` entries pinning every path under the extension's own
-   *  directories that the two commits disagree on to its source entry (a
-   *  removal when the source has none). Only snapshots taken before those
-   *  were left out hold such paths; restoring them would delete the store's
-   *  objects. */
-  ownedPins: string[];
+  /** `--index-info -z` entries pinning every path the two commits disagree
+   *  on to its source entry (a removal when the source has none) under the
+   *  extension's own directories and under unreadable directories. Only
+   *  snapshots taken before the former were left out hold such paths;
+   *  restoring them would delete the store's objects. An unreadable
+   *  directory's entries in the snapshot that could not open it are missing. */
+  keptPins: string[];
   /** Both commits carry `AUTOCRLF_OFF_LINE`. */
   autocrlfOff: boolean;
 }
@@ -163,15 +168,19 @@ interface SnapshotsOutside extends OutsideSnapshot {
 /** Paths neither commit holds the contents of. Nested repositories: gitlinks
  *  (a submodule or committed nested repository is recorded as its HEAD commit
  *  only, and `git apply` without an index skips gitlink hunks) plus the ones a
- *  snapshot left out for having no commit. Unreadable files: a snapshot's
- *  entry for one is stale or missing, so the restore must leave the file on
- *  disk alone. `ownedPaths`: the extension's directories inside the worktree
- *  (`ownedPathsInWorktree`), whose paths get `ownedPins`. Null when a commit
- *  is unreadable. Also reads how both commits
- *  were captured (`autocrlfOff`). The listings are streamed,
+ *  snapshot left out for having no commit. Unreadable files and directories: a
+ *  snapshot's entries for one are stale or missing, so the restore must leave
+ *  it on disk alone. `ownedPaths`: the extension's directories inside the
+ *  worktree (`ownedPathsInWorktree`). Both get `keptPins`. Null when a commit
+ *  is unreadable, or when a path to pin is not UTF-8: it is read as text with
+ *  U+FFFD in place of the bad bytes, so a pin written from it would name
+ *  another path and leave the real one to the patch. Also reads how both
+ *  commits were captured (`autocrlfOff`). The listings are streamed,
  *  so memory stays bounded by what is kept, not by the tree's size.
  *  ponytail: lists every tree entry per restore; record gitlinks at capture
- *  time if undo in million-file trees gets slow. */
+ *  time if undo in million-file trees gets slow. ponytail: a path really
+ *  named with U+FFFD under a pinned folder fails the restore too; pin from
+ *  raw bytes if that ever matters. */
 export async function pathsOutsideSnapshots(
   git: GitRunner,
   sourceHash: string,
@@ -180,6 +189,7 @@ export async function pathsOutsideSnapshots(
 ): Promise<SnapshotsOutside | null> {
   const nested = new Set<string>();
   const unreadable = new Set<string>();
+  const unreadableDirectories = new Set<string>();
   let autocrlfOff = true;
   for (const commit of [sourceHash, targetHash]) {
     const object = await invoke(git, ["cat-file", "commit", commit]);
@@ -192,13 +202,25 @@ export async function pathsOutsideSnapshots(
         nested.add(line.slice(NESTED_REPOSITORY_LINE.length));
       } else if (line.startsWith(UNREADABLE_FILE_LINE)) {
         unreadable.add(line.slice(UNREADABLE_FILE_LINE.length));
+      } else if (line.startsWith(UNREADABLE_DIRECTORY_LINE)) {
+        unreadableDirectories.add(line.slice(UNREADABLE_DIRECTORY_LINE.length));
       }
     }
   }
   const sourceEntries = new Map<string, string>();
-  // Entries under the owned paths: [source, target].
-  const ownedEntries = [new Map<string, string>(), new Map<string, string>()] as const;
-  const ownedPrefixes = ownedPaths.map((path) => `${path}/`);
+  // The first path to pin that is not UTF-8 (see the doc comment).
+  let undecodable = [...unreadable, ...unreadableDirectories].find((path) =>
+    path.includes("\uFFFD"),
+  );
+  // Entries kept at their source state: [source, target].
+  const keptEntries = [new Map<string, string>(), new Map<string, string>()] as const;
+  // The roots themselves too: one snapshot may hold a file or symlink where
+  // the other could not open a folder.
+  const keptRoots = [
+    ...ownedPaths,
+    ...[...unreadableDirectories].map((directory) => directory.slice(0, -1)),
+  ];
+  const keptPrefixes = keptRoots.map((path) => `${path}/`);
   for (const [side, commit] of [sourceHash, targetHash].entries()) {
     // Entries: "<mode> <type> <object>\t<path>", a format `--index-info` reads.
     let partial = "";
@@ -209,8 +231,9 @@ export async function pathsOutsideSnapshots(
         const path = entry.slice(entry.indexOf("\t") + 1);
         if (entry.startsWith("160000 ")) nested.add(path);
         if (commit === sourceHash && unreadable.has(path)) sourceEntries.set(path, entry);
-        if (ownedPaths.includes(path) || ownedPrefixes.some((prefix) => path.startsWith(prefix))) {
-          ownedEntries[side]!.set(path, entry);
+        if (keptRoots.includes(path) || keptPrefixes.some((prefix) => path.startsWith(prefix))) {
+          if (path.includes("\uFFFD")) undecodable ??= path;
+          keptEntries[side]!.set(path, entry);
         }
       }
     };
@@ -222,24 +245,29 @@ export async function pathsOutsideSnapshots(
     // A runner that ignores `onStdout` buffers instead; scanning twice is harmless.
     feed(`${tree.stdout}\0`);
   }
+  if (undecodable !== undefined) {
+    debugLog({ event: "restore-pin-not-utf8", path: undecodable });
+    return null;
+  }
   // Mode 0 with an all-zero id of the repository's hash length removes a path.
   const removal = `0 ${"0".repeat(sourceHash.length)}`;
-  const [sourceOwned, targetOwned] = ownedEntries;
-  const ownedPins: string[] = [];
+  const [sourceKept, targetKept] = keptEntries;
+  const keptPins: string[] = [];
   // Removals first: a source file may sit where the target has a directory.
-  for (const path of targetOwned.keys()) {
-    if (!sourceOwned.has(path)) ownedPins.push(`${removal}\t${path}\0`);
+  for (const path of targetKept.keys()) {
+    if (!sourceKept.has(path)) keptPins.push(`${removal}\t${path}\0`);
   }
-  for (const [path, entry] of sourceOwned) {
-    if (targetOwned.get(path) !== entry) ownedPins.push(`${entry}\0`);
+  for (const [path, entry] of sourceKept) {
+    if (targetKept.get(path) !== entry) keptPins.push(`${entry}\0`);
   }
   return {
     nestedRepositories: [...nested].sort(),
     unreadableFiles: [...unreadable].sort(),
+    unreadableDirectories: [...unreadableDirectories].sort(),
     unreadablePins: [...unreadable].map(
       (path) => `${sourceEntries.get(path) ?? `${removal}\t${path}`}\0`,
     ),
-    ownedPins,
+    keptPins,
     autocrlfOff,
   };
 }
@@ -267,14 +295,198 @@ export function applyCheckPaths(stderr: string): string[] {
   return [...paths];
 }
 
-/** Paths `git apply` touches going from `sourceHash` to `targetHash`. Gitlinks
- *  are skipped: apply leaves them alone and `pathsOutsideSnapshots` reports
- *  them. Null when git fails. */
-export async function changedPaths(
+/** `git apply --check -v` stderr (run under `LC_ALL=C`) for a hunk that
+ *  matched away from its recorded line. */
+const HUNK_OFFSET = /^Hunk #(\d+) succeeded at \d+ \(offset (-?\d+) lines?\)\.$/;
+/** Unified-diff hunk header: old start, old count, new count (a count is 1
+ *  when omitted). */
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@/;
+/** Characters of a patch line kept to spot a header in it: far more than
+ *  any header line needs, so a huge content line costs no memory. */
+const LINE_PREFIX = 64 * 1024;
+const C_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13 };
+
+type Hunk = [oldStart: number, oldCount: number, newCount: number];
+
+/** Paths whose hunks a passing `git apply --check -v` placed somewhere the
+ *  file's lines did not move to. Git takes the nearest match of a hunk's
+ *  lines at any offset, so once the user edits the turn's lines, an
+ *  identical block elsewhere in the file matches instead and the restore
+ *  would rewrite that block. A hunk is in place when the worktree's drift
+ *  from `sourceHash` leaves its old lines untouched and shifts them by
+ *  exactly git's offset, so lines merely inserted or removed above it keep
+ *  restoring. `checkStderr`: that check's output; `patchPath`: its patch,
+ *  made from `sourceHash`; `probeEnv`: a scratch index to diff the worktree
+ *  through; `config`: apply's `-c` args. Null when git fails.
+ *  shortcut: only files with an offset hunk are diffed (a hunk matching at
+ *  its own line after drift moved its block needs an identical copy at
+ *  exactly that line); diff every patched file if that is ever seen. */
+export async function misplacedHunkPaths(
+  git: GitRunner,
+  sourceHash: string,
+  patchPath: string,
+  checkStderr: string,
+  config: readonly string[],
+  probeEnv: Record<string, string>,
+): Promise<string[] | null> {
+  // Patch number ("Checking patch" lines follow the patch file's order) →
+  // hunk number → offset.
+  const offsets = new Map<number, Map<number, number>>();
+  let patch = -1;
+  for (const line of checkStderr.split(/\r?\n/)) {
+    if (line.startsWith("Checking patch ")) patch += 1;
+    const match = HUNK_OFFSET.exec(line);
+    if (!match) continue;
+    const hunks = offsets.get(patch) ?? new Map<number, number>();
+    hunks.set(Number(match[1]), Number(match[2]));
+    offsets.set(patch, hunks);
+  }
+  if (offsets.size === 0) return [];
+
+  const sections = await patchSections(patchPath, new Set(offsets.keys()));
+  const seeded = await invoke(git, ["read-tree", sourceHash], { env: probeEnv });
+  if (seeded.error || seeded.code !== 0) return null;
+  const misplaced: string[] = [];
+  for (const [index, hunkOffsets] of offsets) {
+    const section = sections.get(index);
+    if (!section?.path) return null;
+    const drift = await invoke(
+      git,
+      [
+        ...config,
+        "-c",
+        "core.safecrlf=false",
+        "-c",
+        "diff.autoRefreshIndex=true",
+        // Not `--no-relative`: git before 2.28 rejects it (see `restore.ts`).
+        "-c",
+        "diff.relative=false",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--text",
+        "-U0",
+        "--inter-hunk-context=0",
+        sourceHash,
+        "--",
+        `:(top,literal)${section.path}`,
+      ],
+      { env: probeEnv, timeoutMs: RESTORE_TIMEOUT_MS },
+    );
+    if (drift.error || drift.code !== 0) return null;
+    const changes = drift.stdout
+      .split("\n")
+      .map(hunkHeader)
+      .filter((header) => header !== null);
+    const inPlace = section.hunks.every(([start, count], hunk) => {
+      const end = start + count - 1;
+      let shift = 0;
+      for (const [from, removed, added] of changes) {
+        // `removed` 0: lines inserted after line `from`.
+        if (removed === 0 ? from >= start && from < end : from <= end && from + removed > start) {
+          return false;
+        }
+        if (from < start) shift += added - removed;
+      }
+      return shift === (hunkOffsets.get(hunk + 1) ?? 0);
+    });
+    if (!inPlace) misplaced.push(section.path);
+  }
+  return misplaced;
+}
+
+function hunkHeader(line: string): Hunk | null {
+  const match = HUNK_HEADER.exec(line);
+  return match && [Number(match[1]), Number(match[2] ?? 1), Number(match[3] ?? 1)];
+}
+
+/** Old path (null for an added file) and hunks of each patch in `patchPath`
+ *  whose position (0-based) is in `wanted`. Streamed: the patch can carry
+ *  multi-GB binary data. Only "\n" ends a line, as for `git apply`: a lone
+ *  "\r" belongs to a content line. */
+async function patchSections(
+  patchPath: string,
+  wanted: ReadonlySet<number>,
+): Promise<Map<number, { path: string | null; hunks: Hunk[] }>> {
+  const sections = new Map<number, { path: string | null; hunks: Hunk[] }>();
+  let index = -1;
+  let section: { path: string | null; hunks: Hunk[] } | undefined;
+  const visit = (line: string) => {
+    if (line.startsWith("diff --git ")) {
+      index += 1;
+      section = wanted.has(index) ? { path: null, hunks: [] } : undefined;
+      if (section) sections.set(index, section);
+      return;
+    }
+    if (!section) return;
+    const header = hunkHeader(line);
+    if (header) section.hunks.push(header);
+    // Past the first hunk, a "--- " line is a removed "-- " line.
+    else if (section.hunks.length === 0 && line.startsWith("--- ")) {
+      section.path = headerPath(line.slice(4));
+    }
+  };
+  let line = "";
+  for await (const chunk of createReadStream(patchPath, { encoding: "utf8" })) {
+    const text = chunk as string;
+    let start = 0;
+    for (let end = text.indexOf("\n"); end !== -1; end = text.indexOf("\n", start)) {
+      visit(line + text.slice(start, end));
+      line = "";
+      start = end + 1;
+    }
+    if (line.length < LINE_PREFIX) line += text.slice(start, start + LINE_PREFIX - line.length);
+  }
+  visit(line);
+  return sections;
+}
+
+/** The path of a "--- a/<path>" header field; null for "/dev/null". Git
+ *  C-quotes a path holding special bytes and appends a tab to one holding a
+ *  space. */
+function headerPath(field: string): string | null {
+  let name = field.endsWith("\t") ? field.slice(0, -1) : field;
+  if (name.startsWith('"') && name.endsWith('"')) {
+    const quoted = Buffer.from(name.slice(1, -1), "utf8");
+    const bytes: number[] = [];
+    for (let index = 0; index < quoted.length; index += 1) {
+      if (quoted[index] !== 0x5c) {
+        bytes.push(quoted[index]!);
+        continue;
+      }
+      index += 1;
+      const escape = String.fromCharCode(quoted[index]!);
+      if (escape >= "0" && escape <= "7") {
+        bytes.push(parseInt(quoted.toString("latin1", index, index + 3), 8));
+        index += 2;
+      } else {
+        bytes.push(C_ESCAPES[escape] ?? quoted[index]!);
+      }
+    }
+    name = Buffer.from(bytes).toString("utf8");
+  }
+  return name.startsWith("a/") ? name.slice(2) : null;
+}
+
+/** One `diff-tree -r --no-renames` record. */
+export interface TreeChange {
+  sourceMode: string;
+  targetMode: string;
+  sourceSha: string;
+  targetSha: string;
+  status: string;
+  path: string;
+}
+
+/** Every path that differs between `sourceHash` and `targetHash`, gitlinks
+ *  included. Null when git fails. */
+export async function treeChanges(
   git: GitRunner,
   sourceHash: string,
   targetHash: string,
-): Promise<string[] | null> {
+): Promise<TreeChange[] | null> {
   const changes = await invoke(
     git,
     ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
@@ -283,13 +495,26 @@ export async function changedPaths(
   if (changes.error || changes.code !== 0) return null;
   // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
   const fields = changes.stdout.split("\0");
-  const paths: string[] = [];
+  const records: TreeChange[] = [];
   for (let index = 0; index + 1 < fields.length; index += 2) {
-    const [sourceMode, targetMode] = fields[index]!.slice(1).split(" ");
-    if (sourceMode !== "160000" && targetMode !== "160000") paths.push(fields[index + 1]!);
+    const [sourceMode, targetMode, sourceSha, targetSha, status] =
+      fields[index]!.slice(1).split(" ");
+    records.push({
+      sourceMode: sourceMode!,
+      targetMode: targetMode!,
+      sourceSha: sourceSha!,
+      targetSha: targetSha!,
+      status: status!,
+      path: fields[index + 1]!,
+    });
   }
-  return paths;
+  return records;
 }
+
+/** A record git apply touches: it leaves gitlinks alone and
+ *  `pathsOutsideSnapshots` reports them. */
+export const isApplied = (change: TreeChange) =>
+  change.sourceMode !== "160000" && change.targetMode !== "160000";
 
 /** Paths of `paths` (worktree root relative, `/`-separated) with a symlink or
  *  junction above them in `worktree`. Git for Windows takes a junction for a

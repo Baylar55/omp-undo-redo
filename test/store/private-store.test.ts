@@ -24,7 +24,14 @@ import {
 import type { GitRunner } from "../../src/types.js";
 import { makeRepository } from "../helpers/index.js";
 import { canonicalCwd, storeRootDirectory } from "../../src/infra/paths.js";
-import { privateRepositoryPath } from "../../src/store/setup.js";
+import {
+  privateRepositoryPath,
+  STORE_HOST_KEY,
+  STORE_VOLUME_KEY,
+  storeHasRefs,
+  volumeOf,
+} from "../../src/store/setup.js";
+import { localStoreHost } from "../../src/store/host-identity.js";
 import {
   ensureGitSnapshotStore,
   GIT_STORE_SOURCE_KEY,
@@ -143,6 +150,49 @@ describe("private per-workspace git repositories", () => {
       await rm(storeRoot, { recursive: true, force: true });
     }
   });
+
+  it.each(["private", "git"] as const)(
+    "stamps a %s store with this machine and its source's volume, older stores on relaunch",
+    async (kind) => {
+      const cwd =
+        kind === "git" ? await makeRepository() : await mkdtemp(join(tmpdir(), "omp-stamp-"));
+      const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+      try {
+        let source = await realpath(cwd);
+        const ensure = async (): Promise<string | null | undefined> => {
+          if (kind === "private") {
+            return (await ensurePrivateGitRepository(factory, cwd, storeRoot))?.gitDir;
+          }
+          const resolved = await resolveRepository(createGitRunner(cwd));
+          if (!("repository" in resolved)) throw new Error("not a repository");
+          source = resolved.repository.commonDir;
+          return ensureGitSnapshotStore(factory, resolved.repository, storeRoot);
+        };
+        const gitDir = await ensure();
+        if (!gitDir) throw new Error("store setup failed");
+        const stamps = async () => [
+          await storeConfig(gitDir, STORE_HOST_KEY),
+          await storeConfig(gitDir, STORE_VOLUME_KEY),
+        ];
+        const expected = [
+          { code: 0, value: await localStoreHost() },
+          { code: 0, value: await volumeOf(source) },
+        ];
+        expect(expected[0].value).toMatch(/^[0-9a-f]{64}$/);
+        expect(expected[1].value).toMatch(/^\d+:\d+$/);
+        expect(await stamps()).toEqual(expected);
+        // As an earlier version left it: no stamps.
+        for (const key of [STORE_HOST_KEY, STORE_VOLUME_KEY]) {
+          await gitInStore(cwd, gitDir, ["config", "--unset", key]);
+        }
+        expect(await ensure()).toBe(gitDir);
+        expect(await stamps()).toEqual(expected);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("sets up with a hooks-only init template and recreates a missing info/", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-template-"));
@@ -531,6 +581,36 @@ describe("private per-workspace git repositories", () => {
       await rm(storeRoot, { recursive: true, force: true });
     }
   });
+
+  it.each(["Git snapshot", "Private-Git"])(
+    "gives a %s store loose refs under a reftable default",
+    async (kind) => {
+      // A reftable store keeps a `refs/heads` stub file, so `storeHasRefs` saw
+      // refs forever and gc/eviction never emptied it.
+      const cwd = await makeRepository();
+      const storeRoot = await mkdtemp(join(tmpdir(), "omp-private-store-"));
+      try {
+        vi.stubEnv("GIT_CONFIG_COUNT", "1");
+        vi.stubEnv("GIT_CONFIG_KEY_0", "init.defaultRefFormat");
+        vi.stubEnv("GIT_CONFIG_VALUE_0", "reftable");
+        vi.stubEnv("GIT_DEFAULT_REF_FORMAT", "reftable");
+        let storeDir: string | null;
+        if (kind === "Private-Git") {
+          storeDir = (await ensurePrivateGitRepository(factory, cwd, storeRoot))?.gitDir ?? null;
+        } else {
+          const resolved = await resolveRepository(createGitRunner(cwd));
+          if (!("repository" in resolved)) throw new Error("not a repository");
+          storeDir = await ensureGitSnapshotStore(factory, resolved.repository, storeRoot);
+        }
+        expect(storeDir).not.toBeNull();
+        expect(await storeHasRefs(storeDir!)).toBe(false);
+        await expect(stat(join(storeDir!, "reftable"))).rejects.toThrow();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(storeRoot, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each([
     ["no refs", null],
@@ -975,6 +1055,50 @@ describe("private per-workspace git repositories", () => {
     }
   });
 
+  it("built-in excludes skip directories but snapshot files of the same name", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omp-private-dironly-"));
+    try {
+      const storeRoot = join(cwd, ".omp");
+      const factory = (cwd2: string, env?: Record<string, string>) =>
+        createGitRunner(cwd2, { env });
+      const repository = await ensurePrivateGitRepository(factory, cwd, storeRoot);
+      expect(repository).not.toBeNull();
+      if (!repository) return;
+      // A store seeded by an older version: the store-root entry, then the
+      // built-in names bare, which matched files too.
+      const excludePath = join(repository.gitDir, "info", "exclude");
+      const legacy = [".omp/", ...DEFAULT_EXCLUDES.map((entry) => entry.slice(0, -1))];
+      await writeFile(excludePath, `${legacy.join("\n")}\n`, "utf8");
+      await ensurePrivateGitRepository(factory, cwd, storeRoot);
+      const migrated = (await readFile(excludePath, "utf8")).split("\n").filter(Boolean);
+      // The default `.omp/` duplicates the store-root line above it: dropped.
+      expect(migrated).toEqual([".omp/", ...DEFAULT_EXCLUDES.filter((e) => e !== ".omp/")]);
+
+      await writeFile(join(cwd, "build"), "#!/bin/sh\n");
+      await mkdir(join(cwd, "tools"));
+      await writeFile(join(cwd, "tools", "out"), "x");
+      await mkdir(join(cwd, "dist"));
+      await writeFile(join(cwd, "dist", "bundle.js"), "x");
+      await mkdir(join(cwd, "pkg", "target"), { recursive: true });
+      await writeFile(join(cwd, "pkg", "target", "app"), "x");
+
+      const envGit = createGitRunner(cwd, { env: { GIT_DIR: repository.gitDir } });
+      const snapshot = await createSnapshotCommit(envGit, "dironly-test");
+      expect("hash" in snapshot).toBe(true);
+      if (!("hash" in snapshot)) return;
+      const tree = await envGit(["ls-tree", "-r", "--name-only", snapshot.hash]);
+      expect(tree.code).toBe(0);
+      const paths = tree.stdout.split("\n").filter(Boolean);
+      expect(paths).toContain("build");
+      expect(paths).toContain("tools/out");
+      expect(paths.some((path) => path.startsWith("dist/"))).toBe(false);
+      expect(paths.some((path) => path.includes("target/"))).toBe(false);
+      expect(paths.some((path) => path.startsWith(".omp/"))).toBe(false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("seeds the built-in excludes into the private repo exclude", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omp-private-exclude-"));
     try {
@@ -1016,20 +1140,23 @@ describe("private per-workspace git repositories", () => {
       await writeFile(excludePath, `${fresh}my-secret-dir/\n${fresh}${fresh}`, "utf8");
       await ensurePrivateGitRepository(factory, cwd, storeRoot);
       const healed = (await readFile(excludePath, "utf8")).split("\n").filter(Boolean);
-      expect(healed.filter((line) => line === "node_modules")).toHaveLength(1);
+      expect(healed.filter((line) => line === "node_modules/")).toHaveLength(1);
       expect(healed).toContain("my-secret-dir/");
       for (const ignored of DEFAULT_EXCLUDES) expect(healed).toContain(ignored);
 
       // Store-root entry also collapses to one copy.
       expect(healed.filter((line) => line === ".omp/")).toHaveLength(1);
 
-      // With a negation line, order is significant: no dedupe, but missing entries still land.
+      // With a negation line, order is significant: no dedupe, but missing entries
+      // still land, and an older version's file-matching name becomes
+      // directory-only where it stands.
       await writeFile(excludePath, "node_modules\n!keep-me\nnode_modules\n", "utf8");
       await ensurePrivateGitRepository(factory, cwd, storeRoot);
       const negated = (await readFile(excludePath, "utf8")).split("\n").filter(Boolean);
-      expect(negated.slice(0, 3)).toEqual(["node_modules", "!keep-me", "node_modules"]);
+      expect(negated.slice(0, 3)).toEqual(["node_modules/", "!keep-me", "node_modules/"]);
       for (const ignored of DEFAULT_EXCLUDES) expect(negated).toContain(ignored);
       expect(negated).toContain(".omp/");
+      expect(negated).not.toContain("build");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

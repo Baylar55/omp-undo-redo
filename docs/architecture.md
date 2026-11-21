@@ -69,7 +69,7 @@ src/
 │   ├── git-store.ts             Git-mode store: ensureGitSnapshotStore, runner env (alternates)
 │   ├── private-store.ts         Private-Git store: config, excludes, refused workspaces
 │   ├── pinning.ts               copy/keep borrowed objects safe from gc
-│   ├── host-identity.ts         persistent host id, Linux runtime scope
+│   ├── host-identity.ts         persistent host id, runtime scope (boot + Linux PID namespace)
 │   ├── owners.ts                CheckpointOwnerRegistry: leases, liveness, stale-owner cleanup
 │   ├── backend.ts               resolveBackend: git / private / session-only
 │   └── maintenance/
@@ -195,6 +195,27 @@ are reconstructed from the active session branch as session-only checkpoints, wi
 outgrows it keeps the checkpoint at the cursor and drops the oldest turns first; their snapshots
 stay until retention removes the session.
 
+OMP 18.20+ moves a session it cannot keep writing (another live process holds its file, or the
+file changed on disk) to a new session id with no event; the new header's `continuationOf` names
+the old id, and `/resume` of the old session opens the copy. Every handler reads the id through
+`liveSessionId` (`session/controller.ts`): a record still filed under the old id moves to the new
+one, with its turn in flight, and `SessionNavigation.rekey` copies its history refs into the new
+namespace and saves under the new id from then on. A switch (`/resume`) into a copy of a session
+being left is not a move: `liveSessionId` never refiles the record of the switch's source (from
+`session_before_switch`) or of any session whose release (`releaseLeftSession`) is still waiting
+out its last turn (`leavingSessions`); the copy loads its stored history instead, without a turn
+still finalizing. Resuming a session drops it from `leavingSessions`, so a move of it is followed
+again, and a release that finds its record moved leaves it to the new id. A cancelled switch
+announces nothing, so its source is dropped at the next turn start; until then a move is not
+followed, and a move inside the turn the switch was cancelled in loses that turn's file
+checkpoint. A copy resumed without history of its own
+adopts the old id's file (`SessionHistoryStore.load`), up to its cursor and only while its turns
+are on the copy's branch, since the old session's process may have gone on. Refs are copied, never
+moved: the old session keeps its history. The move is noticed at the next event or command; an
+idle process keeps beating the old id's liveness marker until then (or until it exits), which only
+delays that history's expiry. Until its first write the host has not moved a resumed session, so
+an `/undo` there still saves to the old id's file, which another process may also own.
+
 Before restoring files, `/undo` and `/redo` save a restore intent next to the history. On the next
 load `session/recovery.ts` checks whether the restore patch still applies from either snapshot:
 from the source means nothing changed, from the target moves the cursor, from neither leaves the
@@ -212,6 +233,15 @@ Any link there makes the result `linked`: nothing is written, and the check-only
 a tracked symlink is still restored as a link. A runner without `cwd` gets the worktree from
 `git rev-parse --show-toplevel`. The scan reads the disk once: a link created between it and
 `git apply` is not caught (git's own check still covers real symlinks). Capture is unchanged.
+
+### Hunks applied at an offset
+
+`git apply` matches a hunk at the nearest place its lines appear, so after the user edits a
+turn's lines a repeated block elsewhere in the file can match instead. The check runs with `-v`
+and `misplacedHunkPaths` (`snapshot/restore-scope.ts`) diffs each file with an offset hunk
+against the source snapshot: the restore proceeds only when the user's changes leave every hunk's
+lines intact and shift them by exactly git's offset, otherwise it is a `conflict` naming the file.
+A hunk that matched at its own line is not re-checked.
 
 ### Subagents
 
@@ -231,7 +261,7 @@ use SHA-256 session namespaces; state holds action availability, selected leaf, 
 revision and the latest action result. Per-session writes larger than 64 KiB are skipped.
 Publication is observational and never adds file restoration to session-only mode. A
 `runtime/<pid>/` without a `runtime.json` marker is never replaced or deleted
-(`runtime-dir-foreign`). The marker records the writer's hostname and runtime scope (boot and PID
+(`runtime-dir-foreign`). The marker records the writer's hostname and runtime scope (boot, plus PID
 namespace on Linux, as owner leases do). Only a marker from this host and scope is pid-probed: such
 a `runtime/<pid>/` is replaced by the process now holding that pid, and reaped once the pid is
 gone. One from another scope (a container sharing `~/.omp`, a previous boot) or without a scope
@@ -258,6 +288,11 @@ literal `:(exclude)` pathspecs, and index entries for them (a `HEAD` that tracks
 Restores pin every path under them to its state in the source snapshot, so snapshots taken before
 this exclusion existed cannot rewrite the store either.
 
+A folder `git add -A` cannot open (no permission, a path past `MAX_PATH` under `core.longpaths=false`)
+only draws a warning and exit 0, and its index entries are dropped or left stale. The snapshot
+records it as an unreadable directory marker, and restores pin the folder and every path under it
+the same way, in both directions, and report it as not restored.
+
 Each capture copies into the store every snapshot object the user's `HEAD` does not reach (content
 of a reset or amended commit, a staged-then-dropped file, an old version a file was reverted to),
 and before every store gc the extension packs every snapshot object `HEAD` then does not reach into
@@ -278,8 +313,13 @@ session start (`store/maintenance/legacy.ts`).
 (`.active.<sessionHash>`, fresh for 24 hours) in the shared history directory, a background
 interval re-asserts it for all locally active sessions every 10 minutes, and retention sweeps skip
 any session with a fresh marker — including sweeps started by another process sharing the same
-repository or store. Expired `*.expired.json` tombstones are pruned after twice the retention
-period (default 4 days) so the history directory does not grow without bound.
+repository or store. The marker names its writer (pid and runtime scope: boot, plus PID namespace on
+Linux); a stale marker whose writer shares this process table and is not proven gone (ESRCH) counts
+as live, so an owner suspended or asleep on the same machine keeps its history, as does a marker
+hidden by any error other than a missing marker or history path (`ENOENT`, `ENOTDIR`). Another
+container's or machine's marker ages by mtime alone. A session left by a switch has that claim
+cleared and ages by mtime again. Expired `*.expired.json` tombstones are pruned after twice the
+retention period (default 4 days) so the history directory does not grow without bound.
 
 In Git workspaces, expiration removes the session's history refs under
 `refs/omp-undo-redo/history/<sessionHash>/` and its history file inside the repository's snapshot
@@ -324,9 +364,36 @@ the next launch.
 
 Stale stores whose workspace (Private-Git) or repository (Git mode) has disappeared are evicted
 conservatively: the source must read as missing on two checks moments apart, the store must be
-idle for at least 24 hours, and no capture, finalization, or `git gc` may be in flight. Eviction
-renames the store to `<hash>.git.evicted-<timestamp>` and removes its contents only after 7 days,
-so a transient mount, lock, or permission hiccup can never cost undo history.
+idle for at least 24 hours (owner leases and session heartbeats count as activity), and no
+capture, finalization, or `git gc` may be in flight. Eviction renames the store to
+`<hash>.git.evicted-<timestamp>` and removes its contents only after 7 days, so a transient mount,
+lock, or permission hiccup can never cost undo history.
+
+Each launch records two stamps in the store's `config`, which earlier stores receive the next time
+they are opened:
+
+- `omp-undo-redo.host`: the machine that last opened the store, a hash of its persistent host ID
+  and hostname. A sweep skips stores stamped by another machine, since on a store root shared
+  between machines (an NFS/SMB home, WSL and Windows) a path missing on one may be live on the
+  other. Two machines that share both the host-id file and the hostname (see the
+  [host-id warning](./troubleshooting.md#inspecting-and-deleting-checkpoint-refs-by-hand)) still
+  look like one.
+- `omp-undo-redo.volume`: the source's device and how many levels up its mount root is. A missing
+  source counts as gone only while that mount root is mounted (it holds another device than its
+  parent, or is an existing filesystem root), so an unplugged drive or unmounted mount point keeps
+  its store. On Windows the device is the volume serial, so another volume given the same drive
+  letter does not count; POSIX device numbers can change across reboots and are not compared.
+
+A store stamped with a host but no volume (unreadable at setup) is kept while its source is missing,
+until a launch records one. A store not yet stamped is judged as before: its source counts as gone
+when the path's filesystem root exists (a drive letter or UNC share on Windows; never a `/…` path
+there). A store whose `config` cannot be read is kept.
+
+A store stamped by another machine (or by this one before its hostname or host-id file changed) is
+never evicted here; see
+[Snapshot stores of another machine](./troubleshooting.md#snapshot-stores-of-another-machine). To
+put back a store already set aside, see
+[Recovering a store set aside by eviction](./troubleshooting.md#recovering-a-store-set-aside-by-eviction).
 
 ### Checkpoint refs and owner leases
 
@@ -356,7 +423,7 @@ owner's temporary v2 refs when its lease is valid and either:
 - has the same persistent host ID, hostname, and runtime scope, and its PID probe returns
   `ESRCH`; or
 - differs in host ID, hostname, or runtime scope (a remote owner: another machine, a regenerated
-  `host-id` file, or on Linux a reboot) and has gone 7 days without a refresh.
+  `host-id` file, or a reboot) and has gone 7 days without a refresh.
 
 The 7-day rule compares the scanning runtime's clock with the lease mtime the owner wrote, so an
 owner suspended, clock-skewed or unable to refresh for 7 days can be reaped while still alive. Only
@@ -370,8 +437,12 @@ Git failure decide whether a turn is kept.
 On Linux, the runtime scope binds cleanup to both the current kernel boot ID and PID namespace,
 preventing a container or WSL process outside that namespace from being mistaken for a dead local
 process. If that scope cannot be resolved, automatic cleanup is disabled while v2 checkpointing and
-graceful cleanup continue. Current, live, recently refreshed remote, malformed, future-version,
-unreadable, and otherwise uncertain owners are preserved. Existing ownerless refs and completed
+graceful cleanup continue. On Windows and macOS it binds cleanup to the OS boot ID (the registry's
+`PrefetchParameters\BootId`, `kern.bootsessionuuid`), so a pid an earlier boot recorded is not
+probed against this boot's processes; if that cannot be read, the scope is the same for every boot,
+as in earlier versions, and such a pid reused by a live process keeps its refs until that process
+exits. Current, live, recently refreshed remote, malformed, future-version, unreadable, and
+otherwise uncertain owners are preserved. Existing ownerless refs and completed
 history refs are never stale-runtime cleanup candidates. Automatic maintenance runs once per
 runtime and repository, in the background, with bounded Git operations; maintenance failure does
 not block checkpoint creation or commands.

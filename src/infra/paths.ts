@@ -4,9 +4,9 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { createHash } from "node:crypto";
 
 /** Canonical (long-form, symlink-resolved) absolute path. Sync because the
- *  callers that key the store by it are sync, and `fs/promises` has no
- *  `realpath.native` — the native form is what the 8.3 short-path fixes on
- *  Windows depend on. */
+ *  callers that key the store by it are sync; `.native` because the plain
+ *  JS `realpathSync` keeps Windows 8.3 short names, which the short-path
+ *  fixes depend on expanding. */
 export function canonicalCwd(cwd: string): string {
   try {
     return realpathSync.native(cwd);
@@ -49,7 +49,7 @@ export function defaultStoreRoot(): string {
 }
 
 export function storeRootDirectory(): string {
-  const explicit = process.env.OMP_UNDO_REDO_STORE_DIR ?? process.env.OMP_UNDO_REDO_BLOB_DIR;
+  const explicit = process.env.OMP_UNDO_REDO_STORE_DIR || process.env.OMP_UNDO_REDO_BLOB_DIR;
   if (explicit) return canonicalCwd(explicit);
   if (process.env.OMP_UNDO_REDO_RUNTIME_DIR) {
     const runtime = resolve(process.env.OMP_UNDO_REDO_RUNTIME_DIR);
@@ -65,7 +65,7 @@ export function defaultRuntimeRoot(): string {
 export function runtimeRootDirectory(
   rootDirectory = process.env.OMP_UNDO_REDO_RUNTIME_DIR,
 ): string {
-  return rootDirectory === undefined ? defaultRuntimeRoot() : resolve(rootDirectory);
+  return rootDirectory ? resolve(rootDirectory) : defaultRuntimeRoot();
 }
 
 export function checkpointNamespace(sessionId: string): string {

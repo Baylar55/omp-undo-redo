@@ -16,7 +16,7 @@ Details: [What gets stored and what isn't restored](#what-gets-stored-and-what-i
 
 ## Installation
 
-Requires OMP 18.3.2+ (extensions run under Bun) or Pi with Node.js 20+, and Git. Without Git, or if the snapshot store cannot be set up, undo/redo moves only the conversation and you are told once per session. Store setup is retried every turn; a missing Git is not.
+Requires OMP 18.3.2+ (extensions run under Bun) or Pi with Node.js 20+, and Git 2.25+. Without Git, or if the snapshot store cannot be set up, undo/redo moves only the conversation and you are told once per session. Store setup is retried every turn; a missing Git is not.
 
 Install through the agent; a plain `npm install` does not register the extension.
 
@@ -40,7 +40,7 @@ In Pi, confirm with `pi list` and restart the TUI; `/undo` and `/redo` then appe
 
 Neither command takes arguments or starts a model turn. Both wait for the agent to become idle (no time limit), then up to 3 s each for an in-flight snapshot and for the last turn's finalize; if either is still running, nothing changes and you get a warning.
 
-Snapshots are taken when a turn starts and when it ends, so anything that changes a file mid-turn (a formatter on save, another OMP process in the same repository) is reverted with the agent's edits. Check the restored-file list ("Restored files: notes.md, src/app.ts.") for files the agent did not touch. Edits made after the turn are safe: if they overlap the turn's changes, `/undo` refuses and names the conflicting files; otherwise they stay in place.
+Snapshots are taken when a turn starts and when it ends, so anything that changes a file mid-turn (a formatter on save, another OMP process in the same repository) is reverted with the agent's edits. Check the restored-file list ("Restored files: notes.md, src/app.ts.") for files the agent did not touch. Edits made after the turn are safe: if they overlap the turn's changes, `/undo` refuses and names the conflicting files (an edit anywhere in a file the turn renamed counts, since the rename changes the whole file); otherwise they stay in place.
 
 - **Restarts:** history survives resuming the session in the same worktree until retention expires. If file history is missing, undo moves only the conversation, with a warning.
 - **Subagents** (`task`, eval `agent()`, `/tan`) have no undo of their own; their edits belong to the parent turn.
@@ -55,7 +55,7 @@ Internals: [docs/architecture.md](./docs/architecture.md).
 Snapshots are plaintext Git objects in the store (`~/.omp/omp-undo-redo/repos/` by default), kept for the [retention period](#configuration):
 
 - **Git projects:** tracked files plus untracked files `.gitignore` does not exclude. Your `HEAD`, branches and index are never touched, and mirror push/clone, `git bundle create --all` and `git log --all` never see the snapshots.
-- **Non-Git folders:** everything except the built-in ignore list (`.git`, `.hg`, `.svn`, `node_modules`, `.history`, `dist`, `coverage`, `.omp`, `.next`, `build`, `out`, `target`, `.vs`, `.idea`, `__pycache__`, `.venv`, `.gradle`), matched at any depth. So `.env`, `id_rsa`, `*.pem` are included, and a hand-written `docs/build/` is not.
+- **Non-Git folders:** everything except the built-in ignore list (`.git`, `.hg`, `.svn`, `node_modules`, `.history`, `dist`, `coverage`, `.omp`, `.next`, `build`, `out`, `target`, `.vs`, `.idea`, `__pycache__`, `.venv`, `.gradle`), matched as folders at any depth: a file with one of these names, such as a `build` script, is included. So `.env`, `id_rsa`, `*.pem` are included, and a hand-written `docs/build/` is not.
 - **Through a Windows junction** (`mklink /J`): Git reads it as a plain folder, so snapshots also copy the files it points at, even outside the workspace. Directory symlinks are stored as links and never followed.
 - **Skipped entirely:** your own home directory without Git (and folders above it such as `C:\Users` or `/home`), drive roots, your OS temp directory and the shared temp directories (`/tmp`, `/var/tmp`, `C:\Windows\Temp`), since snapshotting would copy `.ssh`, `AppData`, browser profiles or other users' temp files. Their subfolders are normal workspaces. Running `git init` there does not make it safe: Git mode then snapshots everything not gitignored.
 
@@ -63,7 +63,7 @@ Left as they are by `/undo` and `/redo`:
 
 - **Ignored files:** matched by `.gitignore` or the built-in list.
 - **Nested Git repositories and submodules:** contents and `HEAD` untouched; the result names them.
-- **Files Git could not read** at snapshot time (locked, e.g. Visual Studio's `.vs` databases, or no read permission); the result names them.
+- **Files and folders Git could not read** at snapshot time (locked, e.g. Visual Studio's `.vs` databases, no read permission, or a folder path past 260 characters with `core.longpaths` off); the result names them. For long paths, `git config core.longpaths true` in the repository lets later snapshots capture and restore them.
 - **Pruned Git LFS files:** snapshotting runs clean filters like `git add`, writing LFS objects to `.git/lfs/objects` (or the store's `lfs/` for non-Git folders). If `git lfs prune` removed one and LFS cannot download it again, the restore is rolled back; if the file's current version was pruned too, it is left empty.
 - **Rewritten history:** in Git mode, content reachable from `HEAD` is shared with your repository until the next store gc. Rewriting and pruning it before then (`git filter-repo`, BFG) makes those checkpoints unrestorable; undo/redo reports the failure rather than restoring part of them. Normal `git gc --prune=now` is safe.
 
@@ -71,7 +71,7 @@ Refused whole: an undo or redo that would write, create or delete a file under a
 
 ## Configuration
 
-Optional environment variables, read once at startup and applied process-wide (e.g. `export OMP_UNDO_REDO_RETENTION_DAYS=7`, or `setx OMP_UNDO_REDO_RETENTION_DAYS 7` on Windows, then open a new terminal).
+Optional environment variables applied process-wide (e.g. `export OMP_UNDO_REDO_RETENTION_DAYS=7`, or `setx OMP_UNDO_REDO_RETENTION_DAYS 7` on Windows, then open a new terminal). `OMP_UNDO_REDO_RETENTION_DAYS` is read once at startup; paths and debug logging are read on use.
 
 | Variable                       | Default                        | Meaning                                                                                                                                                                                    |
 | ------------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

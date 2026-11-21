@@ -31,11 +31,13 @@ let childScript: string;
 beforeAll(async () => {
   scratch = await mkdtemp(join(tmpdir(), "omp-undo-redo-killed-"));
   // Parent and children must share one persistent host id, or no owner is
-  // pid-probed; keep it out of the user's own state dir.
-  // shortcut: macOS reads it under homedir(), which stays ambient; stubbing
-  // HOME would also move git's global config. Upgrade if macOS CI needs it.
-  vi.stubEnv("LOCALAPPDATA", join(scratch, "state"));
-  vi.stubEnv("XDG_STATE_HOME", join(scratch, "state"));
+  // pid-probed; keep it out of the user's own state dir. test/setup.ts puts the
+  // parent's under XDG_STATE_HOME on every platform; an unmocked macOS child
+  // reads homedir()/Library/Application Support, so `launch` points the
+  // child's HOME at `scratch` and this dir is that same path.
+  const state = join(scratch, "Library", "Application Support");
+  vi.stubEnv("LOCALAPPDATA", state);
+  vi.stubEnv("XDG_STATE_HOME", state);
   const sources = (await readdir(join(repoRoot, "src"), { recursive: true }))
     .filter((file) => file.endsWith(".ts"))
     .map((file) => join("src", file))
@@ -71,7 +73,15 @@ async function launch(scenario: "undo" | "mid-turn", cwd: string, sessionId: str
   await mkdir(temp, { recursive: true });
   const child = fork(childScript, [scenario, cwd, sessionId], {
     execArgv: [],
-    env: { ...process.env, TMPDIR: temp, TEMP: temp, TMP: temp },
+    // HOME only on macOS: elsewhere the host-id path ignores it, and it would
+    // also move git's global config.
+    env: {
+      ...process.env,
+      ...(process.platform === "darwin" && { HOME: scratch }),
+      TMPDIR: temp,
+      TEMP: temp,
+      TMP: temp,
+    },
     silent: true,
   });
   children.push(child);

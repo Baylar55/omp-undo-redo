@@ -2,17 +2,21 @@ import { lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GitRunner } from "../types.js";
-import { invoke } from "../infra/git-runner.js";
+import { invoke, outputLines } from "../infra/git-runner.js";
+import { debugLog } from "../infra/debug-log.js";
 import { autocrlfSetting, autocrlfOffConfig } from "./markers.js";
 import {
   pathsOutsideSnapshots,
   RESTORE_TIMEOUT_MS,
   shieldIgnoredPaths,
   pinnedTree,
-  changedPaths,
+  treeChanges,
+  isApplied,
   applyCheckPaths,
+  misplacedHunkPaths,
   pathsBeyondLinks,
 } from "./restore-scope.js";
+import type { TreeChange } from "./restore-scope.js";
 
 /** `nestedRepositories` and `unreadableFiles`: paths whose contents the
  *  restore could not touch, relative to the worktree root (see
@@ -20,7 +24,8 @@ import {
  *  created or deleted, relative to the worktree root. The snapshots cover the
  *  whole worktree, so this includes edits made during the turn by anyone
  *  else (an editor, another process), not only the agent's.
- *  `conflictedFiles`: the paths `git apply --check` refused, relative to the
+ *  `conflictedFiles`: the paths `git apply --check` refused or would have
+ *  patched in the wrong place (see `misplacedHunkPaths`), relative to the
  *  worktree root; empty when its output named none. `linkedFiles`: the paths
  *  the restore would reach through a symlink or junction in the worktree
  *  (see `pathsBeyondLinks`); nothing was written. */
@@ -33,7 +38,9 @@ export type CheckpointApplyResult =
     }
   | { status: "conflict"; conflictedFiles: string[] }
   | { status: "linked"; linkedFiles: string[] }
-  | { status: "failed" };
+  /** `interrupted`: `git apply` wrote, and the worktree is not back where
+   *  `sourceHash` applies: files may sit between the snapshots. */
+  | { status: "failed"; interrupted?: true };
 
 /** Restores `targetHash`'s content over a worktree that currently matches
  *  `sourceHash`, via a patch instead of a checkout so the index is untouched.
@@ -57,7 +64,9 @@ export async function applyCheckpoint(
   // Read first: failing after the patch landed would misreport a restore.
   const outside = await pathsOutsideSnapshots(git, sourceHash, targetHash, ownedPaths);
   if (!outside) return { status: "failed" };
-  const { nestedRepositories, unreadableFiles, unreadablePins, ownedPins } = outside;
+  const { nestedRepositories, unreadablePins, keptPins } = outside;
+  // A folder keeps its trailing "/", so the report tells it from a file.
+  const unreadableFiles = [...outside.unreadableFiles, ...outside.unreadableDirectories].sort();
   let config: string[] = [];
   if (outside.autocrlfOff) {
     const setting = await autocrlfSetting(git);
@@ -68,12 +77,13 @@ export async function applyCheckpoint(
     git,
     sourceHash,
     targetHash,
-    [...unreadablePins, ...ownedPins],
+    [...unreadablePins, ...keptPins],
     ownedPaths,
     config,
     checkOnly,
   );
   if (applied === "failed") return { status: "failed" };
+  if (applied === "interrupted") return { status: "failed", interrupted: true };
   if ("conflictedFiles" in applied) return { status: "conflict", ...applied };
   if ("linkedFiles" in applied) return { status: "linked", ...applied };
   return { status: "applied", nestedRepositories, unreadableFiles, ...applied };
@@ -99,30 +109,22 @@ export async function applyCheckpoint(
 async function rollbackPartialApply(
   git: GitRunner,
   sourceHash: string,
-  targetHash: string,
+  changes: readonly TreeChange[],
   directory: string,
   config: readonly string[],
 ): Promise<void> {
   const worktree = git.cwd;
   if (!worktree) return;
   const timeoutMs = RESTORE_TIMEOUT_MS;
-  const changes = await invoke(
-    git,
-    ["diff-tree", "-r", "-z", "--no-renames", sourceHash, targetHash],
-    { timeoutMs },
-  );
-  if (changes.error || changes.code !== 0) return;
-
-  // Raw records: ":<srcmode> <dstmode> <srcsha> <dstsha> <status>\0<path>\0".
   const restore: string[] = [];
   const remove: string[] = [];
   const written = new Map<string, string>();
   const added = new Set<string>();
-  const fields = changes.stdout.split("\0");
-  for (let index = 0; index + 1 < fields.length; index += 2) {
-    const [sourceMode, targetMode, , targetSha, status] = fields[index]!.slice(1).split(" ");
-    const path = fields[index + 1]!;
-    if (sourceMode === "160000" || targetMode === "160000") continue;
+  // Deleted paths found on disk: on a case-insensitive file system possibly
+  // only through an added case twin (see `caseTwinCreations`) that the
+  // removal below takes away, leaving the source's file missing.
+  const deleted: string[] = [];
+  for (const { path, targetSha, status } of changes.filter(isApplied)) {
     const present = await lstat(join(worktree, path)).catch(() => null);
     if (status === "A") {
       // Apply writes nothing when an added path already exists, so a file
@@ -130,7 +132,7 @@ async function rollbackPartialApply(
       // even an empty file (a failed smudge, as below, or a user's lock or
       // marker file), may have been created after `apply --check`: kept.
       if (present?.isFile()) {
-        written.set(path, targetSha!);
+        written.set(path, targetSha);
         added.add(path);
       }
     } else if (!present) {
@@ -142,30 +144,21 @@ async function rollbackPartialApply(
       // is apply's write or an empty source: restoring the source is safe.
       restore.push(path);
     } else if (status !== "D" && present.isFile()) {
-      written.set(path, targetSha!);
+      written.set(path, targetSha);
+    } else if (status === "D") {
+      deleted.push(path);
     }
   }
-  if (written.size > 0) {
-    const paths = [...written.keys()];
-    // C-quote every line: git unquotes a line starting with `"` and dies on
-    // the whole batch if that fails, and a raw newline would split a path.
-    const quoted = paths.map(
-      (path) => `"${path.replace(/[\\"\n]/g, (c) => (c === "\n" ? "\\n" : `\\${c}`))}"`,
-    );
-    const hashed = await invoke(git, [...config, "hash-object", "--stdin-paths"], {
-      stdin: `${quoted.join("\n")}\n`,
-      timeoutMs,
-    });
-    if (hashed.code === 0 && !hashed.error) {
-      const ids = hashed.stdout.split("\n");
-      paths.forEach((path, index) => {
-        if (ids[index] !== written.get(path)) return;
-        (added.has(path) ? remove : restore).push(path);
-      });
-    }
+  for (const path of (await pathsHoldingBlobs(git, written, config)) ?? []) {
+    (added.has(path) ? remove : restore).push(path);
   }
   for (const path of remove) {
     await rm(join(worktree, path), { force: true }).catch(() => undefined);
+  }
+  if (remove.length > 0) {
+    for (const path of deleted) {
+      if (!(await lstat(join(worktree, path)).catch(() => null))) restore.push(path);
+    }
   }
   if (restore.length === 0) return;
 
@@ -177,6 +170,94 @@ async function rollbackPartialApply(
     stdin: restore.map((path) => `${path}\0`).join(""),
     timeoutMs,
   });
+}
+
+/** Paths of `expected` whose worktree file, hashed under `config` and the
+ *  attributes on disk, is the blob `expected` maps it to; null when git
+ *  fails. */
+async function pathsHoldingBlobs(
+  git: GitRunner,
+  expected: ReadonlyMap<string, string>,
+  config: readonly string[],
+): Promise<string[] | null> {
+  const paths = [...expected.keys()];
+  if (paths.length === 0) return [];
+  // C-quote every line: git unquotes a line starting with `"` and dies on
+  // the whole batch if that fails, and a raw newline would split a path.
+  const quoted = paths.map(
+    (path) => `"${path.replace(/[\\"\n]/g, (c) => (c === "\n" ? "\\n" : `\\${c}`))}"`,
+  );
+  const hashed = await invoke(git, [...config, "hash-object", "--stdin-paths"], {
+    stdin: `${quoted.join("\n")}\n`,
+    timeoutMs: RESTORE_TIMEOUT_MS,
+  });
+  if (hashed.code !== 0 || hashed.error) return null;
+  const ids = hashed.stdout.split("\n");
+  return paths.filter((path, index) => ids[index] === expected.get(path));
+}
+
+/** A `.gitattributes` at any depth, in any case (the case-insensitive file
+ *  systems of Windows and macOS serve it to git under any). */
+const ATTRIBUTES_FILE = /(?:^|\/)\.gitattributes$/i;
+
+/** Regular files of `targetHash` that `git apply` writes as exactly their
+ *  `targetHash` blob: created ones (`apply --check` proved the path free) and
+ *  modified ones whose worktree file still hashes to the `sourceHash` blob.
+ *  A drifted file gets the hunks merged into the user's edits instead, which
+ *  a checkout of the target would destroy. Run before apply, so the hash
+ *  reads under the attributes on disk, as apply does. Null when git fails. */
+async function exactRestorePaths(
+  git: GitRunner,
+  changes: readonly TreeChange[],
+  config: readonly string[],
+): Promise<string[] | null> {
+  const exact: string[] = [];
+  const modified = new Map<string, string>();
+  for (const { sourceMode, targetMode, sourceSha, path } of changes) {
+    if (!targetMode.startsWith("100") || sourceMode === "160000") continue;
+    if (sourceMode.startsWith("100")) modified.set(path, sourceSha);
+    else exact.push(path);
+  }
+  const unchanged = await pathsHoldingBlobs(git, modified, config);
+  return unchanged && [...exact, ...unchanged];
+}
+
+/** Paths `targetHash` adds over `sourceHash` that, in `worktree`, are the
+ *  same file as another path the restore changes: on a case-insensitive file
+ *  system, the old name of a case-only rename. Comparing the files, not
+ *  `core.ignorecase`, leaves a case-sensitive one (or a file the user put
+ *  at the new name) to `git apply`'s own check. */
+async function caseTwinCreations(
+  worktree: string,
+  changes: readonly TreeChange[],
+): Promise<string[]> {
+  const byCase = new Map<string, string[]>();
+  const added: string[] = [];
+  for (const { path, status } of changes) {
+    if (status === "A") added.push(path);
+    const key = path.toLowerCase();
+    byCase.set(key, [...(byCase.get(key) ?? []), path]);
+  }
+  // An inode of 0 (some network file systems) identifies nothing.
+  const identity = (path: string) =>
+    lstat(join(worktree, path), { bigint: true }).then(
+      (stats) => (stats.ino === 0n ? null : `${stats.dev}:${stats.ino}`),
+      () => null,
+    );
+  const twins: string[] = [];
+  for (const path of added) {
+    const others = byCase.get(path.toLowerCase())!.filter((other) => other !== path);
+    if (others.length === 0) continue;
+    const file = await identity(path);
+    if (!file) continue;
+    for (const other of others) {
+      if ((await identity(other)) === file) {
+        twins.push(path);
+        break;
+      }
+    }
+  }
+  return twins;
 }
 
 /** Every flag pins the plumbing contract against the user's own
@@ -202,7 +283,11 @@ async function applyPatch(
   config: readonly string[],
   checkOnly: boolean,
 ): Promise<
-  { restoredFiles: string[] } | { conflictedFiles: string[] } | { linkedFiles: string[] } | "failed"
+  | { restoredFiles: string[] }
+  | { conflictedFiles: string[] }
+  | { linkedFiles: string[] }
+  | "failed"
+  | "interrupted"
 > {
   let tempDirectory: string | null = null;
   try {
@@ -218,27 +303,29 @@ async function applyPatch(
       tempDirectory,
     );
     if (!effectiveTarget) return "failed";
-    const diff = await invoke(
-      git,
-      [
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-relative",
-        "--ignore-submodules=none",
-        "--submodule=short",
-        "-U3",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        "--exit-code",
-        "--binary",
-        sourceHash,
-        effectiveTarget,
-        `--output=${patchPath}`,
-      ],
-      restore,
-    );
+    // `-c` rather than `--no-relative`, which git before 2.28 rejects; older
+    // git has no `diff.relative` and ignores the unknown key.
+    const diffArgs = [
+      "-c",
+      "diff.relative=false",
+      "diff",
+      "--no-color",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=none",
+      // Per-path, as every other restore step: a rename section moves the
+      // user's edit to the old name instead of `apply --check` refusing it.
+      "--no-renames",
+      "--submodule=short",
+      "-U3",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      "--exit-code",
+      "--binary",
+      sourceHash,
+      effectiveTarget,
+    ];
+    const diff = await invoke(git, [...diffArgs, `--output=${patchPath}`], restore);
     // A killed or unspawnable child also exits 1, which is `--exit-code`'s
     // "there were differences": without this the truncated patch `--output`
     // already wrote would be applied and reported as a complete restore.
@@ -246,8 +333,9 @@ async function applyPatch(
     if (diff.code === 0) return { restoredFiles: [] };
     if (diff.code !== 1) return "failed";
     // Listed before applying: failing after the patch landed would misreport.
-    const restoredFiles = await changedPaths(git, sourceHash, effectiveTarget);
-    if (!restoredFiles) return "failed";
+    const changes = await treeChanges(git, sourceHash, effectiveTarget);
+    if (!changes) return "failed";
+    const restoredFiles = changes.filter(isApplied).map((change) => change.path);
     // Before `--check` too: recovery's check-only probe must not call such a
     // restore applicable. A runner from a host's `gitRunnerFactory` may carry
     // no cwd: git then names the worktree. A scan of the disk as it is now: a
@@ -256,21 +344,55 @@ async function applyPatch(
     let worktree = git.cwd;
     if (!worktree) {
       const top = await invoke(git, ["rev-parse", "--show-toplevel"]);
-      worktree = top.code === 0 && !top.error ? top.stdout.trim() : "";
+      worktree = top.code === 0 && !top.error ? outputLines(top.stdout)[0] : "";
       if (!worktree) return "failed";
     }
     const linked = await pathsBeyondLinks(worktree, restoredFiles);
     if (linked.length > 0) return { linkedFiles: linked };
+    // A case-insensitive file system serves a case-only rename's old file
+    // under the new name, so `git apply` (which checks every created path
+    // before deleting anything) reports it as "already exists". Those
+    // creations go to a second patch applied once the first has deleted the
+    // old file; checking only the first is complete: the created path is
+    // the old file, whose deletion it checks.
+    const deferred = await caseTwinCreations(worktree, changes);
+    let createPath: string | null = null;
+    if (deferred.length > 0) {
+      createPath = join(tempDirectory, "case-renames.patch");
+      for (const [output, magic] of [
+        [patchPath, "top,exclude,literal"],
+        [createPath, "top,literal"],
+      ] as const) {
+        const pathspecs = deferred.map((path) => `:(${magic})${path}`);
+        const split = await invoke(
+          git,
+          [...diffArgs, `--output=${output}`, "--", ...pathspecs],
+          restore,
+        );
+        if (split.error || split.code !== 1) return "failed";
+      }
+    }
 
-    const check = await invoke(
-      git,
-      [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace", "--check", patchPath],
-      {
-        ...restore,
-        env: { LC_ALL: "C" },
-      },
-    );
-    if (check.code !== 0) {
+    const checkArgs = [
+      ...config,
+      "apply",
+      "--whitespace=nowarn",
+      "--no-ignore-whitespace",
+      "--check",
+    ];
+    const checkOptions = { ...restore, env: { LC_ALL: "C" } };
+    // `-v` reports every hunk git matched away from its recorded line.
+    const verbose = await invoke(git, [...checkArgs, "-v", patchPath], checkOptions);
+    // The probe index: see `misplacedHunkPaths` and the drift probe below.
+    const probeEnv: Record<string, string> = {
+      GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
+    };
+    if (git.env?.GIT_DIR && git.cwd) probeEnv.GIT_WORK_TREE = git.cwd;
+    if (verbose.code !== 0) {
+      if (verbose.error) return "failed";
+      // A failed `-v` check also prints the file lines a hunk searched for,
+      // which `applyCheckPaths` would read as git's own messages.
+      const check = await invoke(git, [...checkArgs, patchPath], checkOptions);
       if (check.error) return "failed";
       // `apply --check` failing does not prove the worktree drifted: a patch
       // git cannot parse fails identically. When the worktree still matches
@@ -291,10 +413,6 @@ async function applyPatch(
       // warning per file. The extension's own directories are left out: their
       // files drift every turn, and an old snapshot holding them would always
       // read as a conflict.
-      const probeEnv: Record<string, string> = {
-        GIT_INDEX_FILE: join(tempDirectory, "probe-index"),
-      };
-      if (git.env?.GIT_DIR && git.cwd) probeEnv.GIT_WORK_TREE = git.cwd;
       const seeded = await invoke(git, ["read-tree", sourceHash], { env: probeEnv });
       if (seeded.error || seeded.code !== 0) return "failed";
       const tracked = await invoke(
@@ -305,6 +423,9 @@ async function applyPatch(
           "core.safecrlf=false",
           "-c",
           "diff.autoRefreshIndex=true",
+          // Not `--no-relative`: git before 2.28 rejects it (see `diffArgs`).
+          "-c",
+          "diff.relative=false",
           "diff",
           "--no-ext-diff",
           "--no-textconv",
@@ -321,19 +442,84 @@ async function applyPatch(
       if (check.stderr.includes("already exists in working directory")) return conflict;
       return "failed";
     }
+    const misplaced = await misplacedHunkPaths(
+      git,
+      sourceHash,
+      patchPath,
+      verbose.stderr,
+      config,
+      probeEnv,
+    );
+    if (!misplaced) return "failed";
+    if (misplaced.length > 0) return { conflictedFiles: misplaced };
 
     if (checkOnly) return { restoredFiles };
-    const applied = await invoke(
-      git,
-      [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace", patchPath],
-      restore,
+    // `git apply` converts the files it writes under the attributes on disk
+    // before the patch, so a restore that changes a `.gitattributes` wrote
+    // them the source's way (CRLF where the target holds no `eol=crlf`), and
+    // the next restore read them as drift. The files apply writes as exactly
+    // the target's blob are checked out again from it, under the target's
+    // attributes, as `git checkout` would write them. The index is seeded
+    // before apply, so only the checkout can fail once the patch landed; an
+    // edit landing between the hash and the checkout is overwritten.
+    // ponytail: a drifted file keeps the source's conversion; re-convert the
+    // merged blob (`apply --cached` on a scratch index) if that ever matters.
+    const reconvert = restoredFiles.some((path) => ATTRIBUTES_FILE.test(path))
+      ? await exactRestorePaths(git, changes, config)
+      : [];
+    if (!reconvert) return "failed";
+    const targetEnv: Record<string, string> = {
+      GIT_INDEX_FILE: join(tempDirectory, "target-index"),
+    };
+    if (git.env?.GIT_DIR) targetEnv.GIT_WORK_TREE = worktree;
+    if (reconvert.length > 0) {
+      const seeded = await invoke(git, ["read-tree", effectiveTarget], { env: targetEnv });
+      if (seeded.error || seeded.code !== 0) return "failed";
+    }
+    const applyArgs = [...config, "apply", "--whitespace=nowarn", "--no-ignore-whitespace"];
+    let applied = await invoke(git, [...applyArgs, patchPath], restore);
+    // Never spawned, so nothing was written: no rollback (see below).
+    if (applied.error === "unavailable") return "failed";
+    if (applied.code === 0 && createPath) {
+      applied = await invoke(git, [...applyArgs, createPath], restore);
+    } else if (applied.code !== 0 && !applied.error && applied.stderr) {
+      // Apply checks the whole patch before writing any of it, so when
+      // `--check` repeats its failure word for word, apply stopped at that
+      // check and wrote nothing: the user changed a path since the check
+      // above. No rollback, which would read a file they deleted or emptied
+      // as one apply removed and restore it. A failed write leaves other
+      // messages (git's write error vs. the paths it removed), and a killed
+      // or timed-out apply may have written: both still roll back, as does
+      // a failed case-rename patch (the first one already wrote). The
+      // comparison runs in apply's own locale; the paths are read under
+      // `LC_ALL=C`, as `applyCheckPaths` expects.
+      const recheck = await invoke(git, [...applyArgs, "--check", patchPath], restore);
+      if (!recheck.error && recheck.code !== 0 && recheck.stderr === applied.stderr) {
+        const check = await invoke(git, [...checkArgs, patchPath], checkOptions);
+        return { conflictedFiles: check.error ? [] : applyCheckPaths(check.stderr) };
+      }
+    }
+    if (applied.code === 0) {
+      if (reconvert.length === 0) return { restoredFiles };
+      // Without stat data in the index every path is rewritten.
+      const checkout = await invoke(git, [...config, "checkout-index", "-f", "-z", "--stdin"], {
+        env: targetEnv,
+        stdin: reconvert.map((path) => `${path}\0`).join(""),
+        ...restore,
+      });
+      return !checkout.error && checkout.code === 0 ? { restoredFiles } : "interrupted";
+    }
+    await rollbackPartialApply(git, sourceHash, changes, tempDirectory, config).catch(
+      (error: unknown) => debugLog({ event: "restore-rollback-failed", error: String(error) }),
     );
-    if (applied.code === 0) return { restoredFiles };
-    await rollbackPartialApply(git, sourceHash, effectiveTarget, tempDirectory, config).catch(
-      () => undefined,
-    );
-    return "failed";
-  } catch {
+    // Where the check above passed again: the worktree is back at the source
+    // (edits outside the hunks aside), so a retry is all the user needs.
+    const back = await invoke(git, [...checkArgs, patchPath], checkOptions);
+    return !back.error && back.code === 0 ? "failed" : "interrupted";
+  } catch (error) {
+    debugLog({ event: "restore-failed", error: String(error) });
+    // Nothing from `git apply` on can throw (`invoke` returns its errors, the
+    // rollback is caught), so an exception here means nothing was written.
     return "failed";
   } finally {
     if (tempDirectory !== null) {

@@ -1,14 +1,19 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { GitRunner } from "../types.js";
-import { invoke } from "../infra/git-runner.js";
+import { invoke, outputLines } from "../infra/git-runner.js";
 
 /** Commit-message lines naming paths a snapshot left out: a nested repository
- *  with no commit, and a file git could not read (locked by another process,
- *  no read permission), whose tree entry is stale or missing. */
+ *  with no commit, a file git could not read (locked by another process,
+ *  no read permission), whose tree entry is stale or missing, and a folder
+ *  git could not open (no permission, a path past MAX_PATH under
+ *  `core.longpaths=false`), with a trailing `/`, whose entries are stale or
+ *  missing. */
 export const NESTED_REPOSITORY_LINE = "Nested repository outside snapshot: ";
 
 export const UNREADABLE_FILE_LINE = "Unreadable file outside snapshot: ";
+
+export const UNREADABLE_DIRECTORY_LINE = "Unreadable directory outside snapshot: ";
 
 /** Commit-message line of a snapshot captured with `core.autocrlf=false`:
  *  a file no text/eol attribute covers is stored as its bytes on disk.
@@ -58,10 +63,11 @@ export async function excludeRules(git: GitRunner, env?: Record<string, string>)
     invoke(git, ["config", "--path", "--default", fallback, "--get", "core.excludesFile"], { env }),
   ]);
   if (paths.error || paths.code !== 0 || global.error || global.code !== 0) return "";
-  const [top, exclude] = paths.stdout.split("\n").map((line) => line.trim());
+  const [top, exclude] = outputLines(paths.stdout);
+  const [excludesFile = ""] = outputLines(global.stdout);
   if (!top || !exclude) return "";
   // `--git-path` is relative to the cwd; git reads a relative excludesFile from the top.
-  const files = [resolve(top, global.stdout.trim()), resolve(git.cwd ?? process.cwd(), exclude)];
+  const files = [resolve(top, excludesFile), resolve(git.cwd ?? process.cwd(), exclude)];
   const contents = await Promise.all(files.map((file) => readFile(file, "latin1").catch(() => "")));
   // Latin-1 maps bytes 1:1, so any rule bytes survive the round trip.
   const rules = contents
@@ -89,6 +95,7 @@ export async function recordedExcludeRules(git: GitRunner, commit: string): Prom
 export interface OutsideSnapshot {
   nestedRepositories: string[];
   unreadableFiles: string[];
+  unreadableDirectories: string[];
 }
 
 export function snapshotMessage(message: string, outside: OutsideSnapshot, rules = ""): string {
@@ -96,6 +103,7 @@ export function snapshotMessage(message: string, outside: OutsideSnapshot, rules
     AUTOCRLF_OFF_LINE,
     ...outside.nestedRepositories.map((path) => `${NESTED_REPOSITORY_LINE}${path}`),
     ...outside.unreadableFiles.map((path) => `${UNREADABLE_FILE_LINE}${path}`),
+    ...outside.unreadableDirectories.map((path) => `${UNREADABLE_DIRECTORY_LINE}${path}`),
     ...(rules ? [`${EXCLUDE_RULES_LINE}${rules}`] : []),
   ];
   return `${message}\n\n${lines.join("\n")}`;

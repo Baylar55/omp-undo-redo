@@ -9,7 +9,7 @@ import { IndexLeasePool } from "../snapshot/index-leases.js";
 import { defaultGitRunnerFactory } from "../store/backend.js";
 import type { FileBackend, PrivateRepoEntry } from "../store/backend.js";
 import { snapshotRunnerEnv } from "../store/git-store.js";
-import { resolvePersistentHostId, resolveRuntimeScope } from "../store/host-identity.js";
+import { localHostIdentity, localRuntimeScope } from "../store/host-identity.js";
 import { GcQueue } from "../store/maintenance/gc.js";
 import { CheckpointOwnerRegistry } from "../store/owners.js";
 import type {
@@ -64,7 +64,9 @@ export type OmpUndoRedoDependencies = {
   gitRunnerFactory?: CwdGitRunnerFactory;
   /** How long the before_agent_start / agent_end / undo / redo handlers wait
    *  for an in-flight checkpoint capture before returning without it. The
-   *  capture keeps running and the turn is finalized when it settles. */
+   *  capture keeps running and the turn is finalized when it settles. Undo and
+   *  redo also wait this long for a started run's late `agent_end`, and then
+   *  for the host to report idle. */
   captureDeadlineMs?: number;
   /** How long a `tool_call` waits for the turn's before-snapshot. Must stay
    *  under the host's 30 s `tool_call` cap, which blocks the tool on timeout. */
@@ -102,6 +104,11 @@ export type ExtensionServices = {
    *  turn starts also holds that turn's edits, which makes it unrestorable.
    *  Never reset, so a session start cannot make a stale value match again. */
   turnSequence: number;
+  /** Settles at the `agent_end` that closes the open run (`flags.runOpen`).
+   *  The host emits `agent_end` to extensions only after its own post-run
+   *  maintenance, so `/undo` can find the host idle with the run's turn not
+   *  yet claimed by a finalize; it waits on this. */
+  runEnd: PromiseWithResolvers<void>;
   /** Turn work (captures, finalizes, session events) shutdown waits on. */
   activeOperations: Set<Promise<void>>;
   /** Background store gcs and retention sweeps: shutdown never waits on them
@@ -109,6 +116,10 @@ export type ExtensionServices = {
   housekeepingOperations: Set<Promise<void>>;
   expirationPromises: Map<string, Promise<void>>;
   explicitActiveHashes: Set<string>;
+  /** Sessions left by a switch whose release has not ended, each to its
+   *  release's token: `liveSessionId` never refiles their records. Entries
+   *  leave with their release, so the map holds at most the in-flight ones. */
+  leavingSessions: Map<string, object>;
   /** Keyed `${sessionId}\0${reason}`: session ids are UUIDs, so the separator
    *  cannot collide. Never pruned: a re-resumed session is not notified again. */
   notifiedSessionReasons: Set<string>;
@@ -118,6 +129,25 @@ export type ExtensionServices = {
      *  subagent session (`ctx.agent.kind === "sub"`); see `isMainSession`. */
     servesMainSession: boolean;
     servesSubagent: boolean;
+    /** The host's agent loop is between `agent_start` and `agent_end`. One
+     *  loop per copy at a time, so not per session: a mid-run session switch
+     *  must not strand it. */
+    runOpen: boolean;
+    /** A `before_agent_start` since the last `agent_end` opened a turn. A
+     *  steering or follow-up message the host injects into a running loop
+     *  emits `before_agent_start` again, but the loop still ends with one
+     *  `agent_end`: with both flags set, that turn is already open. */
+    turnOpen: boolean;
+    /** The last `agent_end` held the turn open (`willContinue`, or any one
+     *  under Pi, `runsEndAtSettle`): the host may run a
+     *  continuation (retry, compaction resume, todo reminder) with no prompt
+     *  of its own, so the turn stays open for it. Its `agent_start` clears
+     *  this; anything else first settles the turn (`settleContinuation`). */
+    continuing: boolean;
+    /** This copy runs under Pi (`isPiSessionStart`): every `agent_end` holds
+     *  the turn open, and `agent_settled` (or the next prompt, command or
+     *  navigation) ends it. */
+    runsEndAtSettle: boolean;
     pendingNavigationSourceSessionId: string | null;
   };
   gitRunnerFor(repository: GitRepository): GitRunner;
@@ -139,10 +169,10 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     return gitRunnerFactory(repository.worktree, snapshotRunnerEnv(repository));
   }
   const ownerRegistry = new CheckpointOwnerRegistry({
-    resolveHostIdentity: resolvePersistentHostId,
-    resolveRuntimeScope,
+    resolveHostIdentity: localHostIdentity,
+    resolveRuntimeScope: localRuntimeScope,
   });
-  const runtimeStore = new RuntimeActionStateStore({ resolveRuntimeScope });
+  const runtimeStore = new RuntimeActionStateStore({ resolveRuntimeScope: localRuntimeScope });
   return {
     gitRunnerFactory,
     captureDeadlineMs,
@@ -158,15 +188,21 @@ export function createServices(deps: OmpUndoRedoDependencies): ExtensionServices
     privateRetentionSweep: null,
     sessions: new Map(),
     turnSequence: 0,
+    runEnd: Promise.withResolvers<void>(),
     activeOperations: new Set(),
     housekeepingOperations: new Set(),
     expirationPromises: new Map(),
     explicitActiveHashes: new Set(),
+    leavingSessions: new Map(),
     notifiedSessionReasons: new Set(),
     flags: {
       closing: false,
       servesMainSession: false,
       servesSubagent: false,
+      runOpen: false,
+      turnOpen: false,
+      continuing: false,
+      runsEndAtSettle: false,
       pendingNavigationSourceSessionId: null,
     },
     gitRunnerFor,

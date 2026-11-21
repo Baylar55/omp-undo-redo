@@ -1,15 +1,22 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import { SHUTDOWN_BUDGET_MS, SHUTDOWN_TURN_DRAIN_MS } from "../host-contract.js";
-import type { AnyContext } from "../host-contract.js";
+import type { AnyContext, CommandHost } from "../host-contract.js";
 import { historyDirectory } from "../history/layout.js";
-import { touchSessionHeartbeat } from "../history/liveness.js";
+import { releaseSessionHeartbeat, touchSessionHeartbeat } from "../history/liveness.js";
 import { timedOutAfter, track } from "../infra/async.js";
 import { checkpointNamespace } from "../infra/paths.js";
 import type { ActionId, PendingTurnCheckpoint } from "../types.js";
-import { ensureNavigation, initializeNavigation, stateOf } from "./controller.js";
+import {
+  ensureNavigation,
+  initializeNavigation,
+  liveSessionId,
+  recordSessionId,
+  stateOf,
+} from "./controller.js";
 import { isMainSession, runShutdownHousekeeping } from "./housekeeping.js";
 import type { SessionNavigation } from "./navigation.js";
 import type { ExtensionServices } from "./services.js";
-import { agentEnd } from "./turn-end.js";
+import { agentEnd, settleContinuation } from "./turn-end.js";
 import { beforeAgentStart, releasePending, toolCall } from "./turn-start.js";
 
 /** Why `/undo` or `/redo` cannot run now, or the navigation to run it on. */
@@ -20,17 +27,13 @@ export type CommandNavigation =
 /** The one entry point `host/` uses into `session/`. */
 export type SessionRegistry = {
   publishActionResult(
-    sessionId: string,
     navigation: SessionNavigation,
     ctx: AnyContext,
     id: ActionId,
     token: string,
     applied: boolean,
   ): Promise<void>;
-  commandNavigation(
-    typed: AnyContext,
-    waitForIdle: () => Promise<void>,
-  ): Promise<CommandNavigation>;
+  commandNavigation(typed: AnyContext & CommandHost): Promise<CommandNavigation>;
   sessionStart(typed: AnyContext): Promise<void>;
   sessionTree(
     typed: AnyContext,
@@ -39,9 +42,12 @@ export type SessionRegistry = {
   rememberNavigationSource(event: unknown, ctx: AnyContext): void;
   adoptSwitchedSession(typed: AnyContext): Promise<void>;
   beforeAgentStart(typed: AnyContext): Promise<void>;
+  agentStart(): void;
   toolCall(typed: AnyContext): Promise<void>;
-  agentEnd(typed: AnyContext): Promise<void>;
-  shutdown(): Promise<void>;
+  agentEnd(typed: AnyContext, willContinue?: boolean): Promise<void>;
+  settleContinuation(typed: AnyContext): Promise<void>;
+  /** `leftSession`: a committed `/new`, `/resume` or fork (Pi), which clears redo. */
+  shutdown(leftSession?: boolean): Promise<void>;
 };
 
 /** Every session of this extension copy: session lifecycle events, switching
@@ -78,13 +84,17 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     [...sessions.values()].flatMap((s) => (s.navigation === undefined ? [] : [s.navigation]));
 
   async function publishActionResult(
-    sessionId: string,
     navigation: SessionNavigation,
     ctx: AnyContext,
     id: ActionId,
     token: string,
     applied: boolean,
   ): Promise<void> {
+    // Detached by a session switch: its emptied state would re-create the
+    // left session's state file (or overwrite a resumed one's).
+    if (navigation.suspended) return;
+    // The command's own session move can be what made the host change the id.
+    const sessionId = liveSessionId(services, ctx);
     await services.runtimeStore.publishActionResult(
       sessionId,
       navigation.snapshot(),
@@ -95,16 +105,35 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
 
   /** `/undo` and `/redo`: the session's navigation once the last turn's
    *  capture and every session's finalize settled. */
-  async function commandNavigation(
-    typed: AnyContext,
-    waitForIdle: () => Promise<void>,
-  ): Promise<CommandNavigation> {
+  async function commandNavigation(typed: AnyContext & CommandHost): Promise<CommandNavigation> {
     if (!isMainSession(services, typed)) return { status: "subagent" };
-    const sessionId = typed.sessionManager.getSessionId();
     // Commands run even mid-stream: the turn's finalize only registers at
     // agent_end, so the guards below must be read after the idle wait.
-    await waitForIdle();
-    const state = sessions.get(sessionId);
+    await typed.waitForIdle();
+    // The host emits `agent_end` to extensions only after its post-run
+    // maintenance (compaction, session_stop hooks) and behind other
+    // extensions' handlers, so its loop can be idle while this run's turn is
+    // still unclaimed. Navigating now would revert the turn before it, and
+    // the late finalize would then record this turn over the undone branch.
+    if (
+      services.flags.runOpen &&
+      (await timedOutAfter(services.runEnd.promise, services.captureDeadlineMs))
+    ) {
+      return { status: "finalizing" };
+    }
+    // A different gap: the host delivers `agent_end` (detached) before it
+    // stops counting the prompt in flight, and `isIdle()` stays false until
+    // then, so `runNavigation`'s busy check could refuse a command typed
+    // mid-stream. Before the continuation settle: a continuation the host
+    // schedules meanwhile still gets to open (`agent_start`).
+    const idleBy = Date.now() + services.captureDeadlineMs;
+    while (!typed.isIdle() && !services.flags.closing && Date.now() < idleBy) await sleep(50);
+    // Idle with a turn still held for a continuation: it was skipped, or
+    // waits on async work. Record it before navigating past it.
+    await settleContinuation(services, typed);
+    // Read after the waits: the turn they waited on can be what moved the
+    // session to a new id.
+    const state = sessions.get(liveSessionId(services, typed));
     // Every session's: a session left by /new or /resume may still be taking
     // its after-snapshot of the shared workspace, and a restore written under
     // it would land in that session's checkpoint. Finalizes never reject.
@@ -153,16 +182,34 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
    *  for the process's lifetime; a later resume reloads it from its persisted
    *  history, as after a restart. Its in-flight work settles first so the
    *  last turn still lands in that history. */
-  async function releaseLeftSession(typed: AnyContext, sessionId: string): Promise<void> {
+  async function releaseLeftSession(
+    typed: AnyContext,
+    sessionId: string,
+    token: object,
+  ): Promise<void> {
+    try {
+      await drainLeftSession(typed, sessionId);
+    } finally {
+      // Even on a throw: left behind, the id would never follow a move again.
+      if (services.leavingSessions.get(sessionId) === token) {
+        services.leavingSessions.delete(sessionId);
+      }
+    }
+  }
+
+  async function drainLeftSession(typed: AnyContext, sessionId: string): Promise<void> {
     const state = stateOf(services, sessionId);
     for (;;) {
       const busy = state.finalize ?? state.initialization ?? state.capture?.complete;
       if (!busy) break;
       await Promise.allSettled([busy]);
     }
-    // Resumed (or reloaded) again meanwhile: it is live.
-    if (services.flags.closing || typed.sessionManager.getSessionId() === sessionId) return;
+    // Resumed (or reloaded) again meanwhile: it is live. If the host has moved
+    // it since, the record is the new id's (`liveSessionId` files it there).
+    if (services.flags.closing || liveSessionId(services, typed) === sessionId) return;
+    if (recordSessionId(services, state, sessionId) !== sessionId) return;
     const navigation = state.navigation;
+    const backend = state.backend;
     const left = state.pending;
     state.navigation = undefined;
     state.pending = undefined;
@@ -184,12 +231,20 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       // `releaseAll` still finds any such lease.
       services.leasePool.releasePersistentSnapshotIndices([sessionId], { inUse: false }),
     ]);
+    // Its marker named this live process, which would shield it from every
+    // sweep until exit; it now ages by mtime. Not if resumed meanwhile.
+    if (backend?.kind === "git" && typed.sessionManager.getSessionId() !== sessionId) {
+      await releaseSessionHeartbeat(
+        historyDirectory(backend.repository),
+        checkpointNamespace(sessionId),
+      );
+    }
   }
 
   async function sessionStart(typed: AnyContext): Promise<void> {
     if (services.flags.closing) return;
     if (!isMainSession(services, typed)) return;
-    const sessionId = typed.sessionManager.getSessionId();
+    const sessionId = liveSessionId(services, typed);
     const state = stateOf(services, sessionId);
     const previousPending = state.pending;
     state.pending = undefined;
@@ -208,7 +263,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     event: { oldLeafId: string | null; newLeafId: string | null },
   ): Promise<void> {
     if (services.flags.closing) return;
-    const navigation = sessions.get(typed.sessionManager.getSessionId())?.navigation;
+    const navigation = sessions.get(liveSessionId(services, typed))?.navigation;
     if (!navigation) return;
     await navigation.handleSessionTreeNavigation(event.oldLeafId, event.newLeafId);
   }
@@ -218,7 +273,7 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
   // which is a safe superset, and releases no session (unknown source).
   const rememberNavigationSource = (_event: unknown, ctx: AnyContext): void => {
     if (services.flags.closing) return;
-    services.flags.pendingNavigationSourceSessionId = ctx.sessionManager.getSessionId();
+    services.flags.pendingNavigationSourceSessionId = liveSessionId(services, ctx);
   };
 
   // The host emits no `session_start` for the session it switched to, so its
@@ -228,11 +283,26 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     if (services.flags.closing) return;
     if (!isMainSession(services, typed)) return;
     const sourceSessionId = services.flags.pendingNavigationSourceSessionId;
+    const token = {};
+    if (sourceSessionId) services.leavingSessions.set(sourceSessionId, token);
+    // Files the copy's record before anything awaits: from then on
+    // `liveSessionId` finds it and never refiles the source's (see there).
+    const sessionId = liveSessionId(services, typed);
+    stateOf(services, sessionId);
     services.flags.pendingNavigationSourceSessionId = null;
+    // Live again (a same-id reload, or a resume of a session still being left).
+    services.leavingSessions.delete(sessionId);
     if (sourceSessionId) {
-      await sessions.get(sourceSessionId)?.navigation?.invalidateRedo();
-      // Detached: the switch must not wait out the source's deferred finalize.
-      void track(() => releaseLeftSession(typed, sourceSessionId), services.activeOperations);
+      try {
+        await sessions.get(sourceSessionId)?.navigation?.invalidateRedo();
+      } finally {
+        // Detached: the switch must not wait out the source's deferred
+        // finalize. Even if the invalidation failed: it ends `token` too.
+        void track(
+          () => releaseLeftSession(typed, sourceSessionId, token),
+          services.activeOperations,
+        );
+      }
     } else {
       await invalidateAllRedo();
     }
@@ -241,8 +311,16 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     await ensureNavigation(services, typed);
   }
 
-  function shutdown(): Promise<void> {
+  function shutdown(leftSession = false): Promise<void> {
     if (shutdownPromise) return shutdownPromise;
+    // Captured before the detach below. Pi replaces this copy on `/new`,
+    // `/resume` and fork; like OMP's `adoptSwitchedSession`, the session left
+    // loses its redo. Pi's copy serves one session, so this is that session's.
+    // ponytail: a `/new` while the session's history is still loading finds
+    // no navigation (it is published only after the load, and `closing` stops
+    // that), so the stored redo survives; clearing it would mean awaiting
+    // `initialization` here before the detach.
+    const leftNavigations = leftSession ? navigations() : [];
     services.flags.closing = true;
     services.flags.pendingNavigationSourceSessionId = null;
     const detachedNavigations = navigations();
@@ -260,7 +338,14 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
       // and is lost only if the process exits first.
       const teardown = (async () => {
         try {
-          // Local cleanup first: idle index leases (a checked-out one may sit
+          // First, and never cut short: `suspend` below empties a navigation
+          // outside its queue, and a suspended navigation never saves. An
+          // invalidation landing after it would be dropped, keeping the
+          // stored redo the user just left behind.
+          await Promise.allSettled(
+            leftNavigations.map((navigation) => navigation.invalidateRedo()),
+          );
+          // Then local cleanup: idle index leases (a checked-out one may sit
           // under a running git) and the runtime directory.
           await Promise.all([
             services.leasePool.releaseAll({ inUse: false }),
@@ -305,9 +390,24 @@ export function createRegistry(services: ExtensionServices): SessionRegistry {
     sessionTree,
     rememberNavigationSource,
     adoptSwitchedSession,
-    beforeAgentStart: (typed) => beforeAgentStart(services, typed),
+    // Before `agent_start`: a new prompt, not the scheduled continuation.
+    beforeAgentStart: async (typed) => {
+      // A source still set is from a cancelled or rolled-back switch (OMP
+      // starts no turn mid-switch), and would stop `liveSessionId` following a
+      // move. ponytail: a move after a cancel within the same turn still loses
+      // that turn; no event marks the cancel any sooner.
+      if (isMainSession(services, typed)) services.flags.pendingNavigationSourceSessionId = null;
+      await settleContinuation(services, typed);
+      await beforeAgentStart(services, typed);
+    },
+    agentStart: () => {
+      if (!services.flags.runOpen) services.runEnd = Promise.withResolvers<void>();
+      services.flags.runOpen = true;
+      services.flags.continuing = false;
+    },
     toolCall: (typed) => toolCall(services, typed),
-    agentEnd: (typed) => agentEnd(services, typed),
+    agentEnd: (typed, willContinue) => agentEnd(services, typed, willContinue),
+    settleContinuation: (typed) => settleContinuation(services, typed),
     shutdown,
   };
 }

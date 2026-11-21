@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { GitRunner } from "../types.js";
 import { canonicalCwd, defaultStoreRoot } from "../infra/paths.js";
+import { localStoreHost } from "./host-identity.js";
 
 function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -207,10 +208,73 @@ export function storeInitArgs(gitDir: string, ...flags: string[]): string[] {
   return ["-c", `${key}=${value}`, "init", "-q", "--template=", ...flags];
 }
 
+/** Env for a store's `git init`: the files ref backend over a user's
+ *  `init.defaultRefFormat`/`GIT_DEFAULT_REF_FORMAT`, since `storeHasRefs` and
+ *  `releaseLooseRef` read refs as files. git before 2.45 ignores it and only
+ *  knows files; `--ref-format` would make that git fail the init. */
+export const STORE_INIT_ENV = { GIT_DEFAULT_REF_FORMAT: "files" } as const;
+
 /** Sets `core.hooksPath` on a finished store that was set up before it was
  *  part of setup. Read without a git process, so a store that has it costs
  *  nothing; an unreadable config is left alone. */
 export async function ensureStoreHooksPath(git: GitRunner, gitDir: string): Promise<void> {
   if ((await readStoreConfig(gitDir))?.has("core.hookspath") !== false) return;
   await git(["config", ...storeHooksConfig(gitDir)]).catch(() => undefined);
+}
+
+/** Config key naming the machine whose launches use a store (`localStoreHost`;
+ *  the last machine to open the store wins). Eviction judges a store's source
+ *  as vanished only on that machine: on a store root shared between machines
+ *  (NFS/SMB home, WSL and Windows sharing `~/.omp`) a path missing here may be
+ *  live there. */
+export const STORE_HOST_KEY = "omp-undo-redo.host";
+
+/** Config key naming the volume holding a store's source as
+ *  `<device>:<levels up to its mount root>` (see `volumeOf`), so eviction can
+ *  tell a source that is gone from one whose drive is unplugged or unmounted. */
+export const STORE_VOLUME_KEY = "omp-undo-redo.volume";
+
+/** `path`'s volume as `<device>:<levels>`: its device number, and how many
+ *  levels up its mount root is, the topmost ancestor on the same device. Null
+ *  when unreadable. */
+export async function volumeOf(path: string): Promise<string | null> {
+  try {
+    const { dev } = await stat(path);
+    let root = path;
+    let levels = 0;
+    for (let parent = dirname(root); parent !== root; parent = dirname(root)) {
+      if ((await stat(parent)).dev !== dev) break;
+      root = parent;
+      levels += 1;
+    }
+    return `${dev}:${levels}`;
+  } catch {
+    return null;
+  }
+}
+
+/** This machine's `STORE_HOST_KEY` and `STORE_VOLUME_KEY` entries for a store
+ *  of `source`; each is omitted when unknown. */
+export async function storeStampConfig(source: string): Promise<Array<[string, string]>> {
+  const [host, volume] = await Promise.all([localStoreHost(), volumeOf(source)]);
+  const entries: Array<[string, string]> = [];
+  if (host) entries.push([STORE_HOST_KEY, host]);
+  if (volume) entries.push([STORE_VOLUME_KEY, volume]);
+  return entries;
+}
+
+/** Restamps a finished store whose stamps are missing (set up by an earlier
+ *  version) or out of date (another machine opened it last, or its source's
+ *  volume changed). Read without a git process, so an up-to-date store costs
+ *  nothing; an unreadable config is left alone. */
+export async function ensureStoreStamps(
+  git: GitRunner,
+  gitDir: string,
+  source: string,
+): Promise<void> {
+  const config = await readStoreConfig(gitDir);
+  if (!config) return;
+  for (const [key, value] of await storeStampConfig(source)) {
+    if (config.get(key) !== value) await git(["config", key, value]).catch(() => undefined);
+  }
 }

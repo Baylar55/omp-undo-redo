@@ -6,7 +6,7 @@ What to do when undo/redo leaves something unexpected behind. What the extension
 
 An `/undo` or `/redo` cut short by a killed process or a crash is settled the next time the session loads. Before restoring files, each one records what it is doing next to the session's history. If the files were fully restored, the undo/redo cursor moves to match them and a notice says so. If the restore never started, nothing changes. Loading only checks the files; it never writes them.
 
-When an interrupted `/undo` or `/redo` left files partly restored, its warning names the snapshot store and two snapshot hashes: the one marked "before the /undo" (or "/redo") is where undo history still points, the other is the command's result. Put the files back at the "before" snapshot, then run the command again. The commands below write only the files that differ between the two snapshots (overwriting any edit you made to them since the interruption) and never touch your Git index, `HEAD`, or any other file; a directory emptied this way is left in place.
+When an interrupted `/undo` or `/redo` left files partly restored, its warning names the snapshot store and two snapshot hashes: the one marked "before the /undo" (or "/redo") is where undo history still points, the other is the command's result. So does the message of an `/undo` or `/redo` whose file writes did not finish and left the worktree changed, or whose session navigation was cancelled and putting the files back then failed. Put the files back at the "before" snapshot, then run the command again if you still want it (after a cancelled navigation you may not). The commands below write only the files that differ between the two snapshots (overwriting any edit you made to them since the interruption) and never touch your Git index, `HEAD`, or any other file; a directory emptied this way is left in place.
 
 Close every OMP and Pi process using the workspace, then run this from the workspace root after filling in the three placeholders. In bash, zsh or Git Bash:
 
@@ -77,17 +77,31 @@ Replace the placeholders with the exact ref and object ID printed by the first c
 > **Warning**
 > On Windows and macOS, never copy or share the `omp-undo-redo/host-id` file (in `%LOCALAPPDATA%` or `~/Library/Application Support`) between machines: cloned virtual machines, synced dotfiles, shared network homes. Two machines with the same host ID and hostname working in the same repository look like one machine, so each treats the other's live sessions as dead and deletes their pending checkpoint refs. On Linux the boot ID marks the other machine as remote, so its pending refs are removed only after it goes 7 days without refreshing them (for example, while suspended mid-turn).
 
+## Snapshot stores of another machine
+
+Every store records the machine that last opened it as `omp-undo-redo.host` in its `config`, and a machine evicts only stores it stamped (or that no version stamped yet). A store of a retired machine, or one stamped before this machine's hostname or `omp-undo-redo/host-id` file changed, is therefore never evicted once its workspace is gone, until that workspace is opened again (which restamps it). To reclaim it, stop every OMP and Pi process on every machine that shares the store root, check that the store's source (`core.worktree` or `omp-undo-redo.commondir` in `<storeRoot>/repos/<hash>.git/config`) is gone on the machine that used it, then delete that `<hash>.git` directory. Deleting it removes its undo history for good.
+
+## Recovering a store set aside by eviction
+
+Eviction renames a store to `<storeRoot>/repos/<hash>.git.evicted-<ms>` (`<ms>` is when, in milliseconds since 1970) and deletes it 7 days after that. Until then it can be put back:
+
+1. Stop every OMP and Pi process on every machine that shares the store root.
+2. If `<hash>.git` exists again (the workspace was opened since and got a new store), move it out of `repos/`. Its history covers only the turns since; those sessions then resume without file undo.
+3. Rename `<hash>.git.evicted-<ms>` back to `<hash>.git`.
+
+This also recovers a store an earlier version set aside while its workspace was in use on another machine, or on a drive that was unplugged at the time.
+
 ## A `runtime/<pid>/` directory without `runtime.json`
 
 A `runtime/<pid>/` directory without a `runtime.json` marker is never replaced or deleted, so a process given that pid publishes no runtime action state (logged as `runtime-dir-foreign` with `OMP_UNDO_REDO_DEBUG=1`). Undo and redo work as usual. Version 1.7.0 and earlier could leave such a directory after a crash or a shutdown that could not delete every file; it holds only `sessions/` and `.tmp` files and is safe to delete by hand.
 
 ## No runtime action state after an upgrade, a reboot or in a container
 
-A `runtime/<pid>/` whose `runtime.json` comes from another runtime scope (another container sharing `~/.omp`, a previous Linux boot) or from an earlier version that recorded none is not this process's to replace until its marker and its directory are both 24 h old. Until then, a process given that pid publishes no runtime action state (`runtime-dir-foreign` with `OMP_UNDO_REDO_DEBUG=1`), and undo and redo work as usual. A directory whose pid is not running in any container that shares the folder is safe to delete by hand. A directory from another hostname is never replaced or reaped.
+A `runtime/<pid>/` whose `runtime.json` comes from another runtime scope (another container sharing `~/.omp`, a previous boot) or from an earlier version that recorded none is not this process's to replace until its marker and its directory are both 24 h old. Until then, a process given that pid publishes no runtime action state (`runtime-dir-foreign` with `OMP_UNDO_REDO_DEBUG=1`), and undo and redo work as usual. A directory whose pid is not running in any container that shares the folder is safe to delete by hand. A directory from another hostname is never replaced or reaped. On Windows and macOS, the first start after upgrading past a version that did not record the boot treats every older directory this way.
 
 ## A snapshot store created with permissive file modes
 
-Stores are created owner-only (`0700`, with `core.sharedRepository=0600`), but private repositories created by an earlier version keep their original object modes. If the store was ever created with a permissive umask, close every OMP and Pi process, then delete `<storeRoot>/repos`. That deletes all undo file history; the store is recreated owner-only on next use.
+`<storeRoot>/repos` is created owner-only (`0700`) and Private-Git stores set `core.sharedRepository=0600` (Git-mode snapshot objects take your repository's modes instead; see SECURITY.md), but private repositories created by an earlier version keep their original object modes. If the store was ever created with a permissive umask, close every OMP and Pi process, then delete `<storeRoot>/repos`. That deletes all undo file history; the store is recreated owner-only on next use.
 
 ## Collecting a debug trace
 

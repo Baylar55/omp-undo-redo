@@ -47,7 +47,7 @@ type ChildResult = {
 };
 
 export interface GitRunnerDependencies {
-  /** Fixed env merged after `process.env` (minus `REPOSITORY_ENV`) and before per-invocation
+  /** Fixed env merged after `process.env` (minus `STRIPPED_ENV`) and before per-invocation
    *  `options.env`, so it overrides the process environment. Used for private
    *  per-workspace repositories where GIT_DIR must be present on every command;
    *  the runner re-exposes it as `runner.env` so callers can detect it. */
@@ -66,15 +66,21 @@ const LAUNCHER_ENV = ["PATH", "HOME", "MSYSTEM", "PLINK_PROTOCOL", "MSYS"];
 
 let directGit: Promise<DirectGit | null> | undefined;
 
-/** `git rev-parse --local-env-vars` minus the `-c` config pair: the set git
+/** Inherited variables dropped before every git command.
+ *  `git rev-parse --local-env-vars` minus the `-c` config pair: the set git
  *  itself clears before running a command in another repository
  *  (run-command.c `sanitize_repo_env`). Inherited from a hook or a dotfiles
  *  setup they would point every command at a foreign repository and
  *  worktree; this runner picks its repository itself, through cwd or its
  *  fixed `env`. `GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` are kept on purpose
  *  (env-supplied `safe.directory` in containers): whoever can set them could
- *  still pass `core.worktree`, but can already set any env of this process. */
-const REPOSITORY_ENV: Record<string, true> = {
+ *  still pass `core.worktree`, but can already set any env of this process.
+ *  Plus the global pathspec settings: every pathspec this runner passes spells
+ *  its own magic (`:(top)`, `--literal-pathspecs`), which they would rewrite
+ *  or reject. Plus the commit identity and dates: they would override the
+ *  `-c user.*` identity snapshot commits pass (`tree.ts` `GIT_AUTHOR`), and an
+ *  empty name or invalid date fails `commit-tree`. */
+const STRIPPED_ENV: Record<string, true> = {
   GIT_ALTERNATE_OBJECT_DIRECTORIES: true,
   GIT_CONFIG: true,
   GIT_OBJECT_DIRECTORY: true,
@@ -88,6 +94,16 @@ const REPOSITORY_ENV: Record<string, true> = {
   GIT_PREFIX: true,
   GIT_SHALLOW_FILE: true,
   GIT_COMMON_DIR: true,
+  GIT_GLOB_PATHSPECS: true,
+  GIT_NOGLOB_PATHSPECS: true,
+  GIT_ICASE_PATHSPECS: true,
+  GIT_LITERAL_PATHSPECS: true,
+  GIT_AUTHOR_NAME: true,
+  GIT_AUTHOR_EMAIL: true,
+  GIT_AUTHOR_DATE: true,
+  GIT_COMMITTER_NAME: true,
+  GIT_COMMITTER_EMAIL: true,
+  GIT_COMMITTER_DATE: true,
 };
 
 /** On Windows `git` on PATH is usually a launcher that starts the real
@@ -159,8 +175,7 @@ async function runGit(
   const { promise, resolve } = Promise.withResolvers<ChildResult>();
   // Windows env names are case-insensitive.
   const inherited = Object.entries(process.env).filter(
-    ([key]) =>
-      !Object.hasOwn(REPOSITORY_ENV, process.platform === "win32" ? key.toUpperCase() : key),
+    ([key]) => !Object.hasOwn(STRIPPED_ENV, process.platform === "win32" ? key.toUpperCase() : key),
   );
   const env: NodeJS.ProcessEnv = {
     ...Object.fromEntries(inherited),
@@ -288,10 +303,16 @@ export function createGitRunner(cwd: string, dependencies: GitRunnerDependencies
   const { env } = dependencies;
   const runner: GitRunner = async (args, options) => {
     const merged = { ...env, ...options?.env };
+    // Bound to a store's objects, a command must not start the user's auto
+    // maintenance (a partial clone's lazy fetch does): it would run against
+    // the store's objects with the user's refs. `-c` reaches git's children.
+    const fullArgs = merged.GIT_OBJECT_DIRECTORY
+      ? ["-c", "maintenance.auto=false", "-c", "gc.auto=0", ...args]
+      : args;
     const started = Date.now();
     const result = await runGit(
       cwd,
-      args,
+      fullArgs,
       { ...options, env: merged },
       dependencies,
       // An injected spawn is a test double; give it the plain command.
@@ -301,7 +322,7 @@ export function createGitRunner(cwd: string, dependencies: GitRunnerDependencies
     // overrides this extension sets (paths, `LC_ALL`).
     debugLog({
       cwd,
-      args,
+      args: fullArgs,
       env: merged,
       code: result.code,
       error: result.error,
@@ -341,4 +362,11 @@ export async function run(
   options?: Parameters<GitRunner>[1],
 ): Promise<boolean> {
   return (await invoke(git, args, options)).code === 0;
+}
+
+/** Lines of a command that prints one raw path per line (`rev-parse`,
+ *  `config --path`). Only the line terminators are stripped: `trim()` would
+ *  also eat a POSIX path's trailing spaces and name a sibling folder. */
+export function outputLines(stdout: string): string[] {
+  return stdout.replace(/\r?\n$/, "").split(/\r?\n/);
 }

@@ -77,10 +77,15 @@
     "@types/node": "^26.4.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^4.1.12",
     "eslint": "^10.9.0",
     "prettier": "^3.0.0",
     "typescript": "^5.0.0",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
+  },
+  "overrides": {
+    "@oh-my-pi/pi-coding-agent": {
+      "puppeteer-core": "^25.13.0"
+    }
   }
 }

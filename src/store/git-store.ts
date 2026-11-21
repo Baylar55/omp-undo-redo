@@ -16,8 +16,11 @@ import {
   setUpStore,
   applyConfig,
   ensureStoreHooksPath,
+  ensureStoreStamps,
   storeHooksConfig,
+  storeStampConfig,
   storeInitArgs,
+  STORE_INIT_ENV,
   readStoreConfig,
   storeHasRefs,
 } from "./setup.js";
@@ -116,22 +119,27 @@ export async function ensureGitSnapshotStore(
         const objectFormat = await repositoryFormat();
         if (!objectFormat) return false;
         const init = await storeGit(storeInitArgs(storeDir, "--bare"), {
-          env: { GIT_DEFAULT_HASH: objectFormat },
+          env: { ...STORE_INIT_ENV, GIT_DEFAULT_HASH: objectFormat },
         });
         return init.code === 0;
       },
-      () =>
+      async () =>
         applyConfig(storeGit, [
           ["core.sharedRepository", "0600"],
           // Only the extension's own git reads these refs, so paths past
           // MAX_PATH cannot hide them from anyone's gc.
           ["core.longpaths", "true"],
           storeHooksConfig(storeDir),
+          ...(await storeStampConfig(repository.commonDir)),
           // Last: `setupFinished` reads it as proof the rest ran.
           [GIT_STORE_SOURCE_KEY, repository.commonDir],
         ]),
-      // Stores set up by earlier versions run hooks until this is set.
-      () => ensureStoreHooksPath(storeGit, storeDir),
+      // Stores set up by earlier versions run hooks and name no machine or
+      // volume until these are set.
+      async () => {
+        await ensureStoreHooksPath(storeGit, storeDir);
+        await ensureStoreStamps(storeGit, storeDir, repository.commonDir);
+      },
     );
     return ready ? storeDir : null;
   } catch {
@@ -155,15 +163,28 @@ export function borrowsObjects(repository: GitRepository): boolean {
  *  which no path inside it can name. Nested entries are harmless: every
  *  consumer takes their union.
  *  shortcut: a runtime root that is the worktree itself stays captured (its
- *  `<pid>/` dirs have no fixed name); exclude those by pattern if it is ever seen. */
-export function ownedPathsInWorktree(repository: GitRepository): string[] {
-  return [storeRootDirectory(), dirname(repository.storeDir), runtimeRootDirectory()]
-    .map((path) => pathInside(repository.worktree, path))
-    .filter((path) => path !== null);
+ *  `<pid>/` dirs have no fixed name); exclude those by pattern if it is ever seen.
+ *  Memoized per repository object: it costs several blocking `realpathSync`
+ *  calls, and capture and restore ask on every turn. */
+export function ownedPathsInWorktree(repository: GitRepository): readonly string[] {
+  let owned = ownedPathsCache.get(repository);
+  if (!owned) {
+    owned = [storeRootDirectory(), dirname(repository.storeDir), runtimeRootDirectory()]
+      .map((path) => pathInside(repository.worktree, path))
+      .filter((path) => path !== null);
+    ownedPathsCache.set(repository, owned);
+  }
+  return owned;
 }
 
+const ownedPathsCache = new WeakMap<GitRepository, readonly string[]>();
+
+/** The user's objects as a `GIT_ALTERNATE_OBJECT_DIRECTORIES` entry. Git
+ *  splits that variable on `;` (Windows) or `:` (POSIX) unless the entry is a
+ *  C-style quoted string, so a path holding the separator must be quoted. */
 function userObjects(repository: GitRepository): string {
-  return join(repository.commonDir, "objects");
+  const path = join(repository.commonDir, "objects");
+  return `"${path.replace(/[\\"]/g, "\\$&").replace(/\n/g, "\\n")}"`;
 }
 
 /** Env binding a runner to `repository`'s snapshot store. Private-Git runs

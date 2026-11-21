@@ -42,8 +42,8 @@ export type NavigationResult =
    *  created or deleted, whoever last edited it. */
   | { status: "moved"; files: "restored"; restoredFiles: string[] }
   /** Restored everything the snapshot holds; `nestedRepositories` and
-   *  `unreadableFiles` (worktree root relative) are outside it and were not
-   *  restored. */
+   *  `unreadableFiles` (worktree root relative; a folder git could not open
+   *  ends in "/") are outside it and were not restored. */
   | {
       status: "moved";
       files: "partial";
@@ -65,7 +65,14 @@ export type NavigationResult =
    *  junction, which a restore never writes through; nothing was written. */
   | { status: "git_failed"; failure: "linked"; linkedFiles: string[] }
   | { status: "git_failed"; failure: "failed" }
-  | { status: "rollback_failed" };
+  /** Writing the files failed partway: they may sit between the snapshots. */
+  | ({ status: "git_failed"; failure: "interrupted" } & ManualRestore)
+  /** Navigation was cancelled and putting the files back failed. */
+  | ({ status: "rollback_failed" } & ManualRestore);
+
+/** The snapshots to restore files from by hand: undo history still points
+ *  at `sourceHash`, `targetHash` is the command's result. */
+export type ManualRestore = { storeDir: string; sourceHash: string; targetHash: string };
 
 export type ActionId = "undo" | "redo";
 
@@ -145,6 +152,14 @@ export interface SnapshotIndexLease {
   baseTree: string;
   /** Seeded against an unborn HEAD; the lease goes stale once HEAD is born. */
   unborn?: true;
+  /** Unborn only: the tree a reused snapshot last wrote, holding no entry the
+   *  ignore rules excluded when `prunedRules` (`excludeRules` output) applied,
+   *  so the next pass checks only entries added since. `prunedRules` is unset
+   *  before the first reused snapshot, and after one pruned under an ignored
+   *  `.gitignore` that no diff can see change: either way the next pass checks
+   *  the whole index. */
+  prunedTree?: string;
+  prunedRules?: string;
 }
 
 export interface GitCheckpoint {

@@ -4,9 +4,16 @@ import { debugLog } from "../infra/debug-log.js";
 import { finishAfterTurn } from "../snapshot/capture.js";
 import { releaseCheckpoint, retainCheckpointForResume } from "../snapshot/checkpoint-refs.js";
 import type { SessionOnlyCheckpoint } from "../types.js";
-import { createNavigation, ensureNavigation, notifySessionOnly, stateOf } from "./controller.js";
+import {
+  createNavigation,
+  ensureNavigation,
+  liveSessionId,
+  notifySessionOnly,
+  recordSessionId,
+  stateOf,
+} from "./controller.js";
 import type { SessionNavigation } from "./navigation.js";
-import type { ExtensionServices, PendingCapture } from "./services.js";
+import type { ExtensionServices, PendingCapture, SessionState } from "./services.js";
 import { releasePending } from "./turn-start.js";
 
 function beginFinalizeTurn(
@@ -16,7 +23,7 @@ function beginFinalizeTurn(
   leafId: string | null,
   turnStartLeaf: string | null,
 ): Promise<void> {
-  const sessionId = typed.sessionManager.getSessionId();
+  const sessionId = liveSessionId(services, typed);
   const state = stateOf(services, sessionId);
   // Claim the capture: from here its checkpoint is this finalize's alone.
   // Taking the slot matters because the gate below can defer this finalize
@@ -52,6 +59,7 @@ function beginFinalizeTurn(
         await finalizeTurn(
           services,
           typed,
+          state,
           sessionId,
           capture,
           leafId,
@@ -60,7 +68,16 @@ function beginFinalizeTurn(
         );
         return;
       }
-      await finalizeTurn(services, typed, sessionId, capture, leafId, turnStartLeaf, turnSequence);
+      await finalizeTurn(
+        services,
+        typed,
+        state,
+        sessionId,
+        capture,
+        leafId,
+        turnStartLeaf,
+        turnSequence,
+      );
     } finally {
       handlerRelease();
     }
@@ -109,15 +126,7 @@ async function resolveNavigation(
   if (typed.sessionManager.getSessionId() !== sessionId) return null;
   const nav =
     (await ensureNavigation(services, typed, turnStartLeaf)) ??
-    createNavigation(
-      typed,
-      sessionId,
-      undefined,
-      services.runtimeStore,
-      undefined,
-      services.gitRunnerFor,
-      services.gitRunnerFactory,
-    );
+    createNavigation(typed, sessionId, undefined, services.runtimeStore, services.gitRunnerFor);
   state.navigation = nav;
   return nav;
 }
@@ -143,12 +152,16 @@ async function recordSessionOnly(
 async function finalizeTurn(
   services: ExtensionServices,
   typed: AnyContext,
-  sessionId: string,
+  state: SessionState,
+  turnSessionId: string,
   capture: PendingCapture,
   leafId: string | null,
   turnStartLeaf: string | null,
   turnSequence: number,
 ): Promise<void> {
+  // Where the turn records: the session may have moved to a new id since it
+  // started (`liveSessionId`), and its record with it.
+  const sessionId = () => recordSessionId(services, state, turnSessionId);
   await capture.complete;
   const before = capture.checkpoint;
   if (!before) return;
@@ -205,7 +218,7 @@ async function finalizeTurn(
           services.gitRunnerFor(result.checkpoint.repository),
           result.checkpoint,
         );
-        await recordSessionOnly(services, typed, sessionId, {
+        await recordSessionOnly(services, typed, sessionId(), {
           kind: "session",
           reason: "file_history_gap",
           parentLeafId: before.parentLeafId,
@@ -213,7 +226,7 @@ async function finalizeTurn(
         });
         return;
       }
-      const nav = await resolveNavigation(services, typed, sessionId, before.parentLeafId);
+      const nav = await resolveNavigation(services, typed, sessionId(), before.parentLeafId);
       if (!nav) {
         await releaseCheckpoint(
           services.gitRunnerFor(result.checkpoint.repository),
@@ -223,7 +236,7 @@ async function finalizeTurn(
       }
       const retained = await retainCheckpointForResume(
         services.gitRunnerFor(result.checkpoint.repository),
-        sessionId,
+        sessionId(),
         result.checkpoint,
       );
       await nav.recordTurnEnd(retained);
@@ -236,11 +249,22 @@ async function finalizeTurn(
       leafId: leafId,
     };
   }
-  await recordSessionOnly(services, typed, sessionId, completed);
+  await recordSessionOnly(services, typed, sessionId(), completed);
 }
 
-export async function agentEnd(services: ExtensionServices, typed: AnyContext): Promise<void> {
-  const sessionId = typed.sessionManager.getSessionId();
+export async function agentEnd(
+  services: ExtensionServices,
+  typed: AnyContext,
+  willContinue = false,
+): Promise<void> {
+  services.flags.runOpen = false;
+  services.runEnd.resolve();
+  // Not a settle: the continuation's edits belong to this turn, and its own
+  // agent_end (or settleContinuation, if it never starts) finalizes it.
+  services.flags.continuing = willContinue;
+  if (willContinue) return;
+  services.flags.turnOpen = false;
+  const sessionId = liveSessionId(services, typed);
   // A lookup, not stateOf: a turn with no record (a subagent's) has nothing to
   // finalize and must not leave an empty record behind.
   const state = services.sessions.get(sessionId);
@@ -264,4 +288,11 @@ export async function agentEnd(services: ExtensionServices, typed: AnyContext): 
     typed.sessionManager.getLeafId(),
     turnStartLeaf,
   );
+}
+
+/** A scheduled continuation can be skipped (an aborted retry, an async wake
+ *  that never comes). A prompt, command or navigation reaching a turn still
+ *  held open for one ends that turn first, at the current leaf. */
+export function settleContinuation(services: ExtensionServices, typed: AnyContext): Promise<void> {
+  return services.flags.continuing ? agentEnd(services, typed) : Promise.resolve();
 }

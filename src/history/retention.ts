@@ -84,8 +84,10 @@ export async function expireGitSessionHistories(
   retentionDays: number,
   activeSessionHashes: ReadonlySet<string> | (() => ReadonlySet<string>),
 ): Promise<number> {
-  if (retentionDays <= 0) return 0;
   const dir = historyDirectory(repository);
+  // Temps and dead-owner markers are not history: clean them even with retention off.
+  await pruneStaleHeartbeats(dir);
+  if (retentionDays <= 0) return 0;
   let files: string[];
   try {
     files = await readdir(dir);
@@ -203,14 +205,9 @@ export async function expireGitSessionHistories(
     }
   }
 
-  await pruneExpiredTombstones(
-    dir,
-    retentionDays,
-    getActive,
-    (v) => HASH.test(v),
-    (hash) => sessionHeartbeatIsFresh(dir, hash),
+  await pruneExpiredTombstones(dir, retentionDays, getActive, (hash) =>
+    sessionHeartbeatIsFresh(dir, hash),
   );
-  await pruneStaleHeartbeats(dir);
   return refsRemoved;
 }
 

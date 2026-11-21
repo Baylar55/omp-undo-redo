@@ -3,6 +3,7 @@ import type {
   GitRepository,
   GitRunner,
   GitRunnerFactory,
+  ManualRestore,
   NavigationPort,
   NavigationResult,
   NavigationState,
@@ -19,7 +20,6 @@ import type { CheckpointApplyResult } from "../snapshot/restore.js";
 import { landsOnParent } from "../host-contract.js";
 
 type ExpectedTreeNavigation = {
-  oldLeafId: string | null;
   /** Every leaf the host may land on for this target. */
   landingLeafIds: ReadonlyArray<string | null>;
 };
@@ -35,6 +35,10 @@ export type RestoreIntentPort = {
   clear(): Promise<void>;
 };
 
+type SessionPort = Omit<NavigationPort, "navigateTree"> & {
+  navigateTree?: NavigationPort["navigateTree"];
+};
+
 export class SessionNavigation {
   private checkpoints: TurnCheckpoint[] = [];
   private currentIndex = -1;
@@ -42,21 +46,37 @@ export class SessionNavigation {
   private expectedTreeNavigation: ExpectedTreeNavigation | null = null;
   private readonly gitForRepository: GitRunnerFactory;
   private navigationTail: Promise<void> = Promise.resolve();
-  private readonly stateChanged: (state: NavigationState) => Promise<void>;
+  private stateChanged: (state: NavigationState) => Promise<void>;
   private readonly applyGit: ApplyCheckpoint;
-  private readonly intents: RestoreIntentPort;
+  private intents: RestoreIntentPort;
+  private isSuspended = false;
 
   constructor(
-    private readonly port: Omit<NavigationPort, "navigateTree"> & {
-      navigateTree?: NavigationPort["navigateTree"];
-    },
+    port: SessionPort,
     git: GitRunner,
+    gitFactory?: undefined,
+    stateChanged?: (state: NavigationState) => Promise<void>,
+    applyGit?: ApplyCheckpoint,
+    intents?: RestoreIntentPort,
+  );
+  constructor(
+    port: SessionPort,
+    git: undefined,
+    gitFactory: GitRunnerFactory,
+    stateChanged?: (state: NavigationState) => Promise<void>,
+    applyGit?: ApplyCheckpoint,
+    intents?: RestoreIntentPort,
+  );
+  constructor(
+    private readonly port: SessionPort,
+    git: GitRunner | undefined,
     gitFactory?: GitRunnerFactory,
     stateChanged?: (state: NavigationState) => Promise<void>,
     applyGit?: ApplyCheckpoint,
     intents?: RestoreIntentPort,
   ) {
-    this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git);
+    // The overloads guarantee one of `git` / `gitFactory`.
+    this.gitForRepository = gitFactory ?? ((_repository: GitRepository) => git!);
     this.stateChanged = stateChanged ?? (async () => undefined);
     this.applyGit =
       applyGit ??
@@ -84,8 +104,10 @@ export class SessionNavigation {
     return { checkpoints: [...this.checkpoints], currentIndex: this.currentIndex };
   }
 
-  /** False when the state could not be saved. */
+  /** False when the state could not be saved. Never saves once suspended:
+   *  work still queued would persist the emptied state, deleting the file. */
   private async persistState(): Promise<boolean> {
+    if (this.isSuspended) return false;
     return this.stateChanged({
       checkpoints: [...this.checkpoints],
       currentIndex: this.currentIndex,
@@ -111,7 +133,6 @@ export class SessionNavigation {
   private async navigateTo(targetId: string): Promise<TreeNavigationResult> {
     const target = this.port.getEntry(targetId);
     this.expectedTreeNavigation = {
-      oldLeafId: this.port.getLeafId(),
       landingLeafIds: landsOnParent(target) ? [targetId, target.parentId] : [targetId],
     };
     try {
@@ -130,17 +151,17 @@ export class SessionNavigation {
     // Must run before any queueing: the host awaits this handler inside its
     // navigateTree call, so an undo/redo's own navigation has to be recognized
     // synchronously or it would deadlock against itself on navigationTail.
+    // By landing leaf only: the host first appends pending `!cmd` output, so
+    // its oldLeafId may not be the leaf the navigation started from.
     const expected = this.expectedTreeNavigation;
-    if (
-      expected &&
-      expected.oldLeafId === oldLeafId &&
-      expected.landingLeafIds.includes(newLeafId)
-    ) {
+    if (expected?.landingLeafIds.includes(newLeafId)) {
       this.expectedTreeNavigation = null;
       return;
     }
     if (oldLeafId === newLeafId) return;
-    await this.serializeNavigation(() => this.performInvalidateRedo());
+    const invalidation = this.serializeNavigation(() => this.performInvalidateRedo());
+    // During our own navigation the chain is waiting on this handler.
+    if (!expected) await invalidation;
   }
 
   async invalidateRedo(): Promise<void> {
@@ -173,6 +194,8 @@ export class SessionNavigation {
   }
 
   private async performRecordTurnEnd(checkpoint: TurnCheckpoint): Promise<void> {
+    // No save will ever reference it: release its refs instead of orphaning them.
+    if (this.isSuspended) return this.releaseFileCheckpoints([checkpoint]);
     const discarded = this.checkpoints.splice(
       this.currentIndex + 1,
       this.checkpoints.length - this.currentIndex - 1,
@@ -183,8 +206,15 @@ export class SessionNavigation {
     await this.releaseFileCheckpoints(discarded);
   }
 
-  /** Teardown-only: runs outside the navigation chain (suspend/resume path). */
+  /** True once `suspend` ran: its state is gone and nothing it does is saved. */
+  get suspended(): boolean {
+    return this.isSuspended;
+  }
+
+  /** Teardown-only: runs outside the navigation chain (suspend/resume path).
+   *  Work already queued still runs; `isSuspended` keeps it from saving. */
   async suspend(): Promise<void> {
+    this.isSuspended = true;
     const checkpoints = this.checkpoints;
     this.checkpoints = [];
     this.currentIndex = -1;
@@ -197,10 +227,40 @@ export class SessionNavigation {
     );
   }
 
+  /** Moves this navigation to the session id its session continues under:
+   *  `adopt` renames the checkpoints into that session's namespace, and this
+   *  state and every later save and intent go to `ports`. Serialized, so no
+   *  undo, redo or recorded turn straddles the move. */
+  async rekey(
+    adopt: (checkpoints: readonly TurnCheckpoint[]) => Promise<TurnCheckpoint[]>,
+    ports: { stateChanged: (state: NavigationState) => Promise<void>; intents: RestoreIntentPort },
+  ): Promise<void> {
+    await this.serializeNavigation(async () => {
+      this.stateChanged = ports.stateChanged;
+      this.intents = ports.intents;
+      // Empty (nothing recorded, or suspended meanwhile): saving it would
+      // delete the new session's history file instead.
+      if (this.checkpoints.length === 0) return;
+      this.checkpoints = await adopt(this.checkpoints);
+      await this.persistState();
+    });
+  }
+
   private async navigateSession(targetId: string | null): Promise<boolean> {
     if (!targetId) return true;
     const result = await this.navigateTo(targetId);
     return !result.cancelled;
+  }
+
+  /** Where undo navigates to: the leaf the turn started from. A turn that
+   *  started on an empty session has none; the root of its branch stands in
+   *  (`getBranch(leafId)[0]`, the turn's first entry). A root has no parent,
+   *  so when it is a user message the host lands on that parent: the empty
+   *  session. */
+  private undoTarget(checkpoint: TurnCheckpoint): string | null {
+    if (checkpoint.parentLeafId !== null) return checkpoint.parentLeafId;
+    if (checkpoint.leafId === null) return null;
+    return this.port.getBranch(checkpoint.leafId)[0]?.id ?? null;
   }
 
   private sessionOnlyResult(checkpoint: SessionOnlyCheckpoint): NavigationResult {
@@ -234,13 +294,19 @@ export class SessionNavigation {
 
   private async applyFileCheckpoint(
     checkpoint: GitCheckpoint,
-    source: "before" | "after",
+    target: "before" | "after",
   ): Promise<CheckpointApplyResult> {
-    return this.applyGit(
-      checkpoint,
-      source === "before" ? checkpoint.afterHash : checkpoint.beforeHash,
-      source === "before" ? checkpoint.beforeHash : checkpoint.afterHash,
-    );
+    const { sourceHash, targetHash } = this.manualRestore(checkpoint, target);
+    return this.applyGit(checkpoint, sourceHash, targetHash);
+  }
+
+  /** Restoring the `target` snapshot: the snapshots a user restores from by
+   *  hand when the files were left between them. */
+  private manualRestore(checkpoint: GitCheckpoint, target: "before" | "after"): ManualRestore {
+    const { storeDir } = checkpoint.repository;
+    return target === "before"
+      ? { storeDir, sourceHash: checkpoint.afterHash, targetHash: checkpoint.beforeHash }
+      : { storeDir, sourceHash: checkpoint.beforeHash, targetHash: checkpoint.afterHash };
   }
 
   private async saveIntent(direction: "undo" | "redo", checkpoint: GitCheckpoint): Promise<void> {
@@ -267,6 +333,7 @@ export class SessionNavigation {
 
   private restoreFailedResult(
     applied: Exclude<CheckpointApplyResult, { status: "applied" }>,
+    restore: ManualRestore,
   ): NavigationResult {
     if (applied.status === "conflict") {
       return {
@@ -278,6 +345,7 @@ export class SessionNavigation {
     if (applied.status === "linked") {
       return { status: "git_failed", failure: "linked", linkedFiles: applied.linkedFiles };
     }
+    if (applied.interrupted) return { status: "git_failed", failure: "interrupted", ...restore };
     return { status: "git_failed", failure: "failed" };
   }
 
@@ -288,8 +356,10 @@ export class SessionNavigation {
   private async performUndo(): Promise<NavigationResult> {
     if (this.currentIndex < 0) return { status: "empty" };
     const checkpoint = await this.holeIfRemoved(this.currentIndex);
+    // Resolved before any file is written: a host read that throws leaves nothing half done.
+    const target = this.undoTarget(checkpoint);
     if (checkpoint.kind === "session") {
-      if (!(await this.navigateSession(checkpoint.parentLeafId))) return { status: "cancelled" };
+      if (!(await this.navigateSession(target))) return { status: "cancelled" };
       this.currentIndex--;
       await this.persistState();
       return this.sessionOnlyResult(checkpoint);
@@ -299,12 +369,17 @@ export class SessionNavigation {
     const applied = await this.applyFileCheckpoint(checkpoint, "before");
     if (applied.status !== "applied") {
       await this.clearIntent();
-      return this.restoreFailedResult(applied);
+      return this.restoreFailedResult(applied, this.manualRestore(checkpoint, "before"));
     }
-    if (!(await this.navigateSession(checkpoint.parentLeafId))) {
+    if (!(await this.navigateSession(target))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "after");
+      // Cleared even when this fails: the next load could find the files at
+      // the target and move the cursor, completing the navigation just
+      // cancelled, or misjudge files the user has since fixed by hand. The
+      // result names the snapshots to restore from instead.
       await this.clearIntent();
-      if (compensated.status !== "applied") return { status: "rollback_failed" };
+      if (compensated.status !== "applied")
+        return { status: "rollback_failed", ...this.manualRestore(checkpoint, "before") };
       return { status: "cancelled" };
     }
     this.currentIndex--;
@@ -331,12 +406,14 @@ export class SessionNavigation {
     const applied = await this.applyFileCheckpoint(checkpoint, "after");
     if (applied.status !== "applied") {
       await this.clearIntent();
-      return this.restoreFailedResult(applied);
+      return this.restoreFailedResult(applied, this.manualRestore(checkpoint, "after"));
     }
     if (!(await this.navigateSession(checkpoint.leafId))) {
       const compensated = await this.applyFileCheckpoint(checkpoint, "before");
+      // Cleared even when this fails: see performUndo.
       await this.clearIntent();
-      if (compensated.status !== "applied") return { status: "rollback_failed" };
+      if (compensated.status !== "applied")
+        return { status: "rollback_failed", ...this.manualRestore(checkpoint, "after") };
       return { status: "cancelled" };
     }
     this.currentIndex++;

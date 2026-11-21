@@ -6,7 +6,8 @@ import type { ActionId, CommandNavigationResult, NavigationResult } from "../typ
 import {
   VERBS,
   commandBlockedMessage,
-  listed,
+  gitFailedMessage,
+  manualRestoreMessage,
   notRestoredMessage,
   restoredFilesMessage,
   unavailableMessage,
@@ -51,18 +52,17 @@ export async function runNavigation(
       ctx.ui.notify(verbs.cancelled, "warning");
       break;
     case "rollback_failed":
-      ctx.ui.notify(verbs.rollbackFailed, "error");
+      ctx.ui.notify(`${verbs.rollbackFailed}${manualRestoreMessage(direction, outcome)}`, "error");
       break;
     case "git_failed":
-      ctx.ui.notify(
-        outcome.failure === "conflict"
-          ? `${verbs.conflict}${outcome.conflictedFiles.length > 0 ? ` Conflicting files: ${listed(outcome.conflictedFiles)}.` : ""}`
-          : outcome.failure === "linked"
-            ? `${verbs.linked} Linked files: ${listed(outcome.linkedFiles)}. Replace the link with a real folder to restore them: https://github.com/Baylar55/omp-undo-redo/blob/main/docs/troubleshooting.md#undo-or-redo-refused-files-under-a-symlink-or-junction`
-            : "Could not restore the Git checkpoint.",
-        "warning",
-      );
+      ctx.ui.notify(gitFailedMessage(direction, outcome), "warning");
       break;
+    default: {
+      // Compile error when NavigationResult gains a status.
+      const _exhaustive: never = outcome;
+      ctx.ui.notify(verbs.unexpected, "error");
+      break;
+    }
   }
   return outcome;
 }
@@ -70,7 +70,7 @@ export async function runNavigation(
 export function registerCommands(pi: ExtensionAPI, registry: SessionRegistry): void {
   const makeHandler = (id: ActionId) => async (_args: string, ctx: ExtensionCommandContext) => {
     const token = randomUUID();
-    const prepared = await registry.commandNavigation(ctx, () => ctx.waitForIdle());
+    const prepared = await registry.commandNavigation(ctx);
     if (prepared.status !== "ready") {
       ctx.ui.notify(commandBlockedMessage(id, prepared.status), "warning");
       return;
@@ -78,14 +78,7 @@ export function registerCommands(pi: ExtensionAPI, registry: SessionRegistry): v
     const nav = prepared.navigation;
     nav.setNavigateTree(ctx.navigateTree);
     const outcome = await runNavigation(nav, ctx, id);
-    await registry.publishActionResult(
-      ctx.sessionManager.getSessionId(),
-      nav,
-      ctx,
-      id,
-      token,
-      outcome.status === "moved",
-    );
+    await registry.publishActionResult(nav, ctx, id, token, outcome.status === "moved");
   };
 
   pi.registerCommand("undo", {

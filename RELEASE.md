@@ -67,7 +67,10 @@ The GitHub Release lists merged PRs (`--generate-notes`), not the changelog. If 
 
 - **Merge through a PR.** `main` requires the `Quality checks` status. A `workflow_dispatch` run does
   not satisfy it — only the `pull_request` run counts. The OS/Node/Bun matrix is not required to
-  merge, but publish reruns it on the tag and stops if any job fails; a red tag means a new patch.
+  merge, but publish reruns it on the tag and stops before publishing if any job fails. A real
+  failure means a new patch; a flake (a 30 s test timeout, a Windows `EBUSY` on a temp dir) means
+  one `gh run rerun <run-id>` on the same tag run. A job that fails the same way again is not a
+  flake: fix it and release a new patch.
 - **Never move or reuse a tag.** Publish skips any version npm already has, so a re-pushed tag
   silently does nothing. A failed or partial publish is corrected with a new patch version. If a
   force-push drops the tagged commit from `main`, re-runs of that tag fail the main-ancestry check;
@@ -75,4 +78,7 @@ The GitHub Release lists merged PRs (`--generate-notes`), not the changelog. If 
 - **Never `npm publish` locally.** The workflow holds `NPM_TOKEN` and provenance requires its OIDC
   identity.
 
-Failure triage: `gh run view <run-id> --log-failed`.
+Failure triage: `gh run view <run-id> --log-failed`. Rerun the whole run, not `--failed`: that
+reruns `publish` but not `verify`, so `publish` would download the earlier attempt's tarball, which
+expires after a day. A full rerun is safe: it re-checks the tag, and publish and release creation
+skip what exists.
