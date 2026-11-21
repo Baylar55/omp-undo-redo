@@ -2,7 +2,7 @@
 
 All notable changes to `@baylarsadigov/omp-undo-redo` are recorded here.
 
-## [Unreleased]
+## [1.8.1] - 2026-11-21
 
 ### Changed
 
