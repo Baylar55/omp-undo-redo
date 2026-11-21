@@ -521,7 +521,12 @@ describe("session navigation", () => {
       async () => {
         applyCalls++;
         await applyGate.promise;
-        return { status: "applied", nestedRepositories: [], unreadableFiles: [], restoredFiles: [] };
+        return {
+          status: "applied",
+          nestedRepositories: [],
+          unreadableFiles: [],
+          restoredFiles: [],
+        };
       },
       {
         save: async (intent) => void intents.push(`save ${intent.direction}`),

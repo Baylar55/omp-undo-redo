@@ -232,8 +232,7 @@ export async function evictStalePrivateRepos(
         // here. Async: a dead network mount then stalls a threadpool
         // thread, as `vanished` would, never the event loop.
         const refused =
-          !found.gitStore &&
-          refusedPrivateWorkspace(await realpath(source).catch(() => source));
+          !found.gitStore && refusedPrivateWorkspace(await realpath(source).catch(() => source));
         if (!refused) {
           if (!(await vanished())) continue;
           await sleep(RETRY_DELAY_MS);

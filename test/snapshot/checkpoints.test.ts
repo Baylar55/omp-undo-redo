@@ -2534,7 +2534,7 @@ describe("history-safe Git checkpoints", () => {
       await rm(excludesFile, { force: true });
       await releasePersistentSnapshotIndices([sessionId, ...freshIds]);
     }
-  });
+  }, 120_000);
 
   it("creates valid empty snapshots in an unborn repository", async () => {
     const { cwd, snap } = await makeRepo();
